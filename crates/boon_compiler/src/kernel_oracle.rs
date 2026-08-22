@@ -20687,6 +20687,20 @@ rows:
     LIST { [first: 1] }
     |> List/map(item, new: stateful_row(row: item))
 
+left_identity:
+    identity_left(value: 1)
+
+right_identity:
+    identity_right(value: "two")
+
+FUNCTION identity_left(value) {
+    value
+}
+
+FUNCTION identity_right(value) {
+    value
+}
+
 FUNCTION increment(value) {
     value + 1
 }
@@ -20739,7 +20753,6 @@ FUNCTION stateful_row(row) {
             packed_input.definition_execution_templates().len() >= 2,
             "fixture must exercise nested user definitions",
         );
-
         let rich = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Server,
@@ -20748,17 +20761,139 @@ FUNCTION stateful_row(row) {
         .expect("build EditorRich definition-template fixture");
         assert!(rich.diagnostics.is_empty(), "{:#?}", rich.diagnostics);
         assert!(rich.fields.definition_execution_templates.len() >= 2);
+        let generic_result_variable = |name: &str| {
+            let callable = rich
+                .fields
+                .callables
+                .iter()
+                .find(|callable| callable.name == name)
+                .unwrap_or_else(|| panic!("fixture must retain generic callable {name}"));
+            let Type::Var(variable) = &callable.result.ty else {
+                panic!("fixture callable {name} must retain a generic result")
+            };
+            *variable
+        };
+        assert_ne!(
+            generic_result_variable("identity_left"),
+            generic_result_variable("identity_right"),
+            "definition-local alpha ordinal zero must relocate to distinct linked variables",
+        );
+        let mut packed_type_materializer = packed_input.compatibility_type_materializer();
+        for expression in &rich.fields.expressions {
+            assert_eq!(
+                packed_type_materializer
+                    .materialize_flow(
+                        packed_input
+                            .expression_flow(expression.id)
+                            .expect("every checked expression has one packed flow"),
+                    )
+                    .expect("materialize packed expression flow"),
+                expression.flow_type,
+                "packed expression flow {} differs from the rich compatibility row",
+                expression.id.0,
+            );
+        }
+        for declaration in &rich.fields.declarations {
+            if let Some(flow) = packed_input.declared_declaration_flow(declaration.id) {
+                assert_eq!(
+                    packed_type_materializer
+                        .materialize_flow(flow)
+                        .expect("materialize packed declared declaration flow"),
+                    declaration.flow_type,
+                    "packed declaration flow {} differs from the rich compatibility row",
+                    declaration.id.0,
+                );
+            }
+        }
+        for call in &rich.fields.calls {
+            let facts = packed_input
+                .call_type_facts(call.id)
+                .expect("every checked call has packed type facts");
+            assert_eq!(
+                facts.syntax_discriminated_result(),
+                call.syntax_discriminated_result,
+            );
+            let expected = normalized_checked_call_substitutions(
+                call,
+                &rich.fields.callables,
+                &rich.fields.context_formals,
+            )
+            .expect("rich call substitutions map to the target callable scheme");
+            let mut packed = facts
+                .substitutions()
+                .map(|substitution| {
+                    Ok::<_, boon_compiler_kernel::KernelCheckedLinkError>(
+                        KernelCallTypeSubstitution {
+                            variable: substitution.parameter(),
+                            value: packed_type_materializer
+                                .materialize_type(substitution.value())?,
+                        },
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .expect("materialize packed call substitutions");
+            packed.sort_unstable_by_key(|substitution| substitution.variable);
+            assert_eq!(
+                packed.as_slice(),
+                expected.as_ref(),
+                "packed call {} substitutions differ from the target callable scheme",
+                call.id.0,
+            );
+        }
+        assert!(
+            packed_input
+                .declared_declaration_flow(boon_checked::DeclId(0))
+                .is_none(),
+            "the language-wide sentinel is outside definition-owned declaration flows",
+        );
+        let abi_declaration = rich
+            .fields
+            .callables
+            .iter()
+            .find(|callable| callable.kind != boon_checked::CheckedCallableKind::User)
+            .expect("fixture references at least one ABI callable")
+            .decl_id;
+        assert!(
+            packed_input
+                .declared_declaration_flow(abi_declaration)
+                .is_none(),
+            "ABI declaration flows remain outside the definition-owned packed range",
+        );
+
+        let rich_expression = rich
+            .fields
+            .expressions
+            .first()
+            .expect("fixture has checked expressions")
+            .id;
         let rich_construction = unsafe {
             boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(rich.fields)
         };
-        let rich_program =
-            boon_typecheck::seal_project_checked_program_construction_with_kernel_authority(
+        let (rich_program, rich_pairing) =
+            boon_typecheck::seal_project_checked_program_construction_with_kernel_publication_and_pairing(
                 &project,
                 rich_construction,
                 &rich.call_occurrences,
                 &rich.checked_image_authority,
+                rich.checked_image_publication,
             )
             .expect("seal EditorRich definition-template replay");
+        let rich_input = rich
+            .semantic_input
+            .seal(&rich_program, &rich_pairing)
+            .expect("bind EditorRich definition-template authority");
+        let foreign_error = packed_type_materializer
+            .materialize_flow(
+                rich_input
+                    .expression_flow(rich_expression)
+                    .expect("EditorRich input exposes its first packed expression flow"),
+            )
+            .expect_err("a compatibility materializer must reject a foreign semantic input");
+        assert!(
+            foreign_error.to_string().contains("foreign packed input"),
+            "unexpected foreign-input rejection: {foreign_error}",
+        );
+        drop(rich_input);
         assert_eq!(
             packed_program.image_handoff().local_image_digest,
             rich_program.image_handoff().local_image_digest,

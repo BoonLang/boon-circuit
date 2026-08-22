@@ -265,6 +265,7 @@ impl DefinitionCodeStore {
 
     pub(crate) fn materialization_cache(&self) -> DefinitionTypeMaterializationCache {
         DefinitionTypeMaterializationCache {
+            type_store_identity: Arc::as_ptr(&self.types) as usize,
             // Most compatibility projections already own the exact rich type
             // they need. Allocate the dense recursive cache only on the first
             // actual packed-type export, not merely because a linker phase
@@ -1021,6 +1022,42 @@ impl<'a> DefinitionCodeRef<'a> {
             .or(Some(base))
     }
 
+    pub(crate) fn declared_declaration_flow(self, ordinal: usize) -> Option<PackedFlow> {
+        self.code
+            .declaration_flows
+            .get(&self.store.declaration_flows)
+            .expect("sealed definition-code declaration-flow span is valid")
+            .get(ordinal)
+            .copied()
+            .flatten()
+    }
+
+    pub(crate) const fn declaration_count(self) -> usize {
+        self.code.declaration_flows.len as usize
+    }
+
+    pub(crate) fn call_type_substitutions(
+        self,
+        ordinal: usize,
+    ) -> Option<&'a [PackedCallTypeSubstitution]> {
+        let call = self
+            .code
+            .calls
+            .get(&self.store.calls)
+            .expect("sealed definition-code call span is valid")
+            .get(ordinal)?;
+        call.substitutions.get(&self.store.call_substitutions)
+    }
+
+    pub(crate) fn call_syntax_discriminated_result(self, ordinal: usize) -> Option<bool> {
+        self.code
+            .calls
+            .get(&self.store.calls)
+            .expect("sealed definition-code call span is valid")
+            .get(ordinal)
+            .map(|call| call.syntax_discriminated_result)
+    }
+
     pub(crate) fn resource_projection_requirement_count(self) -> usize {
         self.code.resource_projection_requirements.len as usize
     }
@@ -1120,6 +1157,22 @@ impl<'a> DefinitionCodeRef<'a> {
         alpha_start: u32,
     ) -> DefinitionCodeMaterializer<'a, 'cache> {
         let mut variables = BTreeMap::new();
+        let next = self.populate_linked_variables(&mut variables, alpha_start);
+        DefinitionCodeMaterializer {
+            code: self,
+            cache,
+            variables,
+            next,
+            alpha_end: next,
+        }
+    }
+
+    pub(crate) fn populate_linked_variables(
+        self,
+        variables: &mut BTreeMap<TypeVar, TypeVar>,
+        alpha_start: u32,
+    ) -> u32 {
+        variables.clear();
         for (ordinal, source) in self.alpha_variables().iter().copied().enumerate() {
             let ordinal =
                 u32::try_from(ordinal).expect("sealed definition alpha-variable count exceeds u32");
@@ -1132,19 +1185,23 @@ impl<'a> DefinitionCodeRef<'a> {
                 ),
             );
         }
-        let next = alpha_start
+        alpha_start
             .checked_add(
                 u32::try_from(variables.len())
                     .expect("sealed definition alpha-variable count exceeds u32"),
             )
-            .expect("linked definition alpha-variable namespace overflows u32");
-        DefinitionCodeMaterializer {
-            code: self,
-            cache,
-            variables,
-            next,
-            alpha_end: next,
-        }
+            .expect("linked definition alpha-variable namespace overflows u32")
+    }
+
+    pub(crate) fn materialize_linked_type_term(
+        self,
+        cache: &mut DefinitionTypeMaterializationCache,
+        variables: &mut BTreeMap<TypeVar, TypeVar>,
+        next: &mut u32,
+        alpha_end: u32,
+        term: TypeTermId,
+    ) -> Type {
+        materialize_linked_type_term(self, cache, variables, next, alpha_end, term)
     }
 
     pub fn materialize_result(self) -> FlowType {
@@ -1428,6 +1485,7 @@ impl<'a> PackedExecutionSelectorRef<'a> {
 /// into the compatibility checked image. It is deliberately external to the
 /// frozen store and is dropped with the linker phase.
 pub(crate) struct DefinitionTypeMaterializationCache {
+    type_store_identity: usize,
     types: Vec<Option<Type>>,
 }
 
@@ -1575,29 +1633,52 @@ impl DefinitionCodeMaterializer<'_, '_> {
     }
 
     fn materialize_type(&mut self, term: TypeTermId) -> Type {
-        let arena = self.code.store.types.as_arena();
-        if self.cache.types.len() != arena.len() {
-            self.cache.types.resize(arena.len(), None);
-        }
-        let raw = arena.export_checked_type_cached(term, &mut self.cache.types);
-        if !arena.has_variable(term) {
-            return raw;
-        }
-        let normalized = alpha_normalize_flow_type(
-            &FlowType {
-                mode: FlowMode::Continuous,
-                ty: raw,
-            },
+        materialize_linked_type_term(
+            self.code,
+            self.cache,
             &mut self.variables,
             &mut self.next,
+            self.alpha_end,
+            term,
         )
-        .ty;
-        assert_eq!(
-            self.next, self.alpha_end,
-            "sealed definition-code alpha map omitted a materialized variable"
-        );
-        normalized
     }
+}
+
+fn materialize_linked_type_term(
+    code: DefinitionCodeRef<'_>,
+    cache: &mut DefinitionTypeMaterializationCache,
+    variables: &mut BTreeMap<TypeVar, TypeVar>,
+    next: &mut u32,
+    alpha_end: u32,
+    term: TypeTermId,
+) -> Type {
+    assert_eq!(
+        cache.type_store_identity,
+        Arc::as_ptr(&code.store.types) as usize,
+        "a definition type cache cannot materialize a foreign frozen type store",
+    );
+    let arena = code.store.types.as_arena();
+    if cache.types.len() != arena.len() {
+        cache.types.resize(arena.len(), None);
+    }
+    let raw = arena.export_checked_type_cached(term, &mut cache.types);
+    if !arena.has_variable(term) {
+        return raw;
+    }
+    let normalized = alpha_normalize_flow_type(
+        &FlowType {
+            mode: FlowMode::Continuous,
+            ty: raw,
+        },
+        variables,
+        next,
+    )
+    .ty;
+    assert_eq!(
+        *next, alpha_end,
+        "sealed definition-code alpha map omitted a materialized variable"
+    );
+    normalized
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

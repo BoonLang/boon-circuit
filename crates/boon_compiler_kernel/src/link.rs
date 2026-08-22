@@ -1,5 +1,6 @@
 #[cfg(test)]
 use crate::KernelLexicalBindingTarget;
+use crate::definition_code::DefinitionTypeMaterializationCache;
 use crate::{
     KernelAbiContextualOperation, KernelAbiInput, KernelCallArgumentKind, KernelCallInputRoleRef,
     KernelCallTargetRef, KernelCheckedSnapshot, KernelDeclarationReference, KernelDefinitionRef,
@@ -388,6 +389,8 @@ struct KernelSemanticCallResultPathLocatorV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct KernelSemanticDefinitionRelocationV1 {
     callable: DeclId,
+    declarations: KernelCheckedRowRange,
+    type_variables: KernelCheckedRowRange,
     expressions: KernelCheckedRowRange,
     calls: KernelCheckedRowRange,
     sources: KernelCheckedRowRange,
@@ -433,6 +436,56 @@ pub struct KernelSemanticInputConstructionV1 {
 pub struct KernelSemanticInputV1 {
     construction: KernelSemanticInputConstructionV1,
     checked_image_digest: [u8; 32],
+}
+
+/// Definition-scoped borrowed reference to one packed type term.
+///
+/// A raw `TypeTermId` is never exposed: its store and definition-local alpha
+/// namespace are both part of this value. Structural consumers inspect it
+/// without allocation; explicit compatibility code may materialize one rich
+/// checked type through the final linked alpha namespace.
+#[derive(Clone, Copy)]
+pub struct KernelDefinitionTypeRef<'a> {
+    input: &'a KernelSemanticInputV1,
+    owner: KernelOwnerId,
+    term: crate::TypeTermId,
+}
+
+#[derive(Clone, Copy)]
+pub struct KernelDefinitionFlowRef<'a> {
+    mode: FlowMode,
+    ty: KernelDefinitionTypeRef<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub struct KernelDefinitionCallTypeFactsRef<'a> {
+    input: &'a KernelSemanticInputV1,
+    owner: KernelOwnerId,
+    substitutions: &'a [crate::PackedCallTypeSubstitution],
+    syntax_discriminated_result: bool,
+}
+
+#[derive(Clone, Copy)]
+pub struct KernelDefinitionCallTypeSubstitutionRef<'a> {
+    input: &'a KernelSemanticInputV1,
+    owner: KernelOwnerId,
+    substitution: &'a crate::PackedCallTypeSubstitution,
+}
+
+/// Explicit, phase-scoped compatibility projector for packed semantic types.
+///
+/// Structural consumers use [`KernelDefinitionTypeRef`] directly and allocate
+/// nothing. A rich checked/editor boundary creates one of these and reuses its
+/// recursive export cache for the complete projection instead of allocating a
+/// project-sized cache for each type root.
+#[doc(hidden)]
+pub struct KernelSemanticTypeMaterializer<'a> {
+    input: &'a KernelSemanticInputV1,
+    cache: DefinitionTypeMaterializationCache,
+    owner: Option<KernelOwnerId>,
+    variables: BTreeMap<TypeVar, TypeVar>,
+    next: u32,
+    alpha_end: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -866,6 +919,28 @@ impl KernelSemanticInputConstructionV1 {
         ))
     }
 
+    fn local_declaration(&self, declaration: DeclId) -> Option<(KernelOwnerId, u32)> {
+        let owner = self
+            .definition_relocations
+            .partition_point(|relocation| relocation.declarations.start <= declaration.0)
+            .checked_sub(1)?;
+        let range = self.definition_relocations.get(owner)?.declarations;
+        let local = declaration.0.checked_sub(range.start)?;
+        let owner = KernelOwnerId(u32::try_from(owner).ok()?);
+        (local < range.len).then_some((owner, local))
+    }
+
+    fn local_call(&self, call: CheckedCallId) -> Option<crate::PackedCallRef> {
+        let owner = self
+            .definition_relocations
+            .partition_point(|relocation| relocation.calls.start <= call.0)
+            .checked_sub(1)?;
+        let range = self.definition_relocations.get(owner)?.calls;
+        let local = call.0.checked_sub(range.start)?;
+        let owner = KernelOwnerId(u32::try_from(owner).ok()?);
+        (local < range.len).then(|| crate::PackedCallRef::new(owner, local))
+    }
+
     fn call_result_path_symbols(
         &self,
         path: KernelSemanticCallResultPathLocatorV1,
@@ -1126,6 +1201,16 @@ impl KernelSemanticInputConstructionV1 {
                 })?;
             for (label, packed, linked) in [
                 (
+                    "declaration",
+                    code.declaration_count(),
+                    definition.declarations.len,
+                ),
+                (
+                    "type variable",
+                    code.alpha_variable_count(),
+                    definition.type_variables.len,
+                ),
+                (
                     "expression",
                     code.expression_count(),
                     definition.expressions.len,
@@ -1156,6 +1241,8 @@ impl KernelSemanticInputConstructionV1 {
             }
             definition_relocations.push(KernelSemanticDefinitionRelocationV1 {
                 callable: definition.public_declaration,
+                declarations: definition.declarations,
+                type_variables: definition.type_variables,
                 expressions: definition.expressions,
                 calls: definition.calls,
                 sources: definition.sources,
@@ -1440,6 +1527,88 @@ impl KernelSemanticInputV1 {
         self.construction.definition_count
     }
 
+    fn definition_type_ref(
+        &self,
+        owner: KernelOwnerId,
+        term: crate::TypeTermId,
+    ) -> KernelDefinitionTypeRef<'_> {
+        KernelDefinitionTypeRef {
+            input: self,
+            owner,
+            term,
+        }
+    }
+
+    /// Create one explicit rich-type compatibility projector for this input.
+    /// Hot semantic consumers should prefer the borrowed structural views.
+    #[doc(hidden)]
+    pub fn compatibility_type_materializer(&self) -> KernelSemanticTypeMaterializer<'_> {
+        KernelSemanticTypeMaterializer {
+            input: self,
+            cache: self.construction.definition_code.materialization_cache(),
+            owner: None,
+            variables: BTreeMap::new(),
+            next: 0,
+            alpha_end: 0,
+        }
+    }
+
+    /// Borrow the checked occurrence flow directly from the packed definition
+    /// store. Resource-required publication overrides are already reflected.
+    pub fn expression_flow(
+        &self,
+        expression: CheckedExprId,
+    ) -> Option<KernelDefinitionFlowRef<'_>> {
+        let expression = self.construction.local_expression(expression)?;
+        let flow = self
+            .construction
+            .definition_code
+            .definition(expression.owner())?
+            .published_expression(expression.expression().0 as usize)?;
+        Some(KernelDefinitionFlowRef {
+            mode: flow.mode,
+            ty: self.definition_type_ref(expression.owner(), flow.term),
+        })
+    }
+
+    /// Borrow a declaration flow that was authored directly in this
+    /// definition artifact. Effective function, parameter, pattern, OUT, and
+    /// value-backed declaration flows remain compatibility-linker derivations
+    /// until the complete declaration authority is packed.
+    pub fn declared_declaration_flow(
+        &self,
+        declaration: DeclId,
+    ) -> Option<KernelDefinitionFlowRef<'_>> {
+        let (owner, ordinal) = self.construction.local_declaration(declaration)?;
+        let flow = self
+            .construction
+            .definition_code
+            .definition(owner)?
+            .declared_declaration_flow(ordinal as usize)?;
+        Some(KernelDefinitionFlowRef {
+            mode: flow.mode,
+            ty: self.definition_type_ref(owner, flow.term),
+        })
+    }
+
+    /// Borrow the caller-owned packed values of one call's type
+    /// substitutions. Keys remain callee parameter ordinals; no global
+    /// `TypeVar` namespace is invented at this boundary.
+    pub fn call_type_facts(
+        &self,
+        call: CheckedCallId,
+    ) -> Option<KernelDefinitionCallTypeFactsRef<'_>> {
+        let call = self.construction.local_call(call)?;
+        let code = self.construction.definition_code.definition(call.owner())?;
+        Some(KernelDefinitionCallTypeFactsRef {
+            input: self,
+            owner: call.owner(),
+            substitutions: code.call_type_substitutions(call.ordinal() as usize)?,
+            syntax_discriminated_result: code
+                .call_syntax_discriminated_result(call.ordinal() as usize)?,
+        })
+    }
+
     /// Borrow one call-result path from the packed kernel authority.
     ///
     /// Absence is distinct from a present path with an empty projection: an
@@ -1680,6 +1849,187 @@ impl KernelSemanticInputV1 {
             }
         }
         Ok(())
+    }
+}
+
+impl<'a> KernelDefinitionTypeRef<'a> {
+    fn with_term(self, term: crate::TypeTermId) -> Self {
+        Self { term, ..self }
+    }
+}
+
+impl KernelSemanticTypeMaterializer<'_> {
+    /// Materialize one type from this projector's packed input through the
+    /// definition's final linked alpha namespace.
+    pub fn materialize_type(
+        &mut self,
+        ty: KernelDefinitionTypeRef<'_>,
+    ) -> Result<Type, KernelCheckedLinkError> {
+        if !std::ptr::eq(self.input, ty.input) {
+            return Err(KernelCheckedLinkError::new(
+                "a semantic type projector cannot materialize a foreign packed input",
+            ));
+        }
+        let code = self
+            .input
+            .construction
+            .definition_code
+            .definition(ty.owner)
+            .expect("sealed kernel semantic type owner exists");
+        let alpha_start = self
+            .input
+            .construction
+            .definition_relocation(ty.owner)
+            .expect("sealed kernel semantic type relocation exists")
+            .type_variables
+            .start;
+        if self.owner != Some(ty.owner) {
+            self.alpha_end = code.populate_linked_variables(&mut self.variables, alpha_start);
+            self.next = self.alpha_end;
+            self.owner = Some(ty.owner);
+        }
+        Ok(code.materialize_linked_type_term(
+            &mut self.cache,
+            &mut self.variables,
+            &mut self.next,
+            self.alpha_end,
+            ty.term,
+        ))
+    }
+
+    pub fn materialize_flow(
+        &mut self,
+        flow: KernelDefinitionFlowRef<'_>,
+    ) -> Result<FlowType, KernelCheckedLinkError> {
+        Ok(FlowType {
+            mode: flow.mode,
+            ty: self.materialize_type(flow.ty)?,
+        })
+    }
+}
+
+impl boon_checked::CheckedTypeView for KernelDefinitionTypeRef<'_> {
+    fn list_item(self) -> Option<Self> {
+        match self
+            .input
+            .construction
+            .definition_code
+            .type_store()
+            .as_arena()
+            .term(self.term)
+        {
+            crate::TypeTerm::List(item) => Some(self.with_term(item)),
+            _ => None,
+        }
+    }
+
+    fn is_text(self) -> bool {
+        matches!(
+            self.input
+                .construction
+                .definition_code
+                .type_store()
+                .as_arena()
+                .term(self.term),
+            crate::TypeTerm::Text
+        )
+    }
+
+    fn is_number(self) -> bool {
+        matches!(
+            self.input
+                .construction
+                .definition_code
+                .type_store()
+                .as_arena()
+                .term(self.term),
+            crate::TypeTerm::Number
+        )
+    }
+
+    fn is_render_contract(self) -> bool {
+        matches!(
+            self.input
+                .construction
+                .definition_code
+                .type_store()
+                .as_arena()
+                .term(self.term),
+            crate::TypeTerm::RenderContract
+        )
+    }
+
+    fn object_field(self, name: &str) -> Option<Self> {
+        let arena = self
+            .input
+            .construction
+            .definition_code
+            .type_store()
+            .as_arena();
+        let crate::TypeTerm::Object { fields, .. } = arena.term(self.term) else {
+            return None;
+        };
+        fields
+            .canonical_iter()
+            .find(|field| arena.name(field.name) == name)
+            .map(|field| self.with_term(field.ty))
+    }
+
+    fn all_variants_are_bare_tags(self, mut predicate: impl FnMut(&str) -> bool) -> bool {
+        let arena = self
+            .input
+            .construction
+            .definition_code
+            .type_store()
+            .as_arena();
+        let crate::TypeTerm::VariantSet(variants) = arena.term(self.term) else {
+            return false;
+        };
+        variants.iter().all(|variant| match variant {
+            crate::VariantTerm::Tag(tag) => predicate(arena.name(*tag)),
+            crate::VariantTerm::Tagged { .. } => false,
+        })
+    }
+}
+
+impl<'a> KernelDefinitionFlowRef<'a> {
+    pub const fn mode(self) -> FlowMode {
+        self.mode
+    }
+
+    pub const fn ty(self) -> KernelDefinitionTypeRef<'a> {
+        self.ty
+    }
+}
+
+impl<'a> KernelDefinitionCallTypeFactsRef<'a> {
+    pub fn substitutions(
+        self,
+    ) -> impl ExactSizeIterator<Item = KernelDefinitionCallTypeSubstitutionRef<'a>> {
+        let input = self.input;
+        let owner = self.owner;
+        self.substitutions.iter().map(
+            move |substitution| KernelDefinitionCallTypeSubstitutionRef {
+                input,
+                owner,
+                substitution,
+            },
+        )
+    }
+
+    pub const fn syntax_discriminated_result(self) -> bool {
+        self.syntax_discriminated_result
+    }
+}
+
+impl<'a> KernelDefinitionCallTypeSubstitutionRef<'a> {
+    pub const fn parameter(self) -> crate::KernelTypeParameterId {
+        self.substitution.variable
+    }
+
+    pub fn value(self) -> KernelDefinitionTypeRef<'a> {
+        self.input
+            .definition_type_ref(self.owner, self.substitution.term)
     }
 }
 
@@ -2662,9 +3012,11 @@ impl KernelCheckedLinkLayout {
         role: ProgramRole,
         projection_demand: KernelCheckedRowProjectionDemand,
     ) -> Result<KernelCheckedRows, KernelCheckedLinkError> {
-        let materialize_expression_rows = || {
+        let mut type_cache = snapshot.definition_code.materialization_cache();
+        let materialize_expression_rows = |type_cache: &mut DefinitionTypeMaterializationCache| {
             Ok::<_, KernelCheckedLinkError>((
-                self.materialize_expressions(snapshot)?.into_vec(),
+                self.materialize_expressions_with_cache(snapshot, type_cache)?
+                    .into_vec(),
                 self.materialize_runtime_flow_terms(snapshot)?,
             ))
         };
@@ -2676,8 +3028,13 @@ impl KernelCheckedLinkLayout {
                     .is_ok_and(|parallelism| parallelism.get() >= 2)
             {
                 std::thread::scope(|scope| {
-                    let expression_worker = scope.spawn(materialize_expression_rows);
-                    let base = self.materialize_base_rows(project, snapshot, role)?;
+                    let expression_worker = scope.spawn(|| {
+                        let mut expression_type_cache =
+                            snapshot.definition_code.materialization_cache();
+                        materialize_expression_rows(&mut expression_type_cache)
+                    });
+                    let base =
+                        self.materialize_base_rows(project, snapshot, role, &mut type_cache)?;
                     let expressions = expression_worker.join().map_err(|_| {
                         KernelCheckedLinkError::new(
                             "kernel checked expression materialization worker panicked",
@@ -2687,14 +3044,14 @@ impl KernelCheckedLinkLayout {
                 })?
             } else {
                 (
-                    self.materialize_base_rows(project, snapshot, role)?,
-                    materialize_expression_rows()?,
+                    self.materialize_base_rows(project, snapshot, role, &mut type_cache)?,
+                    materialize_expression_rows(&mut type_cache)?,
                 )
             };
         #[cfg(target_family = "wasm")]
         let (base, (expressions, runtime_flow_terms)) = (
-            self.materialize_base_rows(project, snapshot, role)?,
-            materialize_expression_rows()?,
+            self.materialize_base_rows(project, snapshot, role, &mut type_cache)?,
+            materialize_expression_rows(&mut type_cache)?,
         );
         let KernelCheckedBaseRows {
             scopes,
@@ -2706,8 +3063,14 @@ impl KernelCheckedLinkLayout {
             states,
             lists,
         } = base;
-        let (calls, call_occurrences) =
-            self.materialize_calls(project, snapshot, &callables, &declarations)?;
+        let (calls, call_occurrences) = self.materialize_calls_with_cache(
+            project,
+            snapshot,
+            &callables,
+            &declarations,
+            &mut type_cache,
+        )?;
+        drop(type_cache);
         let (packed_call_result_paths, packed_call_result_path_symbols) =
             self.pack_call_result_paths(snapshot, &declarations, &callables, &expressions, &calls)?;
         let call_result_paths = match projection_demand {
@@ -2826,14 +3189,18 @@ impl KernelCheckedLinkLayout {
         project: &KernelProjectInput,
         snapshot: &KernelCheckedSnapshot,
         role: ProgramRole,
+        type_cache: &mut DefinitionTypeMaterializationCache,
     ) -> Result<KernelCheckedBaseRows, KernelCheckedLinkError> {
         let scopes = self.materialize_scopes(snapshot)?;
-        let mut declarations = self.materialize_declarations(snapshot)?.into_vec();
+        let mut declarations = self
+            .materialize_declarations_with_cache(snapshot, type_cache)?
+            .into_vec();
         let statements = self.materialize_statements(snapshot)?;
-        let sources = self.materialize_sources(snapshot)?;
-        let states = self.materialize_states(snapshot)?;
-        let lists = self.materialize_lists(snapshot)?;
-        let (user_callables, context_formals) = self.materialize_user_callables(snapshot, role)?;
+        let sources = self.materialize_sources_with_cache(snapshot, type_cache)?;
+        let states = self.materialize_states_with_cache(snapshot, type_cache)?;
+        let lists = self.materialize_lists_with_cache(snapshot, type_cache)?;
+        let (user_callables, context_formals) =
+            self.materialize_user_callables_with_cache(snapshot, role, type_cache)?;
         let mut callables = user_callables.into_vec();
         let (abi_callables, abi_declarations) = self.materialize_abi_callables(project.abi())?;
         callables.extend(abi_callables);
@@ -4174,6 +4541,15 @@ impl KernelCheckedLinkLayout {
         &self,
         snapshot: &KernelCheckedSnapshot,
     ) -> Result<Box<[CheckedDeclaration]>, KernelCheckedLinkError> {
+        let mut type_cache = snapshot.definition_code.materialization_cache();
+        self.materialize_declarations_with_cache(snapshot, &mut type_cache)
+    }
+
+    fn materialize_declarations_with_cache(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        type_cache: &mut DefinitionTypeMaterializationCache,
+    ) -> Result<Box<[CheckedDeclaration]>, KernelCheckedLinkError> {
         if snapshot.definition_count() != self.definitions.len() {
             return Err(KernelCheckedLinkError::new(format!(
                 "kernel checked declaration materializer has {} definitions for a {}-definition layout",
@@ -4186,7 +4562,6 @@ impl KernelCheckedLinkLayout {
                 .checked_sub(1)
                 .expect("the checked declaration namespace reserves row zero") as usize,
         );
-        let mut type_cache = snapshot.definition_code.materialization_cache();
         for definition in snapshot.definition_refs() {
             let facts = definition.facts();
             let owner = definition.owner();
@@ -4233,7 +4608,7 @@ impl KernelCheckedLinkLayout {
                         snapshot,
                         owner,
                         declaration,
-                        &mut type_cache,
+                        type_cache,
                     )?,
                     value: declaration
                         .value
@@ -4423,6 +4798,15 @@ impl KernelCheckedLinkLayout {
         &self,
         snapshot: &KernelCheckedSnapshot,
     ) -> Result<Box<[CheckedExpression]>, KernelCheckedLinkError> {
+        let mut type_cache = snapshot.definition_code.materialization_cache();
+        self.materialize_expressions_with_cache(snapshot, &mut type_cache)
+    }
+
+    fn materialize_expressions_with_cache(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        type_cache: &mut DefinitionTypeMaterializationCache,
+    ) -> Result<Box<[CheckedExpression]>, KernelCheckedLinkError> {
         if snapshot.definition_count() != self.definitions.len() {
             return Err(KernelCheckedLinkError::new(format!(
                 "kernel checked expression materializer has {} definitions for a {}-definition layout",
@@ -4520,15 +4904,12 @@ impl KernelCheckedLinkLayout {
         }
 
         let mut expressions = Vec::with_capacity(self.totals.expressions as usize);
-        let mut type_cache = snapshot.definition_code.materialization_cache();
         for definition in snapshot.definition_refs() {
             let facts = definition.facts();
             let owner = definition.owner();
             let code = definition.code();
-            let mut materializer = code.linked_materializer(
-                &mut type_cache,
-                self.definition(owner)?.type_variables.start,
-            );
+            let mut materializer =
+                code.linked_materializer(type_cache, self.definition(owner)?.type_variables.start);
             let local_len = definition.input().nodes.len();
             if code.expressions().len() != local_len
                 || facts.presentation.expressions.len() != local_len
@@ -4716,18 +5097,28 @@ impl KernelCheckedLinkLayout {
         (Box<[CheckedCallableSignature]>, Box<[CheckedContextFormal]>),
         KernelCheckedLinkError,
     > {
+        let mut type_cache = snapshot.definition_code.materialization_cache();
+        self.materialize_user_callables_with_cache(snapshot, role, &mut type_cache)
+    }
+
+    fn materialize_user_callables_with_cache(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        role: ProgramRole,
+        type_cache: &mut DefinitionTypeMaterializationCache,
+    ) -> Result<
+        (Box<[CheckedCallableSignature]>, Box<[CheckedContextFormal]>),
+        KernelCheckedLinkError,
+    > {
         self.validate_snapshot_definition_count(snapshot, "user callable")?;
         let mut callables = Vec::with_capacity(self.totals.user_callables as usize);
         let mut context_formals = Vec::with_capacity(self.totals.context_formals as usize);
-        let mut type_cache = snapshot.definition_code.materialization_cache();
         for definition in snapshot.definition_refs() {
             let facts = definition.facts();
             let owner = definition.owner();
             let code = definition.code();
-            let mut materializer = code.linked_materializer(
-                &mut type_cache,
-                self.definition(owner)?.type_variables.start,
-            );
+            let mut materializer =
+                code.linked_materializer(type_cache, self.definition(owner)?.type_variables.start);
             let root_statement = definition.linkage().root_statement.ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
                     "kernel definition {} has no root statement while linking callables",
@@ -5201,6 +5592,24 @@ impl KernelCheckedLinkLayout {
         callables: &[CheckedCallableSignature],
         declarations: &[CheckedDeclaration],
     ) -> Result<(Box<[CheckedCall]>, Box<[StableOccurrenceKey]>), KernelCheckedLinkError> {
+        let mut type_cache = snapshot.definition_code.materialization_cache();
+        self.materialize_calls_with_cache(
+            project,
+            snapshot,
+            callables,
+            declarations,
+            &mut type_cache,
+        )
+    }
+
+    fn materialize_calls_with_cache(
+        &self,
+        project: &KernelProjectInput,
+        snapshot: &KernelCheckedSnapshot,
+        callables: &[CheckedCallableSignature],
+        declarations: &[CheckedDeclaration],
+        type_cache: &mut DefinitionTypeMaterializationCache,
+    ) -> Result<(Box<[CheckedCall]>, Box<[StableOccurrenceKey]>), KernelCheckedLinkError> {
         self.validate_snapshot_definition_count(snapshot, "call")?;
         let callable_by_declaration = callables
             .iter()
@@ -5217,7 +5626,6 @@ impl KernelCheckedLinkLayout {
             .collect::<BTreeMap<_, _>>();
         let mut calls = Vec::with_capacity(self.totals.calls as usize);
         let mut call_occurrences = Vec::with_capacity(self.totals.calls as usize);
-        let mut type_cache = snapshot.definition_code.materialization_cache();
         for definition in snapshot.definition_refs() {
             let facts = definition.facts();
             let owner = definition.owner();
@@ -5225,7 +5633,7 @@ impl KernelCheckedLinkLayout {
             let code = definition.code();
             let (packed_calls, call_results) = {
                 let mut materializer =
-                    code.linked_materializer(&mut type_cache, local.type_variables.start);
+                    code.linked_materializer(type_cache, local.type_variables.start);
                 let packed_calls = (0..definition.call_count())
                     .map(|ordinal| {
                         materializer.materialize_call_facts(ordinal).ok_or_else(|| {
@@ -5595,10 +6003,8 @@ impl KernelCheckedLinkLayout {
                                 ))
                             })?;
                         let target_layout = self.definition(target)?;
-                        let mut target_materializer = target_code.linked_materializer(
-                            &mut type_cache,
-                            target_layout.type_variables.start,
-                        );
+                        let mut target_materializer = target_code
+                            .linked_materializer(type_cache, target_layout.type_variables.start);
                         let target_formals = (0..target_code.formals().len())
                             .map(|ordinal| {
                                 target_materializer
@@ -5769,17 +6175,23 @@ impl KernelCheckedLinkLayout {
         &self,
         snapshot: &KernelCheckedSnapshot,
     ) -> Result<Box<[CheckedSource]>, KernelCheckedLinkError> {
+        let mut type_cache = snapshot.definition_code.materialization_cache();
+        self.materialize_sources_with_cache(snapshot, &mut type_cache)
+    }
+
+    fn materialize_sources_with_cache(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        type_cache: &mut DefinitionTypeMaterializationCache,
+    ) -> Result<Box<[CheckedSource]>, KernelCheckedLinkError> {
         self.validate_snapshot_definition_count(snapshot, "SOURCE")?;
         let mut sources = Vec::with_capacity(self.totals.sources as usize);
-        let mut type_cache = snapshot.definition_code.materialization_cache();
         for definition in snapshot.definition_refs() {
             let facts = definition.facts();
             let owner = definition.owner();
             let code = definition.code();
-            let mut materializer = code.linked_materializer(
-                &mut type_cache,
-                self.definition(owner)?.type_variables.start,
-            );
+            let mut materializer =
+                code.linked_materializer(type_cache, self.definition(owner)?.type_variables.start);
             for (ordinal, source) in facts.sources.iter().enumerate() {
                 let id = self.source(owner, source.id.0)?;
                 if id.0 as usize != sources.len() {
@@ -5825,17 +6237,23 @@ impl KernelCheckedLinkLayout {
         &self,
         snapshot: &KernelCheckedSnapshot,
     ) -> Result<Box<[CheckedState]>, KernelCheckedLinkError> {
+        let mut type_cache = snapshot.definition_code.materialization_cache();
+        self.materialize_states_with_cache(snapshot, &mut type_cache)
+    }
+
+    fn materialize_states_with_cache(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        type_cache: &mut DefinitionTypeMaterializationCache,
+    ) -> Result<Box<[CheckedState]>, KernelCheckedLinkError> {
         self.validate_snapshot_definition_count(snapshot, "state")?;
         let mut states = Vec::with_capacity(self.totals.states as usize);
-        let mut type_cache = snapshot.definition_code.materialization_cache();
         for definition in snapshot.definition_refs() {
             let facts = definition.facts();
             let owner = definition.owner();
             let code = definition.code();
-            let mut materializer = code.linked_materializer(
-                &mut type_cache,
-                self.definition(owner)?.type_variables.start,
-            );
+            let mut materializer =
+                code.linked_materializer(type_cache, self.definition(owner)?.type_variables.start);
             for (ordinal, state) in definition.states().enumerate() {
                 let input = state.input();
                 let id = self.state(owner, state.id().0)?;
@@ -5911,17 +6329,23 @@ impl KernelCheckedLinkLayout {
         &self,
         snapshot: &KernelCheckedSnapshot,
     ) -> Result<Box<[CheckedList]>, KernelCheckedLinkError> {
+        let mut type_cache = snapshot.definition_code.materialization_cache();
+        self.materialize_lists_with_cache(snapshot, &mut type_cache)
+    }
+
+    fn materialize_lists_with_cache(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        type_cache: &mut DefinitionTypeMaterializationCache,
+    ) -> Result<Box<[CheckedList]>, KernelCheckedLinkError> {
         self.validate_snapshot_definition_count(snapshot, "LIST")?;
         let mut lists = Vec::with_capacity(self.totals.lists as usize);
-        let mut type_cache = snapshot.definition_code.materialization_cache();
         for definition in snapshot.definition_refs() {
             let facts = definition.facts();
             let owner = definition.owner();
             let code = definition.code();
-            let mut materializer = code.linked_materializer(
-                &mut type_cache,
-                self.definition(owner)?.type_variables.start,
-            );
+            let mut materializer =
+                code.linked_materializer(type_cache, self.definition(owner)?.type_variables.start);
             for (ordinal, list) in facts.lists.iter().enumerate() {
                 let id = self.list(owner, list.id.0)?;
                 if id.0 as usize != lists.len() {

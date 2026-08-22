@@ -10,14 +10,15 @@ use boon_syntax::{
     AstStatement, AstStatementKind, AstTextSegment, AstToken, AstTokenKind, BytesSizeSyntax,
     DocumentAst, LANGUAGE_FEATURE_REGISTRY, LanguageFeatureParseExpectation, LanguageFeatureStage,
     ParsedProgramFields, ParsedSourceFile, ParsedSourceUnitFields, ParserItem, ParserLine,
-    ProgramKind, SourceUnitId, StableCheckOwnerKey, StableDefinitionKey, StableExpressionChildRole,
-    StableExpressionKey, StableExpressionRouteSegment, StableItemRoute, StableItemRouteSegment,
-    StableOccurrenceKey, StableOccurrenceRoute, StableOwnerKey, StableStatementKey,
-    StableStatementKind, StableStatementRoute, StableStatementRouteSegment, SyntaxUnitNamespace,
-    UnitCheckOwnerSlot, UnitChildOwnerBoundary, UnitExpressionParentEdge, UnitItemIndex,
-    UnitItemIndexEntry, UnitItemKind, UnitItemParameter, UnitLocalExpressionId,
-    UnitLocalStatementId, UnitOwnerIndex, UnitOwnerIndexEntry, UnitOwnerRoute,
-    UnitStatementLocator, is_program_role_root, is_reserved_standard_root,
+    ProgramKind, ProjectOwnerCoord, ProjectUnitId, SourceUnitId, StableCheckOwnerKey,
+    StableDefinitionKey, StableExpressionChildRole, StableExpressionKey,
+    StableExpressionRouteSegment, StableItemRoute, StableItemRouteSegment, StableOccurrenceKey,
+    StableOccurrenceRoute, StableOwnerKey, StableStatementKey, StableStatementKind,
+    StableStatementRoute, StableStatementRouteSegment, SyntaxUnitNamespace, UnitCheckOwnerSlot,
+    UnitChildOwnerBoundary, UnitExpressionParentEdge, UnitItemIndex, UnitItemIndexEntry,
+    UnitItemKind, UnitItemParameter, UnitLocalExpressionId, UnitLocalStatementId, UnitOwnerIndex,
+    UnitOwnerIndexEntry, UnitOwnerRoute, UnitStatementLocator, is_program_role_root,
+    is_reserved_standard_root,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -447,6 +448,41 @@ impl<'a> UnitOwnerSyntaxView<'a> {
         &self.entry.expressions
     }
 
+    /// Copy the parser-issued versioned digest for a unit-local statement
+    /// without constructing its rich stable key or cloning its route.
+    /// Pair this with [`Self::source_unit_id`] for the complete stable identity.
+    pub fn statement_route_digest_v1(&self, statement: UnitLocalStatementId) -> Option<[u8; 32]> {
+        self.fields.owner_index.statement_route_digest_v1(statement)
+    }
+
+    /// Copy the existing parser-issued expression-route digest without
+    /// constructing a [`StableExpressionKey`] or cloning the source-unit ID.
+    /// Pair this with [`Self::source_unit_id`] for the complete stable identity.
+    pub fn expression_route_digest_v1(
+        &self,
+        expression: UnitLocalExpressionId,
+    ) -> Option<[u8; 32]> {
+        self.fields
+            .expression_route_digests_v1
+            .get(expression.as_usize())
+            .copied()
+            .flatten()
+    }
+
+    /// Copy the parser-issued versioned digest for a call/pipe occurrence
+    /// without constructing its rich stable key or cloning its route.
+    /// Pair this with [`Self::source_unit_id`] for the complete stable identity.
+    pub fn occurrence_route_digest_v1(
+        &self,
+        expression: UnitLocalExpressionId,
+    ) -> Option<[u8; 32]> {
+        self.fields
+            .occurrence_route_digests_v1
+            .get(expression.as_usize())
+            .copied()
+            .flatten()
+    }
+
     pub fn statement_locator(
         &self,
         statement: UnitLocalStatementId,
@@ -544,11 +580,7 @@ impl<'a> UnitOwnerSyntaxView<'a> {
     ) -> Option<StableExpressionKey> {
         Some(StableExpressionKey {
             source_unit_id: self.fields.source_unit_id.clone(),
-            route_digest_v1: *self
-                .fields
-                .expression_route_digests_v1
-                .get(expression.as_usize())?
-                .as_ref()?,
+            route_digest_v1: self.expression_route_digest_v1(expression)?,
         })
     }
 
@@ -1260,6 +1292,18 @@ impl UnitSyntaxSnapshot {
         })
     }
 
+    /// Borrow one owner partition through its revision-local dense slot.
+    ///
+    /// Unlike [`Self::owner_view`], this performs no stable-route map lookup and
+    /// requires no route construction or clone.
+    pub fn owner_view_by_slot(&self, slot: UnitCheckOwnerSlot) -> Option<UnitOwnerSyntaxView<'_>> {
+        Some(UnitOwnerSyntaxView {
+            fields: &self.fields,
+            entry: self.owner_index.entry_by_slot(slot)?,
+            namespace: Some(self.namespace),
+        })
+    }
+
     pub fn owner_view_for_key(
         &self,
         owner: &StableCheckOwnerKey,
@@ -1652,6 +1696,53 @@ impl ProjectSyntaxSnapshot {
             .units
             .iter()
             .flat_map(|unit| unit.stable_check_owner_keys())
+    }
+
+    /// Iterate every parser-owned check partition with a copy-only project
+    /// coordinate and a borrowed syntax view.
+    ///
+    /// Unit order is the project's canonical unit order and owner order is the
+    /// parser-owned dense slot order. The iterator constructs no stable owner
+    /// key and clones no source ID or structural route.
+    pub fn indexed_owner_views(
+        &self,
+    ) -> impl Iterator<Item = (ProjectOwnerCoord, UnitOwnerSyntaxView<'_>)> + '_ {
+        self.fields
+            .units
+            .iter()
+            .enumerate()
+            .flat_map(|(unit_index, unit)| {
+                let unit_id = ProjectUnitId::__parser_new(unit_index)
+                    .expect("project syntax unit count exceeds the dense u32 namespace");
+                unit.owner_index()
+                    .entries()
+                    .iter()
+                    .enumerate()
+                    .map(move |(entry_index, _)| {
+                        let slot = UnitCheckOwnerSlot::__parser_from_owner_entry_index(entry_index)
+                            .expect("unit owner count exceeds the dense u32 namespace");
+                        let coordinate = ProjectOwnerCoord::__parser_new(unit_id, slot)
+                            .expect("an indexed project owner always has a routed slot");
+                        let view = unit
+                            .owner_view_by_slot(slot)
+                            .expect("an indexed project owner slot resolves its parser entry");
+                        (coordinate, view)
+                    })
+            })
+    }
+
+    /// Resolve a revision-local coordinate back to its borrowed owner view.
+    /// The view exposes the stable source-unit identity by reference and all
+    /// local relocation coordinates and digests without constructing rich
+    /// stable keys.
+    pub fn owner_view_by_coord(
+        &self,
+        coordinate: ProjectOwnerCoord,
+    ) -> Option<UnitOwnerSyntaxView<'_>> {
+        self.fields
+            .units
+            .get(coordinate.unit().as_usize())?
+            .owner_view_by_slot(coordinate.owner_slot())
     }
 
     pub fn owner_view(&self, owner: &StableCheckOwnerKey) -> Option<UnitOwnerSyntaxView<'_>> {
@@ -2680,6 +2771,7 @@ fn parse_normalized_source_unit_syntax(
             item_index,
             owner_index: expression_identities.owner_index,
             occurrence_routes: expression_identities.occurrence_routes,
+            occurrence_route_digests_v1: expression_identities.occurrence_route_digests_v1,
             expression_route_digests_v1: expression_identities.expression_route_digests_v1,
         }),
         validation_index,
@@ -3480,6 +3572,7 @@ fn assemble_canonical_parsed_source_units(
             item_index: _item_index,
             owner_index: _owner_index,
             occurrence_routes: unit_occurrence_routes,
+            occurrence_route_digests_v1: _unit_occurrence_route_digests_v1,
             expression_route_digests_v1: unit_expression_route_digests_v1,
         } = unit.fields;
         if let Some(module) = module.as_deref() {
@@ -9053,10 +9146,13 @@ pub fn stable_expression_child_edges(
 
 const STABLE_EXPRESSION_ROOT_DOMAIN_V1: &[u8] = b"boon.stable-expression-root.v1\0";
 const STABLE_EXPRESSION_CHILD_DOMAIN_V1: &[u8] = b"boon.stable-expression-child.v1\0";
+const STABLE_STATEMENT_ROUTE_DOMAIN_V1: &[u8] = b"boon.stable-statement-route.v1\0";
+const STABLE_OCCURRENCE_ROUTE_DOMAIN_V1: &[u8] = b"boon.stable-occurrence-route.v1\0";
 
 struct UnitExpressionIdentities {
     owner_index: UnitOwnerIndex,
     occurrence_routes: Vec<Option<StableOccurrenceRoute>>,
+    occurrence_route_digests_v1: Vec<Option<[u8; 32]>>,
     expression_route_digests_v1: Vec<Option<[u8; 32]>>,
 }
 
@@ -9131,27 +9227,113 @@ fn stable_expression_role_tag(role: StableExpressionChildRole) -> u8 {
     }
 }
 
-fn stable_expression_root_digest(route: &StableOccurrenceRoute) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(STABLE_EXPRESSION_ROOT_DOMAIN_V1);
-    if let Some(owner) = &route.owner {
+fn stable_identity_owner(hasher: &mut Sha256, owner: Option<&StableItemRoute>) {
+    if let Some(owner) = owner {
         hasher.update([1]);
-        stable_identity_count(&mut hasher, owner.segments().len());
+        stable_identity_count(hasher, owner.segments().len());
         for segment in owner.segments() {
             hasher.update([stable_item_kind_tag(segment.kind)]);
-            stable_identity_names(&mut hasher, &segment.names);
-            stable_identity_count(&mut hasher, segment.matching_sibling_ordinal);
+            stable_identity_names(hasher, &segment.names);
+            stable_identity_count(hasher, segment.matching_sibling_ordinal);
         }
     } else {
         hasher.update([0]);
     }
-    stable_identity_count(&mut hasher, route.statement_route.len());
-    for segment in &route.statement_route {
+}
+
+fn stable_identity_statement_route(hasher: &mut Sha256, route: &[StableStatementRouteSegment]) {
+    stable_identity_count(hasher, route.len());
+    for segment in route {
         hasher.update([stable_statement_kind_tag(segment.kind)]);
-        stable_identity_names(&mut hasher, &segment.names);
-        stable_identity_count(&mut hasher, segment.matching_sibling_reverse_ordinal);
+        stable_identity_names(hasher, &segment.names);
+        stable_identity_count(hasher, segment.matching_sibling_reverse_ordinal);
     }
+}
+
+fn stable_identity_expression_route(hasher: &mut Sha256, route: &[StableExpressionRouteSegment]) {
+    stable_identity_count(hasher, route.len());
+    for segment in route {
+        hasher.update([stable_expression_role_tag(segment.role)]);
+        if let Some(label) = segment.label.as_deref() {
+            hasher.update([1]);
+            stable_identity_text(hasher, label);
+        } else {
+            hasher.update([0]);
+        }
+        stable_identity_count(hasher, segment.matching_sibling_reverse_ordinal);
+    }
+}
+
+fn stable_expression_root_digest(route: &StableOccurrenceRoute) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(STABLE_EXPRESSION_ROOT_DOMAIN_V1);
+    stable_identity_owner(&mut hasher, route.owner.as_ref());
+    stable_identity_statement_route(&mut hasher, &route.statement_route);
     hasher.finalize().into()
+}
+
+fn stable_statement_route_digest_v1(route: &StableStatementRoute) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(STABLE_STATEMENT_ROUTE_DOMAIN_V1);
+    stable_identity_owner(&mut hasher, route.owner.as_ref());
+    stable_identity_statement_route(&mut hasher, &route.statement_route);
+    hasher.finalize().into()
+}
+
+fn stable_occurrence_route_digest_v1(route: &StableOccurrenceRoute) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(STABLE_OCCURRENCE_ROUTE_DOMAIN_V1);
+    stable_identity_owner(&mut hasher, route.owner.as_ref());
+    stable_identity_statement_route(&mut hasher, &route.statement_route);
+    stable_identity_expression_route(&mut hasher, &route.expression_route);
+    hasher.finalize().into()
+}
+
+fn stable_statement_route_digests_v1(
+    path: &str,
+    routes: &[StableStatementRoute],
+) -> Result<Vec<[u8; 32]>, ParseError> {
+    let digests = routes
+        .iter()
+        .map(stable_statement_route_digest_v1)
+        .collect::<Vec<_>>();
+    let mut identities = BTreeMap::new();
+    for (statement, digest) in digests.iter().copied().enumerate() {
+        if let Some(previous) = identities.insert(digest, statement) {
+            return Err(parsed_source_unit_invariant_error(
+                path,
+                format!(
+                    "stable statement route digest collision between statements {previous} and {statement}"
+                ),
+            ));
+        }
+    }
+    Ok(digests)
+}
+
+fn stable_occurrence_route_digests_v1(
+    path: &str,
+    routes: &[Option<StableOccurrenceRoute>],
+) -> Result<Vec<Option<[u8; 32]>>, ParseError> {
+    let digests = routes
+        .iter()
+        .map(|route| route.as_ref().map(stable_occurrence_route_digest_v1))
+        .collect::<Vec<_>>();
+    let mut identities = BTreeMap::new();
+    for (expression, digest) in digests.iter().copied().enumerate() {
+        let Some(digest) = digest else {
+            continue;
+        };
+        if let Some(previous) = identities.insert(digest, expression) {
+            return Err(parsed_source_unit_invariant_error(
+                path,
+                format!(
+                    "stable occurrence route digest collision between expressions {previous} and {expression}"
+                ),
+            ));
+        }
+    }
+    Ok(digests)
 }
 
 fn stable_expression_child_digest(
@@ -9659,6 +9841,7 @@ fn build_unit_expression_identities(
         ));
     }
 
+    let statement_route_digests_v1 = stable_statement_route_digests_v1(path, &statement_routes)?;
     let expression_route_digests_v1 = stable_expression_route_digests(path, &parents, &roots)?;
     let expression_owners = stable_expression_owner_slots(path, &parents, &root_owners)?;
     let mut owner_expressions = vec![Vec::new(); owner_routes.len()];
@@ -9713,6 +9896,7 @@ fn build_unit_expression_identities(
         owner_entries,
         statement_locators,
         statement_routes,
+        statement_route_digests_v1,
         statement_owners,
         expression_owners,
         expression_parents,
@@ -9758,9 +9942,11 @@ fn build_unit_expression_identities(
         base.expression_route = expression_route;
         occurrence_routes[expression.id] = Some(base);
     }
+    let occurrence_route_digests_v1 = stable_occurrence_route_digests_v1(path, &occurrence_routes)?;
     Ok(UnitExpressionIdentities {
         owner_index,
         occurrence_routes,
+        occurrence_route_digests_v1,
         expression_route_digests_v1,
     })
 }
@@ -10492,6 +10678,78 @@ document:
     }
 
     #[test]
+    fn project_indexed_owner_views_match_stable_owner_order_without_route_lookup() {
+        let project = parse_project_syntax(
+            "app/RUN.bn",
+            [
+                (
+                    "app/Math.bn".to_owned(),
+                    "FUNCTION double(input) {\n    result: input + input\n}\n".to_owned(),
+                ),
+                (
+                    "app/RUN.bn".to_owned(),
+                    "value: Math/double(input: 2)\n".to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let indexed = project.indexed_owner_views().collect::<Vec<_>>();
+        let stable = project.stable_check_owner_keys().collect::<Vec<_>>();
+        assert_eq!(indexed.len(), stable.len());
+        assert_eq!(
+            indexed
+                .iter()
+                .map(|(_, view)| view.stable_key())
+                .collect::<Vec<_>>(),
+            stable,
+        );
+
+        let mut seen = BTreeSet::new();
+        for (coordinate, view) in indexed {
+            assert!(seen.insert(coordinate));
+            let resolved = project
+                .owner_view_by_coord(coordinate)
+                .expect("project resolves its indexed owner coordinate");
+            assert!(std::ptr::eq(resolved.route(), view.route()));
+            assert!(std::ptr::eq(
+                resolved.source_unit_id(),
+                view.source_unit_id()
+            ));
+            let unit = &project.units()[coordinate.unit().as_usize()];
+            let entry = unit
+                .owner_index()
+                .entry_by_slot(coordinate.owner_slot())
+                .expect("indexed owner slot resolves");
+            assert!(std::ptr::eq(view.route(), &entry.route));
+            assert_eq!(view.source_unit_id(), &unit.source_unit_id);
+            assert_eq!(
+                unit.owner_view_by_slot(coordinate.owner_slot())
+                    .expect("unit resolves its indexed owner")
+                    .stable_key(),
+                view.stable_key(),
+            );
+        }
+
+        let first_unit = &project.units()[0];
+        assert!(
+            first_unit
+                .owner_view_by_slot(UnitCheckOwnerSlot::__parser_unrouted())
+                .is_none()
+        );
+        let outside = UnitCheckOwnerSlot::__parser_item(first_unit.owner_index().entries().len())
+            .expect("small fixture owner index fits u32");
+        assert!(first_unit.owner_view_by_slot(outside).is_none());
+        assert!(
+            ProjectOwnerCoord::__parser_new(
+                ProjectUnitId::__parser_new(0).unwrap(),
+                UnitCheckOwnerSlot::__parser_unrouted(),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
     fn unit_item_index_keeps_definition_identity_across_body_and_unrelated_item_edits() {
         let before = parse_project_source_unit(
             "app/Math.bn",
@@ -10716,6 +10974,85 @@ document:
         );
         assert_eq!(edited, baseline);
         assert_eq!(baseline.len(), 3);
+    }
+
+    #[test]
+    fn compact_relocation_digests_change_iff_their_rich_identity_changes() {
+        type CompactIdentity = (SourceUnitId, [u8; 32]);
+        type StatementIdentity = (StableStatementKey, CompactIdentity);
+        type OccurrenceIdentity = (StableOccurrenceKey, CompactIdentity);
+
+        fn identities(
+            path: &str,
+            source: &str,
+        ) -> (Vec<StatementIdentity>, Vec<OccurrenceIdentity>) {
+            let parsed = parse_project_source_unit(path, source).unwrap();
+            let mut statements = Vec::new();
+            for entry in parsed.owner_index().entries() {
+                let view = parsed.owner_view(&entry.route).unwrap();
+                for statement in view.statement_ids() {
+                    let rich = view.stable_statement_key_local(*statement).unwrap();
+                    let digest = view.statement_route_digest_v1(*statement).unwrap();
+                    assert_eq!(digest, stable_statement_route_digest_v1(&rich.route));
+                    statements.push((rich, (view.source_unit_id().clone(), digest)));
+                }
+                for expression in view.expression_ids() {
+                    let rich = view.stable_expression_key_local(*expression).unwrap();
+                    assert_eq!(
+                        view.expression_route_digest_v1(*expression),
+                        Some(rich.route_digest_v1)
+                    );
+                }
+            }
+
+            let unit_view = parsed.owner_view(&UnitOwnerRoute::UnitRoot).unwrap();
+            let occurrences = parsed
+                .ast
+                .expressions
+                .iter()
+                .filter_map(|expression| {
+                    let rich = parsed.stable_occurrence_key(expression.id)?;
+                    let local = UnitLocalExpressionId::__parser_new(expression.id).unwrap();
+                    let digest = unit_view.occurrence_route_digest_v1(local).unwrap();
+                    assert_eq!(digest, stable_occurrence_route_digest_v1(&rich.route));
+                    Some((rich, (unit_view.source_unit_id().clone(), digest)))
+                })
+                .collect();
+            (statements, occurrences)
+        }
+
+        fn assert_equivalent<R: PartialEq, C: PartialEq>(rows: &[(R, C)]) {
+            for left in rows {
+                for right in rows {
+                    assert_eq!(left.0 == right.0, left.1 == right.1);
+                }
+            }
+        }
+
+        let baseline = "left: helper(value: 10)\nright: helper(value: 20)\n\nFUNCTION helper(value) {\n    value\n}\n";
+        let edited = "earlier: helper(value: 999)\nleft : helper(value: 11)\nright: helper(value: 21)\n\nFUNCTION helper(value) {\n    value + 0\n}\n";
+        let (mut statements, mut occurrences) = identities("app/RUN.bn", baseline);
+        let (edited_statements, edited_occurrences) = identities("app/RUN.bn", edited);
+        assert!(
+            statements
+                .iter()
+                .any(|left| edited_statements.iter().any(|right| left.0 == right.0))
+        );
+        assert!(
+            occurrences
+                .iter()
+                .any(|left| edited_occurrences.iter().any(|right| left.0 == right.0))
+        );
+        statements.extend(edited_statements);
+        occurrences.extend(edited_occurrences);
+        let (renamed_statements, renamed_occurrences) = identities("app/RENAMED.bn", baseline);
+        statements.extend(renamed_statements);
+        occurrences.extend(renamed_occurrences);
+
+        assert_equivalent(&statements);
+        assert_equivalent(&occurrences);
+        assert!(!statements.is_empty());
+        assert!(!occurrences.is_empty());
     }
 
     #[test]

@@ -9,19 +9,67 @@ use boon_contract::{PackedTextCatalogBuilder, ProjectTextSnapshot};
 use boon_data::ExactRoundingRule;
 use boon_effect_schema::{ValueType, host_effect_spec};
 
-/// Builds the one immutable identifier/path namespace for a normalized kernel
-/// revision. This is the temporary rich-input boundary: once packed syntax is
-/// the producer, it will hand the already-built snapshot to the kernel and
-/// this visitor disappears with the compatibility DTOs.
-pub(crate) fn build_project_text_snapshot(
+/// Adds names introduced by normalized kernel equations rather than copied
+/// from one source row. The one-shot project builder owns this responsibility
+/// so direct packed producers cannot accidentally freeze an incomplete text
+/// authority.
+pub(crate) fn populate_reserved_project_text(
+    catalog: &mut PackedTextCatalogBuilder,
+) -> Result<(), KernelOwnerBuildError> {
+    let mut collector = TextCollector::Intern(catalog);
+    visit_reserved_project_text(&mut collector)
+}
+
+/// Temporary rich-input compatibility visitor.
+///
+/// Production project construction now owns a single mutable catalog through
+/// `KernelProjectInputBuilder`. Existing rich producers still need this
+/// adapter until their rows carry authority-qualified symbol/path IDs. Once
+/// those producers migrate, this visitor and the rich constructors that call
+/// it are deleted rather than retained as a second text-authority path.
+pub(crate) fn populate_compatibility_project_text(
+    catalog: &mut PackedTextCatalogBuilder,
+    owners: &[KernelOwnerProgramInput],
+    facts: &[KernelDefinitionFactsInput],
+    abi: &KernelAbiInput,
+) -> Result<(), KernelOwnerBuildError> {
+    let mut collector = TextCollector::Intern(catalog);
+    visit_compatibility_project_text(&mut collector, owners, facts, abi)
+}
+
+/// Fail-closed validation for the temporary rich adapter.
+///
+/// Current rich rows consume projection paths as symbol sequences, so this
+/// checks every segment against the explicit frozen authority. Future packed
+/// rows carry their `QualifiedPathId` directly and are checked by the builder
+/// before they can enter the project.
+pub(crate) fn validate_compatibility_project_text(
+    text: &ProjectTextSnapshot,
+    owners: &[KernelOwnerProgramInput],
+    facts: &[KernelDefinitionFactsInput],
+    abi: &KernelAbiInput,
+) -> Result<(), KernelOwnerBuildError> {
+    let mut collector = TextCollector::Validate(text);
+    visit_reserved_project_text(&mut collector)?;
+    visit_compatibility_project_text(&mut collector, owners, facts, abi)
+}
+
+/// Compatibility constructor for standalone owner/project helpers that have
+/// not yet moved to `KernelProjectInputBuilder`.
+pub(crate) fn compatibility_project_text_snapshot(
     owners: &[KernelOwnerProgramInput],
     facts: &[KernelDefinitionFactsInput],
     abi: &KernelAbiInput,
 ) -> Result<ProjectTextSnapshot, KernelOwnerBuildError> {
-    let mut collector = TextCollector {
-        catalog: PackedTextCatalogBuilder::new(),
-    };
+    let mut catalog = PackedTextCatalogBuilder::new();
+    populate_reserved_project_text(&mut catalog)?;
+    populate_compatibility_project_text(&mut catalog, owners, facts, abi)?;
+    Ok(catalog.freeze())
+}
 
+fn visit_reserved_project_text(
+    collector: &mut TextCollector<'_>,
+) -> Result<(), KernelOwnerBuildError> {
     // These names are introduced by normalized kernel equations rather than
     // copied from one source row. Keep the list next to the visitor so a term
     // arena never falls back to a second mutable interner.
@@ -49,7 +97,15 @@ pub(crate) fn build_project_text_snapshot(
     for rule in ExactRoundingRule::ALL {
         collector.symbol(rule.as_tag())?;
     }
+    Ok(())
+}
 
+fn visit_compatibility_project_text(
+    collector: &mut TextCollector<'_>,
+    owners: &[KernelOwnerProgramInput],
+    facts: &[KernelDefinitionFactsInput],
+    abi: &KernelAbiInput,
+) -> Result<(), KernelOwnerBuildError> {
     for owner in owners {
         collector.owner(owner)?;
     }
@@ -68,26 +124,46 @@ pub(crate) fn build_project_text_snapshot(
         }
         collector.flow_type(&callable.result)?;
     }
-    Ok(collector.catalog.freeze())
+    Ok(())
 }
 
-struct TextCollector {
-    catalog: PackedTextCatalogBuilder,
+enum TextCollector<'a> {
+    Intern(&'a mut PackedTextCatalogBuilder),
+    Validate(&'a ProjectTextSnapshot),
 }
 
-impl TextCollector {
+impl TextCollector<'_> {
     fn symbol(&mut self, value: &str) -> Result<(), KernelOwnerBuildError> {
-        self.catalog
-            .intern_symbol(value)
-            .map(|_| ())
-            .map_err(|error| KernelOwnerBuildError::new(error.to_string()))
+        match self {
+            Self::Intern(catalog) => catalog
+                .intern_symbol(value)
+                .map(|_| ())
+                .map_err(|error| KernelOwnerBuildError::new(error.to_string())),
+            Self::Validate(text) => text.lookup_symbol(value).map(|_| ()).ok_or_else(|| {
+                KernelOwnerBuildError::new(format!(
+                    "explicit kernel project text authority is missing symbol `{value}`"
+                ))
+            }),
+        }
     }
 
     fn path(&mut self, segments: &[Box<str>]) -> Result<(), KernelOwnerBuildError> {
-        self.catalog
-            .intern_path(segments.iter().map(AsRef::as_ref))
-            .map(|_| ())
-            .map_err(|error| KernelOwnerBuildError::new(error.to_string()))
+        match self {
+            Self::Intern(catalog) => catalog
+                .intern_path(segments.iter().map(AsRef::as_ref))
+                .map(|_| ())
+                .map_err(|error| KernelOwnerBuildError::new(error.to_string())),
+            Self::Validate(text) => {
+                for segment in segments {
+                    if text.lookup_symbol(segment).is_none() {
+                        return Err(KernelOwnerBuildError::new(format!(
+                            "explicit kernel project text authority is missing path segment `{segment}`"
+                        )));
+                    }
+                }
+                Ok(())
+            }
+        }
     }
 
     fn owner(&mut self, owner: &KernelOwnerProgramInput) -> Result<(), KernelOwnerBuildError> {

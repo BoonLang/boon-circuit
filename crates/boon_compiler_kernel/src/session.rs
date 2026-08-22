@@ -5,12 +5,125 @@ use crate::{
     KernelOwnerId, KernelProjectProgramInput, KernelSolveError, KernelSolvedProject,
     compile_project_program_with_definition_facts_abi_and_text,
 };
-use boon_contract::ProjectTextSnapshot;
+use boon_contract::{
+    PackedTextCatalogBuilder, ProjectTextSnapshot, QualifiedPathId, QualifiedSymbolId,
+};
 use boon_syntax::{SourceUnitId, StableCheckOwnerKey};
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+
+/// One-shot construction owner for a kernel project and its text namespace.
+///
+/// Direct packed producers intern symbols and parent-linked paths while they
+/// build normalized rows, then consume this builder together with the final
+/// program/link/ABI inputs. The catalog cannot be detached or frozen through
+/// this API, so every successful project owns exactly the authority that
+/// issued its IDs.
+#[derive(Debug)]
+pub struct KernelProjectInputBuilder {
+    text: PackedTextCatalogBuilder,
+}
+
+impl KernelProjectInputBuilder {
+    pub fn new() -> Self {
+        Self {
+            text: PackedTextCatalogBuilder::new(),
+        }
+    }
+
+    pub fn with_text_capacity(symbols: usize, symbol_bytes: usize, paths: usize) -> Self {
+        Self {
+            text: PackedTextCatalogBuilder::with_capacity(symbols, symbol_bytes, paths),
+        }
+    }
+
+    pub fn intern_symbol(
+        &mut self,
+        value: &str,
+    ) -> Result<QualifiedSymbolId, KernelOwnerBuildError> {
+        self.text
+            .intern_symbol(value)
+            .map_err(|error| KernelOwnerBuildError::new(error.to_string()))
+    }
+
+    pub fn intern_path<'a>(
+        &mut self,
+        segments: impl IntoIterator<Item = &'a str>,
+    ) -> Result<QualifiedPathId, KernelOwnerBuildError> {
+        self.text
+            .intern_path(segments)
+            .map_err(|error| KernelOwnerBuildError::new(error.to_string()))
+    }
+
+    pub fn intern_symbol_path(
+        &mut self,
+        segments: impl IntoIterator<Item = QualifiedSymbolId>,
+    ) -> Result<QualifiedPathId, KernelOwnerBuildError> {
+        self.text
+            .intern_symbol_path(segments)
+            .map_err(|error| KernelOwnerBuildError::new(error.to_string()))
+    }
+
+    pub fn extend_path(
+        &mut self,
+        parent: QualifiedPathId,
+        segment: QualifiedSymbolId,
+    ) -> Result<QualifiedPathId, KernelOwnerBuildError> {
+        self.text
+            .extend_path(parent, segment)
+            .map_err(|error| KernelOwnerBuildError::new(error.to_string()))
+    }
+
+    pub fn root_path(&self) -> QualifiedPathId {
+        self.text.root_path()
+    }
+
+    /// Freezes the sole text catalog exactly once and binds the resulting
+    /// authority to the final immutable project.
+    pub fn finish(
+        mut self,
+        program: KernelProjectProgramInput,
+        definition_facts: Box<[KernelDefinitionFactsInput]>,
+        definition_keys: Box<[StableCheckOwnerKey]>,
+        abi: KernelAbiInput,
+    ) -> Result<KernelProjectInput, KernelOwnerBuildError> {
+        crate::text::populate_reserved_project_text(&mut self.text)?;
+        let text = self.text.freeze();
+        KernelProjectInput::from_explicit_text(
+            program,
+            definition_facts,
+            definition_keys,
+            abi,
+            text,
+        )
+    }
+
+    /// Transitional adapter for rich producers. It is intentionally private:
+    /// new callers must intern IDs during row construction instead of asking
+    /// the kernel to rediscover text after the project is complete.
+    fn from_rich_compatibility(
+        program: &KernelProjectProgramInput,
+        definition_facts: &[KernelDefinitionFactsInput],
+        abi: &KernelAbiInput,
+    ) -> Result<Self, KernelOwnerBuildError> {
+        let mut builder = Self::new();
+        crate::text::populate_compatibility_project_text(
+            &mut builder.text,
+            &program.owners,
+            definition_facts,
+            abi,
+        )?;
+        Ok(builder)
+    }
+}
+
+impl Default for KernelProjectInputBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 /// Immutable, fully linked input for one kernel revision.
 ///
@@ -91,6 +204,18 @@ impl KernelProjectInput {
         definition_keys: Box<[StableCheckOwnerKey]>,
         abi: KernelAbiInput,
     ) -> Result<Self, KernelOwnerBuildError> {
+        let builder =
+            KernelProjectInputBuilder::from_rich_compatibility(&program, &definition_facts, &abi)?;
+        builder.finish(program, definition_facts, definition_keys, abi)
+    }
+
+    fn from_explicit_text(
+        program: KernelProjectProgramInput,
+        definition_facts: Box<[KernelDefinitionFactsInput]>,
+        definition_keys: Box<[StableCheckOwnerKey]>,
+        abi: KernelAbiInput,
+        text: ProjectTextSnapshot,
+    ) -> Result<Self, KernelOwnerBuildError> {
         if program.owners.len() != definition_facts.len() {
             return Err(KernelOwnerBuildError::new(format!(
                 "kernel project input has {} owners but {} definition-fact tables",
@@ -105,6 +230,12 @@ impl KernelProjectInput {
                 definition_keys.len()
             )));
         }
+        crate::text::validate_compatibility_project_text(
+            &text,
+            &program.owners,
+            &definition_facts,
+            &abi,
+        )?;
         let mut definition_by_key = BTreeMap::new();
         let mut units = BTreeMap::<SourceUnitId, Vec<KernelOwnerId>>::new();
         for (index, key) in definition_keys.iter().enumerate() {
@@ -155,8 +286,6 @@ impl KernelProjectInput {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let text =
-            crate::text::build_project_text_snapshot(&program.owners, &definition_facts, &abi)?;
         Ok(Self {
             syntax_units,
             links: KernelResolvedProjectLinkOverlay {
@@ -806,6 +935,76 @@ mod tests {
                 .into_boxed_slice(),
         )
         .expect("session fixture has aligned definition facts")
+    }
+
+    #[test]
+    fn project_input_builder_rejects_foreign_text_ids() {
+        let mut left = KernelProjectInputBuilder::new();
+        let foreign = left.intern_symbol("foreign").unwrap();
+        let mut right = KernelProjectInputBuilder::new();
+
+        let error = right
+            .intern_symbol_path([foreign])
+            .expect_err("a path cannot adopt a symbol from another project authority");
+        assert!(error.to_string().contains("different project authority"));
+    }
+
+    #[test]
+    fn explicit_project_text_must_cover_the_final_rows() {
+        let error = KernelProjectInputBuilder::new()
+            .finish(
+                KernelProjectProgramInput {
+                    owners: vec![value_owner(KernelOwnerNodeKind::Tag("Missing".into()))]
+                        .into_boxed_slice(),
+                },
+                vec![KernelDefinitionFactsInput::default()].into_boxed_slice(),
+                vec![StableCheckOwnerKey::UnitRoot(
+                    SourceUnitId::from_path("missing-text.bn").unwrap(),
+                )]
+                .into_boxed_slice(),
+                KernelAbiInput::default(),
+            )
+            .expect_err("an explicit catalog missing row text must fail closed");
+        assert!(error.to_string().contains("missing symbol `Missing`"));
+    }
+
+    #[test]
+    fn project_text_coordinates_are_deterministic_for_the_same_build_order() {
+        fn build() -> (
+            KernelProjectInput,
+            boon_contract::SymbolId,
+            boon_contract::PathId,
+        ) {
+            let mut builder = KernelProjectInputBuilder::new();
+            let alpha = builder.intern_symbol("alpha").unwrap();
+            let beta = builder.intern_symbol("beta").unwrap();
+            let path = builder.intern_symbol_path([alpha, beta]).unwrap();
+            let alpha = alpha.coordinate();
+            let path = path.coordinate();
+            let project = builder
+                .finish(
+                    KernelProjectProgramInput {
+                        owners: Box::new([]),
+                    },
+                    Box::new([]),
+                    Box::new([]),
+                    KernelAbiInput::default(),
+                )
+                .unwrap();
+            (project, alpha, path)
+        }
+
+        let (left, left_alpha, left_path) = build();
+        let (right, right_alpha, right_path) = build();
+        assert_eq!(left_alpha, right_alpha);
+        assert_eq!(left_path, right_path);
+        assert_eq!(left.text().symbol(left_alpha), Some("alpha"));
+        assert_eq!(right.text().symbol(right_alpha), Some("alpha"));
+        assert_eq!(
+            left.text().path_digest(left_path),
+            right.text().path_digest(right_path)
+        );
+        assert!(!left.text().same_authority(right.text()));
     }
 
     #[test]

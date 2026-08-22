@@ -11386,7 +11386,7 @@ pub fn compile_owner_program_with_definition_facts(
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
-    let text = crate::text::build_project_text_snapshot(
+    let text = crate::text::compatibility_project_text_snapshot(
         std::slice::from_ref(input),
         std::slice::from_ref(facts),
         &crate::KernelAbiInput::default(),
@@ -13711,7 +13711,7 @@ pub fn compile_project_program_with_definition_facts(
             facts.len()
         )));
     }
-    let text = crate::text::build_project_text_snapshot(
+    let text = crate::text::compatibility_project_text_snapshot(
         &input.owners,
         facts,
         &crate::KernelAbiInput::default(),
@@ -26875,7 +26875,8 @@ mod tests {
             }],
         )
         .unwrap();
-        let text = crate::text::build_project_text_snapshot(&input.owners, &facts, &abi).unwrap();
+        let text =
+            crate::text::compatibility_project_text_snapshot(&input.owners, &facts, &abi).unwrap();
         let snapshot = compile_project_program_with_definition_facts_abi_and_text(
             Arc::new(input),
             Arc::from(facts.to_vec()),
@@ -27057,7 +27058,8 @@ mod tests {
             }],
         )
         .unwrap();
-        let text = crate::text::build_project_text_snapshot(&input.owners, &facts, &abi).unwrap();
+        let text =
+            crate::text::compatibility_project_text_snapshot(&input.owners, &facts, &abi).unwrap();
         let snapshot = compile_project_program_with_definition_facts_abi_and_text(
             Arc::new(input),
             Arc::from(facts.to_vec()),
@@ -27429,7 +27431,7 @@ mod tests {
             result: KernelExpressionId(4),
         };
 
-        let wrapper_text = crate::text::build_project_text_snapshot(
+        let wrapper_text = crate::text::compatibility_project_text_snapshot(
             std::slice::from_ref(&wrapper),
             std::slice::from_ref(&KernelDefinitionFactsInput::default()),
             &crate::KernelAbiInput::default(),

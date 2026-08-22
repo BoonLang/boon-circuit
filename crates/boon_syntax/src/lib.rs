@@ -664,6 +664,24 @@ impl UnitLocalExpressionId {
     }
 }
 
+/// Dense project-local coordinate of one immutable syntax unit.
+///
+/// This is revision-local lookup metadata, not a stable source identity. Stable
+/// compiler or persistence contracts continue to use [`SourceUnitId`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProjectUnitId(u32);
+
+impl ProjectUnitId {
+    #[doc(hidden)]
+    pub fn __parser_new(value: usize) -> Option<Self> {
+        u32::try_from(value).ok().map(Self)
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
 /// Compact owner slot used only inside one [`UnitOwnerIndex`].
 ///
 /// Zero means that an arena expression is not reachable from a statement,
@@ -692,6 +710,15 @@ impl UnitCheckOwnerSlot {
             .map(Self)
     }
 
+    #[doc(hidden)]
+    pub fn __parser_from_owner_entry_index(entry_index: usize) -> Option<Self> {
+        if entry_index == 0 {
+            Some(Self::__parser_unit_root())
+        } else {
+            Self::__parser_item(entry_index - 1)
+        }
+    }
+
     pub const fn is_routed(self) -> bool {
         self.0 != 0
     }
@@ -716,6 +743,36 @@ impl UnitCheckOwnerSlot {
         } else {
             None
         }
+    }
+}
+
+/// Allocation-free project-local coordinate of one parser-owned check owner.
+///
+/// The unit and owner slot are meaningful only inside the exact project syntax
+/// snapshot that yielded this coordinate. They must not enter a stable
+/// compiler, persistence, or artifact identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProjectOwnerCoord {
+    unit: ProjectUnitId,
+    owner: UnitCheckOwnerSlot,
+}
+
+impl ProjectOwnerCoord {
+    #[doc(hidden)]
+    pub const fn __parser_new(unit: ProjectUnitId, owner: UnitCheckOwnerSlot) -> Option<Self> {
+        if owner.is_routed() {
+            Some(Self { unit, owner })
+        } else {
+            None
+        }
+    }
+
+    pub const fn unit(self) -> ProjectUnitId {
+        self.unit
+    }
+
+    pub const fn owner_slot(self) -> UnitCheckOwnerSlot {
+        self.owner
     }
 }
 
@@ -863,6 +920,7 @@ pub struct UnitOwnerIndex {
     item_entry_by_route: BTreeMap<StableItemRoute, usize>,
     statement_locators: Box<[UnitStatementLocator]>,
     statement_routes: Box<[StableStatementRoute]>,
+    statement_route_digests_v1: Box<[[u8; 32]]>,
     statement_owners: Box<[UnitCheckOwnerSlot]>,
     expression_owners: Box<[UnitCheckOwnerSlot]>,
     expression_parents: Box<[Option<UnitExpressionParentEdge>]>,
@@ -874,6 +932,7 @@ impl UnitOwnerIndex {
         entries: Vec<UnitOwnerIndexEntry>,
         statement_locators: Vec<UnitStatementLocator>,
         statement_routes: Vec<StableStatementRoute>,
+        statement_route_digests_v1: Vec<[u8; 32]>,
         statement_owners: Vec<UnitCheckOwnerSlot>,
         expression_owners: Vec<UnitCheckOwnerSlot>,
         expression_parents: Vec<Option<UnitExpressionParentEdge>>,
@@ -892,6 +951,7 @@ impl UnitOwnerIndex {
             item_entry_by_route,
             statement_locators: statement_locators.into_boxed_slice(),
             statement_routes: statement_routes.into_boxed_slice(),
+            statement_route_digests_v1: statement_route_digests_v1.into_boxed_slice(),
             statement_owners: statement_owners.into_boxed_slice(),
             expression_owners: expression_owners.into_boxed_slice(),
             expression_parents: expression_parents.into_boxed_slice(),
@@ -910,6 +970,11 @@ impl UnitOwnerIndex {
                 .get(route)
                 .and_then(|index| self.entries.get(*index)),
         }
+    }
+
+    /// Resolve a dense owner slot without cloning or comparing a stable route.
+    pub fn entry_by_slot(&self, slot: UnitCheckOwnerSlot) -> Option<&UnitOwnerIndexEntry> {
+        self.entries.get(slot.owner_entry_index()?)
     }
 
     pub fn statement_count(&self) -> usize {
@@ -932,6 +997,14 @@ impl UnitOwnerIndex {
         statement: UnitLocalStatementId,
     ) -> Option<&StableStatementRoute> {
         self.statement_routes.get(statement.as_usize())
+    }
+
+    /// Copy the parser-issued versioned digest of one statement's stable
+    /// structural route without cloning that route.
+    pub fn statement_route_digest_v1(&self, statement: UnitLocalStatementId) -> Option<[u8; 32]> {
+        self.statement_route_digests_v1
+            .get(statement.as_usize())
+            .copied()
     }
 
     pub fn statement_owner(&self, statement: UnitLocalStatementId) -> Option<UnitCheckOwnerSlot> {
@@ -1101,6 +1174,8 @@ pub struct ParsedSourceUnitFields {
     pub owner_index: UnitOwnerIndex,
     #[serde(skip)]
     pub occurrence_routes: Vec<Option<StableOccurrenceRoute>>,
+    #[serde(skip)]
+    pub occurrence_route_digests_v1: Vec<Option<[u8; 32]>>,
     #[serde(skip)]
     pub expression_route_digests_v1: Vec<Option<[u8; 32]>>,
 }

@@ -624,8 +624,7 @@ fn prepare_kernel_project_projection(
     role: boon_checked::ProgramRole,
     retention: PreparedProjectionRetention,
 ) -> PreparedKernelProjectProjection {
-    let owner_order = project.stable_check_owner_keys().collect::<Vec<_>>();
-    let input_owners = owner_order.len();
+    let input_owners = project.indexed_owner_views().count();
     let value_surfaces = project_value_surfaces(project);
     let kernel_abi = project_kernel_abi(project, role);
     let authoritative_call_shapes = kernel_abi
@@ -641,13 +640,12 @@ fn prepare_kernel_project_projection(
     let mut prepared = Vec::<PreparedOwner>::new();
     let mut container_owners = Vec::<StableCheckOwnerKey>::new();
     let mut unsupported = BTreeMap::<StableCheckOwnerKey, String>::new();
-    for owner in &owner_order {
-        let Some(view) = project.owner_view(owner) else {
-            unsupported.insert(owner.clone(), "owner has no syntax view".to_owned());
-            continue;
-        };
-        if matches!(owner, StableCheckOwnerKey::UnitRoot(_)) && view.statement_ids().is_empty() {
-            container_owners.push(owner.clone());
+    let mut owner_order = Vec::with_capacity(input_owners);
+    for (_, view) in project.indexed_owner_views() {
+        let owner = view.stable_key();
+        owner_order.push(owner.clone());
+        if matches!(&owner, StableCheckOwnerKey::UnitRoot(_)) && view.statement_ids().is_empty() {
+            container_owners.push(owner);
             continue;
         }
         let outcome = (|| {
@@ -667,7 +665,7 @@ fn prepare_kernel_project_projection(
         match outcome {
             Ok(owner) => prepared.push(owner),
             Err(reason) => {
-                unsupported.insert(owner.clone(), reason);
+                unsupported.insert(owner, reason);
             }
         }
     }

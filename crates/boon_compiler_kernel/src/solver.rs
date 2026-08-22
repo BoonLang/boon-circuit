@@ -6,7 +6,7 @@ use crate::{
     KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry, OperationId,
     PackedOperationTable, ProgramConsumer, ProgramOperationRef, PublishMode,
     ResidualOperationFrame, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId,
-    UnsealedComponentArtifact, VariantTerm,
+    UnsealedComponentArtifact, VariantTerm, term::ScratchPool,
 };
 use boon_contract::SymbolId;
 use std::collections::VecDeque;
@@ -307,6 +307,14 @@ struct ComponentSolver {
     term_visit_stack: Vec<TypeTermId>,
     term_variable_buffer: Vec<TypeVariableId>,
     term_visit_generation: u32,
+    /// Phase-local buffers checked out only while one solver operation owns
+    /// their contents. Type-arena mutation can reallocate packed columns, so
+    /// recursive evaluation cannot retain Rust references into those columns;
+    /// copied dense IDs in recycled buffers are the exact lifetime boundary.
+    term_id_scratch: ScratchPool<TypeTermId>,
+    record_field_scratch: ScratchPool<(SymbolId, TypeTermId)>,
+    variant_scratch: ScratchPool<VariantTerm>,
+    variable_scratch: ScratchPool<TypeVariableId>,
     work: KernelSolveWork,
 }
 
@@ -535,6 +543,10 @@ impl ComponentSolver {
             term_visit_stack: Vec::new(),
             term_variable_buffer: Vec::new(),
             term_visit_generation: 0,
+            term_id_scratch: ScratchPool::default(),
+            record_field_scratch: ScratchPool::default(),
+            variant_scratch: ScratchPool::default(),
+            variable_scratch: ScratchPool::default(),
         };
         let execution = SolverExecution {
             operations,
@@ -700,15 +712,47 @@ impl ComponentSolver {
 
     fn update_term_work(&mut self) {
         let term_work = self.program.terms.work();
+        let solver_scratch_misses = self
+            .term_id_scratch
+            .misses()
+            .saturating_add(self.record_field_scratch.misses())
+            .saturating_add(self.variant_scratch.misses())
+            .saturating_add(self.variable_scratch.misses());
+        let solver_scratch_reuses = self
+            .term_id_scratch
+            .reuses()
+            .saturating_add(self.record_field_scratch.reuses())
+            .saturating_add(self.variant_scratch.reuses())
+            .saturating_add(self.variable_scratch.reuses());
+        let solver_scratch_max_depth = self
+            .term_id_scratch
+            .max_checked_out()
+            .max(self.record_field_scratch.max_checked_out())
+            .max(self.variant_scratch.max_checked_out())
+            .max(self.variable_scratch.max_checked_out());
+        let solver_scratch_capacity = self
+            .term_id_scratch
+            .retained_capacity_bytes()
+            .saturating_add(self.record_field_scratch.retained_capacity_bytes())
+            .saturating_add(self.variant_scratch.retained_capacity_bytes())
+            .saturating_add(self.variable_scratch.retained_capacity_bytes());
         self.work.term_intern_requests = term_work.intern_requests;
         self.work.term_intern_hits = term_work.intern_hits;
         self.work.term_intern_requests_by_kind = term_work.intern_requests_by_kind;
         self.work.term_intern_hits_by_kind = term_work.intern_hits_by_kind;
         self.work.nonempty_object_intern_requests = term_work.nonempty_object_intern_requests;
-        self.work.scratch_vector_misses = term_work.scratch_vector_misses;
-        self.work.scratch_vector_reuses = term_work.scratch_vector_reuses;
-        self.work.scratch_max_pool_depth = term_work.scratch_max_pool_depth;
-        self.work.scratch_retained_capacity_bytes = term_work.scratch_retained_capacity_bytes;
+        self.work.scratch_vector_misses = term_work
+            .scratch_vector_misses
+            .saturating_add(solver_scratch_misses);
+        self.work.scratch_vector_reuses = term_work
+            .scratch_vector_reuses
+            .saturating_add(solver_scratch_reuses);
+        self.work.scratch_max_pool_depth = term_work
+            .scratch_max_pool_depth
+            .max(solver_scratch_max_depth);
+        self.work.scratch_retained_capacity_bytes = term_work
+            .scratch_retained_capacity_bytes
+            .saturating_add(u64::try_from(solver_scratch_capacity).unwrap_or(u64::MAX));
         self.work.structural_widen_requests = term_work.structural_widen_requests;
         self.work.structural_widen_hits = term_work.structural_widen_hits;
     }
@@ -1004,12 +1048,14 @@ impl ComponentSolver {
                 }
             }
             PublishMode::Union => {
-                let mut resolved = Vec::with_capacity(inputs.len());
+                let mut resolved = self.term_id_scratch.take();
+                resolved.reserve(inputs.len());
                 for input in inputs {
                     let input = self.import_frame_term(frame_index, frame, *input);
                     resolved.push(self.resolve_term_head(input));
                 }
-                let provider = self.program.terms.union(resolved);
+                let provider = self.program.terms.union(resolved.iter().copied());
+                self.term_id_scratch.recycle(resolved);
                 self.replace_binding(output, provider, true);
             }
             PublishMode::StructuralWiden => {
@@ -1054,15 +1100,23 @@ impl ComponentSolver {
         inputs: &[TypeTermId],
         values: &[TypeTermId],
     ) {
-        let inputs = inputs
-            .iter()
-            .map(|input| self.import_frame_term(frame_index, frame, *input))
-            .collect::<Vec<_>>();
-        let values = values
-            .iter()
-            .map(|value| self.import_frame_term(frame_index, frame, *value))
-            .collect::<Vec<_>>();
-        self.collection(output, kind, &inputs, &values);
+        let mut imported_inputs = self.term_id_scratch.take();
+        imported_inputs.reserve(inputs.len());
+        imported_inputs.extend(
+            inputs
+                .iter()
+                .map(|input| self.import_frame_term(frame_index, frame, *input)),
+        );
+        let mut imported_values = self.term_id_scratch.take();
+        imported_values.reserve(values.len());
+        imported_values.extend(
+            values
+                .iter()
+                .map(|value| self.import_frame_term(frame_index, frame, *value)),
+        );
+        self.collection(output, kind, &imported_inputs, &imported_values);
+        self.term_id_scratch.recycle(imported_values);
+        self.term_id_scratch.recycle(imported_inputs);
     }
 
     fn select_residual(
@@ -1080,7 +1134,8 @@ impl ComponentSolver {
             self.program.terms.term(selector),
             TypeTerm::VariantSet(variants) if variants.len() == 1
         );
-        let mut candidates = Vec::new();
+        let mut candidates = self.term_id_scratch.take();
+        candidates.reserve(arms.len());
         let mut syntax_selected = singleton && selector_parameter_derived;
         for arm in arms {
             if singleton && !self.pattern_accepts(selector, &arm.pattern) {
@@ -1097,7 +1152,8 @@ impl ComponentSolver {
                 break;
             }
         }
-        let provider = self.join_select_candidates(candidates);
+        let provider = self.join_select_candidates(&candidates);
+        self.term_id_scratch.recycle(candidates);
         self.replace_binding(output, provider, true);
         self.syntax_selected_here[output.0 as usize] = singleton && selector_parameter_derived;
         self.set_syntax_selected(output, syntax_selected);
@@ -1111,37 +1167,42 @@ impl ComponentSolver {
         tag: Option<SymbolId>,
         entries: &[KernelRecordEntry],
     ) -> Result<(), KernelSolveError> {
-        let mut fields = Vec::<(SymbolId, TypeTermId)>::new();
+        let mut fields = self.record_field_scratch.take();
+        fields.reserve(entries.len());
         let mut syntax_selected = false;
-        for entry in entries {
-            match entry {
-                KernelRecordEntry::Field { name, value } => {
-                    let value = self.import_frame_term(frame_index, frame, *value);
-                    syntax_selected |= self.term_syntax_selected(value);
-                    let value = self.resolve_term_head(value);
-                    insert_record_field(&mut fields, *name, value);
-                }
-                KernelRecordEntry::Spread { value } => {
-                    let value = self.import_frame_term(frame_index, frame, *value);
-                    syntax_selected |= self.term_syntax_selected(value);
-                    let value = self.resolve_term_head(value);
-                    self.merge_record_spread(value, &mut fields)?;
+        let result = (|| {
+            for entry in entries {
+                match entry {
+                    KernelRecordEntry::Field { name, value } => {
+                        let value = self.import_frame_term(frame_index, frame, *value);
+                        syntax_selected |= self.term_syntax_selected(value);
+                        let value = self.resolve_term_head(value);
+                        insert_record_field(&mut fields, *name, value);
+                    }
+                    KernelRecordEntry::Spread { value } => {
+                        let value = self.import_frame_term(frame_index, frame, *value);
+                        syntax_selected |= self.term_syntax_selected(value);
+                        let value = self.resolve_term_head(value);
+                        self.merge_record_spread(value, &mut fields)?;
+                    }
                 }
             }
-        }
-        let object = self.program.terms.object(fields, false);
-        let provider = if let Some(tag) = tag {
-            let variant = VariantTerm::Tagged {
-                tag,
-                fields: object,
+            let object = self.program.terms.object(fields.iter().copied(), false);
+            let provider = if let Some(tag) = tag {
+                let variant = VariantTerm::Tagged {
+                    tag,
+                    fields: object,
+                };
+                self.program.terms.variant_set([variant])
+            } else {
+                object
             };
-            self.program.terms.variant_set([variant])
-        } else {
-            object
-        };
-        self.replace_binding(output, provider, true);
-        self.set_syntax_selected(output, syntax_selected);
-        Ok(())
+            self.replace_binding(output, provider, true);
+            self.set_syntax_selected(output, syntax_selected);
+            Ok(())
+        })();
+        self.record_field_scratch.recycle(fields);
+        result
     }
 
     fn import_frame_term(
@@ -1171,26 +1232,27 @@ impl ComponentSolver {
                 }
             }
             PublishMode::Union => {
-                let resolved = inputs
-                    .iter()
-                    .map(|input| self.resolve_term_head(*input))
-                    .collect::<Vec<_>>();
-                let provider = self.program.terms.union(resolved);
+                let mut resolved = self.term_id_scratch.take();
+                resolved.reserve(inputs.len());
+                for input in inputs {
+                    resolved.push(self.resolve_term_head(*input));
+                }
+                let provider = self.program.terms.union(resolved.iter().copied());
+                self.term_id_scratch.recycle(resolved);
                 self.replace_binding(output, provider, true);
             }
             PublishMode::StructuralWiden => {
-                let mut resolved_inputs = Vec::with_capacity(inputs.len());
+                let mut provider = None;
                 for input in inputs {
                     let input = self.resolve_term(*input);
                     if !matches!(self.program.terms.term(input), TypeTerm::Variable(_)) {
-                        resolved_inputs.push(input);
+                        provider = Some(match provider {
+                            None => input,
+                            Some(current) => self.program.terms.structural_widen(current, input),
+                        });
                     }
                 }
-                let mut inputs = resolved_inputs.into_iter();
-                let mut provider = inputs.next().unwrap_or_else(|| self.program.terms.absent());
-                for input in inputs {
-                    provider = self.program.terms.structural_widen(provider, input);
-                }
+                let provider = provider.unwrap_or_else(|| self.program.terms.absent());
                 self.replace_binding(output, provider, true);
             }
             PublishMode::Replace => {
@@ -1384,33 +1446,42 @@ impl ComponentSolver {
         let provider = self.resolve_term_head(provider);
         match pattern {
             KernelPattern::Tag { name, .. } => match self.program.terms.term_head(provider) {
-                TypeTermHead::VariantSet(variants) => self
-                    .program
-                    .terms
-                    .variant_terms(variants)
-                    .to_vec()
-                    .into_iter()
-                    .find_map(|variant| match variant {
-                        VariantTerm::Tagged { tag, fields }
-                            if self.program.terms.name(tag) == name.as_ref() =>
-                        {
-                            Some(fields)
+                TypeTermHead::VariantSet(variants) => {
+                    let mut matched = None;
+                    for ordinal in 0..variants.len() {
+                        let variant = self.program.terms.variant_terms(variants)[ordinal];
+                        matched = match variant {
+                            VariantTerm::Tagged { tag, fields }
+                                if self.program.terms.name(tag) == name.as_ref() =>
+                            {
+                                Some(fields)
+                            }
+                            VariantTerm::Tag(tag)
+                                if self.program.terms.name(tag) == name.as_ref() =>
+                            {
+                                Some(self.program.terms.object([], false))
+                            }
+                            VariantTerm::Tag(_) | VariantTerm::Tagged { .. } => None,
+                        };
+                        if matched.is_some() {
+                            break;
                         }
-                        VariantTerm::Tag(tag) if self.program.terms.name(tag) == name.as_ref() => {
-                            Some(self.program.terms.object([], false))
-                        }
-                        VariantTerm::Tag(_) | VariantTerm::Tagged { .. } => None,
-                    }),
+                    }
+                    matched
+                }
                 TypeTermHead::Union(members) => {
-                    let matches = self
-                        .program
-                        .terms
-                        .term_ids(members)
-                        .to_vec()
-                        .into_iter()
-                        .filter_map(|member| self.narrow_pattern_payload(member, pattern))
-                        .collect::<Vec<_>>();
-                    (!matches.is_empty()).then(|| self.program.terms.union(matches))
+                    let mut matches = self.term_id_scratch.take();
+                    matches.reserve(members.len());
+                    for ordinal in 0..members.len() {
+                        let member = self.program.terms.term_ids(members)[ordinal];
+                        if let Some(matched) = self.narrow_pattern_payload(member, pattern) {
+                            matches.push(matched);
+                        }
+                    }
+                    let result = (!matches.is_empty())
+                        .then(|| self.program.terms.union(matches.iter().copied()));
+                    self.term_id_scratch.recycle(matches);
+                    result
                 }
                 _ => None,
             },
@@ -1512,12 +1583,18 @@ impl ComponentSolver {
                 Some(value)
             }
             (_, TypeTermHead::Union(members)) => {
-                let members = self.program.terms.term_ids(members).to_vec();
-                let items = members
-                    .into_iter()
-                    .filter_map(|member| self.collection_component_type(member, kind))
-                    .collect::<Vec<_>>();
-                (!items.is_empty()).then(|| self.program.terms.union(items))
+                let mut items = self.term_id_scratch.take();
+                items.reserve(members.len());
+                for ordinal in 0..members.len() {
+                    let member = self.program.terms.term_ids(members)[ordinal];
+                    if let Some(item) = self.collection_component_type(member, kind) {
+                        items.push(item);
+                    }
+                }
+                let result =
+                    (!items.is_empty()).then(|| self.program.terms.union(items.iter().copied()));
+                self.term_id_scratch.recycle(items);
+                result
             }
             (
                 _,
@@ -1542,7 +1619,8 @@ impl ComponentSolver {
             self.program.terms.term(selector),
             TypeTerm::VariantSet(variants) if variants.len() == 1
         );
-        let mut candidates = Vec::new();
+        let mut candidates = self.term_id_scratch.take();
+        candidates.reserve(arms.len());
         let mut syntax_selected = singleton && selector_parameter_derived;
         for arm in arms {
             if singleton && !self.pattern_accepts(selector, &arm.pattern) {
@@ -1558,7 +1636,8 @@ impl ComponentSolver {
                 break;
             }
         }
-        let provider = self.join_select_candidates(candidates);
+        let provider = self.join_select_candidates(&candidates);
+        self.term_id_scratch.recycle(candidates);
         self.replace_binding(output, provider, true);
         self.syntax_selected_here[output.0 as usize] = singleton && selector_parameter_derived;
         self.set_syntax_selected(output, syntax_selected);
@@ -1567,18 +1646,18 @@ impl ComponentSolver {
     /// Preserve unresolved arm identities until the invocation frame closes.
     /// Once every candidate is concrete, use the language's structural branch
     /// join instead of retaining a union of compatible lists/records.
-    fn join_select_candidates(&mut self, candidates: Vec<TypeTermId>) -> TypeTermId {
+    fn join_select_candidates(&mut self, candidates: &[TypeTermId]) -> TypeTermId {
         if candidates.is_empty() {
             return self.program.terms.absent();
         }
         if candidates
             .iter()
             .copied()
-            .any(|candidate| self.term_contains_variable(candidate))
+            .any(|candidate| self.program.terms.has_variable(candidate))
         {
-            return self.program.terms.union(candidates);
+            return self.program.terms.union(candidates.iter().copied());
         }
-        let mut candidates = candidates.into_iter();
+        let mut candidates = candidates.iter().copied();
         let first = candidates
             .next()
             .expect("non-empty select candidates were checked");
@@ -1608,35 +1687,40 @@ impl ComponentSolver {
         tag: Option<SymbolId>,
         entries: &[KernelRecordEntry],
     ) -> Result<(), KernelSolveError> {
-        let mut fields = Vec::<(SymbolId, TypeTermId)>::new();
+        let mut fields = self.record_field_scratch.take();
+        fields.reserve(entries.len());
         let mut syntax_selected = false;
-        for entry in entries {
-            match entry {
-                KernelRecordEntry::Field { name, value } => {
-                    syntax_selected |= self.term_syntax_selected(*value);
-                    let value = self.resolve_term_head(*value);
-                    insert_record_field(&mut fields, *name, value);
-                }
-                KernelRecordEntry::Spread { value } => {
-                    syntax_selected |= self.term_syntax_selected(*value);
-                    let value = self.resolve_term_head(*value);
-                    self.merge_record_spread(value, &mut fields)?;
+        let result = (|| {
+            for entry in entries {
+                match entry {
+                    KernelRecordEntry::Field { name, value } => {
+                        syntax_selected |= self.term_syntax_selected(*value);
+                        let value = self.resolve_term_head(*value);
+                        insert_record_field(&mut fields, *name, value);
+                    }
+                    KernelRecordEntry::Spread { value } => {
+                        syntax_selected |= self.term_syntax_selected(*value);
+                        let value = self.resolve_term_head(*value);
+                        self.merge_record_spread(value, &mut fields)?;
+                    }
                 }
             }
-        }
-        let object = self.program.terms.object(fields, false);
-        let provider = if let Some(tag) = tag {
-            let variant = VariantTerm::Tagged {
-                tag,
-                fields: object,
+            let object = self.program.terms.object(fields.iter().copied(), false);
+            let provider = if let Some(tag) = tag {
+                let variant = VariantTerm::Tagged {
+                    tag,
+                    fields: object,
+                };
+                self.program.terms.variant_set([variant])
+            } else {
+                object
             };
-            self.program.terms.variant_set([variant])
-        } else {
-            object
-        };
-        self.replace_binding(output, provider, true);
-        self.set_syntax_selected(output, syntax_selected);
-        Ok(())
+            self.replace_binding(output, provider, true);
+            self.set_syntax_selected(output, syntax_selected);
+            Ok(())
+        })();
+        self.record_field_scratch.recycle(fields);
+        result
     }
 
     fn summary_call(
@@ -1855,41 +1939,46 @@ impl ComponentSolver {
                 inputs: item_values,
                 values: map_values,
             } => {
-                let mut items = Vec::with_capacity(item_values.len());
-                for value in item_values {
-                    items.push(self.evaluate_summary_value(
-                        program,
-                        resolve_input,
-                        *value,
-                        scratch,
-                        node_evaluations,
-                    )?);
-                }
-                let mut values = Vec::with_capacity(map_values.len());
-                for value in map_values {
-                    values.push(self.evaluate_summary_value(
-                        program,
-                        resolve_input,
-                        *value,
-                        scratch,
-                        node_evaluations,
-                    )?);
-                }
-                Ok(SummaryValue {
-                    term: self.collection_type(
-                        *kind,
-                        &items.iter().map(|value| value.term).collect::<Vec<_>>(),
-                        &values.iter().map(|value| value.term).collect::<Vec<_>>(),
-                    ),
-                    parameter_derived: items
-                        .iter()
-                        .chain(&values)
-                        .any(|value| value.parameter_derived),
-                    syntax_selected: items
-                        .iter()
-                        .chain(&values)
-                        .any(|value| value.syntax_selected),
-                })
+                let mut items = self.term_id_scratch.take();
+                items.reserve(item_values.len());
+                let mut values = self.term_id_scratch.take();
+                values.reserve(map_values.len());
+                let result = (|| {
+                    let mut parameter_derived = false;
+                    let mut syntax_selected = false;
+                    for value in item_values {
+                        let value = self.evaluate_summary_value(
+                            program,
+                            resolve_input,
+                            *value,
+                            scratch,
+                            node_evaluations,
+                        )?;
+                        items.push(value.term);
+                        parameter_derived |= value.parameter_derived;
+                        syntax_selected |= value.syntax_selected;
+                    }
+                    for value in map_values {
+                        let value = self.evaluate_summary_value(
+                            program,
+                            resolve_input,
+                            *value,
+                            scratch,
+                            node_evaluations,
+                        )?;
+                        values.push(value.term);
+                        parameter_derived |= value.parameter_derived;
+                        syntax_selected |= value.syntax_selected;
+                    }
+                    Ok(SummaryValue {
+                        term: self.collection_type(*kind, &items, &values),
+                        parameter_derived,
+                        syntax_selected,
+                    })
+                })();
+                self.term_id_scratch.recycle(values);
+                self.term_id_scratch.recycle(items);
+                result
             }
             KernelSummaryNode::Invoke {
                 program: nested,
@@ -1955,81 +2044,90 @@ impl ComponentSolver {
                         syntax_selected: *syntax_discriminating && selector.parameter_derived,
                     });
                 }
-                let mut candidates = Vec::new();
-                for arm in arms {
-                    let mut candidate = self.evaluate_summary_value(
-                        program,
-                        resolve_input,
-                        arm.output,
-                        scratch,
-                        node_evaluations,
-                    )?;
-                    candidate.term = self.resolve_term(candidate.term);
-                    if matches!(self.program.terms.term(candidate.term), TypeTerm::Absent) {
-                        continue;
+                let mut candidates = self.term_id_scratch.take();
+                candidates.reserve(arms.len());
+                let result = (|| {
+                    let mut parameter_derived = selector.parameter_derived;
+                    let mut syntax_selected = false;
+                    for arm in arms {
+                        let mut candidate = self.evaluate_summary_value(
+                            program,
+                            resolve_input,
+                            arm.output,
+                            scratch,
+                            node_evaluations,
+                        )?;
+                        candidate.term = self.resolve_term(candidate.term);
+                        if matches!(self.program.terms.term(candidate.term), TypeTerm::Absent) {
+                            continue;
+                        }
+                        candidates.push(candidate.term);
+                        parameter_derived |= candidate.parameter_derived;
+                        syntax_selected |= candidate.syntax_selected;
                     }
-                    candidates.push(candidate);
-                }
-                Ok(SummaryValue {
-                    term: self.join_select_candidates(
-                        candidates.iter().map(|candidate| candidate.term).collect(),
-                    ),
-                    parameter_derived: selector.parameter_derived
-                        || candidates
-                            .iter()
-                            .any(|candidate| candidate.parameter_derived),
-                    syntax_selected: candidates.iter().any(|candidate| candidate.syntax_selected),
-                })
+                    Ok(SummaryValue {
+                        term: self.join_select_candidates(&candidates),
+                        parameter_derived,
+                        syntax_selected,
+                    })
+                })();
+                self.term_id_scratch.recycle(candidates);
+                result
             }
             KernelSummaryNode::Record { tag, entries } => {
-                let mut fields = Vec::<(SymbolId, TypeTermId)>::new();
+                let mut fields = self.record_field_scratch.take();
+                fields.reserve(entries.len());
                 let mut parameter_derived = false;
                 let mut syntax_selected = false;
-                for entry in entries {
-                    match entry {
-                        KernelSummaryRecordEntry::Field { name, value } => {
-                            let mut value = self.evaluate_summary_value(
-                                program,
-                                resolve_input,
-                                *value,
-                                scratch,
-                                node_evaluations,
-                            )?;
-                            parameter_derived |= value.parameter_derived;
-                            syntax_selected |= value.syntax_selected;
-                            value.term = self.resolve_term_head(value.term);
-                            insert_record_field(&mut fields, *name, value.term);
-                        }
-                        KernelSummaryRecordEntry::Spread { value } => {
-                            let mut value = self.evaluate_summary_value(
-                                program,
-                                resolve_input,
-                                *value,
-                                scratch,
-                                node_evaluations,
-                            )?;
-                            parameter_derived |= value.parameter_derived;
-                            syntax_selected |= value.syntax_selected;
-                            value.term = self.resolve_term_head(value.term);
-                            self.merge_record_spread(value.term, &mut fields)?;
+                let result = (|| {
+                    for entry in entries {
+                        match entry {
+                            KernelSummaryRecordEntry::Field { name, value } => {
+                                let mut value = self.evaluate_summary_value(
+                                    program,
+                                    resolve_input,
+                                    *value,
+                                    scratch,
+                                    node_evaluations,
+                                )?;
+                                parameter_derived |= value.parameter_derived;
+                                syntax_selected |= value.syntax_selected;
+                                value.term = self.resolve_term_head(value.term);
+                                insert_record_field(&mut fields, *name, value.term);
+                            }
+                            KernelSummaryRecordEntry::Spread { value } => {
+                                let mut value = self.evaluate_summary_value(
+                                    program,
+                                    resolve_input,
+                                    *value,
+                                    scratch,
+                                    node_evaluations,
+                                )?;
+                                parameter_derived |= value.parameter_derived;
+                                syntax_selected |= value.syntax_selected;
+                                value.term = self.resolve_term_head(value.term);
+                                self.merge_record_spread(value.term, &mut fields)?;
+                            }
                         }
                     }
-                }
-                let object = self.program.terms.object(fields, false);
-                let term = if let Some(tag) = tag {
-                    let variant = VariantTerm::Tagged {
-                        tag: *tag,
-                        fields: object,
+                    let object = self.program.terms.object(fields.iter().copied(), false);
+                    let term = if let Some(tag) = tag {
+                        let variant = VariantTerm::Tagged {
+                            tag: *tag,
+                            fields: object,
+                        };
+                        self.program.terms.variant_set([variant])
+                    } else {
+                        object
                     };
-                    self.program.terms.variant_set([variant])
-                } else {
-                    object
-                };
-                Ok(SummaryValue {
-                    term,
-                    parameter_derived,
-                    syntax_selected,
-                })
+                    Ok(SummaryValue {
+                        term,
+                        parameter_derived,
+                        syntax_selected,
+                    })
+                })();
+                self.record_field_scratch.recycle(fields);
+                result
             }
         })();
         scratch.active[index] = 0;
@@ -2053,32 +2151,40 @@ impl ComponentSolver {
                 }
             }
             TypeTermHead::VariantSet(variants) => {
-                let variants = self
-                    .program
-                    .terms
-                    .variant_terms(variants)
-                    .to_vec()
-                    .into_iter()
-                    .map(|variant| match variant {
+                let mut rebuilt = self.variant_scratch.take();
+                rebuilt.reserve(variants.len());
+                for ordinal in 0..variants.len() {
+                    let variant = self.program.terms.variant_terms(variants)[ordinal];
+                    rebuilt.push(match variant {
                         VariantTerm::Tag(tag) => VariantTerm::Tag(tag),
                         VariantTerm::Tagged { tag, fields } => VariantTerm::Tagged {
                             tag,
                             fields: self.erase_unbound_contextual_holes(fields),
                         },
-                    })
-                    .collect::<Vec<_>>();
-                self.program.terms.variant_set_preserving_order(variants)
-            }
-            TypeTermHead::Object { shape, open } => {
-                let fields = self
+                    });
+                }
+                let result = self
                     .program
                     .terms
-                    .object_fields_for_shape(shape)
-                    .into_vec()
-                    .into_iter()
-                    .map(|field| (field.name, self.erase_unbound_contextual_holes(field.ty)))
-                    .collect::<Vec<_>>();
-                self.program.terms.object(fields, open)
+                    .variant_set_preserving_order(rebuilt.iter().copied());
+                self.variant_scratch.recycle(rebuilt);
+                result
+            }
+            TypeTermHead::Object { shape, open } => {
+                let field_count = self.program.terms.object_fields_for_shape(shape).len();
+                let mut fields = self.record_field_scratch.take();
+                fields.reserve(field_count);
+                for ordinal in 0..field_count {
+                    let field = self
+                        .program
+                        .terms
+                        .object_field_for_shape(shape, ordinal)
+                        .expect("sealed object shape field exists");
+                    fields.push((field.name, self.erase_unbound_contextual_holes(field.ty)));
+                }
+                let result = self.program.terms.object(fields.iter().copied(), open);
+                self.record_field_scratch.recycle(fields);
+                result
             }
             TypeTermHead::List(item) => {
                 let item = self.erase_unbound_contextual_holes(item);
@@ -2098,27 +2204,30 @@ impl ComponentSolver {
                 result_mode,
                 result,
             } => {
-                let args = self
-                    .program
-                    .terms
-                    .term_ids(args)
-                    .to_vec()
-                    .into_iter()
-                    .map(|argument| self.erase_unbound_contextual_holes(argument))
-                    .collect::<Vec<_>>();
+                let mut rebuilt_args = self.term_id_scratch.take();
+                rebuilt_args.reserve(args.len());
+                for ordinal in 0..args.len() {
+                    let argument = self.program.terms.term_ids(args)[ordinal];
+                    rebuilt_args.push(self.erase_unbound_contextual_holes(argument));
+                }
                 let result = self.erase_unbound_contextual_holes(result);
-                self.program.terms.function(args, result_mode, result)
+                let function =
+                    self.program
+                        .terms
+                        .function(rebuilt_args.iter().copied(), result_mode, result);
+                self.term_id_scratch.recycle(rebuilt_args);
+                function
             }
             TypeTermHead::Union(members) => {
-                let members = self
-                    .program
-                    .terms
-                    .term_ids(members)
-                    .to_vec()
-                    .into_iter()
-                    .map(|member| self.erase_unbound_contextual_holes(member))
-                    .collect::<Vec<_>>();
-                self.program.terms.union(members)
+                let mut rebuilt = self.term_id_scratch.take();
+                rebuilt.reserve(members.len());
+                for ordinal in 0..members.len() {
+                    let member = self.program.terms.term_ids(members)[ordinal];
+                    rebuilt.push(self.erase_unbound_contextual_holes(member));
+                }
+                let result = self.program.terms.union(rebuilt.iter().copied());
+                self.term_id_scratch.recycle(rebuilt);
+                result
             }
             TypeTermHead::Text
             | TypeTermHead::Number
@@ -2139,14 +2248,19 @@ impl ComponentSolver {
     ) -> Result<(), KernelSolveError> {
         match self.program.terms.term_head(spread) {
             TypeTermHead::Object { shape, .. } => {
-                let spread_fields = self.program.terms.object_fields_for_shape(shape).into_vec();
-                for field in spread_fields {
+                let field_count = self.program.terms.object_fields_for_shape(shape).len();
+                for ordinal in 0..field_count {
+                    let field = self
+                        .program
+                        .terms
+                        .object_field_for_shape(shape, ordinal)
+                        .expect("sealed spread object field exists");
                     insert_record_field(fields, field.name, field.ty);
                 }
             }
             TypeTermHead::Union(members) => {
-                let members = self.program.terms.term_ids(members).to_vec();
-                for member in members {
+                for ordinal in 0..members.len() {
+                    let member = self.program.terms.term_ids(members)[ordinal];
                     self.merge_record_spread(member, fields)?;
                 }
             }
@@ -2178,23 +2292,34 @@ impl ComponentSolver {
                 self.program.terms.lookup_object_field(shape, field)
             }
             TypeTermHead::Union(members) => {
-                let members = self.program.terms.term_ids(members).to_vec();
-                let projected = members
-                    .into_iter()
-                    .filter_map(|member| self.project_field(member, field))
-                    .collect::<Vec<_>>();
-                (!projected.is_empty()).then(|| self.program.terms.union(projected))
+                let mut projected = self.term_id_scratch.take();
+                projected.reserve(members.len());
+                for ordinal in 0..members.len() {
+                    let member = self.program.terms.term_ids(members)[ordinal];
+                    if let Some(value) = self.project_field(member, field) {
+                        projected.push(value);
+                    }
+                }
+                let result = (!projected.is_empty())
+                    .then(|| self.program.terms.union(projected.iter().copied()));
+                self.term_id_scratch.recycle(projected);
+                result
             }
             TypeTermHead::VariantSet(variants) => {
-                let variants = self.program.terms.variant_terms(variants).to_vec();
-                let projected = variants
-                    .into_iter()
-                    .filter_map(|variant| match variant {
-                        VariantTerm::Tagged { fields, .. } => self.project_field(fields, field),
-                        VariantTerm::Tag(_) => None,
-                    })
-                    .collect::<Vec<_>>();
-                (!projected.is_empty()).then(|| self.program.terms.union(projected))
+                let mut projected = self.term_id_scratch.take();
+                projected.reserve(variants.len());
+                for ordinal in 0..variants.len() {
+                    let variant = self.program.terms.variant_terms(variants)[ordinal];
+                    if let VariantTerm::Tagged { fields, .. } = variant
+                        && let Some(value) = self.project_field(fields, field)
+                    {
+                        projected.push(value);
+                    }
+                }
+                let result = (!projected.is_empty())
+                    .then(|| self.program.terms.union(projected.iter().copied()));
+                self.term_id_scratch.recycle(projected);
+                result
             }
             _ => None,
         }
@@ -2210,13 +2335,15 @@ impl ComponentSolver {
                     .lookup_object_field(shape, field)
                     .is_none()
             }
-            TypeTermHead::Union(members) => self
-                .program
-                .terms
-                .term_ids(members)
-                .to_vec()
-                .into_iter()
-                .any(|member| self.open_shape_may_contain_field(member, field)),
+            TypeTermHead::Union(members) => {
+                for ordinal in 0..members.len() {
+                    let member = self.program.terms.term_ids(members)[ordinal];
+                    if self.open_shape_may_contain_field(member, field) {
+                        return true;
+                    }
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -2273,19 +2400,19 @@ impl ComponentSolver {
                     shape: right_shape, ..
                 },
             ) => {
-                let left_fields = self
-                    .program
-                    .terms
-                    .object_fields_for_shape(left_shape)
-                    .into_vec();
-                let right_fields = self
-                    .program
-                    .terms
-                    .object_fields_for_shape(right_shape)
-                    .into_vec();
-                for left in left_fields {
-                    if let Some(right) = right_fields.iter().find(|right| right.name == left.name) {
-                        self.unify_terms(left.ty, right.ty);
+                let field_count = self.program.terms.object_fields_for_shape(left_shape).len();
+                for ordinal in 0..field_count {
+                    let left = self
+                        .program
+                        .terms
+                        .object_field_for_shape(left_shape, ordinal)
+                        .expect("sealed equality object field exists");
+                    if let Some(right) = self
+                        .program
+                        .terms
+                        .lookup_object_field(right_shape, left.name)
+                    {
+                        self.unify_terms(left.ty, right);
                     }
                 }
             }
@@ -2316,9 +2443,9 @@ impl ComponentSolver {
                     ..
                 },
             ) if left_args.len() == right_args.len() => {
-                let left_args = self.program.terms.term_ids(left_args).to_vec();
-                let right_args = self.program.terms.term_ids(right_args).to_vec();
-                for (left, right) in left_args.into_iter().zip(right_args) {
+                for ordinal in 0..left_args.len() {
+                    let left = self.program.terms.term_ids(left_args)[ordinal];
+                    let right = self.program.terms.term_ids(right_args)[ordinal];
                     self.unify_terms(left, right);
                 }
                 self.unify_terms(left_result, right_result);
@@ -2396,10 +2523,21 @@ impl ComponentSolver {
         variable: TypeVariableId,
         provider: TypeTermId,
     ) -> Option<TypeTermId> {
+        if !self.program.terms.has_variable(provider) {
+            return Some(provider);
+        }
+        match self.program.terms.term_head(provider) {
+            TypeTermHead::Variable(candidate) => {
+                return (self.root(candidate) != variable).then_some(provider);
+            }
+            TypeTermHead::Union(_) => {}
+            _ => return Some(provider),
+        }
         let mut removed_self = false;
-        let mut retained = Vec::new();
-        let mut pending = vec![provider];
-        let mut expanded_variables = Vec::new();
+        let mut retained = self.term_id_scratch.take();
+        let mut pending = self.term_id_scratch.take();
+        pending.push(provider);
+        let mut expanded_variables = self.variable_scratch.take();
         while let Some(candidate) = pending.pop() {
             match self.program.terms.term_head(candidate) {
                 TypeTermHead::Variable(candidate) => {
@@ -2429,13 +2567,17 @@ impl ComponentSolver {
                 _ => retained.push(candidate),
             }
         }
-        if !removed_self {
-            return Some(provider);
-        }
-        if retained.is_empty() {
-            return None;
-        }
-        Some(self.program.terms.union(retained))
+        let result = if !removed_self {
+            Some(provider)
+        } else if retained.is_empty() {
+            None
+        } else {
+            Some(self.program.terms.union(retained.iter().copied()))
+        };
+        self.variable_scratch.recycle(expanded_variables);
+        self.term_id_scratch.recycle(pending);
+        self.term_id_scratch.recycle(retained);
+        result
     }
 
     fn merge_equal_terms(&mut self, left: TypeTermId, right: TypeTermId) -> TypeTermId {
@@ -2470,27 +2612,40 @@ impl ComponentSolver {
                     open: right_open,
                 },
             ) => {
-                let mut fields = self
-                    .program
-                    .terms
-                    .object_fields_for_shape(left_shape)
-                    .into_vec();
-                let right_fields = self
+                let left_field_count = self.program.terms.object_fields_for_shape(left_shape).len();
+                let right_field_count = self
                     .program
                     .terms
                     .object_fields_for_shape(right_shape)
-                    .into_vec();
-                for right in right_fields {
-                    if let Some(index) = fields.iter().position(|left| left.name == right.name) {
-                        fields[index].ty = self.merge_equal_terms(fields[index].ty, right.ty);
+                    .len();
+                let mut fields = self.record_field_scratch.take();
+                fields.reserve(left_field_count.saturating_add(right_field_count));
+                for ordinal in 0..left_field_count {
+                    let field = self
+                        .program
+                        .terms
+                        .object_field_for_shape(left_shape, ordinal)
+                        .expect("sealed left equality field exists");
+                    fields.push((field.name, field.ty));
+                }
+                for ordinal in 0..right_field_count {
+                    let right = self
+                        .program
+                        .terms
+                        .object_field_for_shape(right_shape, ordinal)
+                        .expect("sealed right equality field exists");
+                    if let Some(index) = fields.iter().position(|left| left.0 == right.name) {
+                        fields[index].1 = self.merge_equal_terms(fields[index].1, right.ty);
                     } else {
-                        fields.push(right);
+                        fields.push((right.name, right.ty));
                     }
                 }
-                self.program.terms.object(
-                    fields.into_iter().map(|field| (field.name, field.ty)),
-                    left_open || right_open,
-                )
+                let result = self
+                    .program
+                    .terms
+                    .object(fields.iter().copied(), left_open || right_open);
+                self.record_field_scratch.recycle(fields);
+                result
             }
             (TypeTermHead::List(left), TypeTermHead::List(right)) => {
                 let item = self.merge_equal_terms(left, right);
@@ -2526,15 +2681,20 @@ impl ComponentSolver {
                     result: right_result,
                 },
             ) if left_args.len() == right_args.len() && left_mode == right_mode => {
-                let left_args = self.program.terms.term_ids(left_args).to_vec();
-                let right_args = self.program.terms.term_ids(right_args).to_vec();
-                let args = left_args
-                    .into_iter()
-                    .zip(right_args)
-                    .map(|(left, right)| self.merge_equal_terms(left, right))
-                    .collect::<Vec<_>>();
+                let mut merged_args = self.term_id_scratch.take();
+                merged_args.reserve(left_args.len());
+                for ordinal in 0..left_args.len() {
+                    let left = self.program.terms.term_ids(left_args)[ordinal];
+                    let right = self.program.terms.term_ids(right_args)[ordinal];
+                    merged_args.push(self.merge_equal_terms(left, right));
+                }
                 let result = self.merge_equal_terms(left_result, right_result);
-                self.program.terms.function(args, left_mode, result)
+                let function =
+                    self.program
+                        .terms
+                        .function(merged_args.iter().copied(), left_mode, result);
+                self.term_id_scratch.recycle(merged_args);
+                function
             }
             _ => self.program.terms.structural_widen(left, right),
         }
@@ -2550,7 +2710,10 @@ impl ComponentSolver {
             std::mem::swap(&mut left, &mut right);
         }
         let right_binding = self.cells[right.0 as usize].binding.take();
-        self.clear_binding_dependencies(right);
+        // `right` is permanently retired below, so retaining this capacity in
+        // its dependency row would strand one allocation until the component
+        // is dropped. Ordinary rebinding keeps its live root's row capacity.
+        drop(self.detach_binding_dependencies(right));
         let right_contextual = self.cells[right.0 as usize].contextual_hole;
         let right_authoritative = self.cells[right.0 as usize].authoritative_provider;
         self.cells[right.0 as usize].parent = left;
@@ -2635,32 +2798,40 @@ impl ComponentSolver {
                 resolved
             }
             TypeTermHead::VariantSet(variants) => {
-                let variants = self
-                    .program
-                    .terms
-                    .variant_terms(variants)
-                    .to_vec()
-                    .into_iter()
-                    .map(|variant| match variant {
+                let mut rebuilt = self.variant_scratch.take();
+                rebuilt.reserve(variants.len());
+                for ordinal in 0..variants.len() {
+                    let variant = self.program.terms.variant_terms(variants)[ordinal];
+                    rebuilt.push(match variant {
                         VariantTerm::Tag(tag) => VariantTerm::Tag(tag),
                         VariantTerm::Tagged { tag, fields } => VariantTerm::Tagged {
                             tag,
                             fields: self.resolve_term_inner(fields, generation),
                         },
-                    })
-                    .collect::<Vec<_>>();
-                self.program.terms.variant_set_preserving_order(variants)
-            }
-            TypeTermHead::Object { shape, open } => {
-                let fields = self
+                    });
+                }
+                let result = self
                     .program
                     .terms
-                    .object_fields_for_shape(shape)
-                    .into_vec()
-                    .into_iter()
-                    .map(|field| (field.name, self.resolve_term_inner(field.ty, generation)))
-                    .collect::<Vec<_>>();
-                self.program.terms.object(fields, open)
+                    .variant_set_preserving_order(rebuilt.iter().copied());
+                self.variant_scratch.recycle(rebuilt);
+                result
+            }
+            TypeTermHead::Object { shape, open } => {
+                let field_count = self.program.terms.object_fields_for_shape(shape).len();
+                let mut fields = self.record_field_scratch.take();
+                fields.reserve(field_count);
+                for ordinal in 0..field_count {
+                    let field = self
+                        .program
+                        .terms
+                        .object_field_for_shape(shape, ordinal)
+                        .expect("sealed resolved object field exists");
+                    fields.push((field.name, self.resolve_term_inner(field.ty, generation)));
+                }
+                let result = self.program.terms.object(fields.iter().copied(), open);
+                self.record_field_scratch.recycle(fields);
+                result
             }
             TypeTermHead::List(item) => {
                 let item = self.resolve_term_inner(item, generation);
@@ -2680,27 +2851,30 @@ impl ComponentSolver {
                 result_mode,
                 result,
             } => {
-                let args = self
-                    .program
-                    .terms
-                    .term_ids(args)
-                    .to_vec()
-                    .into_iter()
-                    .map(|argument| self.resolve_term_inner(argument, generation))
-                    .collect::<Vec<_>>();
+                let mut rebuilt_args = self.term_id_scratch.take();
+                rebuilt_args.reserve(args.len());
+                for ordinal in 0..args.len() {
+                    let argument = self.program.terms.term_ids(args)[ordinal];
+                    rebuilt_args.push(self.resolve_term_inner(argument, generation));
+                }
                 let result = self.resolve_term_inner(result, generation);
-                self.program.terms.function(args, result_mode, result)
+                let function =
+                    self.program
+                        .terms
+                        .function(rebuilt_args.iter().copied(), result_mode, result);
+                self.term_id_scratch.recycle(rebuilt_args);
+                function
             }
             TypeTermHead::Union(members) => {
-                let members = self
-                    .program
-                    .terms
-                    .term_ids(members)
-                    .to_vec()
-                    .into_iter()
-                    .map(|member| self.resolve_term_inner(member, generation))
-                    .collect::<Vec<_>>();
-                self.program.terms.union(members)
+                let mut rebuilt = self.term_id_scratch.take();
+                rebuilt.reserve(members.len());
+                for ordinal in 0..members.len() {
+                    let member = self.program.terms.term_ids(members)[ordinal];
+                    rebuilt.push(self.resolve_term_inner(member, generation));
+                }
+                let result = self.program.terms.union(rebuilt.iter().copied());
+                self.term_id_scratch.recycle(rebuilt);
+                result
             }
             TypeTermHead::Text
             | TypeTermHead::Number
@@ -2779,14 +2953,15 @@ impl ComponentSolver {
         );
     }
 
-    fn term_contains_variable(&mut self, term: TypeTermId) -> bool {
-        self.collect_term_variables(term);
-        !self.term_variable_buffer.is_empty()
+    fn clear_binding_dependencies(&mut self, parent: TypeVariableId) {
+        let mut dependencies = self.detach_binding_dependencies(parent);
+        dependencies.clear();
+        self.binding_dependencies[parent.0 as usize] = dependencies;
     }
 
-    fn clear_binding_dependencies(&mut self, parent: TypeVariableId) {
+    fn detach_binding_dependencies(&mut self, parent: TypeVariableId) -> Vec<TypeVariableId> {
         let dependencies = std::mem::take(&mut self.binding_dependencies[parent.0 as usize]);
-        for dependency in dependencies {
+        for dependency in dependencies.iter().copied() {
             let dependents = &mut self.binding_dependents[dependency.0 as usize];
             if let Ok(index) = dependents.binary_search(&parent) {
                 dependents.remove(index);
@@ -2794,6 +2969,7 @@ impl ComponentSolver {
                     self.work.dynamic_dependency_edges.saturating_sub(1);
             }
         }
+        dependencies
     }
 
     fn insert_binding_dependent(&mut self, dependency: TypeVariableId, dependent: TypeVariableId) {
@@ -3603,11 +3779,107 @@ mod tests {
         solver.replace_binding(parent, first, true);
         assert_eq!(solver.binding_dependents[first_leaf.0 as usize], [parent]);
         assert_eq!(solver.work.dynamic_dependency_edges, 1);
+        let dependency_capacity = solver.binding_dependencies[parent.0 as usize].capacity();
+        assert!(dependency_capacity > 0);
 
         solver.replace_binding(parent, second, true);
         assert!(solver.binding_dependents[first_leaf.0 as usize].is_empty());
         assert_eq!(solver.binding_dependents[second_leaf.0 as usize], [parent]);
         assert_eq!(solver.work.dynamic_dependency_edges, 1);
+        assert_eq!(
+            solver.binding_dependencies[parent.0 as usize].capacity(),
+            dependency_capacity,
+            "binding replacement must recycle its dependency row capacity",
+        );
+    }
+
+    #[test]
+    fn repeated_solver_operations_reuse_typed_phase_scratch() {
+        let mut builder = ComponentProgramBuilder::new();
+        let output = builder.new_authoritative_provider();
+        let field = builder.terms_mut().intern_name("value");
+        let text = builder.terms().text();
+        let number = builder.terms().number();
+        let (mut solver, _) = ComponentSolver::new(builder.finish());
+
+        let record = [KernelRecordEntry::Field {
+            name: field,
+            value: text,
+        }];
+        solver.record(output, None, &record).unwrap();
+        assert_eq!(solver.record_field_scratch.misses(), 1);
+        assert_eq!(solver.record_field_scratch.reuses(), 0);
+        solver.record(output, None, &record).unwrap();
+        assert_eq!(solver.record_field_scratch.misses(), 1);
+        assert_eq!(solver.record_field_scratch.reuses(), 1);
+
+        solver
+            .publish(output, &[text, number], PublishMode::Union)
+            .unwrap();
+        assert_eq!(solver.term_id_scratch.misses(), 1);
+        assert_eq!(solver.term_id_scratch.reuses(), 0);
+        solver
+            .publish(output, &[text, number], PublishMode::Union)
+            .unwrap();
+        assert_eq!(solver.term_id_scratch.misses(), 1);
+        assert_eq!(solver.term_id_scratch.reuses(), 1);
+    }
+
+    #[test]
+    fn failed_record_operation_recycles_typed_phase_scratch() {
+        let mut builder = ComponentProgramBuilder::new();
+        let output = builder.new_authoritative_provider();
+        let invalid_variant = builder.terms_mut().variant_tag("NotARecord");
+        let invalid = builder.terms_mut().variant_set([invalid_variant]);
+        let field = builder.terms_mut().intern_name("value");
+        let text = builder.terms().text();
+        let (mut solver, _) = ComponentSolver::new(builder.finish());
+
+        let error = solver
+            .record(
+                output,
+                None,
+                &[KernelRecordEntry::Spread { value: invalid }],
+            )
+            .expect_err("variant spread must be rejected");
+        assert!(error.to_string().contains("expects a record value"));
+        assert_eq!(solver.record_field_scratch.misses(), 1);
+        assert_eq!(solver.record_field_scratch.reuses(), 0);
+
+        solver
+            .record(
+                output,
+                None,
+                &[KernelRecordEntry::Field {
+                    name: field,
+                    value: text,
+                }],
+            )
+            .unwrap();
+        assert_eq!(solver.record_field_scratch.misses(), 1);
+        assert_eq!(solver.record_field_scratch.reuses(), 1);
+    }
+
+    #[test]
+    fn union_retirement_does_not_strand_dependency_row_capacity() {
+        let mut builder = ComponentProgramBuilder::new();
+        let left = builder.new_variable();
+        let right = builder.new_variable();
+        let dependency = builder.new_variable();
+        let field = builder.terms_mut().intern_name("value");
+        let dependency_term = builder.variable_term(dependency);
+        let right_binding = builder
+            .terms_mut()
+            .object([(field, dependency_term)], false);
+        let (mut solver, _) = ComponentSolver::new(builder.finish());
+
+        solver.replace_binding(right, right_binding, true);
+        assert!(solver.binding_dependencies[right.0 as usize].capacity() > 0);
+        solver.union_variables(left, right);
+
+        assert_eq!(solver.root_readonly(right), left);
+        assert_eq!(solver.binding_dependencies[right.0 as usize].capacity(), 0);
+        assert_eq!(solver.binding_dependents[dependency.0 as usize], [left]);
     }
 
     #[test]

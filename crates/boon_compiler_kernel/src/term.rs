@@ -296,7 +296,7 @@ struct DiagnosticTextRow {
 /// completed calls return their capacity for the next operation.  Frozen
 /// stores drop the pools' backing allocations.
 #[derive(Debug)]
-struct ScratchPool<T> {
+pub(crate) struct ScratchPool<T> {
     available: Vec<Vec<T>>,
     checked_out: usize,
     misses: u64,
@@ -317,7 +317,7 @@ impl<T> Default for ScratchPool<T> {
 }
 
 impl<T> ScratchPool<T> {
-    fn take(&mut self) -> Vec<T> {
+    pub(crate) fn take(&mut self) -> Vec<T> {
         self.checked_out = self
             .checked_out
             .checked_add(1)
@@ -336,7 +336,7 @@ impl<T> ScratchPool<T> {
         values
     }
 
-    fn recycle(&mut self, mut values: Vec<T>) {
+    pub(crate) fn recycle(&mut self, mut values: Vec<T>) {
         self.checked_out = self
             .checked_out
             .checked_sub(1)
@@ -357,7 +357,19 @@ impl<T> ScratchPool<T> {
         self.max_checked_out = 0;
     }
 
-    fn retained_capacity_bytes(&self) -> usize {
+    pub(crate) const fn misses(&self) -> u64 {
+        self.misses
+    }
+
+    pub(crate) const fn reuses(&self) -> u64 {
+        self.reuses
+    }
+
+    pub(crate) const fn max_checked_out(&self) -> u64 {
+        self.max_checked_out
+    }
+
+    pub(crate) fn retained_capacity_bytes(&self) -> usize {
         self.available
             .capacity()
             .saturating_mul(std::mem::size_of::<Vec<T>>())
@@ -927,6 +939,33 @@ impl TypeTermArena {
             canonical: &self.object_fields[shape.canonical_fields.range()],
             semantic_order: &self.semantic_field_order[shape.semantic_order.range()],
         }
+    }
+
+    /// Copy one field in authored semantic order without retaining a borrow
+    /// across an arena mutation. Solver recursion may append new terms and
+    /// shapes, so a dense field value—not a slice reference—is the safe hot
+    /// boundary.
+    pub(crate) fn object_field_for_shape(
+        &self,
+        shape: u32,
+        ordinal: usize,
+    ) -> Option<ObjectFieldTerm> {
+        let shape = self.object_shapes.get(shape as usize)?;
+        if ordinal >= shape.semantic_order.len() {
+            return None;
+        }
+        let semantic = *self
+            .semantic_field_order
+            .get(shape.semantic_order.range().start.checked_add(ordinal)?)?;
+        self.object_fields
+            .get(
+                shape
+                    .canonical_fields
+                    .range()
+                    .start
+                    .checked_add(semantic as usize)?,
+            )
+            .copied()
     }
 
     /// Append direct child terms in the exact public/semantic traversal order.

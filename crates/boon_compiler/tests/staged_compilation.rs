@@ -34,6 +34,18 @@ fn staged_check_and_finish_match_monolithic_compilation() {
     .unwrap();
     assert!(!checked.output.report.has_errors());
     assert!(
+        checked.output.report.expr_type_table.entries.is_empty()
+            && checked.output.report.function_type_table.entries.is_empty()
+            && checked
+                .output
+                .report
+                .named_value_type_table
+                .entries
+                .is_empty()
+            && checked.output.report.output_root_types.is_empty(),
+        "successful runtime staging must not mirror lowering-owned rich type tables in its report",
+    );
+    assert!(
         checked
             .output
             .checked_program_fields()
@@ -60,6 +72,15 @@ fn staged_check_and_finish_match_monolithic_compilation() {
         ProgramRole::Server,
     ))
     .unwrap();
+    assert!(
+        !editor_checked
+            .output
+            .report
+            .expr_type_table
+            .entries
+            .is_empty(),
+        "editor staging must retain its rich type report",
+    );
     assert!(
         !editor_checked
             .output
@@ -98,13 +119,17 @@ fn staged_check_and_finish_match_monolithic_compilation() {
 
 #[test]
 fn staged_finish_rejects_checked_errors() {
-    let checked = check_editor_source(CompilerCheckRequest::source_text(
+    let checked = check_runtime_source(CompilerCheckRequest::source_text(
         "staged-error.bn",
         "value: missing_name",
         ProgramRole::Client,
     ))
     .unwrap();
     assert!(checked.output.report.has_errors());
+    assert!(
+        !checked.output.report.expr_type_table.entries.is_empty(),
+        "a failed runtime check must retain its rich type report for diagnostics",
+    );
     let error = finish_checked_machine_plan(
         checked,
         CheckedCompileRequest::new(

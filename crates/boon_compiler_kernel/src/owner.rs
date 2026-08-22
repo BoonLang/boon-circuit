@@ -10211,12 +10211,14 @@ fn compile_owner_program_with_definition_facts_and_text(
     let principals = vec![allocate_owner_instance(
         &mut builder,
         &mut mode_builder,
+        &text,
         input,
         &formal_static_variants,
     )];
     let principal = &principals[0];
     let context = OwnerCompileContext {
         initial_state_surface: false,
+        text: &text,
         owner: KernelOwnerId(0),
         input,
         expressions: &principal.expressions,
@@ -12625,6 +12627,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
             allocate_owner_instance(
                 &mut builder,
                 &mut mode_builder,
+                &text,
                 owner,
                 &vec![None; owner.formal_count as usize],
             )
@@ -12656,6 +12659,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
         .enumerate()
         .map(|(owner_index, owner)| {
             syntax_selected_call_nodes(
+                &text,
                 owner,
                 &principals[owner_index].static_variants,
                 &formal_dependent_expressions[owner_index],
@@ -12705,6 +12709,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
         let instance = &principals[owner_index];
         let context = OwnerCompileContext {
             initial_state_surface: false,
+            text: &text,
             owner: owner_id,
             input: owner,
             expressions: &instance.expressions,
@@ -12944,7 +12949,25 @@ impl ModeSource {
     }
 }
 
-type StaticVariantSet = BTreeSet<Box<str>>;
+/// Immutable compile-time tag set in the project's sole text namespace.
+///
+/// Invocation and specialization frames share these tiny sorted slabs instead
+/// of recursively cloning `BTreeSet<Box<str>>` values. The dense symbol IDs
+/// are process-local coordinates; stable receipts continue to resolve their
+/// bytes through the owning [`ProjectTextSnapshot`].
+type StaticVariantSet = Arc<[SymbolId]>;
+
+fn static_variant_set(symbols: impl IntoIterator<Item = SymbolId>) -> StaticVariantSet {
+    let mut symbols = symbols.into_iter().collect::<Vec<_>>();
+    symbols.sort_unstable_by_key(|symbol| symbol.as_u32());
+    symbols.dedup();
+    Arc::from(symbols)
+}
+
+fn static_variant_symbol(text: &ProjectTextSnapshot, name: &str) -> SymbolId {
+    text.lookup_symbol(name)
+        .unwrap_or_else(|| panic!("kernel static variant `{name}` is absent from text authority"))
+}
 
 #[derive(Clone, Debug)]
 struct CallActual {
@@ -13137,10 +13160,11 @@ fn merge_call_mode(left: Option<FlowMode>, right: FlowMode) -> Option<FlowMode> 
 fn allocate_owner_instance(
     builder: &mut ComponentProgramBuilder,
     mode_builder: &mut ModeProgramBuilder,
+    text: &ProjectTextSnapshot,
     owner: &KernelOwnerProgramInput,
     formal_static_variants: &[Option<StaticVariantSet>],
 ) -> OwnerInstance {
-    let static_variants = infer_static_variants(owner, formal_static_variants);
+    let static_variants = infer_static_variants(text, owner, formal_static_variants);
     allocate_owner_instance_with_static_variants(
         builder,
         mode_builder,
@@ -13292,6 +13316,7 @@ fn allocate_invocation_owner_instance(
 
 struct OwnerCompileContext<'a> {
     initial_state_surface: bool,
+    text: &'a ProjectTextSnapshot,
     owner: KernelOwnerId,
     input: &'a KernelOwnerProgramInput,
     expressions: &'a [TypeVariableId],
@@ -13363,6 +13388,7 @@ fn edge_static_variants(
 }
 
 fn infer_static_variants(
+    text: &ProjectTextSnapshot,
     owner: &KernelOwnerProgramInput,
     formal_static_variants: &[Option<StaticVariantSet>],
 ) -> Vec<Option<StaticVariantSet>> {
@@ -13370,16 +13396,19 @@ fn infer_static_variants(
     for (index, node) in owner.nodes.iter().enumerate() {
         variants[index] = match &node.kind {
             KernelOwnerNodeKind::Known(Type::VariantSet(values))
-            | KernelOwnerNodeKind::Source(Type::VariantSet(values)) => values
-                .iter()
-                .map(|variant| match variant {
+            | KernelOwnerNodeKind::Source(Type::VariantSet(values)) => Some(static_variant_set(
+                values.iter().map(|variant| match variant {
                     Variant::Tag(tag) | Variant::Tagged { tag, .. } => {
-                        Some(tag.clone().into_boxed_str())
+                        static_variant_symbol(text, tag)
                     }
-                })
-                .collect::<Option<StaticVariantSet>>(),
-            KernelOwnerNodeKind::Tag(tag) => Some(BTreeSet::from([tag.clone()])),
-            KernelOwnerNodeKind::Record { tag: Some(tag) } => Some(BTreeSet::from([tag.clone()])),
+                }),
+            )),
+            KernelOwnerNodeKind::Tag(tag) => {
+                Some(static_variant_set([static_variant_symbol(text, tag)]))
+            }
+            KernelOwnerNodeKind::Record { tag: Some(tag) } => {
+                Some(static_variant_set([static_variant_symbol(text, tag)]))
+            }
             KernelOwnerNodeKind::FormalRead { formal, fields }
             | KernelOwnerNodeKind::ContextRead { formal, fields }
                 if fields.is_empty() =>
@@ -13390,7 +13419,10 @@ fn infer_static_variants(
                     .flatten()
             }
             KernelOwnerNodeKind::Infix { operation } if infix_returns_bool(operation) => {
-                Some(BTreeSet::from(["False".into(), "True".into()]))
+                Some(static_variant_set([
+                    static_variant_symbol(text, "False"),
+                    static_variant_symbol(text, "True"),
+                ]))
             }
             KernelOwnerNodeKind::PureBuiltin {
                 kind:
@@ -13398,10 +13430,13 @@ fn infer_static_variants(
                     | KernelPureBuiltinKind::ListPredicate
                     | KernelPureBuiltinKind::Boolean
                     | KernelPureBuiltinKind::BoolToggle,
-            } => Some(BTreeSet::from(["False".into(), "True".into()])),
+            } => Some(static_variant_set([
+                static_variant_symbol(text, "False"),
+                static_variant_symbol(text, "True"),
+            ])),
             KernelOwnerNodeKind::PureBuiltin {
                 kind: KernelPureBuiltinKind::StreamPulses,
-            } => Some(BTreeSet::from(["Pulse".into()])),
+            } => Some(static_variant_set([static_variant_symbol(text, "Pulse")])),
             _ => None,
         };
     }
@@ -13429,7 +13464,7 @@ fn infer_static_variants(
                     })
                 }
                 KernelOwnerNodeKind::When => {
-                    let arms = possible_when_arm_expressions(owner, index, &variants);
+                    let arms = possible_when_arm_expressions(text, owner, index, &variants);
                     merge_static_expression_variants(&arms, &variants)
                 }
                 KernelOwnerNodeKind::Then => {
@@ -13545,14 +13580,15 @@ fn merge_static_expression_variants(
     if expressions.is_empty() {
         return None;
     }
-    let mut merged = BTreeSet::new();
+    let mut merged = Vec::new();
     for expression in expressions {
-        merged.extend(variants.get(*expression)?.as_ref()?.iter().cloned());
+        merged.extend(variants.get(*expression)?.as_ref()?.iter().copied());
     }
-    Some(merged)
+    Some(static_variant_set(merged))
 }
 
 fn possible_when_arm_expressions(
+    text: &ProjectTextSnapshot,
     owner: &KernelOwnerProgramInput,
     when: usize,
     variants: &[Option<StaticVariantSet>],
@@ -13577,12 +13613,12 @@ fn possible_when_arm_expressions(
         return arms;
     };
     let mut selected = BTreeSet::new();
-    for tag in selector {
+    for tag in selector.iter().copied() {
         if let Some(arm) = arms.iter().copied().find(|arm| {
             matches!(
                 &owner.nodes[*arm].kind,
                 KernelOwnerNodeKind::MatchArm { pattern }
-                    if static_pattern_accepts_tag(pattern, tag)
+                    if static_pattern_accepts_tag(text, pattern, tag)
             )
         }) {
             selected.insert(arm);
@@ -13591,10 +13627,14 @@ fn possible_when_arm_expressions(
     selected.into_iter().collect()
 }
 
-fn static_pattern_accepts_tag(pattern: &KernelPattern, tag: &str) -> bool {
+fn static_pattern_accepts_tag(
+    text: &ProjectTextSnapshot,
+    pattern: &KernelPattern,
+    tag: SymbolId,
+) -> bool {
     match pattern {
         KernelPattern::Wildcard | KernelPattern::Binding { .. } => true,
-        KernelPattern::Tag { name, .. } => name.as_ref() == tag,
+        KernelPattern::Tag { name, .. } => text.lookup_symbol(name) == Some(tag),
         KernelPattern::Number
         | KernelPattern::Text
         | KernelPattern::Bits { .. }
@@ -13603,6 +13643,7 @@ fn static_pattern_accepts_tag(pattern: &KernelPattern, tag: &str) -> bool {
 }
 
 fn reachable_owner_nodes(
+    text: &ProjectTextSnapshot,
     owner: &KernelOwnerProgramInput,
     result: usize,
     variants: &[Option<StaticVariantSet>],
@@ -13622,7 +13663,7 @@ fn reachable_owner_nodes(
                     .map(|edge| edge.expression.0 as usize)
                     .filter(|input| *input < owner.nodes.len()),
             );
-            pending.extend(possible_when_arm_expressions(owner, index, variants));
+            pending.extend(possible_when_arm_expressions(text, owner, index, variants));
         } else {
             pending.extend(
                 node.inputs
@@ -13644,6 +13685,7 @@ fn reachable_owner_nodes(
 /// the complete update domain. This does not require a parallel static-type
 /// evaluator merely to rediscover a tag nested inside another call's record.
 fn syntax_selected_call_nodes(
+    text: &ProjectTextSnapshot,
     owner: &KernelOwnerProgramInput,
     variants: &[Option<StaticVariantSet>],
     formal_dependencies: &[bool],
@@ -13665,9 +13707,9 @@ fn syntax_selected_call_nodes(
         if !formal_dependencies.get(selector).copied().unwrap_or(false) {
             continue;
         }
-        let arms = possible_when_arm_expressions(owner, when, variants);
+        let arms = possible_when_arm_expressions(text, owner, when, variants);
         for arm in arms {
-            for expression in reachable_owner_nodes(owner, arm, variants) {
+            for expression in reachable_owner_nodes(text, owner, arm, variants) {
                 if matches!(
                     owner.nodes[expression].kind,
                     KernelOwnerNodeKind::UserCall { .. }
@@ -13851,6 +13893,7 @@ fn compile_residual_type_module(
         .collect::<Vec<_>>();
     let context = OwnerCompileContext {
         initial_state_surface,
+        text,
         owner: owner_id,
         input: owner,
         expressions: &local.expressions,
@@ -14044,6 +14087,7 @@ fn principal_external_variables(
 fn specialize_owner(
     specializations: &mut HashMap<SpecializationKey, OwnerSpecialization>,
     compile_work: &mut KernelCompileWork,
+    text: &ProjectTextSnapshot,
     project: &KernelProjectProgramInput,
     formal_dependent_expressions: &[Box<[bool]>],
     target: KernelOwnerId,
@@ -14058,6 +14102,7 @@ fn specialize_owner(
     specialize_owner_static(
         specializations,
         compile_work,
+        text,
         project,
         formal_dependent_expressions,
         target,
@@ -14069,6 +14114,7 @@ fn specialize_owner(
 fn specialize_owner_static(
     specializations: &mut HashMap<SpecializationKey, OwnerSpecialization>,
     compile_work: &mut KernelCompileWork,
+    text: &ProjectTextSnapshot,
     project: &KernelProjectProgramInput,
     formal_dependent_expressions: &[Box<[bool]>],
     target: KernelOwnerId,
@@ -14088,10 +14134,10 @@ fn specialize_owner_static(
             compile_work.reused_specialization_plans.saturating_add(1);
         return Ok((key, specialization.clone()));
     }
-    let static_variants = infer_static_variants(owner, &formal_static_variants);
+    let static_variants = infer_static_variants(text, owner, &formal_static_variants);
     let result =
         checked_expression_index(owner.result, owner.nodes.len(), "specialized owner result")?;
-    let reachable = reachable_owner_nodes(owner, result, &static_variants)
+    let reachable = reachable_owner_nodes(text, owner, result, &static_variants)
         .into_iter()
         .collect::<Vec<_>>()
         .into_boxed_slice();
@@ -14114,7 +14160,8 @@ fn specialize_owner_static(
                         .is_some_and(|variants| variants.len() == 1)
             })
     });
-    let syntax_selected_calls = syntax_selected_call_nodes(owner, &static_variants, dependencies);
+    let syntax_selected_calls =
+        syntax_selected_call_nodes(text, owner, &static_variants, dependencies);
     let specialization = OwnerSpecialization {
         invocation_dependencies: invocation_expression_dependencies(
             owner,
@@ -14139,6 +14186,7 @@ fn instantiate_owner(
     specializations: &mut HashMap<SpecializationKey, OwnerSpecialization>,
     residual_modules: &mut HashMap<SpecializationKey, Arc<ResidualTypeModule>>,
     compile_work: &mut KernelCompileWork,
+    text: &ProjectTextSnapshot,
     project: &KernelProjectProgramInput,
     principals: &[OwnerInstance],
     formal_dependent_results: &[bool],
@@ -14228,7 +14276,7 @@ fn instantiate_owner(
         Arc::clone(module)
     } else {
         let module = compile_residual_type_module(
-            builder.terms().text_snapshot(),
+            text,
             target,
             owner,
             Some(project),
@@ -14255,6 +14303,7 @@ fn instantiate_owner(
     let result = (|| {
         let context = OwnerCompileContext {
             initial_state_surface,
+            text,
             owner: target,
             input: owner,
             expressions: &instance.expressions,
@@ -17236,6 +17285,7 @@ fn compile_node(
             let (specialization_key, specialization) = specialize_owner(
                 specializations,
                 compile_work,
+                context.text,
                 project,
                 context.formal_dependent_expressions,
                 *target,
@@ -17340,6 +17390,7 @@ fn compile_node(
                 specializations,
                 residual_modules,
                 compile_work,
+                context.text,
                 project,
                 context.principals,
                 context.formal_dependent_results,
@@ -18375,7 +18426,7 @@ fn possible_when_arm_references(
             .collect());
     };
     let mut selected = BTreeSet::new();
-    for tag in selector {
+    for tag in selector.iter().copied() {
         for edge in &arm_edges {
             let arm = referenced_node(context, node_index, edge)?;
             let KernelOwnerNodeKind::MatchArm { pattern } = &arm.kind else {
@@ -18383,7 +18434,7 @@ fn possible_when_arm_references(
                     "kernel owner node {node_index} WHEN targets a non-arm expression"
                 )));
             };
-            if static_pattern_accepts_tag(pattern, &tag) {
+            if static_pattern_accepts_tag(context.text, pattern, tag) {
                 selected.insert(edge.expression.0 as usize);
                 break;
             }
@@ -25837,7 +25888,13 @@ mod tests {
             result: KernelExpressionId(4),
         };
 
-        let wrapper_variants = infer_static_variants(&wrapper, &[None]);
+        let wrapper_text = crate::text::build_project_text_snapshot(
+            std::slice::from_ref(&wrapper),
+            std::slice::from_ref(&KernelDefinitionFactsInput::default()),
+            &crate::KernelAbiInput::default(),
+        )
+        .unwrap();
+        let wrapper_variants = infer_static_variants(&wrapper_text, &wrapper, &[None]);
         assert!(
             wrapper_variants[0].is_none(),
             "the nested selector must remain unknown to the compile-time root-tag shortcut",

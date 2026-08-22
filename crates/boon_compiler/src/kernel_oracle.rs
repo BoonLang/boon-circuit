@@ -2947,7 +2947,14 @@ pub(crate) fn compiler_checked_from_kernel(
         role,
         KernelCheckedProjectionDemand::RuntimePacked,
     )?;
-    checked_source_from_kernel_construction(project, parse_work, parse_ms, started, checked)
+    checked_source_from_kernel_construction(
+        project,
+        parse_work,
+        parse_ms,
+        started,
+        checked,
+        crate::CheckedReportDemand::Runtime,
+    )
 }
 
 pub(crate) fn compiler_editor_checked_from_kernel(
@@ -2962,7 +2969,14 @@ pub(crate) fn compiler_editor_checked_from_kernel(
         role,
         KernelCheckedProjectionDemand::EditorRich,
     )?;
-    checked_source_from_kernel_construction(project, parse_work, parse_ms, started, checked)
+    checked_source_from_kernel_construction(
+        project,
+        parse_work,
+        parse_ms,
+        started,
+        checked,
+        crate::CheckedReportDemand::Editor,
+    )
 }
 
 fn checked_source_from_kernel_construction(
@@ -2971,6 +2985,7 @@ fn checked_source_from_kernel_construction(
     parse_ms: f64,
     started: Instant,
     checked: KernelCheckedConstruction,
+    report_demand: crate::CheckedReportDemand,
 ) -> Result<crate::CheckedSourceFromSource, String> {
     let owner_work = crate::CompilerOwnerWork {
         statements: u64::try_from(checked.fields.statements.len()).unwrap_or(u64::MAX),
@@ -3002,6 +3017,7 @@ fn checked_source_from_kernel_construction(
         Some(checked.call_occurrences),
         Some(Box::new(checked.checked_image_authority)),
         Some(Box::new(checked.checked_image_publication)),
+        report_demand,
     ))
 }
 

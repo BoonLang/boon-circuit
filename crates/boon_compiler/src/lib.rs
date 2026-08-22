@@ -305,6 +305,17 @@ pub struct CheckedSourceFromSource {
     kernel_semantic_input: boon_compiler_kernel::KernelSemanticInputConstructionV1,
 }
 
+/// Selects which public diagnostic projection must survive checked-image
+/// construction. Runtime lowering already owns every lowering table in the
+/// checked construction; retaining those recursive tables again in a
+/// successful report would create a dead second owner. Editor and failing
+/// checks still require the complete report projection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckedReportDemand {
+    Runtime,
+    Editor,
+}
+
 /// Produces structured parser/type diagnostics for a failed runtime compile.
 /// Callers use this only on the error path, so successful compilation does not
 /// repeat parsing or type checking.
@@ -932,6 +943,7 @@ pub(crate) fn checked_source_from_checked_fields(
     checked_call_occurrences: Option<Box<[boon_syntax::StableOccurrenceKey]>>,
     checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
     checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
+    report_demand: CheckedReportDemand,
 ) -> CheckedSourceFromSource {
     let metadata = &fields.lowering_metadata;
     let render_slot_failure_count = metadata
@@ -948,49 +960,63 @@ pub(crate) fn checked_source_from_checked_fields(
             .filter(|entry| matches!(entry.flow_type.ty, boon_checked::Type::Unknown))
             .count(),
     );
-    let mut builtin_signature_coverage = syntax.operators().to_vec();
-    builtin_signature_coverage.extend(syntax.functions().iter().cloned());
-    builtin_signature_coverage.sort();
-    builtin_signature_coverage.dedup();
+    let report_has_errors = diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
+        || render_slot_failure_count > 0;
+    let retain_rich_report = report_demand == CheckedReportDemand::Editor || report_has_errors;
+    let builtin_signature_coverage = retain_rich_report
+        .then(|| {
+            let mut coverage = syntax.operators().to_vec();
+            coverage.extend(syntax.functions().iter().cloned());
+            coverage.sort();
+            coverage.dedup();
+            coverage
+        })
+        .unwrap_or_default();
     // Project facts intentionally retain render-slot failures both in the
     // complete flat diagnostic aggregate and on the render slot that owns
     // their editor presentation. A checked report historically exposes slot
     // failures through the slot table, so remove those exact rows from its
     // flat channel instead of counting and presenting one fact twice.
-    let render_diagnostics = metadata
-        .render_slot_table
-        .slots
-        .iter()
-        .flat_map(|slot| &slot.diagnostics)
-        .map(|diagnostic| {
-            (
-                match diagnostic.severity {
-                    boon_checked::DiagnosticSeverity::Error => 0u8,
-                    boon_checked::DiagnosticSeverity::Warning => 1u8,
-                },
-                diagnostic.line,
-                diagnostic.start,
-                diagnostic.end,
-                diagnostic.message.clone(),
-            )
-        })
-        .collect::<std::collections::BTreeSet<_>>();
-    let report_diagnostics = diagnostics
-        .iter()
-        .filter(|diagnostic| {
-            !render_diagnostics.contains(&(
-                match diagnostic.severity {
-                    boon_checked::DiagnosticSeverity::Error => 0u8,
-                    boon_checked::DiagnosticSeverity::Warning => 1u8,
-                },
-                diagnostic.line,
-                diagnostic.start,
-                diagnostic.end,
-                diagnostic.message.clone(),
-            ))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let report_diagnostics = if render_slot_failure_count == 0 {
+        diagnostics.to_vec()
+    } else {
+        let render_diagnostics = metadata
+            .render_slot_table
+            .slots
+            .iter()
+            .flat_map(|slot| &slot.diagnostics)
+            .map(|diagnostic| {
+                (
+                    match diagnostic.severity {
+                        boon_checked::DiagnosticSeverity::Error => 0u8,
+                        boon_checked::DiagnosticSeverity::Warning => 1u8,
+                    },
+                    diagnostic.line,
+                    diagnostic.start,
+                    diagnostic.end,
+                    diagnostic.message.as_str(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                !render_diagnostics.contains(&(
+                    match diagnostic.severity {
+                        boon_checked::DiagnosticSeverity::Error => 0u8,
+                        boon_checked::DiagnosticSeverity::Warning => 1u8,
+                    },
+                    diagnostic.line,
+                    diagnostic.start,
+                    diagnostic.end,
+                    diagnostic.message.as_str(),
+                ))
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
     let report = boon_checked::TypeCheckReport {
         expression_count: syntax.expression_count(),
         checked_expression_count: fields.expressions.len(),
@@ -999,21 +1025,39 @@ pub(crate) fn checked_source_from_checked_fields(
         render_slot_count: metadata.render_slot_table.slots.len(),
         render_slot_failure_count,
         builtin_signature_coverage,
-        source_payload_shape_coverage: metadata
-            .source_payload_shape_table
-            .iter()
-            .map(|entry| entry.diagnostic_path.clone())
-            .collect(),
-        source_payload_shape_table: metadata.source_payload_shape_table.clone(),
-        host_port_table: metadata.host_port_table.clone(),
+        source_payload_shape_coverage: retain_rich_report
+            .then(|| {
+                metadata
+                    .source_payload_shape_table
+                    .iter()
+                    .map(|entry| entry.diagnostic_path.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        source_payload_shape_table: retain_rich_report
+            .then(|| metadata.source_payload_shape_table.clone())
+            .unwrap_or_default(),
+        host_port_table: retain_rich_report
+            .then(|| metadata.host_port_table.clone())
+            .unwrap_or_default(),
         full_document_typecheck_coverage: fields.expressions.len() == syntax.expression_count(),
-        output_root_types: metadata.output_root_types.clone(),
-        expr_type_table: metadata.expr_type_table.clone(),
-        function_type_table: metadata.function_type_table.clone(),
-        named_value_type_table: metadata.named_value_type_table.clone(),
+        output_root_types: retain_rich_report
+            .then(|| metadata.output_root_types.clone())
+            .unwrap_or_default(),
+        expr_type_table: retain_rich_report
+            .then(|| metadata.expr_type_table.clone())
+            .unwrap_or_default(),
+        function_type_table: retain_rich_report
+            .then(|| metadata.function_type_table.clone())
+            .unwrap_or_default(),
+        named_value_type_table: retain_rich_report
+            .then(|| metadata.named_value_type_table.clone())
+            .unwrap_or_default(),
         type_hint_table: boon_checked::TypeHintTable::default(),
         resolved_constant_table: boon_checked::ResolvedConstantTable::default(),
-        render_slot_table: metadata.render_slot_table.clone(),
+        render_slot_table: retain_rich_report
+            .then(|| metadata.render_slot_table.clone())
+            .unwrap_or_default(),
         constraints: Vec::new(),
         diagnostics: report_diagnostics,
     };

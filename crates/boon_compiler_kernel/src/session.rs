@@ -242,21 +242,87 @@ impl CheckDemand {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KernelDemandedCheckArtifact {
-    pub owner: StableCheckOwnerKey,
-    pub dense_owner: KernelOwnerId,
-    pub definition: crate::DefinitionArtifact,
+pub struct KernelDemandedCheckSnapshot {
+    owners: Box<[KernelOwnerId]>,
+    project: Arc<KernelProjectInput>,
+    definition_code: Arc<crate::DefinitionCodeStore>,
+    interface: Arc<KernelInterfaceSnapshot>,
+    work: crate::KernelSolveWork,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KernelDemandedCheckSnapshot {
-    pub definitions: Box<[KernelDemandedCheckArtifact]>,
-    pub program: Arc<KernelProjectProgramInput>,
-    pub definition_facts: Arc<[KernelDefinitionFactsInput]>,
-    pub definition_code: Arc<crate::DefinitionCodeStore>,
-    pub type_store: Arc<crate::FrozenTypeStore>,
-    pub interface: Arc<KernelInterfaceSnapshot>,
-    pub work: crate::KernelSolveWork,
+#[derive(Clone, Copy)]
+pub struct KernelDemandedCheckDefinitionRef<'a> {
+    owner: &'a StableCheckOwnerKey,
+    dense_owner: KernelOwnerId,
+    definition: crate::KernelDefinitionRef<'a>,
+}
+
+impl<'a> KernelDemandedCheckDefinitionRef<'a> {
+    pub fn owner(&self) -> &StableCheckOwnerKey {
+        self.owner
+    }
+
+    pub const fn dense_owner(self) -> KernelOwnerId {
+        self.dense_owner
+    }
+
+    pub const fn definition(self) -> crate::KernelDefinitionRef<'a> {
+        self.definition
+    }
+}
+
+impl KernelDemandedCheckSnapshot {
+    pub fn definition_count(&self) -> usize {
+        self.owners.len()
+    }
+
+    pub fn dense_owners(&self) -> &[KernelOwnerId] {
+        &self.owners
+    }
+
+    pub fn definition_refs(
+        &self,
+    ) -> impl ExactSizeIterator<Item = KernelDemandedCheckDefinitionRef<'_>> + '_ {
+        self.owners.iter().copied().map(|dense_owner| {
+            let owner = self
+                .project
+                .links()
+                .definition_key(dense_owner)
+                .expect("validated demanded owner retains its stable key");
+            let definition = crate::KernelDefinitionRef::from_authorities(
+                self.project.program(),
+                self.project.definition_facts(),
+                &self.definition_code,
+                dense_owner,
+            )
+            .expect("validated demanded owner remains in every shared authority");
+            KernelDemandedCheckDefinitionRef {
+                owner,
+                dense_owner,
+                definition,
+            }
+        })
+    }
+
+    pub fn project(&self) -> &Arc<KernelProjectInput> {
+        &self.project
+    }
+
+    pub fn definition_code(&self) -> &Arc<crate::DefinitionCodeStore> {
+        &self.definition_code
+    }
+
+    pub fn type_store(&self) -> &Arc<crate::FrozenTypeStore> {
+        self.definition_code.type_store()
+    }
+
+    pub fn interface(&self) -> &Arc<KernelInterfaceSnapshot> {
+        &self.interface
+    }
+
+    pub const fn work(&self) -> crate::KernelSolveWork {
+        self.work
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -267,11 +333,15 @@ pub enum KernelCheckProduct {
 }
 
 impl KernelCheckProduct {
-    pub fn materialized_definition_count(&self) -> usize {
+    /// Number of definition views published by this demand.
+    ///
+    /// These views borrow the shared project and packed-code authorities; the
+    /// count deliberately says nothing about compatibility DTO materialization.
+    pub fn published_definition_count(&self) -> usize {
         match self {
             Self::Diagnostics(_) => 0,
-            Self::CheckedImage(snapshot) => snapshot.definitions.len(),
-            Self::Definitions(snapshot) => snapshot.definitions.len(),
+            Self::CheckedImage(snapshot) => snapshot.definition_count(),
+            Self::Definitions(snapshot) => snapshot.definition_count(),
         }
     }
 
@@ -423,9 +493,7 @@ impl KernelSession {
             CheckDemand::Diagnostics => {
                 if let Some(solved) = self.solved.as_ref() {
                     (
-                        KernelCheckProduct::Diagnostics(Arc::new(
-                            solved.project.interface_snapshot(),
-                        )),
+                        KernelCheckProduct::Diagnostics(solved.project.interface_snapshot()),
                         solved.compile_work,
                     )
                 } else {
@@ -479,7 +547,7 @@ impl KernelSession {
                     .compile_work;
                 (
                     KernelCheckProduct::Definitions(Arc::new(
-                        self.attach_stable_definition_keys(demanded)?,
+                        self.attach_stable_definition_keys(demanded, dense.into_boxed_slice())?,
                     )),
                     compile_work,
                 )
@@ -553,28 +621,20 @@ impl KernelSession {
                 KernelCheckProduct::Diagnostics(Arc::clone(&snapshot.interface))
             }
             CheckDemand::Definitions(definitions) => {
-                let definitions = definitions
+                let owners = definitions
                     .iter()
                     .map(|owner| {
-                        let dense_owner = self
-                            .project
+                        self.project
                             .links()
                             .definition_id(owner)
-                            .expect("definition demand was validated");
-                        KernelDemandedCheckArtifact {
-                            owner: owner.clone(),
-                            dense_owner,
-                            definition: snapshot.definitions[dense_owner.0 as usize].clone(),
-                        }
+                            .expect("definition demand was validated")
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
                 KernelCheckProduct::Definitions(Arc::new(KernelDemandedCheckSnapshot {
-                    definitions,
-                    program: Arc::clone(&snapshot.program),
-                    definition_facts: Arc::clone(&snapshot.definition_facts),
+                    owners,
+                    project: Arc::clone(&self.project),
                     definition_code: Arc::clone(&snapshot.definition_code),
-                    type_store: Arc::clone(&snapshot.type_store),
                     interface: Arc::clone(&snapshot.interface),
                     work: snapshot.work,
                 }))
@@ -589,44 +649,24 @@ impl KernelSession {
     fn attach_stable_definition_keys(
         &self,
         demanded: KernelDemandedDefinitionSnapshot,
+        owners: Box<[KernelOwnerId]>,
     ) -> Result<KernelDemandedCheckSnapshot, KernelCheckError> {
-        let type_store = Arc::clone(&demanded.type_store);
-        let program = Arc::clone(&demanded.program);
-        let definition_facts = Arc::clone(&demanded.definition_facts);
-        let definition_code = Arc::clone(&demanded.definition_code);
-        let interface = Arc::clone(&demanded.interface);
-        let mut definitions = demanded
-            .definitions
-            .into_vec()
-            .into_iter()
-            .map(|definition| {
-                let owner = self
-                    .project
-                    .links()
-                    .definition_key(definition.owner)
-                    .cloned()
-                    .ok_or_else(|| {
-                        KernelCheckError::invalid_demand(format!(
-                            "kernel demanded artifact references missing dense owner {}",
-                            definition.owner.0
-                        ))
-                    })?;
-                Ok(KernelDemandedCheckArtifact {
-                    owner,
-                    dense_owner: definition.owner,
-                    definition: definition.definition,
-                })
-            })
-            .collect::<Result<Vec<_>, KernelCheckError>>()?;
-        definitions.sort_by(|left, right| left.owner.cmp(&right.owner));
+        let (dense_selection, definition_code, interface, work) = demanded.into_selected_parts();
+        if owners.len() != dense_selection.len()
+            || owners
+                .iter()
+                .any(|owner| dense_selection.binary_search(owner).is_err())
+        {
+            return Err(KernelCheckError::invalid_demand(
+                "kernel stable and dense definition selections disagree",
+            ));
+        }
         Ok(KernelDemandedCheckSnapshot {
-            definitions: definitions.into_boxed_slice(),
-            program,
-            definition_facts,
+            owners,
+            project: Arc::clone(&self.project),
             definition_code,
-            type_store,
             interface,
-            work: demanded.work,
+            work,
         })
     }
 }
@@ -840,7 +880,7 @@ mod tests {
         );
         assert_eq!(snapshot.public_results[2].ty, Type::Number);
         assert!(snapshot.diagnostics.is_empty());
-        assert_eq!(result.product.materialized_definition_count(), 0);
+        assert_eq!(result.product.published_definition_count(), 0);
         assert_eq!(result.product.sealed_definition_count(), 0);
         assert!(!result.reused);
         assert!(
@@ -908,7 +948,7 @@ mod tests {
                 mismatch: KernelTypeMismatch::Type,
             }
         ));
-        assert_eq!(result.product.materialized_definition_count(), 0);
+        assert_eq!(result.product.published_definition_count(), 0);
         assert_eq!(result.product.sealed_definition_count(), 0);
 
         let checked = session
@@ -926,7 +966,7 @@ mod tests {
     }
 
     #[test]
-    fn demanded_definitions_materialize_only_the_canonical_requested_set() {
+    fn demanded_definitions_publish_only_the_canonical_requested_set() {
         let mut session = KernelSession::new(project(KernelOwnerNodeKind::Text));
         let first = session.project().links().definitions()[1].clone();
         let second = session.project().links().definitions()[2].clone();
@@ -939,30 +979,27 @@ mod tests {
         let KernelCheckProduct::Definitions(snapshot) = &result.product else {
             panic!("definition demand returned another product")
         };
+        let definitions = snapshot.definition_refs().collect::<Vec<_>>();
         assert_eq!(
-            snapshot
-                .definitions
+            definitions
                 .iter()
-                .map(|definition| definition.dense_owner)
+                .map(|definition| definition.dense_owner())
                 .collect::<Vec<_>>(),
             vec![KernelOwnerId(1), KernelOwnerId(2)]
         );
-        assert_eq!(snapshot.definitions[0].owner, first);
-        assert!(snapshot.definitions.iter().all(|definition| {
-            snapshot.interface.public_results[definition.dense_owner.0 as usize].ty == Type::Text
+        assert_eq!(definitions[0].owner(), &first);
+        assert!(definitions.iter().all(|definition| {
+            snapshot.interface().public_results[definition.dense_owner().0 as usize].ty
+                == Type::Text
         }));
-        assert_eq!(result.product.materialized_definition_count(), 2);
+        assert_eq!(result.product.published_definition_count(), 2);
         assert_eq!(result.product.sealed_definition_count(), 0);
         assert_eq!(
             crate::owner::test_compatibility_definition_materializations(),
-            2,
-            "sparse demand must not construct and discard undemanded compatibility artifacts",
+            0,
+            "sparse demand must select borrowed rows without compatibility artifacts",
         );
-        assert!(Arc::ptr_eq(&snapshot.program, &session.project.program));
-        assert!(Arc::ptr_eq(
-            &snapshot.definition_facts,
-            &session.project.definition_facts,
-        ));
+        assert!(Arc::ptr_eq(snapshot.project(), &session.project));
     }
 
     #[test]
@@ -971,7 +1008,7 @@ mod tests {
         let checked = session
             .check(CheckDemand::CheckedImage)
             .expect("checked-image demand solves");
-        assert_eq!(checked.product.materialized_definition_count(), 3);
+        assert_eq!(checked.product.published_definition_count(), 3);
         assert_eq!(checked.product.sealed_definition_count(), 3);
         assert!(!checked.reused);
         let KernelCheckProduct::CheckedImage(checked_snapshot) = &checked.product else {
@@ -991,26 +1028,23 @@ mod tests {
             .check(CheckDemand::Definitions(Box::new([demanded.clone()])))
             .expect("checked image satisfies sparse definition demand");
         assert!(sparse.reused);
-        assert_eq!(sparse.product.materialized_definition_count(), 1);
+        assert_eq!(sparse.product.published_definition_count(), 1);
         let KernelCheckProduct::Definitions(sparse_snapshot) = &sparse.product else {
             panic!("sparse demand returned another product")
         };
-        assert!(Arc::ptr_eq(
-            &sparse_snapshot.definition_facts,
-            &session.project.definition_facts,
-        ));
-        assert!(Arc::ptr_eq(
-            &sparse_snapshot.program,
-            &session.project.program,
-        ));
-        assert_eq!(sparse_snapshot.definitions[0].owner, demanded);
-        assert_eq!(sparse_snapshot.definitions[0].dense_owner, KernelOwnerId(1));
+        assert!(Arc::ptr_eq(sparse_snapshot.project(), &session.project));
+        let sparse_definition = sparse_snapshot
+            .definition_refs()
+            .next()
+            .expect("one sparse definition remains selected");
+        assert_eq!(sparse_definition.owner(), &demanded);
+        assert_eq!(sparse_definition.dense_owner(), KernelOwnerId(1));
 
         let diagnostics = session
             .check(CheckDemand::Diagnostics)
             .expect("checked image satisfies diagnostics demand");
         assert!(diagnostics.reused);
-        assert_eq!(diagnostics.product.materialized_definition_count(), 0);
+        assert_eq!(diagnostics.product.published_definition_count(), 0);
     }
 
     #[test]

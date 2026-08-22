@@ -22,30 +22,30 @@ use boon_compiler_kernel::{
     KernelAbiParameterInput, KernelAbiResultSpecialization, KernelCallArgumentKind,
     KernelCallArgumentSource, KernelCallInputRole, KernelCallPassInput, KernelCallShapeArgument,
     KernelCallShapeInput, KernelCallShapeParameter, KernelCallShapeResolution,
-    KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallTarget, KernelCallTypeSubstitution,
+    KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallTypeSubstitution,
     KernelCallableAbiInput, KernelCallableKind, KernelCheckProduct, KernelCheckedLinkLayout,
     KernelCollectionKind, KernelCompileWork, KernelConditionalKind, KernelDeclarationId,
     KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
     KernelDeclarationPresentation, KernelDeclarationReference, KernelDefinitionFactsInput,
     KernelDefinitionPresentation, KernelDefinitionRelocations, KernelDiagnosticKind,
     KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExecutionBlockBindingInput,
-    KernelExecutionRecordFieldInput, KernelExecutionShapeInput, KernelExpressionArtifactKind,
-    KernelExpressionId, KernelExpressionPresentation, KernelExpressionRelocation,
-    KernelExpressionSemanticPayload, KernelExternalExpression, KernelExternalTarget,
-    KernelHostEffectArtifact, KernelInheritedFormal, KernelInterfaceSnapshot, KernelLexicalAccess,
-    KernelLexicalBindingInput, KernelLexicalBindingTarget, KernelLexicalBindingTargetInput,
-    KernelListId, KernelListInput, KernelMatchPatternPayload, KernelOwnerEdgeRole, KernelOwnerId,
-    KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput,
-    KernelParameterEvaluationScope, KernelParameterKind, KernelPattern, KernelProjectInput,
-    KernelProjectProgramInput, KernelPureBuiltinKind, KernelRenderConstructorKind, KernelScopeId,
-    KernelScopeKind, KernelScopeOrigin, KernelScopePresentation, KernelScopeReference,
-    KernelSession, KernelSolveWork, KernelSourceId, KernelSourceInput, KernelSourceSpan,
-    KernelStateId, KernelStateInput, KernelStatementChildReference, KernelStatementId,
-    KernelStatementInput, KernelStatementKind, KernelStatementParameter,
-    KernelStatementPresentation, KernelStatementReference, KernelStatementValueUse,
-    KernelStructuralDeclarationInput, KernelTextTemplateSegment, KernelTypeMismatch,
-    KernelValueReference, is_kernel_host_effect, is_registered_kernel_host_effect,
-    project_kernel_call_shape, project_kernel_source_expression_diagnostics,
+    KernelExecutionRecordFieldInput, KernelExecutionShapeInput, KernelExpressionId,
+    KernelExpressionPresentation, KernelExpressionRelocation, KernelExpressionSemanticPayload,
+    KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
+    KernelInheritedFormal, KernelInterfaceSnapshot, KernelLexicalAccess, KernelLexicalBindingInput,
+    KernelLexicalBindingTargetInput, KernelListId, KernelListInput, KernelMatchPatternPayload,
+    KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
+    KernelOwnerProgramInput, KernelParameterEvaluationScope, KernelParameterKind, KernelPattern,
+    KernelProjectInput, KernelProjectProgramInput, KernelPureBuiltinKind,
+    KernelRenderConstructorKind, KernelScopeId, KernelScopeKind, KernelScopeOrigin,
+    KernelScopePresentation, KernelScopeReference, KernelSession, KernelSolveWork, KernelSourceId,
+    KernelSourceInput, KernelSourceSpan, KernelStateId, KernelStateInput,
+    KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
+    KernelStatementParameter, KernelStatementPresentation, KernelStatementReference,
+    KernelStatementValueUse, KernelStructuralDeclarationInput, KernelTextTemplateSegment,
+    KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
+    is_registered_kernel_host_effect, project_kernel_call_shape,
+    project_kernel_source_expression_diagnostics,
 };
 use boon_data::{Bits, ExactNumber};
 use boon_parser::{ProjectSyntaxSnapshot, UnitOwnerSyntaxView};
@@ -56,7 +56,6 @@ use boon_syntax::{
     UnitItemKind, UnitLocalStatementId,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1376,8 +1375,8 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     checked_scopes = materialized_scopes;
                     checked_declarations = materialized_declarations;
                     checked_expressions = materialized_expressions;
-                    checked_expression_keys = checked
-                        .definition_facts
+                    checked_expression_keys = kernel_input
+                        .definition_facts()
                         .iter()
                         .flat_map(|facts| {
                             facts.relocations.expressions.iter().map(|relocation| {
@@ -1397,8 +1396,8 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                         ));
                     }
                     checked_statements = materialized_statements;
-                    checked_statement_keys = checked
-                        .definition_facts
+                    checked_statement_keys = kernel_input
+                        .definition_facts()
                         .iter()
                         .flat_map(|facts| facts.relocations.statements.iter().cloned())
                         .collect::<Vec<_>>()
@@ -1457,13 +1456,13 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                 Vec::new(),
             )
         },
-        |artifact| {
-            let work = artifact.work;
-            let dependency_edges = artifact.dependencies.dependency_count();
-            let reverse_consumer_edges = artifact.dependencies.reverse_consumer_count();
+        |snapshot| {
+            let work = snapshot.work();
+            let dependency_edges = snapshot.dependencies().dependency_count();
+            let reverse_consumer_edges = snapshot.dependencies().reverse_consumer_count();
             let currentness = active
                 .iter()
-                .zip(&artifact.currentness)
+                .zip(snapshot.currentness())
                 .map(|(prepared_index, receipt)| KernelOwnerOracleCurrentness {
                     owner: prepared[*prepared_index].owner.clone(),
                     basis_fingerprint_v14: receipt.basis_fingerprint_v14,
@@ -1473,10 +1472,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     fingerprint_v18: receipt.fingerprint_v18,
                 })
                 .collect::<Vec<_>>();
-            let definition_code = Arc::clone(&artifact.definition_code);
-            let interface = Arc::clone(&artifact.interface);
-            let definition_facts = Arc::clone(&artifact.definition_facts);
-            let definitions = artifact.definitions;
+            let interface = snapshot.interface();
             let result_by_owner = active
                 .iter()
                 .zip(interface.public_results.iter())
@@ -1495,17 +1491,16 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                 .collect::<BTreeSet<_>>();
             let supported = active
                 .iter()
-                .zip(definitions)
-                .zip(definition_facts.iter())
+                .zip(snapshot.definition_refs())
                 .enumerate()
-                .map(|(dense_index, ((prepared_index, artifact), facts))| {
+                .map(|(dense_index, (prepared_index, definition))| {
                     let dense_owner = KernelOwnerId(
                         u32::try_from(dense_index)
                             .expect("kernel definition count exceeds u32"),
                     );
-                    let code = definition_code
-                        .definition(dense_owner)
-                        .expect("kernel structural definition owns one packed code row");
+                    assert_eq!(definition.owner(), dense_owner);
+                    let code = definition.code();
+                    let facts = definition.facts();
                     let owner = &prepared[*prepared_index];
                     assert_eq!(
                         facts.relocations.expressions,
@@ -1544,44 +1539,11 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                         "kernel snapshot shares every exact expression semantic payload"
                     );
                     assert_eq!(
-                        artifact.call_syntax.len(),
-                        owner.payload().definition_facts.call_syntax.len(),
-                        "kernel definition artifacts retain every authored call surface"
-                    );
-                    for (linked, authored) in artifact
-                        .call_syntax
-                        .iter()
-                        .zip(owner.payload().definition_facts.call_syntax.iter())
-                    {
-                        assert_eq!(linked.expression, authored.expression);
-                        assert_eq!(linked.function, authored.function);
-                        assert_eq!(linked.pipe_input.is_some(), authored.pipe_input.is_some());
-                        assert_eq!(linked.arguments.len(), authored.arguments.len());
-                        for (linked, authored) in
-                            linked.arguments.iter().zip(authored.arguments.iter())
-                        {
-                            assert_eq!(linked.ordinal, authored.ordinal);
-                            assert_eq!(linked.kind, authored.kind);
-                            assert_eq!(linked.name, authored.name);
-                        }
-                        assert_eq!(
-                            linked.pass.map(|pass| pass.final_clause),
-                            authored.pass.map(|pass| pass.final_clause),
-                        );
-                    }
-                    assert_eq!(
-                        artifact.execution_shapes.len(),
+                        facts.execution_shapes.len(),
                         owner.payload().definition_facts.execution_shapes.len(),
-                        "kernel definition artifacts retain every lossy structural execution shape"
+                        "kernel definition facts retain every lossy structural execution shape"
                     );
-                    for (linked, authored) in artifact
-                        .execution_shapes
-                        .iter()
-                        .zip(owner.payload().definition_facts.execution_shapes.iter())
-                    {
-                        assert_eq!(linked.expression(), authored.expression());
-                    }
-                    let execution_shape_count = artifact.execution_shapes.len();
+                    let execution_shape_count = facts.execution_shapes.len();
                     let stable_provider = |value: KernelValueReference| match value {
                         KernelValueReference::Local(expression) => {
                             KernelOwnerOracleValueReference::Expression(
@@ -1616,66 +1578,95 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                             }
                         }
                     };
-                    let collections = artifact
-                        .expressions
+                    let collections = definition
+                        .input()
+                        .nodes
                         .iter()
-                        .filter_map(|expression| {
-                            let KernelExpressionArtifactKind::Collection { kind, capacity } =
-                                &expression.kind
+                        .enumerate()
+                        .filter_map(|(ordinal, expression)| {
+                            let expression_id = KernelExpressionId(
+                                u32::try_from(ordinal)
+                                    .expect("kernel expression count exceeds u32"),
+                            );
+                            let boon_compiler_kernel::KernelExpressionKindRef::Collection {
+                                kind,
+                                capacity,
+                            } = definition
+                                .expression_kind(expression_id)
+                                .expect("kernel node owns an opcode view")
                             else {
                                 return None;
                             };
                             Some(KernelOwnerOracleCollection {
-                                expression: owner.expressions[expression.id.0 as usize].clone(),
-                                kind: *kind,
-                                capacity: *capacity,
+                                expression: owner.expressions[ordinal].clone(),
+                                kind,
+                                capacity,
                                 inputs: expression
                                     .inputs
                                     .iter()
                                     .map(|input| KernelOwnerOracleExpressionInput {
                                         role: input.role.clone(),
-                                        provider: stable_provider(input.value),
+                                        provider: stable_provider(
+                                            definition
+                                                .resolve_value(input.expression, ordinal)
+                                                .expect("validated collection input resolves"),
+                                        ),
                                     })
                                     .collect::<Vec<_>>()
                                     .into_boxed_slice(),
                                 flow_type: code
-                                    .materialize_expression(expression.id.0 as usize)
+                                    .materialize_expression(ordinal)
                                     .expect("kernel collection owns a packed flow row"),
                             })
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
-                    let sources = artifact
-                        .expressions
+                    let sources = definition
+                        .input()
+                        .nodes
                         .iter()
-                        .filter_map(|expression| {
-                            let KernelExpressionArtifactKind::Source = &expression.kind else {
+                        .enumerate()
+                        .filter_map(|(ordinal, _)| {
+                            let expression_id = KernelExpressionId(
+                                u32::try_from(ordinal)
+                                    .expect("kernel expression count exceeds u32"),
+                            );
+                            let boon_compiler_kernel::KernelExpressionKindRef::Source = definition
+                                .expression_kind(expression_id)
+                                .expect("kernel node owns an opcode view")
+                            else {
                                 return None;
                             };
                             Some(KernelOwnerOracleSource {
-                                expression: owner.expressions[expression.id.0 as usize].clone(),
+                                expression: owner.expressions[ordinal].clone(),
                                 payload_type: code
-                                    .materialize_expression_kind_type(expression.id.0 as usize)
+                                    .materialize_expression_kind_type(ordinal)
                                     .expect("kernel SOURCE owns a packed ABI type"),
                                 flow_type: code
-                                    .materialize_expression(expression.id.0 as usize)
+                                    .materialize_expression(ordinal)
                                     .expect("kernel SOURCE owns a packed flow row"),
                             })
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
                     assert_eq!(
-                        artifact.statements.len(),
+                        facts.statements.len(),
                         owner.statements.len(),
-                        "kernel statement artifacts retain one stable row each"
+                        "kernel statement facts retain one stable row each"
                     );
-                    let statements = artifact
+                    let statements = facts
                         .statements
                         .iter()
                         .map(|statement| KernelOwnerOracleStatement {
                             statement: owner.statements[statement.id.0 as usize].clone(),
                             kind: statement.kind.clone(),
-                            value: statement.value.map(&stable_provider),
+                            value: statement.value.map(|value| {
+                                stable_provider(
+                                    definition
+                                        .resolve_value(value, statement.id.0 as usize)
+                                        .expect("validated statement value resolves"),
+                                )
+                            }),
                             children: statement
                                 .children
                                 .iter()
@@ -1703,36 +1694,45 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
-                    let declaration_origins = artifact
+                    let declaration_origins = facts
                         .declarations
                         .iter()
                         .map(|declaration| {
                             stable_kernel_declaration_origin(owner, &declaration.origin)
                         })
                         .collect::<Vec<_>>();
-                    let declarations = artifact
+                    let declarations = facts
                         .declarations
                         .iter()
                         .map(|declaration| KernelOwnerOracleDeclaration {
                             origin: declaration_origins[declaration.id.0 as usize].clone(),
                             name: declaration.name.clone(),
                             kind: declaration.kind,
-                            value: declaration.value.map(&stable_provider),
+                            value: declaration.value.map(|value| {
+                                stable_provider(
+                                    definition
+                                        .resolve_value(value, declaration.id.0 as usize)
+                                        .expect("validated declaration value resolves"),
+                                )
+                            }),
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
-                    let lexical_bindings = artifact
+                    let lexical_bindings = facts
                         .lexical_bindings
                         .iter()
                         .map(|binding| {
-                            let target = match &binding.target {
-                                KernelLexicalBindingTarget::Declaration(
+                            let target = match definition
+                                .resolve_lexical_target(binding)
+                                .expect("validated lexical target resolves")
+                            {
+                                boon_compiler_kernel::KernelLexicalBindingTargetRef::Declaration(
                                     KernelDeclarationReference::Local(declaration),
                                 ) => KernelOwnerOracleLexicalTarget::Declaration {
                                     owner: owner.owner.clone(),
                                     origin: declaration_origins[declaration.0 as usize].clone(),
                                 },
-                                KernelLexicalBindingTarget::Declaration(
+                                boon_compiler_kernel::KernelLexicalBindingTargetRef::Declaration(
                                     KernelDeclarationReference::OwnerPublic(target),
                                 ) => {
                                     let target = active
@@ -1748,7 +1748,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                         target.owner.clone(),
                                     )
                                 }
-                                KernelLexicalBindingTarget::Declaration(
+                                boon_compiler_kernel::KernelLexicalBindingTargetRef::Declaration(
                                     KernelDeclarationReference::OwnerDeclaration {
                                         owner: target,
                                         declaration,
@@ -1777,16 +1777,20 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                         ),
                                     }
                                 }
-                                KernelLexicalBindingTarget::ContextFormal { ordinal } => {
+                                boon_compiler_kernel::KernelLexicalBindingTargetRef::ContextFormal {
+                                    ordinal,
+                                } => {
                                     KernelOwnerOracleLexicalTarget::ContextFormal {
                                         owner: owner.owner.clone(),
-                                        ordinal: *ordinal,
+                                        ordinal,
                                     }
                                 }
-                                KernelLexicalBindingTarget::Value { provider } => {
-                                    KernelOwnerOracleLexicalTarget::Value(stable_provider(*provider))
+                                boon_compiler_kernel::KernelLexicalBindingTargetRef::Value {
+                                    provider,
+                                } => {
+                                    KernelOwnerOracleLexicalTarget::Value(stable_provider(provider))
                                 }
-                                KernelLexicalBindingTarget::RuntimeContext => {
+                                boon_compiler_kernel::KernelLexicalBindingTargetRef::RuntimeContext => {
                                     KernelOwnerOracleLexicalTarget::RuntimeContext
                                 }
                             };
@@ -1846,15 +1850,16 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                             }
                         }
                     };
-                    let stable_path = |path: &boon_compiler_kernel::KernelSemanticPath| {
-                        match path.anchor {
+                    let stable_path =
+                        |anchor: KernelDeclarationReference, projection: &[Box<str>]| {
+                        match anchor {
                             KernelDeclarationReference::Local(declaration) => {
                                 KernelOwnerOracleSemanticPath {
                                     anchor_owner: owner.owner.clone(),
                                     anchor: Some(
                                         declaration_origins[declaration.0 as usize].clone(),
                                     ),
-                                    projection: path.projection.clone(),
+                                    projection: projection.to_vec().into_boxed_slice(),
                                 }
                             }
                             KernelDeclarationReference::OwnerPublic(target) => {
@@ -1870,7 +1875,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                 KernelOwnerOracleSemanticPath {
                                     anchor_owner: target.owner.clone(),
                                     anchor: None,
-                                    projection: path.projection.clone(),
+                                    projection: projection.to_vec().into_boxed_slice(),
                                 }
                             }
                             KernelDeclarationReference::OwnerDeclaration {
@@ -1898,7 +1903,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                         target,
                                         &declaration.origin,
                                     )),
-                                    projection: path.projection.clone(),
+                                    projection: projection.to_vec().into_boxed_slice(),
                                 }
                             }
                         }
@@ -1924,7 +1929,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                 .expect("a public resource owner has a root statement")
                         }
                     };
-                    let source_resources = artifact
+                    let source_resources = facts
                         .sources
                         .iter()
                         .enumerate()
@@ -1932,7 +1937,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                             declaration: stable_declaration(source.declaration),
                             statement: stable_statement(source.statement),
                             expression: owner.expressions[source.expression.0 as usize].clone(),
-                            path: stable_path(&source.path),
+                            path: stable_path(source.declaration, &source.projection),
                             interval_ms: source.interval_ms,
                             payload_type: code
                                 .materialize_source_payload_type(ordinal)
@@ -1940,25 +1945,40 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
-                    let states = artifact
-                        .states
-                        .iter()
+                    let states = definition
+                        .states()
                         .enumerate()
-                        .map(|(ordinal, state)| KernelOwnerOracleState {
-                            binding_declaration: stable_declaration(state.binding_declaration),
-                            declaration: stable_declaration(state.declaration),
-                            statement: stable_statement(state.statement),
-                            expression: owner.expressions[state.expression.0 as usize].clone(),
-                            initial: stable_provider(state.initial),
-                            path: stable_path(&state.path),
-                            kind: state.kind,
-                            flow_type: code
-                                .materialize_state_flow(ordinal)
-                                .expect("kernel state resource owns a packed flow"),
+                        .map(|(ordinal, state)| {
+                            let input = state.input();
+                            let projection = match state.path() {
+                                boon_compiler_kernel::KernelStatePathRef::Authored(projection) => {
+                                    projection.to_vec().into_boxed_slice()
+                                }
+                                boon_compiler_kernel::KernelStatePathRef::Synthetic(ordinal) => {
+                                    vec![format!("state_{ordinal}").into_boxed_str()]
+                                        .into_boxed_slice()
+                                }
+                            };
+                            KernelOwnerOracleState {
+                                binding_declaration: stable_declaration(
+                                    input.binding_declaration,
+                                ),
+                                declaration: stable_declaration(input.declaration),
+                                statement: stable_statement(input.statement),
+                                expression: owner.expressions[input.expression.0 as usize].clone(),
+                                initial: stable_provider(
+                                    state.initial().expect("validated state initial resolves"),
+                                ),
+                                path: stable_path(input.declaration, &projection),
+                                kind: input.kind,
+                                flow_type: code
+                                    .materialize_state_flow(ordinal)
+                                    .expect("kernel state resource owns a packed flow"),
+                            }
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
-                    let lists = artifact
+                    let lists = facts
                         .lists
                         .iter()
                         .enumerate()
@@ -1966,7 +1986,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                             declaration: stable_declaration(list.declaration),
                             statement: stable_statement(list.statement),
                             producer: owner.expressions[list.producer.0 as usize].clone(),
-                            path: stable_path(&list.path),
+                            path: stable_path(list.declaration, &list.projection),
                             item_type: code
                                 .materialize_list_item_type(ordinal)
                                 .expect("kernel LIST resource owns a packed item type"),
@@ -2027,30 +2047,31 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
-                    let mut call_syntax = artifact
+                    let mut call_syntax = facts
                         .call_syntax
-                        .into_iter()
+                        .iter()
                         .map(|syntax| (syntax.expression, syntax))
                         .collect::<BTreeMap<_, _>>();
-                    let calls = artifact
-                        .calls
-                        .into_iter()
-                        .enumerate()
-                        .map(|(ordinal, call)| {
+                    let calls = (0..definition.call_count())
+                        .map(|ordinal| {
+                            let call = definition
+                                .call(ordinal)
+                                .expect("packed call coordinate remains resolvable");
+                            let expression = call.expression();
                             let facts = code
                                 .materialize_call_facts(ordinal)
                                 .expect("kernel call owns one packed fact row");
                             let result = code
-                                .materialize_expression(call.expression.0 as usize)
+                                .materialize_expression(expression.0 as usize)
                                 .expect("kernel call owns one packed result flow");
-                            let syntax = call_syntax.remove(&call.expression).unwrap_or_else(|| {
+                            let syntax = call_syntax.remove(&expression).unwrap_or_else(|| {
                                 panic!(
                                     "kernel call expression {} has no authored call surface",
-                                    call.expression.0
+                                    expression.0
                                 )
                             });
-                            let target = match call.target {
-                                KernelCallTarget::User {
+                            let target = match call.target() {
+                                boon_compiler_kernel::KernelCallTargetRef::User {
                                     target,
                                     inherited_formal,
                                 } => {
@@ -2068,50 +2089,85 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                                         inherited_formal,
                                     }
                                 }
-                                KernelCallTarget::RenderConstructor { kind } => {
-                                    KernelOwnerOracleCallTarget::RenderConstructor(kind)
+                                boon_compiler_kernel::KernelCallTargetRef::RenderConstructor {
+                                    kind,
+                                } => {
+                                    KernelOwnerOracleCallTarget::RenderConstructor(kind.clone())
                                 }
-                                KernelCallTarget::PureBuiltin { kind } => {
+                                boon_compiler_kernel::KernelCallTargetRef::PureBuiltin { kind } => {
                                     KernelOwnerOracleCallTarget::PureBuiltin(kind)
                                 }
-                                KernelCallTarget::FixedAbi => {
+                                boon_compiler_kernel::KernelCallTargetRef::FixedAbi => {
                                     KernelOwnerOracleCallTarget::FixedAbi
                                 }
-                                KernelCallTarget::HostEffect { operation } => {
-                                    KernelOwnerOracleCallTarget::HostEffect(operation)
+                                boon_compiler_kernel::KernelCallTargetRef::HostEffect {
+                                    operation,
+                                } => {
+                                    KernelOwnerOracleCallTarget::HostEffect(operation.into())
                                 }
-                                KernelCallTarget::FieldProjection { field } => {
-                                    KernelOwnerOracleCallTarget::FieldProjection(field)
+                                boon_compiler_kernel::KernelCallTargetRef::FieldProjection {
+                                    field,
+                                } => {
+                                    KernelOwnerOracleCallTarget::FieldProjection(field.into())
                                 }
                             };
                             KernelOwnerOracleCall {
-                                expression: owner.expressions
-                                    [call.expression.0 as usize]
-                                    .clone(),
-                                function: syntax.function,
-                                pipe_input: syntax.pipe_input.map(&stable_provider),
+                                expression: owner.expressions[expression.0 as usize].clone(),
+                                function: syntax.function.clone(),
+                                pipe_input: syntax.pipe_input.map(|value| {
+                                    stable_provider(
+                                        definition
+                                            .resolve_value(value, expression.0 as usize)
+                                            .expect("validated call pipe input resolves"),
+                                    )
+                                }),
                                 arguments: syntax
                                     .arguments
                                     .iter()
                                     .map(|argument| KernelOwnerOracleCallSyntaxArgument {
                                         kind: argument.kind,
                                         name: argument.name.clone(),
-                                        provider: stable_provider(argument.value),
+                                        provider: stable_provider(
+                                            definition
+                                                .resolve_value(
+                                                    argument.value,
+                                                    expression.0 as usize,
+                                                )
+                                                .expect("validated call argument resolves"),
+                                        ),
                                     })
                                     .collect::<Vec<_>>()
                                     .into_boxed_slice(),
                                 pass: syntax.pass.map(|pass| KernelOwnerOracleCallPass {
-                                    provider: stable_provider(pass.value),
+                                    provider: stable_provider(
+                                        definition
+                                            .resolve_value(pass.value, expression.0 as usize)
+                                            .expect("validated call PASS value resolves"),
+                                    ),
                                     final_clause: pass.final_clause,
                                 }),
                                 target,
                                 inputs: call
-                                    .inputs
+                                    .inputs()
                                     .iter()
                                     .map(|input| {
+                                        let role = match call
+                                            .input_role(input)
+                                            .expect("validated call input role resolves")
+                                        {
+                                            boon_compiler_kernel::KernelCallInputRoleRef::Formal {
+                                                ordinal,
+                                            } => KernelCallInputRole::Formal { ordinal },
+                                            boon_compiler_kernel::KernelCallInputRoleRef::Abi {
+                                                name,
+                                            } => KernelCallInputRole::Abi { name: name.into() },
+                                        };
                                         KernelOwnerOracleCallInput {
-                                            role: input.role.clone(),
-                                            provider: stable_provider(input.value),
+                                            role,
+                                            provider: stable_provider(
+                                                call.input_value(input)
+                                                    .expect("validated call input resolves"),
+                                            ),
                                         }
                                     })
                                     .collect::<Vec<_>>()
@@ -2126,8 +2182,9 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                         call_syntax.is_empty(),
                         "every authored call surface must link to one solved call"
                     );
-                    let effects = artifact
-                        .effects
+                    let effects = definition
+                        .materialize_host_effects()
+                        .expect("validated host effects remain materializable")
                         .into_iter()
                         .map(|effect| {
                             (
@@ -2140,11 +2197,11 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     let expressions = owner
                         .expressions
                         .iter()
-                        .zip(artifact.expressions)
-                        .map(|(source, expression)| {
+                        .enumerate()
+                        .map(|(ordinal, source)| {
                             (
                                 source.clone(),
-                                code.materialize_expression(expression.id.0 as usize)
+                                code.materialize_expression(ordinal)
                                     .expect("kernel expression owns one packed flow"),
                             )
                         })

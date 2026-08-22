@@ -1,16 +1,18 @@
+#[cfg(test)]
+use crate::build_packed_snapshot_receipts;
 use crate::solver::ComponentSolveSession;
 use crate::{
-    ComponentArtifact, ComponentOutputSnapshot, ComponentProgram, ComponentProgramBuilder,
+    ComponentOutputSnapshot, ComponentProgram, ComponentProgramBuilder,
     DefinitionAdditionalTypeRoots, DefinitionCodeBuilder, DefinitionCodeStore,
     DefinitionTermProofScratch, FrozenTypeStore, KernelCollectionOperationKind, KernelPattern,
     KernelRecordEntry, KernelSelectArm, KernelSolveError, KernelSolveWork, KernelSummaryCallInput,
     KernelSummaryNode, KernelSummaryProgram, KernelSummaryProjectionStep, KernelSummaryRecordEntry,
     KernelSummarySelectArm, KernelSummaryValueId, OutputId, PackedCallFactsInput, PackedCallRef,
     PackedCallTypeSubstitution, PackedDiagnosticTypes, PackedExpressionRef, PackedFlow,
-    PackedResourceProjectionRequirementInput, PackedSourceReadInput, PublishMode, TypeTerm,
-    TypeTermHead, TypeTermId, TypeVariableId, UnsealedComponentArtifact, VariantTerm,
-    alpha_normalize_callable_interface_and_diagnostics, build_packed_snapshot_receipts,
-    build_snapshot_receipts, definition_basis_fingerprint,
+    PackedPublishedState, PackedResourceProjectionRequirementInput, PackedSourceReadInput,
+    PublishMode, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId, UnsealedComponentArtifact,
+    VariantTerm, alpha_normalize_callable_interface_and_diagnostics,
+    build_borrowed_snapshot_receipts, build_snapshot_receipts, definition_basis_fingerprint,
     definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
@@ -20,7 +22,8 @@ use boon_checked::{
 use boon_contract::{ProjectTextSnapshot, SymbolId};
 use boon_data::{Bits, ExactNumber, ExactNumberParseReason, ExactRoundingRule};
 use boon_effect_schema::{
-    BarrierSpec, DeliveryCardinalitySpec, ReplaySpec, ResultPolicySpec, ValueType, host_effect_spec,
+    BarrierSpec, DeliveryCardinalityPolicySpec, DeliveryCardinalitySpec, ReplaySpec,
+    ResultPolicySpec, ValueType, host_effect_policy, host_effect_spec,
 };
 use boon_syntax::{
     AstExpr, AstExprKind, AstMatchPattern, StableExpressionKey, StableOccurrenceKey,
@@ -1001,16 +1004,17 @@ pub(crate) struct KernelProjectSolveSession {
 /// Quiescent project graph before any optional checked product is published.
 ///
 /// Keeping this boundary explicit lets one session solve type equations once,
-/// answer diagnostics from public interfaces, and materialize sparse or full
-/// checked artifacts only when a later demand requires them.
+/// answer diagnostics from public interfaces, publish sparse borrowed views,
+/// and seal a full checked image only when a later demand requires it.
 #[derive(Debug)]
 pub struct KernelSolvedProject {
-    artifact: ComponentArtifact,
     definition_code: Arc<DefinitionCodeStore>,
     program: Arc<KernelProjectProgramInput>,
+    #[cfg(test)]
     owners: Box<[KernelProjectOwnerOutputs]>,
     definition_facts: Arc<[KernelDefinitionFactsInput]>,
     derived: Arc<KernelSolvedDerived>,
+    work: KernelSolveWork,
 }
 
 #[derive(Clone, Debug)]
@@ -1178,6 +1182,288 @@ impl<'a> KernelDefinitionInputRef<'a> {
     }
 }
 
+/// Borrowed production view over one definition's immutable authored facts
+/// and its single packed solve authority.
+///
+/// The view contains no owned strings, vectors, or recursive types and cannot
+/// outlive the checked snapshot from which it was obtained.
+#[derive(Clone, Copy)]
+pub struct KernelDefinitionRef<'a> {
+    owner: KernelOwnerId,
+    input: &'a KernelOwnerProgramInput,
+    facts: &'a KernelDefinitionFactsInput,
+    code: crate::DefinitionCodeRef<'a>,
+}
+
+pub struct KernelDefinitionIter<'a> {
+    snapshot: &'a KernelCheckedSnapshot,
+    next: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct KernelDefinitionCallRef<'a> {
+    definition: KernelDefinitionRef<'a>,
+    expression: KernelExpressionId,
+    node: &'a KernelOwnerNode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelStatePathRef<'a> {
+    Authored(&'a [Box<str>]),
+    Synthetic(u32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelLexicalBindingTargetRef {
+    Declaration(KernelDeclarationReference),
+    ContextFormal { ordinal: u32 },
+    Value { provider: KernelValueReference },
+    RuntimeContext,
+}
+
+#[derive(Clone, Copy)]
+pub struct KernelPublishedStateRef<'a> {
+    definition: KernelDefinitionRef<'a>,
+    id: KernelStateId,
+    input: &'a KernelStateInput,
+    synthetic_ordinal: Option<u32>,
+}
+
+pub struct KernelPublishedStateIter<'a> {
+    definition: KernelDefinitionRef<'a>,
+    rows: std::slice::Iter<'a, PackedPublishedState>,
+    next_id: u32,
+}
+
+impl<'a> Iterator for KernelDefinitionIter<'a> {
+    type Item = KernelDefinitionRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let owner = KernelOwnerId(u32::try_from(self.next).ok()?);
+        let definition = self.snapshot.definition(owner)?;
+        self.next += 1;
+        Some(definition)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.snapshot.definition_count().saturating_sub(self.next);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for KernelDefinitionIter<'_> {}
+
+impl<'a> Iterator for KernelPublishedStateIter<'a> {
+    type Item = KernelPublishedStateRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let row = *self.rows.next()?;
+        let id = KernelStateId(self.next_id);
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("sealed kernel state namespace exceeds u32");
+        Some(KernelPublishedStateRef {
+            definition: self.definition,
+            id,
+            input: self
+                .definition
+                .facts
+                .states
+                .get(row.input_ordinal as usize)
+                .expect("sealed published-state coordinate is inside definition facts"),
+            synthetic_ordinal: row.synthetic_ordinal(),
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.rows.size_hint()
+    }
+}
+
+impl ExactSizeIterator for KernelPublishedStateIter<'_> {}
+
+impl<'a> KernelDefinitionRef<'a> {
+    pub(crate) fn from_authorities(
+        program: &'a KernelProjectProgramInput,
+        facts: &'a [KernelDefinitionFactsInput],
+        code: &'a DefinitionCodeStore,
+        owner: KernelOwnerId,
+    ) -> Option<Self> {
+        let index = owner.0 as usize;
+        Some(Self {
+            owner,
+            input: program.owners.get(index)?,
+            facts: facts.get(index)?,
+            code: code.definition(owner)?,
+        })
+    }
+
+    pub const fn owner(self) -> KernelOwnerId {
+        self.owner
+    }
+
+    pub const fn input(self) -> &'a KernelOwnerProgramInput {
+        self.input
+    }
+
+    pub const fn facts(self) -> &'a KernelDefinitionFactsInput {
+        self.facts
+    }
+
+    pub const fn code(self) -> crate::DefinitionCodeRef<'a> {
+        self.code
+    }
+
+    pub const fn linkage(self) -> KernelDefinitionLinkage {
+        self.facts.linkage
+    }
+
+    pub fn resolve_value(
+        self,
+        encoded: KernelExpressionId,
+        consumer: usize,
+    ) -> Result<KernelValueReference, KernelOwnerBuildError> {
+        kernel_value_reference(self.input, encoded, consumer)
+    }
+
+    pub fn resolve_structural_declaration(
+        self,
+        declaration: KernelStructuralDeclarationInput,
+        value: KernelExpressionId,
+        consumer: usize,
+    ) -> Result<KernelDeclarationReference, KernelOwnerBuildError> {
+        link_structural_declaration(self.input, declaration, value, consumer)
+    }
+
+    pub fn resolve_lexical_target(
+        self,
+        binding: &'a KernelLexicalBindingInput,
+    ) -> Result<KernelLexicalBindingTargetRef, KernelOwnerBuildError> {
+        Ok(match binding.target {
+            KernelLexicalBindingTargetInput::Declaration(declaration) => {
+                KernelLexicalBindingTargetRef::Declaration(declaration)
+            }
+            KernelLexicalBindingTargetInput::ContextFormal { ordinal } => {
+                KernelLexicalBindingTargetRef::ContextFormal { ordinal }
+            }
+            KernelLexicalBindingTargetInput::Value { provider } => {
+                KernelLexicalBindingTargetRef::Value {
+                    provider: self.resolve_value(provider, binding.expression.0 as usize)?,
+                }
+            }
+            KernelLexicalBindingTargetInput::RuntimeContext => {
+                KernelLexicalBindingTargetRef::RuntimeContext
+            }
+        })
+    }
+
+    pub fn expression_effect(self, expression: KernelExpressionId) -> Option<KernelEffectSummary> {
+        let node = self.input.nodes.get(expression.0 as usize)?;
+        match &node.kind {
+            KernelOwnerNodeKind::UserCall { target, .. } => self.code.effect_summary_for(*target),
+            _ => Some(local_expression_effect(&node.kind)),
+        }
+    }
+
+    pub fn expression_kind(
+        self,
+        expression: KernelExpressionId,
+    ) -> Option<KernelExpressionKindRef<'a>> {
+        self.input
+            .nodes
+            .get(expression.0 as usize)
+            .map(|node| (&node.kind).into())
+    }
+
+    pub fn call_count(self) -> usize {
+        self.code.call_count()
+    }
+
+    pub fn call(self, ordinal: usize) -> Option<KernelDefinitionCallRef<'a>> {
+        let expression = self.code.call_expression(ordinal)?;
+        Some(KernelDefinitionCallRef {
+            definition: self,
+            expression,
+            node: self.input.nodes.get(expression.0 as usize)?,
+        })
+    }
+
+    pub fn state_count(self) -> usize {
+        self.code.state_count()
+    }
+
+    pub fn states(self) -> KernelPublishedStateIter<'a> {
+        KernelPublishedStateIter {
+            definition: self,
+            rows: self.code.states().iter(),
+            next_id: 0,
+        }
+    }
+
+    pub fn materialize_host_effects(
+        self,
+    ) -> Result<Box<[KernelHostEffectArtifact]>, KernelOwnerBuildError> {
+        collect_host_effect_artifacts(self.input)
+    }
+}
+
+impl<'a> KernelDefinitionCallRef<'a> {
+    pub const fn expression(self) -> KernelExpressionId {
+        self.expression
+    }
+
+    pub const fn node(self) -> &'a KernelOwnerNode {
+        self.node
+    }
+
+    pub fn target(self) -> KernelCallTargetRef<'a> {
+        kernel_call_target_ref(&self.node.kind)
+            .expect("sealed packed call coordinate points to a call node")
+    }
+
+    pub fn inputs(self) -> &'a [KernelOwnerInputEdge] {
+        &self.node.inputs
+    }
+
+    pub fn input_value(
+        self,
+        edge: &KernelOwnerInputEdge,
+    ) -> Result<KernelValueReference, KernelOwnerBuildError> {
+        self.definition
+            .resolve_value(edge.expression, self.expression.0 as usize)
+    }
+
+    pub fn input_role(
+        self,
+        edge: &'a KernelOwnerInputEdge,
+    ) -> Result<KernelCallInputRoleRef<'a>, KernelOwnerBuildError> {
+        kernel_call_input_role_ref(&self.node.kind, &edge.role, self.expression)
+    }
+}
+
+impl<'a> KernelPublishedStateRef<'a> {
+    pub const fn id(self) -> KernelStateId {
+        self.id
+    }
+
+    pub const fn input(self) -> &'a KernelStateInput {
+        self.input
+    }
+
+    pub const fn path(self) -> KernelStatePathRef<'a> {
+        match self.synthetic_ordinal {
+            Some(ordinal) => KernelStatePathRef::Synthetic(ordinal),
+            None => KernelStatePathRef::Authored(&self.input.projection),
+        }
+    }
+
+    pub fn initial(self) -> Result<KernelValueReference, KernelOwnerBuildError> {
+        self.definition
+            .resolve_value(self.input.initial, self.input.expression.0 as usize)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PendingKernelExpressionArtifact {
     id: KernelExpressionId,
@@ -1203,8 +1489,8 @@ struct KernelProjectCallSolve {
     syntax_discriminated_root_output: Option<OutputId>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum KernelCallTargetRef<'a> {
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelCallTargetRef<'a> {
     User {
         target: KernelOwnerId,
         inherited_formal: Option<KernelInheritedFormal>,
@@ -1225,6 +1511,7 @@ enum KernelCallTargetRef<'a> {
 }
 
 impl KernelCallTargetRef<'_> {
+    #[cfg(test)]
     fn to_owned(self) -> KernelCallTarget {
         match self {
             Self::User {
@@ -1253,6 +1540,34 @@ impl KernelCallTargetRef<'_> {
     }
 }
 
+fn kernel_call_target_ref(kind: &KernelOwnerNodeKind) -> Option<KernelCallTargetRef<'_>> {
+    match kind {
+        KernelOwnerNodeKind::UserCall {
+            target,
+            inherited_formal,
+        } => Some(KernelCallTargetRef::User {
+            target: *target,
+            inherited_formal: *inherited_formal,
+        }),
+        KernelOwnerNodeKind::RenderConstructor { kind } => {
+            Some(KernelCallTargetRef::RenderConstructor { kind })
+        }
+        KernelOwnerNodeKind::PureBuiltin { kind } => {
+            Some(KernelCallTargetRef::PureBuiltin { kind: *kind })
+        }
+        KernelOwnerNodeKind::FixedAbiCall { .. } => Some(KernelCallTargetRef::FixedAbi),
+        KernelOwnerNodeKind::HostEffect { operation } => Some(KernelCallTargetRef::HostEffect {
+            operation: operation.as_ref(),
+        }),
+        KernelOwnerNodeKind::FieldProjection { field } => {
+            Some(KernelCallTargetRef::FieldProjection {
+                field: field.as_ref(),
+            })
+        }
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy)]
 struct KernelProjectCallRef<'a> {
     definition: KernelDefinitionInputRef<'a>,
@@ -1266,31 +1581,8 @@ impl<'a> KernelProjectCallRef<'a> {
     }
 
     fn target(self) -> KernelCallTargetRef<'a> {
-        match &self.node.kind {
-            KernelOwnerNodeKind::UserCall {
-                target,
-                inherited_formal,
-            } => KernelCallTargetRef::User {
-                target: *target,
-                inherited_formal: *inherited_formal,
-            },
-            KernelOwnerNodeKind::RenderConstructor { kind } => {
-                KernelCallTargetRef::RenderConstructor { kind }
-            }
-            KernelOwnerNodeKind::PureBuiltin { kind } => {
-                KernelCallTargetRef::PureBuiltin { kind: *kind }
-            }
-            KernelOwnerNodeKind::FixedAbiCall { .. } => KernelCallTargetRef::FixedAbi,
-            KernelOwnerNodeKind::HostEffect { operation } => KernelCallTargetRef::HostEffect {
-                operation: operation.as_ref(),
-            },
-            KernelOwnerNodeKind::FieldProjection { field } => {
-                KernelCallTargetRef::FieldProjection {
-                    field: field.as_ref(),
-                }
-            }
-            _ => unreachable!("validated project call sidecar points to a non-call node"),
-        }
+        kernel_call_target_ref(&self.node.kind)
+            .expect("validated project call sidecar points to a non-call node")
     }
 
     fn inputs(self) -> &'a [KernelOwnerInputEdge] {
@@ -1309,32 +1601,40 @@ impl<'a> KernelProjectCallRef<'a> {
         self,
         edge: &'a KernelOwnerInputEdge,
     ) -> Result<KernelCallInputRoleRef<'a>, KernelOwnerBuildError> {
-        match (&self.node.kind, &edge.role) {
-            (
-                KernelOwnerNodeKind::UserCall { .. },
-                KernelOwnerEdgeRole::CallArgument { ordinal }
-                | KernelOwnerEdgeRole::CallOutArgument { ordinal },
-            ) => Ok(KernelCallInputRoleRef::Formal { ordinal: *ordinal }),
-            (
-                KernelOwnerNodeKind::RenderConstructor { .. }
-                | KernelOwnerNodeKind::PureBuiltin { .. }
-                | KernelOwnerNodeKind::FixedAbiCall { .. }
-                | KernelOwnerNodeKind::HostEffect { .. }
-                | KernelOwnerNodeKind::FieldProjection { .. },
-                KernelOwnerEdgeRole::AbiArgument { name },
-            ) => Ok(KernelCallInputRoleRef::Abi {
-                name: name.as_ref(),
-            }),
-            (_, role) => Err(KernelOwnerBuildError::new(format!(
-                "kernel call node {} has non-call input role {role:?}",
-                self.expression().0,
-            ))),
-        }
+        kernel_call_input_role_ref(&self.node.kind, &edge.role, self.expression())
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-enum KernelCallInputRoleRef<'a> {
+fn kernel_call_input_role_ref<'a>(
+    kind: &KernelOwnerNodeKind,
+    role: &'a KernelOwnerEdgeRole,
+    expression: KernelExpressionId,
+) -> Result<KernelCallInputRoleRef<'a>, KernelOwnerBuildError> {
+    match (kind, role) {
+        (
+            KernelOwnerNodeKind::UserCall { .. },
+            KernelOwnerEdgeRole::CallArgument { ordinal }
+            | KernelOwnerEdgeRole::CallOutArgument { ordinal },
+        ) => Ok(KernelCallInputRoleRef::Formal { ordinal: *ordinal }),
+        (
+            KernelOwnerNodeKind::RenderConstructor { .. }
+            | KernelOwnerNodeKind::PureBuiltin { .. }
+            | KernelOwnerNodeKind::FixedAbiCall { .. }
+            | KernelOwnerNodeKind::HostEffect { .. }
+            | KernelOwnerNodeKind::FieldProjection { .. },
+            KernelOwnerEdgeRole::AbiArgument { name },
+        ) => Ok(KernelCallInputRoleRef::Abi {
+            name: name.as_ref(),
+        }),
+        (_, role) => Err(KernelOwnerBuildError::new(format!(
+            "kernel call node {} has non-call input role {role:?}",
+            expression.0,
+        ))),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelCallInputRoleRef<'a> {
     Formal { ordinal: u32 },
     Abi { name: &'a str },
 }
@@ -2429,11 +2729,164 @@ pub struct RichKernelListArtifact {
     pub key_policy: CheckedListKeyPolicy,
 }
 
-/// Type-free opcode retained by the production checked snapshot.
+/// Allocation-free, type-erasing opcode view over one authored solver node.
 ///
-/// Closed input/result types live in the store-qualified `DefinitionCodeStore`;
-/// keeping them out of this enum prevents the structural inventory from
-/// retaining a second recursive `Type` graph.
+/// Variant and field order deliberately matches `KernelExpressionArtifactKind`
+/// so the V17 compatibility hash can stream the same events without cloning
+/// strings, projections, patterns, or recursive type payloads.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum KernelExpressionKindRef<'a> {
+    Known,
+    Source,
+    Absent,
+    Text,
+    TextTemplate,
+    Number,
+    Byte,
+    Bits(u32),
+    Tag(&'a str),
+    Record {
+        tag: Option<&'a str>,
+    },
+    Block,
+    Collection {
+        kind: KernelCollectionKind,
+        capacity: Option<usize>,
+    },
+    MapEntry,
+    FormalRead {
+        formal: u32,
+        fields: &'a [Box<str>],
+    },
+    ContextRead {
+        formal: u32,
+        fields: &'a [Box<str>],
+    },
+    LexicalRead {
+        fields: &'a [Box<str>],
+    },
+    ValueRead {
+        fields: &'a [Box<str>],
+        mode_narrowing: Option<KernelExpressionId>,
+    },
+    DerivedRead {
+        fields: &'a [Box<str>],
+    },
+    PatternRead {
+        pattern: &'a KernelPattern,
+        fields: &'a [Box<str>],
+    },
+    CollectionItemRead,
+    FreshOut,
+    UserCall {
+        target: KernelOwnerId,
+        inherited_formal: Option<KernelInheritedFormal>,
+    },
+    RenderConstructor {
+        kind: &'a KernelRenderConstructorKind,
+    },
+    PureBuiltin {
+        kind: KernelPureBuiltinKind,
+    },
+    FixedAbiCall,
+    HostEffect {
+        operation: &'a str,
+    },
+    Latest,
+    When,
+    Then,
+    Infix {
+        operation: &'a str,
+    },
+    Draining,
+    Hold,
+    MatchArm {
+        pattern: &'a KernelPattern,
+    },
+    Arrow,
+    Delimiter,
+    Unknown,
+    Flush,
+    FieldProjection {
+        field: &'a str,
+    },
+}
+
+impl<'a> From<&'a KernelOwnerNodeKind> for KernelExpressionKindRef<'a> {
+    fn from(kind: &'a KernelOwnerNodeKind) -> Self {
+        match kind {
+            KernelOwnerNodeKind::Known(_) => Self::Known,
+            KernelOwnerNodeKind::Source(_) => Self::Source,
+            KernelOwnerNodeKind::Absent => Self::Absent,
+            KernelOwnerNodeKind::Text => Self::Text,
+            KernelOwnerNodeKind::TextTemplate => Self::TextTemplate,
+            KernelOwnerNodeKind::Number => Self::Number,
+            KernelOwnerNodeKind::Byte => Self::Byte,
+            KernelOwnerNodeKind::Bits(width) => Self::Bits(*width),
+            KernelOwnerNodeKind::Tag(tag) => Self::Tag(tag),
+            KernelOwnerNodeKind::Record { tag } => Self::Record {
+                tag: tag.as_deref(),
+            },
+            KernelOwnerNodeKind::Block => Self::Block,
+            KernelOwnerNodeKind::Collection { kind, capacity } => Self::Collection {
+                kind: *kind,
+                capacity: *capacity,
+            },
+            KernelOwnerNodeKind::MapEntry => Self::MapEntry,
+            KernelOwnerNodeKind::FormalRead { formal, fields } => Self::FormalRead {
+                formal: *formal,
+                fields,
+            },
+            KernelOwnerNodeKind::ContextRead { formal, fields } => Self::ContextRead {
+                formal: *formal,
+                fields,
+            },
+            KernelOwnerNodeKind::LexicalRead { fields } => Self::LexicalRead { fields },
+            KernelOwnerNodeKind::ValueRead {
+                fields,
+                mode_narrowing,
+            } => Self::ValueRead {
+                fields,
+                mode_narrowing: *mode_narrowing,
+            },
+            KernelOwnerNodeKind::DerivedRead { fields } => Self::DerivedRead { fields },
+            KernelOwnerNodeKind::PatternRead { pattern, fields } => {
+                Self::PatternRead { pattern, fields }
+            }
+            KernelOwnerNodeKind::CollectionItemRead => Self::CollectionItemRead,
+            KernelOwnerNodeKind::FreshOut => Self::FreshOut,
+            KernelOwnerNodeKind::UserCall {
+                target,
+                inherited_formal,
+            } => Self::UserCall {
+                target: *target,
+                inherited_formal: *inherited_formal,
+            },
+            KernelOwnerNodeKind::RenderConstructor { kind } => Self::RenderConstructor { kind },
+            KernelOwnerNodeKind::PureBuiltin { kind } => Self::PureBuiltin { kind: *kind },
+            KernelOwnerNodeKind::FixedAbiCall { .. } => Self::FixedAbiCall,
+            KernelOwnerNodeKind::HostEffect { operation } => Self::HostEffect { operation },
+            KernelOwnerNodeKind::Latest => Self::Latest,
+            KernelOwnerNodeKind::When => Self::When,
+            KernelOwnerNodeKind::Then => Self::Then,
+            KernelOwnerNodeKind::Infix { operation } => Self::Infix { operation },
+            KernelOwnerNodeKind::Draining => Self::Draining,
+            KernelOwnerNodeKind::Hold => Self::Hold,
+            KernelOwnerNodeKind::MatchArm { pattern } => Self::MatchArm { pattern },
+            KernelOwnerNodeKind::Arrow => Self::Arrow,
+            KernelOwnerNodeKind::Delimiter => Self::Delimiter,
+            KernelOwnerNodeKind::Unknown => Self::Unknown,
+            KernelOwnerNodeKind::Flush => Self::Flush,
+            KernelOwnerNodeKind::FieldProjection { field } => Self::FieldProjection { field },
+        }
+    }
+}
+
+/// Type-free opcode retained only by the differential compatibility oracle.
+///
+/// Production consumers use [`KernelExpressionKindRef`] over the immutable
+/// owner program instead of cloning names, projections, patterns, and kinds.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub enum KernelExpressionArtifactKind {
     Known,
@@ -2512,6 +2965,7 @@ pub enum KernelExpressionArtifactKind {
     },
 }
 
+#[cfg(test)]
 impl From<&KernelOwnerNodeKind> for KernelExpressionArtifactKind {
     fn from(kind: &KernelOwnerNodeKind) -> Self {
         match kind {
@@ -2595,6 +3049,7 @@ impl From<&KernelOwnerNodeKind> for KernelExpressionArtifactKind {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelExpressionArtifact {
     pub id: KernelExpressionId,
@@ -2603,6 +3058,7 @@ pub struct KernelExpressionArtifact {
     pub effect: KernelEffectSummary,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelDeclarationArtifact {
     pub id: KernelDeclarationId,
@@ -2612,6 +3068,7 @@ pub struct KernelDeclarationArtifact {
     pub value: Option<KernelValueReference>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelCallArtifact {
     pub expression: KernelExpressionId,
@@ -2619,6 +3076,7 @@ pub struct KernelCallArtifact {
     pub inputs: Box<[KernelCallInputArtifact]>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelSourceArtifact {
     pub id: KernelSourceId,
@@ -2629,6 +3087,7 @@ pub struct KernelSourceArtifact {
     pub interval_ms: Option<u64>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelStateArtifact {
     pub id: KernelStateId,
@@ -2641,6 +3100,7 @@ pub struct KernelStateArtifact {
     pub kind: CheckedStateKind,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub struct KernelListArtifact {
     pub id: KernelListId,
@@ -2652,8 +3112,10 @@ pub struct KernelListArtifact {
     pub key_policy: CheckedListKeyPolicy,
 }
 
-/// Type-free structural rows for one production definition. All type-bearing
-/// columns are addressed through the sibling `DefinitionCodeStore` entry.
+/// Former type-free structural publication retained only as a differential
+/// oracle. Production checked snapshots borrow the program/fact/code
+/// authorities directly and never construct this graph.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DefinitionArtifact {
     pub linkage: KernelDefinitionLinkage,
@@ -2742,29 +3204,69 @@ pub struct KernelDefinitionSnapshot {
 /// Immutable checked snapshot produced by one complete dense solve.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCheckedSnapshot {
-    pub definitions: Box<[DefinitionArtifact]>,
+    #[cfg(test)]
+    pub(crate) definitions: Box<[DefinitionArtifact]>,
     /// Shared normalized owner program retained once for borrowed structural
     /// views. Published definition rows remain a compatibility product until
     /// their downstream consumers are moved onto this authority.
-    pub program: Arc<KernelProjectProgramInput>,
+    pub(crate) program: Arc<KernelProjectProgramInput>,
     /// Shared immutable syntax/link facts for every dense definition. These
     /// rows are owned once by `KernelProjectInput`; checked publication keeps
     /// the same allocation instead of cloning rich paths and literal values.
-    pub definition_facts: Arc<[KernelDefinitionFactsInput]>,
+    pub(crate) definition_facts: Arc<[KernelDefinitionFactsInput]>,
     /// One packed, store-qualified authority for all solver-owned definition
     /// flow roots. The checked linker consumes this directly; rich artifacts
     /// no longer retain one boxed flow sidecar per definition.
-    pub definition_code: Arc<DefinitionCodeStore>,
-    pub type_store: Arc<FrozenTypeStore>,
+    pub(crate) definition_code: Arc<DefinitionCodeStore>,
     /// The only retained rich type surface: public callable interfaces and
     /// user-facing diagnostics. Definition bodies remain packed.
-    pub interface: Arc<KernelInterfaceSnapshot>,
+    pub(crate) interface: Arc<KernelInterfaceSnapshot>,
     pub dependencies: crate::KernelDefinitionDependencyGraph,
     pub currentness: Box<[crate::KernelPackedDefinitionCurrentnessReceipt]>,
     pub work: KernelSolveWork,
 }
 
 impl KernelCheckedSnapshot {
+    pub fn definition_count(&self) -> usize {
+        self.definition_code.definition_count()
+    }
+
+    pub fn definition(&self, owner: KernelOwnerId) -> Option<KernelDefinitionRef<'_>> {
+        KernelDefinitionRef::from_authorities(
+            &self.program,
+            &self.definition_facts,
+            &self.definition_code,
+            owner,
+        )
+    }
+
+    pub fn definition_refs(&self) -> KernelDefinitionIter<'_> {
+        KernelDefinitionIter {
+            snapshot: self,
+            next: 0,
+        }
+    }
+
+    pub fn interface(&self) -> &KernelInterfaceSnapshot {
+        &self.interface
+    }
+
+    pub fn type_store(&self) -> &Arc<FrozenTypeStore> {
+        self.definition_code.type_store()
+    }
+
+    pub fn dependencies(&self) -> &crate::KernelDefinitionDependencyGraph {
+        &self.dependencies
+    }
+
+    pub fn currentness(&self) -> &[crate::KernelPackedDefinitionCurrentnessReceipt] {
+        &self.currentness
+    }
+
+    pub const fn work(&self) -> KernelSolveWork {
+        self.work
+    }
+
     pub fn result_flow(&self, owner: KernelOwnerId) -> Option<&FlowType> {
         self.interface.public_results.get(owner.0 as usize)
     }
@@ -2798,7 +3300,9 @@ impl KernelCheckedSnapshot {
 
     pub fn diagnostics_for(&self, owner: KernelOwnerId) -> Option<&[KernelDiagnosticArtifact]> {
         let owner = owner.0 as usize;
-        self.definitions.get(owner)?;
+        if owner >= self.definition_count() {
+            return None;
+        }
         let start = (0..owner).try_fold(0usize, |start, index| {
             Some(
                 start
@@ -2843,36 +3347,99 @@ pub struct KernelDiagnosticValueArtifact {
     pub ty: Type,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KernelDemandedDefinitionArtifact {
-    pub owner: KernelOwnerId,
-    pub definition: DefinitionArtifact,
-}
-
-/// Sparse checked artifact product for explicit definition demand.
+/// Sparse borrowed-definition product for explicit definition demand.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDemandedDefinitionSnapshot {
-    pub definitions: Box<[KernelDemandedDefinitionArtifact]>,
-    pub program: Arc<KernelProjectProgramInput>,
-    pub definition_facts: Arc<[KernelDefinitionFactsInput]>,
-    pub definition_code: Arc<DefinitionCodeStore>,
-    pub type_store: Arc<FrozenTypeStore>,
-    pub interface: Arc<KernelInterfaceSnapshot>,
-    pub work: KernelSolveWork,
+    owners: Box<[KernelOwnerId]>,
+    program: Arc<KernelProjectProgramInput>,
+    definition_facts: Arc<[KernelDefinitionFactsInput]>,
+    definition_code: Arc<DefinitionCodeStore>,
+    interface: Arc<KernelInterfaceSnapshot>,
+    work: KernelSolveWork,
+}
+
+impl KernelDemandedDefinitionSnapshot {
+    pub fn definition_count(&self) -> usize {
+        self.owners.len()
+    }
+
+    pub fn owners(&self) -> &[KernelOwnerId] {
+        &self.owners
+    }
+
+    pub fn definition(&self, owner: KernelOwnerId) -> Option<KernelDefinitionRef<'_>> {
+        self.owners.binary_search(&owner).ok()?;
+        KernelDefinitionRef::from_authorities(
+            &self.program,
+            &self.definition_facts,
+            &self.definition_code,
+            owner,
+        )
+    }
+
+    pub fn definition_refs(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (KernelOwnerId, KernelDefinitionRef<'_>)> + '_ {
+        self.owners.iter().copied().map(|owner| {
+            let definition = KernelDefinitionRef::from_authorities(
+                &self.program,
+                &self.definition_facts,
+                &self.definition_code,
+                owner,
+            )
+            .expect("validated demanded owner remains in every shared authority");
+            (owner, definition)
+        })
+    }
+
+    pub fn program(&self) -> &Arc<KernelProjectProgramInput> {
+        &self.program
+    }
+
+    pub fn definition_facts(&self) -> &Arc<[KernelDefinitionFactsInput]> {
+        &self.definition_facts
+    }
+
+    pub fn definition_code(&self) -> &Arc<DefinitionCodeStore> {
+        &self.definition_code
+    }
+
+    pub fn type_store(&self) -> &Arc<FrozenTypeStore> {
+        self.definition_code.type_store()
+    }
+
+    pub fn interface(&self) -> &Arc<KernelInterfaceSnapshot> {
+        &self.interface
+    }
+
+    pub const fn work(&self) -> KernelSolveWork {
+        self.work
+    }
+
+    pub(crate) fn into_selected_parts(
+        self,
+    ) -> (
+        Box<[KernelOwnerId]>,
+        Arc<DefinitionCodeStore>,
+        Arc<KernelInterfaceSnapshot>,
+        KernelSolveWork,
+    ) {
+        (self.owners, self.definition_code, self.interface, self.work)
+    }
 }
 
 /// Returns whether the permanent kernel can resolve this operation entirely
 /// from the lower-level host-effect ABI registry.
 pub fn is_kernel_host_effect(operation: &str) -> bool {
-    host_effect_spec(operation).is_some_and(|spec| {
-        spec.result_policy == ResultPolicySpec::ReturnValue && spec.schema.is_some()
+    host_effect_policy(operation).is_some_and(|policy| {
+        policy.result_policy == ResultPolicySpec::ReturnValue && policy.has_typed_schema
     })
 }
 
 /// Returns whether the stable host-effect registry owns `operation`, even
 /// when its compact result policy has not migrated into this kernel yet.
 pub fn is_registered_kernel_host_effect(operation: &str) -> bool {
-    host_effect_spec(operation).is_some()
+    host_effect_policy(operation).is_some()
 }
 
 impl KernelOwnerProgram {
@@ -2994,11 +3561,12 @@ impl KernelProjectProgram {
         self.into_solve_session()?.solve_interfaces()
     }
 
-    /// Materialize only the explicitly demanded definition artifacts.
+    /// Publish borrowed views for only the explicitly demanded definitions.
     ///
-    /// Public results for every definition are still solved because call and
-    /// cross-owner equations share one component. Undemanded expression,
-    /// statement, resource, dependency, and receipt tables are never built.
+    /// The shared type graph and packed `DefinitionCode` are finalized for the
+    /// complete project because cross-owner equations and one code/type store
+    /// form a single authority. This demand only selects views; it constructs
+    /// no rich compatibility artifacts and seals no dependency receipts.
     pub fn solve_definitions(
         self,
         demanded: &[KernelOwnerId],
@@ -3125,63 +3693,95 @@ impl KernelProjectSolveSession {
                 "kernel-solve-detail component_us={solve_us} packed_finalize_us={finalize_us}"
             );
         }
+        let work = artifact.work;
         Ok(KernelSolvedProject {
-            artifact,
             definition_code,
             program: self.program,
+            #[cfg(test)]
             owners: self.owners,
             definition_facts: self.definition_facts,
             derived: Arc::new(KernelSolvedDerived { interface }),
+            work,
         })
     }
 }
 
 impl KernelSolvedProject {
-    pub fn interface_snapshot(&self) -> KernelInterfaceSnapshot {
-        self.derived.interface.as_ref().clone()
+    pub fn interface_snapshot(&self) -> Arc<KernelInterfaceSnapshot> {
+        Arc::clone(&self.derived.interface)
     }
 
     pub fn checked_snapshot(&self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
         let trace = std::env::var_os("BOON_KERNEL_TRACE").is_some();
         let total_started = Instant::now();
-        let type_store = self.artifact.type_store();
         let definition_code = Arc::clone(&self.definition_code);
         let interface_started = Instant::now();
         let interface = Arc::clone(&self.derived.interface);
         let interface_us = interface_started.elapsed().as_micros();
-        let effects_started = Instant::now();
-        let owner_effects = project_owner_effect_summaries(&self.program, &self.definition_facts);
-        let effects_us = effects_started.elapsed().as_micros();
-        let preparation_started = Instant::now();
-        let basis_fingerprints = self
-            .owners
-            .iter()
-            .map(|owner| owner.basis_fingerprint_v14)
-            .collect::<Vec<_>>();
-        let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(
-            &self.program,
-            &self.owners,
-            &self.definition_facts,
-        );
-        let preparation_us = preparation_started.elapsed().as_micros();
-        let definitions_started = Instant::now();
-        let definitions = materialize_project_definition_structures(
-            &self.program,
-            &self.definition_facts,
-            &self.owners,
-            &synthetic_state_ordinals,
-            &owner_effects,
-            None,
-        )?;
-        let definitions_us = definitions_started.elapsed().as_micros();
+        #[cfg(test)]
+        let (definitions, basis_fingerprints, effects_us, preparation_us, definitions_us) = {
+            let effects_started = Instant::now();
+            let owner_effects =
+                project_owner_effect_summaries(&self.program, &self.definition_facts);
+            let effects_us = effects_started.elapsed().as_micros();
+            let preparation_started = Instant::now();
+            let basis_fingerprints = self
+                .definition_code
+                .definitions()
+                .map(crate::DefinitionCodeRef::basis_fingerprint_v14)
+                .collect::<Vec<_>>();
+            let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(
+                &self.program,
+                &self.owners,
+                &self.definition_facts,
+            );
+            let preparation_us = preparation_started.elapsed().as_micros();
+            let definitions_started = Instant::now();
+            let definitions = materialize_project_definition_structures(
+                &self.program,
+                &self.definition_facts,
+                &self.owners,
+                &synthetic_state_ordinals,
+                &owner_effects,
+                None,
+            )?;
+            let definitions_us = definitions_started.elapsed().as_micros();
+            (
+                definitions,
+                basis_fingerprints,
+                effects_us,
+                preparation_us,
+                definitions_us,
+            )
+        };
+        #[cfg(not(test))]
+        let (effects_us, preparation_us, definitions_us) = (0_u128, 0_u128, 0_u128);
         let receipts_started = Instant::now();
-        let (dependencies, currentness) = build_packed_snapshot_receipts(
-            &definitions,
+        let (dependencies, currentness) = build_borrowed_snapshot_receipts(
+            &self.program,
             &self.definition_facts,
             &definition_code,
             &interface,
-            &basis_fingerprints,
         )?;
+        #[cfg(test)]
+        {
+            let (compatibility_dependencies, compatibility_currentness) =
+                build_packed_snapshot_receipts(
+                    &definitions,
+                    &self.definition_facts,
+                    &definition_code,
+                    &interface,
+                    &basis_fingerprints,
+                )?;
+            assert_eq!(
+                dependencies, compatibility_dependencies,
+                "borrowed dependency construction must exactly match the compatibility artifact",
+            );
+            assert_eq!(
+                currentness, compatibility_currentness,
+                "borrowed V17/V3/V18 receipts must exactly match the compatibility artifact",
+            );
+        }
         let receipts_us = receipts_started.elapsed().as_micros();
         if trace {
             eprintln!(
@@ -3190,15 +3790,15 @@ impl KernelSolvedProject {
             );
         }
         Ok(KernelCheckedSnapshot {
+            #[cfg(test)]
             definitions,
             program: Arc::clone(&self.program),
             definition_facts: Arc::clone(&self.definition_facts),
             definition_code,
-            type_store,
             interface,
             dependencies,
             currentness,
-            work: self.artifact.work,
+            work: self.work,
         })
     }
 
@@ -3210,7 +3810,6 @@ impl KernelSolvedProject {
         &self,
         demanded: &[KernelOwnerId],
     ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
-        let type_store = self.artifact.type_store();
         let interface = Arc::clone(&self.derived.interface);
         let definition_code = Arc::clone(&self.definition_code);
         let mut demanded = demanded.to_vec();
@@ -3218,41 +3817,20 @@ impl KernelSolvedProject {
         demanded.dedup();
         if let Some(owner) = demanded
             .iter()
-            .find(|owner| owner.0 as usize >= self.owners.len())
+            .find(|owner| owner.0 as usize >= self.definition_code.definition_count())
         {
             return Err(KernelSolveError::new(format!(
                 "kernel definition demand references missing owner {}",
                 owner.0
             )));
         }
-        let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(
-            &self.program,
-            &self.owners,
-            &self.definition_facts,
-        );
-        let owner_effects = project_owner_effect_summaries(&self.program, &self.definition_facts);
-        let materialized = materialize_project_definition_structures(
-            &self.program,
-            &self.definition_facts,
-            &self.owners,
-            &synthetic_state_ordinals,
-            &owner_effects,
-            Some(&demanded),
-        )?;
-        debug_assert_eq!(materialized.len(), demanded.len());
-        let definitions = demanded
-            .into_iter()
-            .zip(materialized)
-            .map(|(owner, definition)| KernelDemandedDefinitionArtifact { owner, definition })
-            .collect::<Vec<_>>();
         Ok(KernelDemandedDefinitionSnapshot {
-            definitions: definitions.into_boxed_slice(),
+            owners: demanded.into_boxed_slice(),
             program: Arc::clone(&self.program),
             definition_facts: Arc::clone(&self.definition_facts),
             definition_code,
-            type_store,
             interface,
-            work: self.artifact.work,
+            work: self.work,
         })
     }
 
@@ -5327,9 +5905,13 @@ fn build_definition_code_builder(
     let mut packed_diagnostic_types = Vec::new();
     let mut source_payload_types = Vec::new();
     let mut state_flows = Vec::new();
+    let mut published_states = Vec::new();
     let mut list_item_types = Vec::new();
     let mut packed_resource_projection_requirements = Vec::new();
     let mut proof_scratch = DefinitionTermProofScratch::default();
+    let owner_effects = project_owner_effect_summaries(program, definition_facts);
+    let synthetic_state_ordinals =
+        allocate_project_synthetic_state_ordinals(program, owners, definition_facts);
     for (owner_index, (owner, owner_call_facts)) in
         owners.iter().zip(call_facts.into_vec()).enumerate()
     {
@@ -5395,7 +5977,7 @@ fn build_definition_code_builder(
         }
         packed_calls.clear();
         packed_call_substitutions.clear();
-        for call in &owner_call_facts {
+        for (solve, call) in owner.calls.iter().zip(&owner_call_facts) {
             let substitution_start =
                 u32::try_from(packed_call_substitutions.len()).map_err(|_| {
                     KernelSolveError::new(
@@ -5415,6 +5997,7 @@ fn build_definition_code_builder(
                     )
                 })?;
             packed_calls.push(PackedCallFactsInput {
+                expression: solve.expression,
                 substitution_start,
                 substitution_len: substitution_end - substitution_start,
                 syntax_discriminated_result: call.syntax_discriminated_result,
@@ -5443,22 +6026,41 @@ fn build_definition_code_builder(
             );
         }
         state_flows.clear();
-        for state in definition_facts[owner_index].states.iter().filter(|state| {
-            state_input_candidate_survives(
-                &program.owners[owner_index],
-                state,
-                &owner.expression_modes,
-            )
-        }) {
+        published_states.clear();
+        for (input_ordinal, (state, synthetic_ordinal)) in definition_facts[owner_index]
+            .states
+            .iter()
+            .zip(synthetic_state_ordinals[owner_index].iter().copied())
+            .enumerate()
+            .filter(|(_, (state, _))| {
+                state_input_candidate_survives(
+                    &program.owners[owner_index],
+                    state,
+                    &owner.expression_modes,
+                )
+            })
+        {
+            if state.synthetic_path != synthetic_ordinal.is_some() {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner_index} state input {input_ordinal} disagrees with its synthetic-path ordinal",
+                )));
+            }
             let expression = state.expression.0 as usize;
             let output = owner.expressions[expression];
-            state_flows.push(PackedFlow {
+            let flow = PackedFlow {
                 mode: owner.expression_modes[expression],
                 term: artifact
                     .output(output)
                     .expect("kernel state expression belongs to its solved component")
                     .term(),
-            });
+            };
+            state_flows.push(flow);
+            published_states.push(PackedPublishedState::new(
+                u32::try_from(input_ordinal)
+                    .expect("kernel state input count exceeds dense u32 namespace"),
+                synthetic_ordinal,
+                flow,
+            ));
         }
         list_item_types.clear();
         for list in &definition_facts[owner_index].lists {
@@ -5628,6 +6230,8 @@ fn build_definition_code_builder(
             &packed_formal_flows,
             &packed_expression_flows,
             DefinitionAdditionalTypeRoots {
+                effect_summary: owner_effects[owner_index],
+                basis_fingerprint_v14: owner.basis_fingerprint_v14,
                 expression_flush_types,
                 expression_kind_types: &expression_kind_types,
                 declaration_flows: &declaration_flows,
@@ -5635,7 +6239,8 @@ fn build_definition_code_builder(
                 call_substitutions: &packed_call_substitutions,
                 diagnostic_types: &packed_diagnostic_types,
                 source_payload_types: &source_payload_types,
-                state_flows: &state_flows,
+                state_input_count: definition_facts[owner_index].states.len(),
+                states: &published_states,
                 list_item_types: &list_item_types,
                 resource_projection_requirements: &packed_resource_projection_requirements,
                 resource_projection_origins: &resource_projection_facts.origins,
@@ -7106,6 +7711,7 @@ pub(crate) fn test_compatibility_definition_materializations() -> usize {
     TEST_COMPATIBILITY_DEFINITION_MATERIALIZATIONS.get()
 }
 
+#[cfg(test)]
 fn materialize_project_definition_structures(
     program: &KernelProjectProgramInput,
     definition_facts: &[KernelDefinitionFactsInput],
@@ -11614,12 +12220,14 @@ fn collect_host_effect_artifacts(
                 return None;
             };
             Some((|| {
-                let spec = host_effect_spec(operation).ok_or_else(|| {
+                let policy = host_effect_policy(operation).ok_or_else(|| {
                     KernelOwnerBuildError::new(format!(
                         "kernel host-effect node {expression} names unknown operation `{operation}`"
                     ))
                 })?;
-                if spec.result_policy != ResultPolicySpec::ReturnValue || spec.schema.is_none() {
+                if policy.result_policy != ResultPolicySpec::ReturnValue
+                    || !policy.has_typed_schema
+                {
                     return Err(KernelOwnerBuildError::new(format!(
                         "kernel host-effect node {expression} operation `{operation}` has no return-value schema"
                     )));
@@ -11629,11 +12237,11 @@ fn collect_host_effect_artifacts(
                         u32::try_from(expression)
                             .expect("kernel owner expression count exceeds u32"),
                     ),
-                    operation: spec.operation.into(),
-                    replay: spec.replay,
-                    barrier: spec.barrier,
-                    result_policy: spec.result_policy,
-                    delivery: spec.delivery,
+                    operation: policy.operation.into(),
+                    replay: policy.replay,
+                    barrier: policy.barrier,
+                    result_policy: policy.result_policy,
+                    delivery: materialize_delivery_policy(policy.delivery),
                 })
             })())
         })
@@ -11648,18 +12256,35 @@ fn validate_host_effect_inputs(
         let KernelOwnerNodeKind::HostEffect { operation } = &node.kind else {
             continue;
         };
-        let spec = host_effect_spec(operation).ok_or_else(|| {
+        let policy = host_effect_policy(operation).ok_or_else(|| {
             KernelOwnerBuildError::new(format!(
                 "kernel host-effect node {expression} names unknown operation `{operation}`"
             ))
         })?;
-        if spec.result_policy != ResultPolicySpec::ReturnValue || spec.schema.is_none() {
+        if policy.result_policy != ResultPolicySpec::ReturnValue || !policy.has_typed_schema {
             return Err(KernelOwnerBuildError::new(format!(
                 "kernel host-effect node {expression} operation `{operation}` has no return-value schema"
             )));
         }
     }
     Ok(())
+}
+
+fn materialize_delivery_policy(policy: DeliveryCardinalityPolicySpec) -> DeliveryCardinalitySpec {
+    match policy {
+        DeliveryCardinalityPolicySpec::Single => DeliveryCardinalitySpec::Single,
+        DeliveryCardinalityPolicySpec::Stream {
+            initial_credits,
+            max_in_flight,
+            credit_result_tags,
+            terminal_result_tags,
+        } => DeliveryCardinalitySpec::Stream {
+            initial_credits,
+            max_in_flight,
+            credit_result_tags: credit_result_tags.to_vec(),
+            terminal_result_tags: terminal_result_tags.to_vec(),
+        },
+    }
 }
 
 fn validate_project_expression_inputs(
@@ -19991,6 +20616,10 @@ mod tests {
         let checked = solved
             .checked_snapshot()
             .expect("source diagnostics seal into checked image");
+        assert!(
+            Arc::ptr_eq(&interfaces, &checked.interface),
+            "diagnostics and checked publication must share one interface allocation",
+        );
         assert_eq!(
             checked
                 .diagnostics_for(KernelOwnerId(0))

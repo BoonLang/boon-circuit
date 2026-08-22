@@ -160,6 +160,8 @@ struct PackedExecutionNode {
 /// families to the same store; they must not create another parallel sidecar.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DefinitionCode {
+    effect_summary: crate::KernelEffectSummary,
+    basis_fingerprint_v14: [u8; 32],
     result: KernelArtifactFlowTermV1,
     formals: Span32,
     expressions: Span32,
@@ -169,7 +171,7 @@ struct DefinitionCode {
     calls: Span32,
     diagnostic_types: Span32,
     source_payload_types: Span32,
-    state_flows: Span32,
+    states: Span32,
     list_item_types: Span32,
     resource_projection_requirements: Span32,
     alpha_variables: Span32,
@@ -202,7 +204,7 @@ pub struct DefinitionCodeStore {
     call_substitutions: Box<[PackedCallTypeSubstitution]>,
     diagnostic_types: Box<[Option<PackedDiagnosticTypes>]>,
     source_payload_types: Box<[crate::TypeTermId]>,
-    state_flows: Box<[PackedFlow]>,
+    states: Box<[PackedPublishedState]>,
     list_item_types: Box<[crate::TypeTermId]>,
     resource_projection_requirements: Box<[PackedResourceProjectionRequirement]>,
     resource_projection_origins: Box<[PackedSourceRead]>,
@@ -223,6 +225,19 @@ impl DefinitionCodeStore {
 
     pub fn definition_count(&self) -> usize {
         self.definitions.len()
+    }
+
+    pub(crate) fn definitions(&self) -> impl ExactSizeIterator<Item = DefinitionCodeRef<'_>> + '_ {
+        self.definitions
+            .iter()
+            .enumerate()
+            .map(|(owner, code)| DefinitionCodeRef {
+                store: self,
+                owner: KernelOwnerId(
+                    u32::try_from(owner).expect("kernel definition count exceeds u32"),
+                ),
+                code,
+            })
     }
 
     pub fn definition(&self, owner: KernelOwnerId) -> Option<DefinitionCodeRef<'_>> {
@@ -557,7 +572,7 @@ impl DefinitionCodeStore {
                     definition.source_payload_types,
                     self.source_payload_types.len(),
                 ),
-                ("state-flow", definition.state_flows, self.state_flows.len()),
+                ("published-state", definition.states, self.states.len()),
                 (
                     "LIST-item",
                     definition.list_item_types,
@@ -581,11 +596,25 @@ impl DefinitionCodeStore {
                     )));
                 }
             }
-            for call in definition
+            let calls = definition
                 .calls
                 .get(&self.calls)
-                .expect("validated call span")
+                .expect("validated call span");
+            if calls
+                .windows(2)
+                .any(|calls| calls[0].expression >= calls[1].expression)
             {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner} calls are not in unique expression order"
+                )));
+            }
+            for call in calls {
+                if call.expression.0 >= definition.expressions.len {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code owner {owner} call expression {} is outside its expression rows",
+                        call.expression.0,
+                    )));
+                }
                 call.substitutions
                     .get(&self.call_substitutions)
                     .ok_or_else(|| {
@@ -593,6 +622,18 @@ impl DefinitionCodeStore {
                             "kernel definition-code owner {owner} has an invalid call-substitution span"
                         ))
                     })?;
+            }
+            let states = definition
+                .states
+                .get(&self.states)
+                .expect("validated published-state span");
+            if states
+                .windows(2)
+                .any(|states| states[0].input_ordinal >= states[1].input_ordinal)
+            {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {owner} states are not in unique input order"
+                )));
             }
             for requirement in definition
                 .resource_projection_requirements
@@ -732,11 +773,11 @@ impl DefinitionCodeStore {
             }
             stack.extend(
                 definition
-                    .state_flows
-                    .get(&self.state_flows)
+                    .states
+                    .get(&self.states)
                     .expect("validated state span")
                     .iter()
-                    .map(|flow| flow.term),
+                    .map(|state| state.flow.term),
             );
             stack.extend(
                 definition
@@ -939,12 +980,45 @@ impl<'a> DefinitionCodeRef<'a> {
         self.code.calls.len as usize
     }
 
+    pub(crate) fn call_expression(self, ordinal: usize) -> Option<crate::KernelExpressionId> {
+        self.code
+            .calls
+            .get(&self.store.calls)
+            .expect("sealed definition-code call span is valid")
+            .get(ordinal)
+            .map(|call| call.expression)
+    }
+
+    pub(crate) const fn effect_summary(self) -> crate::KernelEffectSummary {
+        self.code.effect_summary
+    }
+
+    pub(crate) fn effect_summary_for(
+        self,
+        owner: KernelOwnerId,
+    ) -> Option<crate::KernelEffectSummary> {
+        self.store
+            .definition(owner)
+            .map(DefinitionCodeRef::effect_summary)
+    }
+
+    pub(crate) const fn basis_fingerprint_v14(self) -> [u8; 32] {
+        self.code.basis_fingerprint_v14
+    }
+
     pub(crate) fn source_count(self) -> usize {
         self.code.source_payload_types.len as usize
     }
 
     pub(crate) fn state_count(self) -> usize {
-        self.code.state_flows.len as usize
+        self.code.states.len as usize
+    }
+
+    pub(crate) fn states(self) -> &'a [PackedPublishedState] {
+        self.code
+            .states
+            .get(&self.store.states)
+            .expect("sealed definition-code state span is valid")
     }
 
     pub(crate) fn list_count(self) -> usize {
@@ -1230,12 +1304,12 @@ impl<'a> DefinitionCodeRef<'a> {
 
     pub fn materialize_state_flow(self, ordinal: usize) -> Option<FlowType> {
         self.code
-            .state_flows
-            .get(&self.store.state_flows)
+            .states
+            .get(&self.store.states)
             .expect("sealed definition-code state-flow span is valid")
             .get(ordinal)
             .copied()
-            .map(|flow| self.materialize_packed_flow(flow))
+            .map(|state| self.materialize_packed_flow(state.flow))
     }
 
     pub fn materialize_list_item_type(self, ordinal: usize) -> Option<Type> {
@@ -1318,7 +1392,7 @@ impl<'a> PackedDefinitionExecutionRef<'a> {
     }
 
     pub(crate) const fn state_count(self) -> usize {
-        self.code.code.state_flows.len as usize
+        self.code.code.states.len as usize
     }
 
     pub(crate) const fn list_count(self) -> usize {
@@ -1474,12 +1548,12 @@ impl DefinitionCodeMaterializer<'_, '_> {
         let flow = self
             .code
             .code
-            .state_flows
-            .get(&self.code.store.state_flows)
+            .states
+            .get(&self.code.store.states)
             .expect("sealed definition-code state-flow span is valid")
             .get(ordinal)
             .copied()?;
-        Some(self.materialize_packed_flow(flow))
+        Some(self.materialize_packed_flow(flow.flow))
     }
 
     pub(crate) fn materialize_list_item_type(&mut self, ordinal: usize) -> Option<Type> {
@@ -1617,15 +1691,51 @@ impl PackedResourceProjectionRequirement {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PackedCallFacts {
+    expression: crate::KernelExpressionId,
     substitutions: Span32,
     syntax_discriminated_result: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PackedCallFactsInput {
+    pub(crate) expression: crate::KernelExpressionId,
     pub(crate) substitution_start: u32,
     pub(crate) substitution_len: u32,
     pub(crate) syntax_discriminated_result: bool,
+}
+
+const MISSING_SYNTHETIC_STATE_ORDINAL: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedPublishedState {
+    pub(crate) input_ordinal: u32,
+    pub(crate) synthetic_ordinal: u32,
+    pub(crate) flow: PackedFlow,
+}
+
+impl PackedPublishedState {
+    pub(crate) const fn new(
+        input_ordinal: u32,
+        synthetic_ordinal: Option<u32>,
+        flow: PackedFlow,
+    ) -> Self {
+        Self {
+            input_ordinal,
+            synthetic_ordinal: match synthetic_ordinal {
+                Some(ordinal) => ordinal,
+                None => MISSING_SYNTHETIC_STATE_ORDINAL,
+            },
+            flow,
+        }
+    }
+
+    pub(crate) const fn synthetic_ordinal(self) -> Option<u32> {
+        if self.synthetic_ordinal == MISSING_SYNTHETIC_STATE_ORDINAL {
+            None
+        } else {
+            Some(self.synthetic_ordinal)
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1663,6 +1773,8 @@ pub(crate) struct MaterializedResourceProjectionRequirement {
 }
 
 pub(crate) struct DefinitionAdditionalTypeRoots<'a> {
+    pub(crate) effect_summary: crate::KernelEffectSummary,
+    pub(crate) basis_fingerprint_v14: [u8; 32],
     pub(crate) expression_flush_types: &'a [Option<crate::TypeTermId>],
     pub(crate) expression_kind_types: &'a [Option<crate::TypeTermId>],
     pub(crate) declaration_flows: &'a [Option<PackedFlow>],
@@ -1670,7 +1782,10 @@ pub(crate) struct DefinitionAdditionalTypeRoots<'a> {
     pub(crate) call_substitutions: &'a [PackedCallTypeSubstitution],
     pub(crate) diagnostic_types: &'a [Option<PackedDiagnosticTypes>],
     pub(crate) source_payload_types: &'a [crate::TypeTermId],
-    pub(crate) state_flows: &'a [PackedFlow],
+    /// Number of authored state candidates in the immutable definition facts.
+    /// Published rows retain dense input ordinals into that authority.
+    pub(crate) state_input_count: usize,
+    pub(crate) states: &'a [PackedPublishedState],
     pub(crate) list_item_types: &'a [crate::TypeTermId],
     pub(crate) resource_projection_requirements: &'a [PackedResourceProjectionRequirementInput],
     pub(crate) resource_projection_origins: &'a [PackedSourceReadInput],
@@ -1708,7 +1823,7 @@ pub(crate) struct DefinitionCodeBuilder {
     call_substitutions: Vec<PackedCallTypeSubstitution>,
     diagnostic_types: Vec<Option<PackedDiagnosticTypes>>,
     source_payload_types: Vec<crate::TypeTermId>,
-    state_flows: Vec<PackedFlow>,
+    states: Vec<PackedPublishedState>,
     list_item_types: Vec<crate::TypeTermId>,
     resource_projection_requirements: Vec<PackedResourceProjectionRequirement>,
     resource_projection_origins: Vec<PackedSourceRead>,
@@ -1739,7 +1854,7 @@ impl DefinitionCodeBuilder {
             call_substitutions: Vec::new(),
             diagnostic_types: Vec::new(),
             source_payload_types: Vec::new(),
-            state_flows: Vec::new(),
+            states: Vec::new(),
             list_item_types: Vec::new(),
             resource_projection_requirements: Vec::new(),
             resource_projection_origins: Vec::new(),
@@ -2158,7 +2273,23 @@ impl DefinitionCodeBuilder {
             additional.call_substitutions.iter().copied(),
         )?;
         let mut packed_calls = Vec::with_capacity(additional.calls.len());
+        if additional
+            .calls
+            .windows(2)
+            .any(|calls| calls[0].expression >= calls[1].expression)
+        {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition-code owner {} calls are not in unique expression order",
+                owner.0,
+            )));
+        }
         for call in additional.calls {
+            if call.expression.0 >= expressions.len {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {} call expression {} is outside its expression rows",
+                    owner.0, call.expression.0,
+                )));
+            }
             let local_end = call
                 .substitution_start
                 .checked_add(call.substitution_len)
@@ -2173,6 +2304,7 @@ impl DefinitionCodeBuilder {
                 ));
             }
             packed_calls.push(PackedCallFacts {
+                expression: call.expression,
                 substitutions: Span32 {
                     start: call_substitution_base
                         .checked_add(call.substitution_start)
@@ -2202,10 +2334,25 @@ impl DefinitionCodeBuilder {
             &mut self.source_payload_types,
             additional.source_payload_types.iter().copied(),
         )?;
-        let state_flows = Span32::append(
-            &mut self.state_flows,
-            additional.state_flows.iter().copied(),
-        )?;
+        if additional
+            .states
+            .windows(2)
+            .any(|states| states[0].input_ordinal >= states[1].input_ordinal)
+        {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition-code owner {} states are not in unique input order",
+                owner.0,
+            )));
+        }
+        for state in additional.states {
+            if state.input_ordinal as usize >= additional.state_input_count {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code owner {} state input {} is outside its {} authored state rows",
+                    owner.0, state.input_ordinal, additional.state_input_count,
+                )));
+            }
+        }
+        let states = Span32::append(&mut self.states, additional.states.iter().copied())?;
         let list_item_types = Span32::append(
             &mut self.list_item_types,
             additional.list_item_types.iter().copied(),
@@ -2333,6 +2480,8 @@ impl DefinitionCodeBuilder {
             additional.alpha_variables.iter().copied(),
         )?;
         self.definitions.push(DefinitionCode {
+            effect_summary: additional.effect_summary,
+            basis_fingerprint_v14: additional.basis_fingerprint_v14,
             result,
             formals,
             expressions,
@@ -2342,7 +2491,7 @@ impl DefinitionCodeBuilder {
             calls,
             diagnostic_types,
             source_payload_types,
-            state_flows,
+            states,
             list_item_types,
             resource_projection_requirements,
             alpha_variables,
@@ -2376,7 +2525,7 @@ impl DefinitionCodeBuilder {
             call_substitutions: self.call_substitutions.into_boxed_slice(),
             diagnostic_types: self.diagnostic_types.into_boxed_slice(),
             source_payload_types: self.source_payload_types.into_boxed_slice(),
-            state_flows: self.state_flows.into_boxed_slice(),
+            states: self.states.into_boxed_slice(),
             list_item_types: self.list_item_types.into_boxed_slice(),
             resource_projection_requirements: self
                 .resource_projection_requirements
@@ -2414,24 +2563,31 @@ mod tests {
         list_count: usize,
     ) {
         let expressions = vec![flow; expression_count];
-        let calls = vec![
-            PackedCallFactsInput {
+        let calls = (0..call_count)
+            .map(|ordinal| PackedCallFactsInput {
+                expression: crate::KernelExpressionId(
+                    u32::try_from(ordinal).expect("test call count fits u32"),
+                ),
                 substitution_start: 0,
                 substitution_len: 0,
                 syntax_discriminated_result: false,
-            };
-            call_count
-        ];
+            })
+            .collect::<Vec<_>>();
         let expression_flush_types = vec![None; expression_count];
         let expression_kind_types = vec![None; expression_count];
         let source_payload_types = vec![flow.term; source_count];
-        let state_flows = vec![
-            PackedFlow {
-                mode: flow.mode,
-                term: flow.term,
-            };
-            state_count
-        ];
+        let states = (0..state_count)
+            .map(|ordinal| {
+                PackedPublishedState::new(
+                    u32::try_from(ordinal).expect("test state count fits u32"),
+                    None,
+                    PackedFlow {
+                        mode: flow.mode,
+                        term: flow.term,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
         let list_item_types = vec![flow.term; list_count];
         builder
             .push(
@@ -2440,6 +2596,8 @@ mod tests {
                 &[],
                 &expressions,
                 DefinitionAdditionalTypeRoots {
+                    effect_summary: crate::KernelEffectSummary::default(),
+                    basis_fingerprint_v14: [owner as u8; 32],
                     expression_flush_types: &expression_flush_types,
                     expression_kind_types: &expression_kind_types,
                     declaration_flows: &[],
@@ -2447,7 +2605,8 @@ mod tests {
                     call_substitutions: &[],
                     diagnostic_types: &[],
                     source_payload_types: &source_payload_types,
-                    state_flows: &state_flows,
+                    state_input_count: state_count,
+                    states: &states,
                     list_item_types: &list_item_types,
                     resource_projection_requirements: &[],
                     resource_projection_origins: &[],
@@ -2635,10 +2794,14 @@ mod tests {
             mode: FlowMode::Continuous,
             term: declaration_variable,
         })];
-        let states = [PackedFlow {
-            mode: FlowMode::TickPresent,
-            term: state_variable,
-        }];
+        let states = [PackedPublishedState::new(
+            0,
+            None,
+            PackedFlow {
+                mode: FlowMode::TickPresent,
+                term: state_variable,
+            },
+        )];
         let alpha = [TypeVariableId(7), TypeVariableId(9)];
         let mut builder = DefinitionCodeBuilder::with_capacity(1, 1, 2);
         builder
@@ -2648,6 +2811,8 @@ mod tests {
                 &[],
                 &expressions,
                 DefinitionAdditionalTypeRoots {
+                    effect_summary: crate::KernelEffectSummary::default(),
+                    basis_fingerprint_v14: [3; 32],
                     expression_flush_types: &flushes,
                     expression_kind_types: &kind_types,
                     declaration_flows: &declarations,
@@ -2655,7 +2820,8 @@ mod tests {
                     call_substitutions: &[],
                     diagnostic_types: &[],
                     source_payload_types: &[],
-                    state_flows: &states,
+                    state_input_count: states.len(),
+                    states: &states,
                     list_item_types: &[],
                     resource_projection_requirements: &[],
                     resource_projection_origins: &[],
@@ -2701,6 +2867,95 @@ mod tests {
     }
 
     #[test]
+    fn definition_builder_rejects_invalid_call_and_state_coordinates() {
+        let arena = TypeTermArena::new();
+        let unknown = arena.unknown();
+        let flow = KernelArtifactFlowTermV1 {
+            mode: FlowMode::Continuous,
+            term: unknown,
+            stable_digest: [0; 32],
+            runtime_erased_digest: [0; 32],
+        };
+        let invalid_call = [PackedCallFactsInput {
+            expression: crate::KernelExpressionId(1),
+            substitution_start: 0,
+            substitution_len: 0,
+            syntax_discriminated_result: false,
+        }];
+        let mut builder = DefinitionCodeBuilder::with_capacity(1, 1, 0);
+        let error = builder
+            .push(
+                KernelOwnerId(0),
+                flow,
+                &[],
+                &[flow],
+                DefinitionAdditionalTypeRoots {
+                    effect_summary: crate::KernelEffectSummary::default(),
+                    basis_fingerprint_v14: [0; 32],
+                    expression_flush_types: &[None],
+                    expression_kind_types: &[None],
+                    declaration_flows: &[],
+                    calls: &invalid_call,
+                    call_substitutions: &[],
+                    diagnostic_types: &[],
+                    source_payload_types: &[],
+                    state_input_count: 0,
+                    states: &[],
+                    list_item_types: &[],
+                    resource_projection_requirements: &[],
+                    resource_projection_origins: &[],
+                    resource_projection_symbols: &[],
+                    alpha_variables: &[],
+                    stable_digest: [0; 32],
+                },
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("outside its expression rows"));
+
+        let invalid_state = [PackedPublishedState::new(
+            1,
+            None,
+            PackedFlow {
+                mode: FlowMode::Continuous,
+                term: unknown,
+            },
+        )];
+        let mut builder = DefinitionCodeBuilder::with_capacity(1, 1, 0);
+        let error = builder
+            .push(
+                KernelOwnerId(0),
+                flow,
+                &[],
+                &[flow],
+                DefinitionAdditionalTypeRoots {
+                    effect_summary: crate::KernelEffectSummary::default(),
+                    basis_fingerprint_v14: [0; 32],
+                    expression_flush_types: &[None],
+                    expression_kind_types: &[None],
+                    declaration_flows: &[],
+                    calls: &[],
+                    call_substitutions: &[],
+                    diagnostic_types: &[],
+                    source_payload_types: &[],
+                    state_input_count: 1,
+                    states: &invalid_state,
+                    list_item_types: &[],
+                    resource_projection_requirements: &[],
+                    resource_projection_origins: &[],
+                    resource_projection_symbols: &[],
+                    alpha_variables: &[],
+                    stable_digest: [0; 32],
+                },
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("outside its 1 authored state rows")
+        );
+    }
+
+    #[test]
     fn resource_projection_rows_require_dense_expression_order() {
         let arena = TypeTermArena::new();
         let unknown = arena.unknown();
@@ -2740,6 +2995,8 @@ mod tests {
                 &[],
                 &[flow, flow],
                 DefinitionAdditionalTypeRoots {
+                    effect_summary: crate::KernelEffectSummary::default(),
+                    basis_fingerprint_v14: [0; 32],
                     expression_flush_types: &[None, None],
                     expression_kind_types: &[None, None],
                     declaration_flows: &[],
@@ -2747,7 +3004,8 @@ mod tests {
                     call_substitutions: &[],
                     diagnostic_types: &[],
                     source_payload_types: &[],
-                    state_flows: &[],
+                    state_input_count: 0,
+                    states: &[],
                     list_item_types: &[],
                     resource_projection_requirements: &requirements,
                     resource_projection_origins: &[],

@@ -35,6 +35,31 @@ pub enum DeliveryCardinalitySpec {
     },
 }
 
+/// Allocation-free execution policy for a registered host effect.
+///
+/// This deliberately excludes the owned intent/result schema. Compiler paths
+/// that only need scheduling and receipt policy must not construct that schema.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeliveryCardinalityPolicySpec {
+    Single,
+    Stream {
+        initial_credits: u32,
+        max_in_flight: u32,
+        credit_result_tags: &'static [&'static str],
+        terminal_result_tags: &'static [&'static str],
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostEffectPolicySpec {
+    pub operation: &'static str,
+    pub replay: ReplaySpec,
+    pub barrier: BarrierSpec,
+    pub result_policy: ResultPolicySpec,
+    pub delivery: DeliveryCardinalityPolicySpec,
+    pub has_typed_schema: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ValueType {
     Number,
@@ -158,42 +183,172 @@ pub const HOST_EFFECT_OPERATIONS: &[&str] = &[
     WELLEN_CURSOR_VALUES_OPERATION,
 ];
 
-pub fn host_effect_spec(operation: &str) -> Option<HostEffectSpec> {
-    if !HOST_EFFECT_OPERATIONS.contains(&operation) {
-        return None;
-    }
-    let simple = match operation {
-        "Directory/entries" => Some((
+const CONTENT_PROGRESS_TAGS: &[&str] = &["Progress"];
+const CONTENT_IMPORT_TERMINAL_TAGS: &[&str] = &["Busy", "Cancelled", "Failed", "Imported"];
+const CONTENT_SAVE_TERMINAL_TAGS: &[&str] = &["Busy", "Cancelled", "Failed", "Saved"];
+const FILE_STREAM_CREDIT_TAGS: &[&str] = &["Chunk"];
+const FILE_STREAM_TERMINAL_TAGS: &[&str] = &["Cancelled", "Failed", "Finished"];
+
+/// Returns only the allocation-free policy columns of a registered effect.
+///
+/// Keep this match explicit: adding an ABI operation requires choosing its
+/// replay, barrier, result, and delivery semantics instead of inheriting a
+/// permissive default.
+pub fn host_effect_policy(operation: &str) -> Option<HostEffectPolicySpec> {
+    let operation = HOST_EFFECT_OPERATIONS
+        .iter()
+        .copied()
+        .find(|registered| *registered == operation)?;
+    let (replay, barrier, result_policy, delivery, has_typed_schema) = match operation {
+        "Directory/entries" | "File/read_text" => (
             ReplaySpec::ReadOnly,
             BarrierSpec::None,
             ResultPolicySpec::ReturnValue,
-        )),
-        "File/read_text" => Some((
+            DeliveryCardinalityPolicySpec::Single,
+            false,
+        ),
+        FILE_READ_BYTES_OPERATION
+        | OUTBOUND_HTTP_REQUEST_OPERATION
+        | WALL_CLOCK_READ_OPERATION
+        | SECURE_RANDOM_BYTES_OPERATION
+        | SECRET_VERIFY_OPERATION
+        | HMAC_SHA256_SIGN_OPERATION
+        | HMAC_SHA256_VERIFY_OPERATION
+        | TIMER_DEADLINE_OPERATION
+        | WELLEN_OPEN_OPERATION
+        | WELLEN_HIERARCHY_PAGE_OPERATION
+        | WELLEN_SIGNAL_PAGE_OPERATION
+        | WELLEN_CURSOR_VALUES_OPERATION => (
             ReplaySpec::ReadOnly,
             BarrierSpec::None,
             ResultPolicySpec::ReturnValue,
-        )),
-        "File/write_text" => Some((
+            DeliveryCardinalityPolicySpec::Single,
+            true,
+        ),
+        FILE_READ_STREAM_OPERATION => (
+            ReplaySpec::ReadOnly,
+            BarrierSpec::None,
+            ResultPolicySpec::ReturnValue,
+            DeliveryCardinalityPolicySpec::Stream {
+                initial_credits: FILE_STREAM_INITIAL_CREDITS,
+                max_in_flight: FILE_STREAM_MAX_IN_FLIGHT,
+                credit_result_tags: FILE_STREAM_CREDIT_TAGS,
+                terminal_result_tags: FILE_STREAM_TERMINAL_TAGS,
+            },
+            true,
+        ),
+        CONTENT_IMPORT_OPERATION => (
+            ReplaySpec::ReadOnly,
+            BarrierSpec::None,
+            ResultPolicySpec::ReturnValue,
+            DeliveryCardinalityPolicySpec::Stream {
+                initial_credits: FILE_STREAM_INITIAL_CREDITS,
+                max_in_flight: FILE_STREAM_MAX_IN_FLIGHT,
+                credit_result_tags: CONTENT_PROGRESS_TAGS,
+                terminal_result_tags: CONTENT_IMPORT_TERMINAL_TAGS,
+            },
+            true,
+        ),
+        FILE_WRITE_BYTES_OPERATION => (
+            ReplaySpec::ProcessScoped,
+            BarrierSpec::None,
+            ResultPolicySpec::ReturnValue,
+            DeliveryCardinalityPolicySpec::Single,
+            true,
+        ),
+        CONTENT_SAVE_OPERATION => (
+            ReplaySpec::ProcessScoped,
+            BarrierSpec::None,
+            ResultPolicySpec::ReturnValue,
+            DeliveryCardinalityPolicySpec::Stream {
+                initial_credits: FILE_STREAM_INITIAL_CREDITS,
+                max_in_flight: FILE_STREAM_MAX_IN_FLIGHT,
+                credit_result_tags: CONTENT_PROGRESS_TAGS,
+                terminal_result_tags: CONTENT_SAVE_TERMINAL_TAGS,
+            },
+            true,
+        ),
+        "File/write_text" => (
             ReplaySpec::NonReplayable,
             BarrierSpec::BeforeAndAfter,
             ResultPolicySpec::Acknowledgement,
-        )),
-        "Log/error" | "Log/info" => Some((
+            DeliveryCardinalityPolicySpec::Single,
+            false,
+        ),
+        "Log/error" | "Log/info" => (
             ReplaySpec::NonReplayable,
             BarrierSpec::None,
             ResultPolicySpec::Discarded,
-        )),
-        _ => None,
+            DeliveryCardinalityPolicySpec::Single,
+            false,
+        ),
+        "DevelopmentPasskey/register" | "DevelopmentPasskey/authenticate" => (
+            ReplaySpec::IdempotentBytesKey,
+            BarrierSpec::BeforeAndAfter,
+            ResultPolicySpec::ReturnValue,
+            DeliveryCardinalityPolicySpec::Single,
+            true,
+        ),
+        _ => unreachable!("registered host effect is missing an explicit policy"),
     };
-    if let Some((replay, barrier, result_policy)) = simple {
-        return Some(HostEffectSpec {
-            operation: canonical_operation(operation),
-            replay,
-            barrier,
-            result_policy,
-            delivery: DeliveryCardinalitySpec::Single,
-            schema: None,
-        });
+    Some(HostEffectPolicySpec {
+        operation,
+        replay,
+        barrier,
+        result_policy,
+        delivery,
+        has_typed_schema,
+    })
+}
+
+impl DeliveryCardinalityPolicySpec {
+    fn materialize(self) -> DeliveryCardinalitySpec {
+        match self {
+            Self::Single => DeliveryCardinalitySpec::Single,
+            Self::Stream {
+                initial_credits,
+                max_in_flight,
+                credit_result_tags,
+                terminal_result_tags,
+            } => DeliveryCardinalitySpec::Stream {
+                initial_credits,
+                max_in_flight,
+                credit_result_tags: credit_result_tags.to_vec(),
+                terminal_result_tags: terminal_result_tags.to_vec(),
+            },
+        }
+    }
+}
+
+impl HostEffectPolicySpec {
+    fn materialize(self, schema: Option<EffectSchema>) -> HostEffectSpec {
+        assert_eq!(
+            self.has_typed_schema,
+            schema.is_some(),
+            "host-effect policy and schema registry disagree for `{}`",
+            self.operation,
+        );
+        HostEffectSpec {
+            operation: self.operation,
+            replay: self.replay,
+            barrier: self.barrier,
+            result_policy: self.result_policy,
+            delivery: self.delivery.materialize(),
+            schema,
+        }
+    }
+}
+
+fn typed_host_effect(operation: &'static str, schema: EffectSchema) -> HostEffectSpec {
+    host_effect_policy(operation)
+        .expect("typed host effect belongs to the registry")
+        .materialize(Some(schema))
+}
+
+pub fn host_effect_spec(operation: &str) -> Option<HostEffectSpec> {
+    let policy = host_effect_policy(operation)?;
+    if !policy.has_typed_schema {
+        return Some(policy.materialize(None));
     }
     match operation {
         FILE_READ_BYTES_OPERATION => Some(file_read_bytes()),
@@ -214,7 +369,7 @@ pub fn host_effect_spec(operation: &str) -> Option<HostEffectSpec> {
         WELLEN_HIERARCHY_PAGE_OPERATION => Some(wellen_hierarchy_page()),
         WELLEN_SIGNAL_PAGE_OPERATION => Some(wellen_signal_page()),
         WELLEN_CURSOR_VALUES_OPERATION => Some(wellen_cursor_values()),
-        _ => None,
+        _ => unreachable!("typed host-effect policy has no schema builder"),
     }
 }
 
@@ -305,7 +460,6 @@ fn waveform_value_type() -> ValueType {
 fn wellen_open() -> HostEffectSpec {
     transient_host_service(
         WELLEN_OPEN_OPERATION,
-        ReplaySpec::ReadOnly,
         record([field("content", content_ref_type())]),
         ValueType::Variant {
             variants: vec![
@@ -332,13 +486,9 @@ fn wellen_open() -> HostEffectSpec {
 }
 
 fn wellen_hierarchy_page() -> HostEffectSpec {
-    HostEffectSpec {
-        operation: WELLEN_HIERARCHY_PAGE_OPERATION,
-        replay: ReplaySpec::ReadOnly,
-        barrier: BarrierSpec::None,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Single,
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        WELLEN_HIERARCHY_PAGE_OPERATION,
+        EffectSchema {
             intent: record([
                 field("artifact", waveform_artifact_type()),
                 field("request_fingerprint", ValueType::Text),
@@ -397,18 +547,14 @@ fn wellen_hierarchy_page() -> HostEffectSpec {
                 },
             ],
             intent_defaults: Vec::new(),
-        }),
-    }
+        },
+    )
 }
 
 fn wellen_signal_page() -> HostEffectSpec {
-    HostEffectSpec {
-        operation: WELLEN_SIGNAL_PAGE_OPERATION,
-        replay: ReplaySpec::ReadOnly,
-        barrier: BarrierSpec::None,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Single,
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        WELLEN_SIGNAL_PAGE_OPERATION,
+        EffectSchema {
             intent: record([
                 field("artifact", waveform_artifact_type()),
                 field("request_fingerprint", ValueType::Text),
@@ -487,18 +633,14 @@ fn wellen_signal_page() -> HostEffectSpec {
                 },
             ],
             intent_defaults: Vec::new(),
-        }),
-    }
+        },
+    )
 }
 
 fn wellen_cursor_values() -> HostEffectSpec {
-    HostEffectSpec {
-        operation: WELLEN_CURSOR_VALUES_OPERATION,
-        replay: ReplaySpec::ReadOnly,
-        barrier: BarrierSpec::None,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Single,
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        WELLEN_CURSOR_VALUES_OPERATION,
+        EffectSchema {
             intent: record([
                 field("artifact", waveform_artifact_type()),
                 field("request_fingerprint", ValueType::Text),
@@ -538,14 +680,13 @@ fn wellen_cursor_values() -> HostEffectSpec {
                 max_inclusive: WELLEN_MAX_SAFE_TIME,
             }],
             intent_defaults: Vec::new(),
-        }),
-    }
+        },
+    )
 }
 
 fn wall_clock_read() -> HostEffectSpec {
     transient_host_service(
         WALL_CLOCK_READ_OPERATION,
-        ReplaySpec::ReadOnly,
         record([]),
         ValueType::Variant {
             variants: vec![
@@ -565,7 +706,6 @@ fn wall_clock_read() -> HostEffectSpec {
 fn secure_random_bytes() -> HostEffectSpec {
     transient_host_service(
         SECURE_RANDOM_BYTES_OPERATION,
-        ReplaySpec::ReadOnly,
         record([field("byte_count", ValueType::Number)]),
         ValueType::Variant {
             variants: vec![
@@ -582,7 +722,6 @@ fn secure_random_bytes() -> HostEffectSpec {
 fn secret_verify() -> HostEffectSpec {
     transient_host_service(
         SECRET_VERIFY_OPERATION,
-        ReplaySpec::ReadOnly,
         record([
             field("secret", ValueType::Text),
             field("candidate", ValueType::Bytes { fixed_len: None }),
@@ -599,7 +738,6 @@ fn secret_verify() -> HostEffectSpec {
 fn hmac_sha256_sign() -> HostEffectSpec {
     transient_host_service(
         HMAC_SHA256_SIGN_OPERATION,
-        ReplaySpec::ReadOnly,
         record([
             field("secret", ValueType::Text),
             field("message", ValueType::Bytes { fixed_len: None }),
@@ -624,7 +762,6 @@ fn hmac_sha256_sign() -> HostEffectSpec {
 fn hmac_sha256_verify() -> HostEffectSpec {
     transient_host_service(
         HMAC_SHA256_VERIFY_OPERATION,
-        ReplaySpec::ReadOnly,
         record([
             field("secret", ValueType::Text),
             field("message", ValueType::Bytes { fixed_len: None }),
@@ -647,7 +784,6 @@ fn hmac_sha256_verify() -> HostEffectSpec {
 fn timer_deadline() -> HostEffectSpec {
     transient_host_service(
         TIMER_DEADLINE_OPERATION,
-        ReplaySpec::ReadOnly,
         record([field("delay_ms", ValueType::Number)]),
         ValueType::Variant {
             variants: vec![
@@ -660,23 +796,18 @@ fn timer_deadline() -> HostEffectSpec {
 
 fn transient_host_service(
     operation: &'static str,
-    replay: ReplaySpec,
     intent: ValueType,
     result: ValueType,
 ) -> HostEffectSpec {
-    HostEffectSpec {
+    typed_host_effect(
         operation,
-        replay,
-        barrier: BarrierSpec::None,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Single,
-        schema: Some(EffectSchema {
+        EffectSchema {
             intent,
             result,
             intent_constraints: Vec::new(),
             intent_defaults: Vec::new(),
-        }),
-    }
+        },
+    )
 }
 
 fn file_read_bytes() -> HostEffectSpec {
@@ -690,13 +821,9 @@ fn file_read_bytes() -> HostEffectSpec {
         ],
     )];
     variants.extend(file_failure_variants());
-    HostEffectSpec {
-        operation: FILE_READ_BYTES_OPERATION,
-        replay: ReplaySpec::ReadOnly,
-        barrier: BarrierSpec::None,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Single,
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        FILE_READ_BYTES_OPERATION,
+        EffectSchema {
             intent: record([
                 field("file", file_selection_type()),
                 field("max_bytes", ValueType::Number),
@@ -711,8 +838,8 @@ fn file_read_bytes() -> HostEffectSpec {
                 field_name: "max_bytes",
                 value: IntentDefaultValueSpec::ExactInteger(FILE_BYTES_DEFAULT_LIMIT),
             }],
-        }),
-    }
+        },
+    )
 }
 
 fn file_write_bytes() -> HostEffectSpec {
@@ -721,13 +848,9 @@ fn file_write_bytes() -> HostEffectSpec {
         [field("byte_count", ValueType::Number)],
     )];
     variants.extend(file_failure_variants());
-    HostEffectSpec {
-        operation: FILE_WRITE_BYTES_OPERATION,
-        replay: ReplaySpec::ProcessScoped,
-        barrier: BarrierSpec::None,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Single,
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        FILE_WRITE_BYTES_OPERATION,
+        EffectSchema {
             intent: record([
                 field("file", file_target_type()),
                 field("bytes", ValueType::Bytes { fixed_len: None }),
@@ -739,8 +862,8 @@ fn file_write_bytes() -> HostEffectSpec {
                 max_inclusive: FILE_BYTES_MAX_LIMIT,
             }],
             intent_defaults: Vec::new(),
-        }),
-    }
+        },
+    )
 }
 
 fn content_import() -> HostEffectSpec {
@@ -763,24 +886,15 @@ fn content_import() -> HostEffectSpec {
         variant("Imported", [field("content", content_ref_type())]),
     ];
     variants.extend(file_failure_variants());
-    HostEffectSpec {
-        operation: CONTENT_IMPORT_OPERATION,
-        replay: ReplaySpec::ReadOnly,
-        barrier: BarrierSpec::None,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Stream {
-            initial_credits: FILE_STREAM_INITIAL_CREDITS,
-            max_in_flight: FILE_STREAM_MAX_IN_FLIGHT,
-            credit_result_tags: vec!["Progress"],
-            terminal_result_tags: vec!["Busy", "Cancelled", "Failed", "Imported"],
-        },
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        CONTENT_IMPORT_OPERATION,
+        EffectSchema {
             intent: record([field("file", file_selection_type())]),
             result: ValueType::Variant { variants },
             intent_constraints: Vec::new(),
             intent_defaults: Vec::new(),
-        }),
-    }
+        },
+    )
 }
 
 fn content_save() -> HostEffectSpec {
@@ -796,18 +910,9 @@ fn content_save() -> HostEffectSpec {
         variant("Saved", [field("byte_count", ValueType::Number)]),
     ];
     variants.extend(file_failure_variants());
-    HostEffectSpec {
-        operation: CONTENT_SAVE_OPERATION,
-        replay: ReplaySpec::ProcessScoped,
-        barrier: BarrierSpec::None,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Stream {
-            initial_credits: FILE_STREAM_INITIAL_CREDITS,
-            max_in_flight: FILE_STREAM_MAX_IN_FLIGHT,
-            credit_result_tags: vec!["Progress"],
-            terminal_result_tags: vec!["Busy", "Cancelled", "Failed", "Saved"],
-        },
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        CONTENT_SAVE_OPERATION,
+        EffectSchema {
             intent: record([
                 field("content", content_ref_type()),
                 field("file", file_target_type()),
@@ -815,23 +920,14 @@ fn content_save() -> HostEffectSpec {
             result: ValueType::Variant { variants },
             intent_constraints: Vec::new(),
             intent_defaults: Vec::new(),
-        }),
-    }
+        },
+    )
 }
 
 fn file_read_stream() -> HostEffectSpec {
-    HostEffectSpec {
-        operation: FILE_READ_STREAM_OPERATION,
-        replay: ReplaySpec::ReadOnly,
-        barrier: BarrierSpec::None,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Stream {
-            initial_credits: FILE_STREAM_INITIAL_CREDITS,
-            max_in_flight: FILE_STREAM_MAX_IN_FLIGHT,
-            credit_result_tags: vec!["Chunk"],
-            terminal_result_tags: vec!["Cancelled", "Failed", "Finished"],
-        },
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        FILE_READ_STREAM_OPERATION,
+        EffectSchema {
             intent: record([
                 field("file", file_selection_type()),
                 field("chunk_bytes", ValueType::Number),
@@ -887,8 +983,8 @@ fn file_read_stream() -> HostEffectSpec {
                 field_name: "chunk_bytes",
                 value: IntentDefaultValueSpec::ExactInteger(FILE_STREAM_DEFAULT_CHUNK_BYTES),
             }],
-        }),
-    }
+        },
+    )
 }
 
 fn host_service_failure() -> Variant {
@@ -901,25 +997,10 @@ fn host_service_failure() -> Variant {
     )
 }
 
-fn canonical_operation(operation: &str) -> &'static str {
-    match operation {
-        "Directory/entries" => "Directory/entries",
-        "File/read_text" => "File/read_text",
-        "File/write_text" => "File/write_text",
-        "Log/error" => "Log/error",
-        "Log/info" => "Log/info",
-        _ => unreachable!("caller filters known operations"),
-    }
-}
-
 fn development_passkey_registration() -> HostEffectSpec {
-    HostEffectSpec {
-        operation: "DevelopmentPasskey/register",
-        replay: ReplaySpec::IdempotentBytesKey,
-        barrier: BarrierSpec::BeforeAndAfter,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Single,
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        "DevelopmentPasskey/register",
+        EffectSchema {
             intent: record([
                 field("workspace_id", ValueType::Text),
                 field("workspace_grant_id", ValueType::Text),
@@ -958,18 +1039,14 @@ fn development_passkey_registration() -> HostEffectSpec {
             },
             intent_constraints: Vec::new(),
             intent_defaults: Vec::new(),
-        }),
-    }
+        },
+    )
 }
 
 fn development_passkey_authentication() -> HostEffectSpec {
-    HostEffectSpec {
-        operation: "DevelopmentPasskey/authenticate",
-        replay: ReplaySpec::IdempotentBytesKey,
-        barrier: BarrierSpec::BeforeAndAfter,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Single,
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        "DevelopmentPasskey/authenticate",
+        EffectSchema {
             intent: record([
                 field("account_id", ValueType::Text),
                 field("credential_count", ValueType::Number),
@@ -997,8 +1074,8 @@ fn development_passkey_authentication() -> HostEffectSpec {
             },
             intent_constraints: Vec::new(),
             intent_defaults: Vec::new(),
-        }),
-    }
+        },
+    )
 }
 
 fn outbound_http_request() -> HostEffectSpec {
@@ -1017,13 +1094,9 @@ fn outbound_http_request() -> HostEffectSpec {
     let headers = || ValueType::List {
         item: Box::new(header()),
     };
-    HostEffectSpec {
-        operation: OUTBOUND_HTTP_REQUEST_OPERATION,
-        replay: ReplaySpec::ReadOnly,
-        barrier: BarrierSpec::None,
-        result_policy: ResultPolicySpec::ReturnValue,
-        delivery: DeliveryCardinalitySpec::Single,
-        schema: Some(EffectSchema {
+    typed_host_effect(
+        OUTBOUND_HTTP_REQUEST_OPERATION,
+        EffectSchema {
             intent: record([
                 field("endpoint", ValueType::Text),
                 field(
@@ -1074,8 +1147,8 @@ fn outbound_http_request() -> HostEffectSpec {
             },
             intent_constraints: Vec::new(),
             intent_defaults: Vec::new(),
-        }),
-    }
+        },
+    )
 }
 
 impl HostEffectSpec {
@@ -1313,6 +1386,293 @@ fn variant<const N: usize>(tag: &'static str, fields: [Field; N]) -> Variant {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allocation_free_policies_match_owned_host_effect_specs() {
+        for operation in HOST_EFFECT_OPERATIONS {
+            let policy = host_effect_policy(operation)
+                .unwrap_or_else(|| panic!("registered host effect `{operation}` has no policy"));
+            let spec = host_effect_spec(operation)
+                .unwrap_or_else(|| panic!("registered host effect `{operation}` has no schema"));
+            assert_eq!(policy.operation, spec.operation);
+            assert_eq!(policy.replay, spec.replay);
+            assert_eq!(policy.barrier, spec.barrier);
+            assert_eq!(policy.result_policy, spec.result_policy);
+            assert_eq!(policy.has_typed_schema, spec.schema.is_some());
+            match (policy.delivery, &spec.delivery) {
+                (DeliveryCardinalityPolicySpec::Single, DeliveryCardinalitySpec::Single) => {}
+                (
+                    DeliveryCardinalityPolicySpec::Stream {
+                        initial_credits,
+                        max_in_flight,
+                        credit_result_tags,
+                        terminal_result_tags,
+                    },
+                    DeliveryCardinalitySpec::Stream {
+                        initial_credits: owned_initial_credits,
+                        max_in_flight: owned_max_in_flight,
+                        credit_result_tags: owned_credit_result_tags,
+                        terminal_result_tags: owned_terminal_result_tags,
+                    },
+                ) => {
+                    assert_eq!(initial_credits, *owned_initial_credits);
+                    assert_eq!(max_in_flight, *owned_max_in_flight);
+                    assert_eq!(credit_result_tags, owned_credit_result_tags);
+                    assert_eq!(terminal_result_tags, owned_terminal_result_tags);
+                }
+                (policy, owned) => panic!(
+                    "delivery policy mismatch for `{operation}`: {policy:?} versus {owned:?}"
+                ),
+            }
+        }
+        assert!(host_effect_policy("Unknown/effect").is_none());
+    }
+
+    #[test]
+    fn allocation_free_policy_registry_is_unique_complete_and_golden() {
+        let single =
+            |operation, replay, barrier, result_policy, has_typed_schema| HostEffectPolicySpec {
+                operation,
+                replay,
+                barrier,
+                result_policy,
+                delivery: DeliveryCardinalityPolicySpec::Single,
+                has_typed_schema,
+            };
+        let expected = vec![
+            single(
+                "Directory/entries",
+                ReplaySpec::ReadOnly,
+                BarrierSpec::None,
+                ResultPolicySpec::ReturnValue,
+                false,
+            ),
+            single(
+                FILE_READ_BYTES_OPERATION,
+                ReplaySpec::ReadOnly,
+                BarrierSpec::None,
+                ResultPolicySpec::ReturnValue,
+                true,
+            ),
+            single(
+                FILE_WRITE_BYTES_OPERATION,
+                ReplaySpec::ProcessScoped,
+                BarrierSpec::None,
+                ResultPolicySpec::ReturnValue,
+                true,
+            ),
+            HostEffectPolicySpec {
+                operation: FILE_READ_STREAM_OPERATION,
+                replay: ReplaySpec::ReadOnly,
+                barrier: BarrierSpec::None,
+                result_policy: ResultPolicySpec::ReturnValue,
+                delivery: DeliveryCardinalityPolicySpec::Stream {
+                    initial_credits: 4,
+                    max_in_flight: 4,
+                    credit_result_tags: &["Chunk"],
+                    terminal_result_tags: &["Cancelled", "Failed", "Finished"],
+                },
+                has_typed_schema: true,
+            },
+            single(
+                "File/read_text",
+                ReplaySpec::ReadOnly,
+                BarrierSpec::None,
+                ResultPolicySpec::ReturnValue,
+                false,
+            ),
+            single(
+                "File/write_text",
+                ReplaySpec::NonReplayable,
+                BarrierSpec::BeforeAndAfter,
+                ResultPolicySpec::Acknowledgement,
+                false,
+            ),
+            HostEffectPolicySpec {
+                operation: CONTENT_IMPORT_OPERATION,
+                replay: ReplaySpec::ReadOnly,
+                barrier: BarrierSpec::None,
+                result_policy: ResultPolicySpec::ReturnValue,
+                delivery: DeliveryCardinalityPolicySpec::Stream {
+                    initial_credits: 4,
+                    max_in_flight: 4,
+                    credit_result_tags: &["Progress"],
+                    terminal_result_tags: &["Busy", "Cancelled", "Failed", "Imported"],
+                },
+                has_typed_schema: true,
+            },
+            HostEffectPolicySpec {
+                operation: CONTENT_SAVE_OPERATION,
+                replay: ReplaySpec::ProcessScoped,
+                barrier: BarrierSpec::None,
+                result_policy: ResultPolicySpec::ReturnValue,
+                delivery: DeliveryCardinalityPolicySpec::Stream {
+                    initial_credits: 4,
+                    max_in_flight: 4,
+                    credit_result_tags: &["Progress"],
+                    terminal_result_tags: &["Busy", "Cancelled", "Failed", "Saved"],
+                },
+                has_typed_schema: true,
+            },
+            single(
+                "Log/error",
+                ReplaySpec::NonReplayable,
+                BarrierSpec::None,
+                ResultPolicySpec::Discarded,
+                false,
+            ),
+            single(
+                "Log/info",
+                ReplaySpec::NonReplayable,
+                BarrierSpec::None,
+                ResultPolicySpec::Discarded,
+                false,
+            ),
+            single(
+                "DevelopmentPasskey/register",
+                ReplaySpec::IdempotentBytesKey,
+                BarrierSpec::BeforeAndAfter,
+                ResultPolicySpec::ReturnValue,
+                true,
+            ),
+            single(
+                "DevelopmentPasskey/authenticate",
+                ReplaySpec::IdempotentBytesKey,
+                BarrierSpec::BeforeAndAfter,
+                ResultPolicySpec::ReturnValue,
+                true,
+            ),
+        ];
+        let mut expected = expected;
+        expected.extend(
+            [
+                OUTBOUND_HTTP_REQUEST_OPERATION,
+                WALL_CLOCK_READ_OPERATION,
+                SECURE_RANDOM_BYTES_OPERATION,
+                SECRET_VERIFY_OPERATION,
+                HMAC_SHA256_SIGN_OPERATION,
+                HMAC_SHA256_VERIFY_OPERATION,
+                TIMER_DEADLINE_OPERATION,
+                WELLEN_OPEN_OPERATION,
+                WELLEN_HIERARCHY_PAGE_OPERATION,
+                WELLEN_SIGNAL_PAGE_OPERATION,
+                WELLEN_CURSOR_VALUES_OPERATION,
+            ]
+            .map(|operation| {
+                single(
+                    operation,
+                    ReplaySpec::ReadOnly,
+                    BarrierSpec::None,
+                    ResultPolicySpec::ReturnValue,
+                    true,
+                )
+            }),
+        );
+
+        assert_eq!(HOST_EFFECT_OPERATIONS.len(), 23);
+        assert_eq!(
+            HOST_EFFECT_OPERATIONS
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            HOST_EFFECT_OPERATIONS.len(),
+            "host-effect registry operations must be unique",
+        );
+        assert_eq!(
+            HOST_EFFECT_OPERATIONS
+                .iter()
+                .map(|operation| host_effect_policy(operation).unwrap())
+                .collect::<Vec<_>>(),
+            expected,
+        );
+    }
+
+    #[test]
+    fn policy_schema_and_stream_partitions_are_exact() {
+        let schema_less = HOST_EFFECT_OPERATIONS
+            .iter()
+            .filter_map(|operation| {
+                let policy = host_effect_policy(operation).unwrap();
+                (!policy.has_typed_schema).then_some(policy.operation)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            schema_less,
+            [
+                "Directory/entries",
+                "File/read_text",
+                "File/write_text",
+                "Log/error",
+                "Log/info",
+            ],
+        );
+
+        let streams = HOST_EFFECT_OPERATIONS
+            .iter()
+            .filter_map(|operation| {
+                let policy = host_effect_policy(operation).unwrap();
+                match policy.delivery {
+                    DeliveryCardinalityPolicySpec::Single => None,
+                    delivery @ DeliveryCardinalityPolicySpec::Stream { .. } => {
+                        Some((policy.operation, delivery))
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            streams,
+            vec![
+                (
+                    FILE_READ_STREAM_OPERATION,
+                    DeliveryCardinalityPolicySpec::Stream {
+                        initial_credits: 4,
+                        max_in_flight: 4,
+                        credit_result_tags: &["Chunk"],
+                        terminal_result_tags: &["Cancelled", "Failed", "Finished"],
+                    },
+                ),
+                (
+                    CONTENT_IMPORT_OPERATION,
+                    DeliveryCardinalityPolicySpec::Stream {
+                        initial_credits: 4,
+                        max_in_flight: 4,
+                        credit_result_tags: &["Progress"],
+                        terminal_result_tags: &["Busy", "Cancelled", "Failed", "Imported"],
+                    },
+                ),
+                (
+                    CONTENT_SAVE_OPERATION,
+                    DeliveryCardinalityPolicySpec::Stream {
+                        initial_credits: 4,
+                        max_in_flight: 4,
+                        credit_result_tags: &["Progress"],
+                        terminal_result_tags: &["Busy", "Cancelled", "Failed", "Saved"],
+                    },
+                ),
+            ],
+        );
+
+        for (operation, terminal_tag) in [
+            (CONTENT_IMPORT_OPERATION, "Imported"),
+            (CONTENT_SAVE_OPERATION, "Saved"),
+        ] {
+            let spec = host_effect_spec(operation).unwrap();
+            assert_eq!(spec.validate(), Ok(()));
+            let DeliveryCardinalitySpec::Stream {
+                initial_credits,
+                max_in_flight,
+                credit_result_tags,
+                terminal_result_tags,
+            } = spec.delivery
+            else {
+                panic!("`{operation}` must retain stream delivery")
+            };
+            assert_eq!((initial_credits, max_in_flight), (4, 4));
+            assert_eq!(credit_result_tags, ["Progress"]);
+            assert_eq!(terminal_result_tags.last().copied(), Some(terminal_tag),);
+        }
+    }
 
     #[test]
     fn every_host_effect_namespace_is_a_reserved_standard_root() {

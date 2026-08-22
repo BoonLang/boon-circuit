@@ -1276,39 +1276,45 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
         let input =
             KernelProjectInput::new_with_abi(project_input, definition_facts, definition_keys, abi)
                 .map_err(|error| error.to_string());
-        let compiled = input
-            .as_ref()
-            .map_err(Clone::clone)
-            .and_then(|input| input.compile().map_err(|error| error.to_string()));
-        if let Ok(program) = &compiled {
-            compile_work = program.compile_work();
-        }
+        let kernel_session = input.and_then(|input| {
+            let mut session = KernelSession::new(input);
+            compile_work = session.prepare().map_err(|error| error.to_string())?;
+            Ok(session)
+        });
         program_compile_us = elapsed_us(compile_started.elapsed());
-        let solved = compiled.and_then(|program| {
+        let solved = kernel_session.and_then(|mut session| {
             let graph_solve_started = Instant::now();
-            let solved = program.solve_graph().map_err(|error| error.to_string());
+            let solved = session
+                .solve_graph()
+                .map_err(|error| error.to_string());
             graph_solve_us = elapsed_us(graph_solve_started.elapsed());
             solve_us = graph_solve_us;
-            solved.and_then(|solved| {
+            solved.and_then(|_| {
                 if std::env::var_os("BOON_KERNEL_MEASURE_DEMANDS").is_some() {
                     let interface_projection_started = Instant::now();
-                    let interfaces = solved.interface_snapshot();
+                    let interfaces = session
+                        .check(CheckDemand::Diagnostics)
+                        .map_err(|error| error.to_string())?;
                     interface_projection_us = elapsed_us(interface_projection_started.elapsed());
+                    let KernelCheckProduct::Diagnostics(interfaces) = interfaces.product else {
+                        unreachable!("diagnostics demand returns an interface snapshot")
+                    };
                     debug_assert_eq!(interfaces.definition_count(), active.len());
                 }
                 let checked_image_started = Instant::now();
-                let checked = solved
-                    .into_checked_snapshot()
+                let checked = session
+                    .check(CheckDemand::CheckedImage)
                     .map_err(|error| error.to_string());
                 checked_image_us = elapsed_us(checked_image_started.elapsed());
                 solve_us = graph_solve_us.saturating_add(checked_image_us);
                 checked.and_then(|checked| {
+                    let KernelCheckProduct::CheckedImage(checked) = checked.product else {
+                        unreachable!("checked-image demand returns a checked snapshot")
+                    };
                     let checked_link_started = Instant::now();
                     let checked_link_trace =
                         std::env::var_os("BOON_KERNEL_TRACE").is_some();
-                    let kernel_input = input
-                        .as_ref()
-                        .expect("a solved kernel graph retains its immutable input");
+                    let kernel_input = session.project();
                     let layout_started = Instant::now();
                     let layout = KernelCheckedLinkLayout::new(kernel_input, &checked)
                         .map_err(|error| error.to_string())?;
@@ -4780,6 +4786,14 @@ fn compact_call_syntax_input(
             .ok_or_else(|| {
                 format!(
                     "authored call expression {} has no parser-issued structural occurrence",
+                    syntax.id,
+                )
+            })?,
+        authored_site_digest_v4: view
+            .checked_structural_call_site_digest_v4_for_syntax(syntax.id)
+            .ok_or_else(|| {
+                format!(
+                    "authored call expression {} has no parser-sealed V4 identity",
                     syntax.id,
                 )
             })?,
@@ -9387,7 +9401,9 @@ fn kernel_resource_projection(
                 }
                 KernelOwnerNodeKind::Arrow => input.role == KernelOwnerEdgeRole::ArrowOutput,
                 KernelOwnerNodeKind::Known(_)
+                | KernelOwnerNodeKind::KnownPacked(_)
                 | KernelOwnerNodeKind::Source(_)
+                | KernelOwnerNodeKind::SourcePacked(_)
                 | KernelOwnerNodeKind::Absent
                 | KernelOwnerNodeKind::Text
                 | KernelOwnerNodeKind::TextTemplate
@@ -9408,6 +9424,7 @@ fn kernel_resource_projection(
                 | KernelOwnerNodeKind::RenderConstructor { .. }
                 | KernelOwnerNodeKind::PureBuiltin { .. }
                 | KernelOwnerNodeKind::FixedAbiCall { .. }
+                | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
                 | KernelOwnerNodeKind::HostEffect { .. }
                 | KernelOwnerNodeKind::Infix { .. }
                 | KernelOwnerNodeKind::Hold
@@ -11027,7 +11044,9 @@ fn resource_containing_statements(
                 }
                 KernelOwnerNodeKind::Flush => input.role == KernelOwnerEdgeRole::FlushPayload,
                 KernelOwnerNodeKind::Known(_)
+                | KernelOwnerNodeKind::KnownPacked(_)
                 | KernelOwnerNodeKind::Source(_)
+                | KernelOwnerNodeKind::SourcePacked(_)
                 | KernelOwnerNodeKind::Absent
                 | KernelOwnerNodeKind::Text
                 | KernelOwnerNodeKind::TextTemplate
@@ -11047,6 +11066,7 @@ fn resource_containing_statements(
                 | KernelOwnerNodeKind::CollectionItemRead
                 | KernelOwnerNodeKind::FreshOut
                 | KernelOwnerNodeKind::FixedAbiCall { .. }
+                | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
                 | KernelOwnerNodeKind::Latest
                 | KernelOwnerNodeKind::Arrow
                 | KernelOwnerNodeKind::Delimiter
@@ -20596,14 +20616,14 @@ mod tests {
             prepared.definition_keys,
         )
         .expect("nested checked-presentation input validates");
-        let mut session = KernelSession::new(input.clone());
+        let mut session = KernelSession::new(input);
         let checked = session
             .check(CheckDemand::CheckedImage)
             .expect("nested checked-presentation project solves");
         let KernelCheckProduct::CheckedImage(snapshot) = checked.product else {
             unreachable!()
         };
-        let layout = KernelCheckedLinkLayout::new(&input, &snapshot)
+        let layout = KernelCheckedLinkLayout::new(session.project(), &snapshot)
             .expect("nested checked-presentation scopes link");
         let expected = layout
             .scope(

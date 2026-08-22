@@ -1148,6 +1148,62 @@ pub struct StableOccurrenceKey {
     pub route: StableOccurrenceRoute,
 }
 
+#[derive(Serialize)]
+struct BorrowedStableOccurrenceKey<'a> {
+    source_unit_id: &'a SourceUnitId,
+    route: &'a StableOccurrenceRoute,
+}
+
+#[derive(Serialize)]
+struct CheckedStructuralCallSiteDigestV4<'a> {
+    occurrence: BorrowedStableOccurrenceKey<'a>,
+}
+
+/// Canonical checked structural-call digest over borrowed parser identity.
+///
+/// This is the single V4 hashing authority. The borrowed form lets the parser
+/// seal the digest while it already owns the route, without cloning a
+/// [`StableOccurrenceKey`].
+#[doc(hidden)]
+pub fn checked_structural_call_site_digest_v4_from_parts(
+    source_unit_id: &SourceUnitId,
+    route: &StableOccurrenceRoute,
+) -> Result<[u8; 32], String> {
+    checked_structural_call_site_digest_v4_from_parts_with_buffer(
+        source_unit_id,
+        route,
+        &mut Vec::new(),
+    )
+}
+
+/// Scratch-reusing form used while sealing all call sites in one syntax unit.
+#[doc(hidden)]
+pub fn checked_structural_call_site_digest_v4_from_parts_with_buffer(
+    source_unit_id: &SourceUnitId,
+    route: &StableOccurrenceRoute,
+    bytes: &mut Vec<u8>,
+) -> Result<[u8; 32], String> {
+    boon_contract::canonical_serde_hash_v1_with_buffer(
+        b"boon.checked-structural-call-site.v4\0",
+        &CheckedStructuralCallSiteDigestV4 {
+            occurrence: BorrowedStableOccurrenceKey {
+                source_unit_id,
+                route,
+            },
+        },
+        bytes,
+    )
+    .map_err(|error| format!("failed to hash checked call site: {error}"))
+}
+
+/// Canonical checked structural-call digest for an existing rich key.
+#[doc(hidden)]
+pub fn checked_structural_call_site_digest_v4(
+    occurrence: &StableOccurrenceKey,
+) -> Result<[u8; 32], String> {
+    checked_structural_call_site_digest_v4_from_parts(&occurrence.source_unit_id, &occurrence.route)
+}
+
 /// Stable compiler identity for one syntax expression across source revisions.
 ///
 /// The digest commits only the parser-owned structural route: authored item
@@ -1159,6 +1215,17 @@ pub struct StableOccurrenceKey {
 pub struct StableExpressionKey {
     pub source_unit_id: SourceUnitId,
     pub route_digest_v1: [u8; 32],
+}
+
+/// One parser-sealed checked call identity keyed by its unit-local expression.
+///
+/// Only actual call/pipe expressions receive a row. Keeping this sparse avoids
+/// a 33-byte optional digest slot for every unrelated syntax expression while
+/// preserving allocation-free binary lookup by the dense local id.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct UnitCheckedCallSiteV4 {
+    pub expression: UnitLocalExpressionId,
+    pub digest: [u8; 32],
 }
 
 /// Public read-only schema projected by an opaque parser-produced source unit.
@@ -1174,6 +1241,8 @@ pub struct ParsedSourceUnitFields {
     pub owner_index: UnitOwnerIndex,
     #[serde(skip)]
     pub occurrence_routes: Vec<Option<StableOccurrenceRoute>>,
+    #[serde(skip)]
+    pub checked_call_sites_v4: Vec<UnitCheckedCallSiteV4>,
     #[serde(skip)]
     pub occurrence_route_digests_v1: Vec<Option<[u8; 32]>>,
     #[serde(skip)]

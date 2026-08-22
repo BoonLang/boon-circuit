@@ -3,7 +3,6 @@ use crate::{
     KernelAbiInput, KernelCheckedSnapshot, KernelCompileWork, KernelDefinitionFactsInput,
     KernelDemandedDefinitionSnapshot, KernelInterfaceSnapshot, KernelOwnerBuildError,
     KernelOwnerId, KernelProjectProgramInput, KernelSolveError, KernelSolvedProject,
-    compile_project_program_with_definition_facts_abi_and_text,
 };
 use boon_contract::{
     PackedTextCatalogBuilder, ProjectTextSnapshot, QualifiedPathId, QualifiedSymbolId,
@@ -84,19 +83,49 @@ impl KernelProjectInputBuilder {
     /// authority to the final immutable project.
     pub fn finish(
         mut self,
-        program: KernelProjectProgramInput,
+        mut program: KernelProjectProgramInput,
         definition_facts: Box<[KernelDefinitionFactsInput]>,
         definition_keys: Box<[StableCheckOwnerKey]>,
         abi: KernelAbiInput,
     ) -> Result<KernelProjectInput, KernelOwnerBuildError> {
+        if program.owners.len() != definition_facts.len() {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel project input has {} owners but {} definition-fact tables",
+                program.owners.len(),
+                definition_facts.len()
+            )));
+        }
+        if program.owners.len() != definition_keys.len() {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel project input has {} owners but {} stable definition keys",
+                program.owners.len(),
+                definition_keys.len()
+            )));
+        }
         crate::text::populate_reserved_project_text(&mut self.text)?;
         let text = self.text.freeze();
+        crate::text::validate_compatibility_project_text(
+            &text,
+            &program.owners,
+            &definition_facts,
+            &abi,
+        )?;
+        let basis_fingerprints = Arc::from(crate::project_definition_basis_fingerprints(
+            &program,
+            &definition_facts,
+        )?);
+        let mut terms = crate::TypeTermArena::with_text(text.clone());
+        crate::pack_project_closed_type_roots(&mut program, &mut terms)?;
+        let packed_input_term_count = terms.len();
         KernelProjectInput::from_explicit_text(
             program,
             definition_facts,
             definition_keys,
             abi,
             text,
+            terms,
+            packed_input_term_count,
+            basis_fingerprints,
         )
     }
 
@@ -130,7 +159,7 @@ impl Default for KernelProjectInputBuilder {
 /// Parser arenas and legacy owner DTOs do not cross this boundary. The dense
 /// owner programs are the normalized syntax product; their external owner IDs
 /// and the definition-fact tables are the resolved project-link overlay.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct KernelProjectInput {
     syntax_units: Box<[KernelSyntaxUnitInput]>,
     links: KernelResolvedProjectLinkOverlay,
@@ -141,19 +170,19 @@ pub struct KernelProjectInput {
     definition_facts: Arc<[KernelDefinitionFactsInput]>,
     abi: Arc<KernelAbiInput>,
     text: ProjectTextSnapshot,
+    /// One-shot state moved into `KernelSession` before this input can be
+    /// observed as revision metadata. Keeping the arena and V14 basis together
+    /// prevents either construction authority from surviving as duplicate
+    /// persistent state after preparation.
+    construction: Option<KernelProjectConstruction>,
 }
 
-impl PartialEq for KernelProjectInput {
-    fn eq(&self, other: &Self) -> bool {
-        self.syntax_units == other.syntax_units
-            && self.links == other.links
-            && self.program == other.program
-            && self.definition_facts == other.definition_facts
-            && self.abi == other.abi
-    }
+#[derive(Debug)]
+struct KernelProjectConstruction {
+    terms: crate::TypeTermArena,
+    packed_input_term_count: usize,
+    basis_fingerprints_v14: Arc<[[u8; 32]]>,
 }
-
-impl Eq for KernelProjectInput {}
 
 /// One immutable normalized syntax unit. Definitions retain their stable
 /// parser-owned identity while the dense IDs remain revision-local.
@@ -215,6 +244,9 @@ impl KernelProjectInput {
         definition_keys: Box<[StableCheckOwnerKey]>,
         abi: KernelAbiInput,
         text: ProjectTextSnapshot,
+        terms: crate::TypeTermArena,
+        packed_input_term_count: usize,
+        basis_fingerprints_v14: Arc<[[u8; 32]]>,
     ) -> Result<Self, KernelOwnerBuildError> {
         if program.owners.len() != definition_facts.len() {
             return Err(KernelOwnerBuildError::new(format!(
@@ -230,12 +262,6 @@ impl KernelProjectInput {
                 definition_keys.len()
             )));
         }
-        crate::text::validate_compatibility_project_text(
-            &text,
-            &program.owners,
-            &definition_facts,
-            &abi,
-        )?;
         let mut definition_by_key = BTreeMap::new();
         let mut units = BTreeMap::<SourceUnitId, Vec<KernelOwnerId>>::new();
         for (index, key) in definition_keys.iter().enumerate() {
@@ -295,6 +321,11 @@ impl KernelProjectInput {
             program: Arc::new(program),
             definition_facts: Arc::from(definition_facts),
             abi: Arc::new(abi),
+            construction: Some(KernelProjectConstruction {
+                terms,
+                packed_input_term_count,
+                basis_fingerprints_v14,
+            }),
             text,
         })
     }
@@ -327,12 +358,24 @@ impl KernelProjectInput {
         &self.text
     }
 
-    pub fn compile(&self) -> Result<crate::KernelProjectProgram, KernelOwnerBuildError> {
-        compile_project_program_with_definition_facts_abi_and_text(
+    fn take_construction(&mut self) -> KernelProjectConstruction {
+        self.construction
+            .take()
+            .expect("kernel project input construction authority is consumed exactly once")
+    }
+
+    fn compile_with_construction(
+        &self,
+        construction: KernelProjectConstruction,
+    ) -> Result<crate::KernelProjectProgram, KernelOwnerBuildError> {
+        crate::compile_project_program_with_definition_facts_abi_text_and_terms(
             Arc::clone(&self.program),
             Arc::clone(&self.definition_facts),
             Arc::clone(&self.abi),
             self.text.clone(),
+            construction.terms,
+            construction.packed_input_term_count,
+            construction.basis_fingerprints_v14,
         )
     }
 }
@@ -370,7 +413,7 @@ impl CheckDemand {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct KernelDemandedCheckSnapshot {
     owners: Box<[KernelOwnerId]>,
     project: Arc<KernelProjectInput>,
@@ -378,6 +421,18 @@ pub struct KernelDemandedCheckSnapshot {
     interface: Arc<KernelInterfaceSnapshot>,
     work: crate::KernelSolveWork,
 }
+
+impl PartialEq for KernelDemandedCheckSnapshot {
+    fn eq(&self, other: &Self) -> bool {
+        self.owners == other.owners
+            && Arc::ptr_eq(&self.project, &other.project)
+            && self.definition_code == other.definition_code
+            && self.interface == other.interface
+            && self.work == other.work
+    }
+}
+
+impl Eq for KernelDemandedCheckSnapshot {}
 
 #[derive(Clone, Copy)]
 pub struct KernelDemandedCheckDefinitionRef<'a> {
@@ -558,18 +613,23 @@ struct CachedSolvedProject {
 pub struct KernelSession {
     revision: KernelRevisionId,
     project: Arc<KernelProjectInput>,
+    pending: Option<KernelProjectConstruction>,
     prepared: Option<KernelProjectSolveSession>,
     solved: Option<CachedSolvedProject>,
+    failed: Option<KernelCheckError>,
     checks: BTreeMap<CheckDemand, CachedKernelCheck>,
 }
 
 impl KernelSession {
-    pub fn new(project: KernelProjectInput) -> Self {
+    pub fn new(mut project: KernelProjectInput) -> Self {
+        let pending = Some(project.take_construction());
         Self {
             revision: KernelRevisionId(1),
             project: Arc::new(project),
+            pending,
             prepared: None,
             solved: None,
+            failed: None,
             checks: BTreeMap::new(),
         }
     }
@@ -582,18 +642,58 @@ impl KernelSession {
         &self.project
     }
 
-    pub fn replace_project(&mut self, project: KernelProjectInput) -> KernelRevisionId {
+    pub fn replace_project(&mut self, mut project: KernelProjectInput) -> KernelRevisionId {
         self.revision = KernelRevisionId(
             self.revision
                 .0
                 .checked_add(1)
                 .expect("kernel session revision counter exhausted"),
         );
+        self.pending = Some(project.take_construction());
         self.project = Arc::new(project);
         self.prepared = None;
         self.solved = None;
+        self.failed = None;
         self.checks.clear();
         self.revision
+    }
+
+    /// Compile the current revision into one retained equation graph without
+    /// solving it. The session remains the sole owner of the packed input and
+    /// compiled type authority, so profiling cannot split them into an
+    /// independently ownable tuple.
+    pub fn prepare(&mut self) -> Result<KernelCompileWork, KernelCheckError> {
+        if let Some(cached) = self.checks.values().next() {
+            return Ok(cached.compile_work);
+        }
+        self.ensure_prepared()?;
+        Ok(self
+            .prepared
+            .as_ref()
+            .map(KernelProjectSolveSession::compile_work)
+            .or_else(|| self.solved.as_ref().map(|solved| solved.compile_work))
+            .or_else(|| {
+                self.checks
+                    .values()
+                    .next()
+                    .map(|cached| cached.compile_work)
+            })
+            .expect("a prepared kernel revision retains compile work"))
+    }
+
+    /// Bring the retained equation graph to quiescence without publishing a
+    /// checked image. This is primarily useful to measure graph solving apart
+    /// from optional checked-image construction.
+    pub fn solve_graph(&mut self) -> Result<KernelCompileWork, KernelCheckError> {
+        if let Some(cached) = self.checks.get(&CheckDemand::CheckedImage) {
+            return Ok(cached.compile_work);
+        }
+        self.ensure_solved()?;
+        Ok(self
+            .solved
+            .as_ref()
+            .expect("a solved kernel revision retains its graph")
+            .compile_work)
     }
 
     pub fn check(&mut self, demand: CheckDemand) -> Result<KernelCheckResult, KernelCheckError> {
@@ -627,15 +727,32 @@ impl KernelSession {
                     )
                 } else {
                     self.ensure_prepared()?;
-                    let prepared = self
-                        .prepared
-                        .as_mut()
-                        .expect("kernel diagnostics own a prepared graph");
-                    let compile_work = prepared.compile_work();
-                    (
-                        KernelCheckProduct::Diagnostics(Arc::new(prepared.solve_interfaces()?)),
-                        compile_work,
-                    )
+                    let (compile_work, interfaces) = {
+                        let prepared = self
+                            .prepared
+                            .as_mut()
+                            .expect("kernel diagnostics own a prepared graph");
+                        (
+                            prepared.compile_work(),
+                            prepared.solve_interfaces().map_err(KernelCheckError::from),
+                        )
+                    };
+                    match interfaces {
+                        Ok(interfaces) => (
+                            KernelCheckProduct::Diagnostics(Arc::new(interfaces)),
+                            compile_work,
+                        ),
+                        Err(error) => {
+                            // Interface solving mutates the retained graph. A
+                            // failed solve is terminal for this immutable
+                            // revision: replay the original error instead of
+                            // exposing a partially advanced graph to a later
+                            // demand.
+                            self.prepared = None;
+                            self.failed = Some(error.clone());
+                            return Err(error);
+                        }
+                    }
                 }
             }
             CheckDemand::CheckedImage => {
@@ -644,10 +761,16 @@ impl KernelSession {
                     .solved
                     .take()
                     .expect("kernel checked image owns a solved graph");
+                let checked = match solved.project.into_checked_snapshot() {
+                    Ok(checked) => checked,
+                    Err(error) => {
+                        let error = KernelCheckError::from(error);
+                        self.failed = Some(error.clone());
+                        return Err(error);
+                    }
+                };
                 (
-                    KernelCheckProduct::CheckedImage(Arc::new(
-                        solved.project.into_checked_snapshot()?,
-                    )),
+                    KernelCheckProduct::CheckedImage(Arc::new(checked)),
                     solved.compile_work,
                 )
             }
@@ -696,13 +819,35 @@ impl KernelSession {
     }
 
     fn ensure_prepared(&mut self) -> Result<(), KernelCheckError> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         if self.prepared.is_none() && self.solved.is_none() {
-            self.prepared = Some(self.project.compile()?.into_solve_session()?);
+            let construction = self.pending.take().ok_or_else(|| {
+                KernelCheckError::invalid_demand(
+                    "kernel revision construction authority was consumed without a prepared solve",
+                )
+            })?;
+            let prepared = self
+                .project
+                .compile_with_construction(construction)
+                .map_err(KernelCheckError::from)
+                .and_then(|program| program.into_solve_session().map_err(KernelCheckError::from));
+            match prepared {
+                Ok(prepared) => self.prepared = Some(prepared),
+                Err(error) => {
+                    self.failed = Some(error.clone());
+                    return Err(error);
+                }
+            }
         }
         Ok(())
     }
 
     fn ensure_solved(&mut self) -> Result<(), KernelCheckError> {
+        if let Some(error) = &self.failed {
+            return Err(error.clone());
+        }
         if self.solved.is_some() {
             return Ok(());
         }
@@ -712,10 +857,19 @@ impl KernelSession {
             .take()
             .expect("kernel full solve owns a prepared graph");
         let compile_work = prepared.compile_work();
-        self.solved = Some(CachedSolvedProject {
-            project: prepared.finish_graph()?,
-            compile_work,
-        });
+        match prepared.finish_graph() {
+            Ok(project) => {
+                self.solved = Some(CachedSolvedProject {
+                    project,
+                    compile_work,
+                });
+            }
+            Err(error) => {
+                let error = KernelCheckError::from(error);
+                self.failed = Some(error.clone());
+                return Err(error);
+            }
+        }
         Ok(())
     }
 
@@ -1029,6 +1183,155 @@ mod tests {
     }
 
     #[test]
+    fn project_input_consumes_rich_closed_roots_into_one_type_authority() {
+        let closed = Type::List(Type::shared(Type::Number));
+        let program = KernelProjectProgramInput {
+            owners: vec![
+                value_owner(KernelOwnerNodeKind::Known(closed.clone())),
+                value_owner(KernelOwnerNodeKind::Source(closed.clone())),
+                value_owner(KernelOwnerNodeKind::FixedAbiCall {
+                    result: closed.clone(),
+                }),
+                value_owner(KernelOwnerNodeKind::Known(closed)),
+            ]
+            .into_boxed_slice(),
+        };
+        let facts = vec![KernelDefinitionFactsInput::default(); 4].into_boxed_slice();
+        let expected_basis = crate::project_definition_basis_fingerprints(&program, &facts)
+            .expect("rich fixture has a stable V14 basis");
+        let project = KernelProjectInput::new(
+            program,
+            facts,
+            (0..4)
+                .map(|index| {
+                    StableCheckOwnerKey::UnitRoot(
+                        SourceUnitId::from_path(&format!("packed-root-{index}.bn")).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+        .expect("closed roots pack during one-shot project construction");
+
+        let construction = project
+            .construction
+            .as_ref()
+            .expect("unprepared input owns one construction authority");
+        assert_eq!(
+            construction.basis_fingerprints_v14.as_ref(),
+            expected_basis.as_ref()
+        );
+        let refs = project
+            .program()
+            .owners
+            .iter()
+            .map(|owner| match owner.nodes[0].kind {
+                KernelOwnerNodeKind::KnownPacked(reference)
+                | KernelOwnerNodeKind::SourcePacked(reference)
+                | KernelOwnerNodeKind::FixedAbiCallPacked { result: reference } => reference,
+                ref rich => panic!("project retained compatibility-only rich root {rich:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert!(refs.windows(2).all(|pair| pair[0] == pair[1]));
+        let terms = &construction.terms;
+        assert!(
+            refs.iter()
+                .all(|reference| terms.resolve_type_ref(*reference).is_some())
+        );
+        assert_eq!(construction.packed_input_term_count, terms.len());
+    }
+
+    #[test]
+    fn project_builder_rejects_internal_packed_rows_before_v14_hashing() {
+        let text =
+            crate::text::compatibility_project_text_snapshot(&[], &[], &KernelAbiInput::default())
+                .unwrap();
+        let foreign = crate::TypeTermArena::with_text(text);
+        let reference = foreign.type_ref(foreign.number());
+        let error = KernelProjectInputBuilder::new()
+            .finish(
+                KernelProjectProgramInput {
+                    owners: vec![value_owner(KernelOwnerNodeKind::KnownPacked(reference))]
+                        .into_boxed_slice(),
+                },
+                vec![KernelDefinitionFactsInput::default()].into_boxed_slice(),
+                vec![StableCheckOwnerKey::UnitRoot(
+                    SourceUnitId::from_path("premature-packed.bn").unwrap(),
+                )]
+                .into_boxed_slice(),
+                KernelAbiInput::default(),
+            )
+            .expect_err("process-local packed coordinates cannot enter the stable V14 hash");
+        assert!(error.to_string().contains("before the stable V14 basis"));
+    }
+
+    #[test]
+    fn packed_closed_roots_reject_foreign_type_authorities() {
+        let text =
+            crate::text::compatibility_project_text_snapshot(&[], &[], &KernelAbiInput::default())
+                .unwrap();
+        let foreign = crate::TypeTermArena::with_text(text.clone());
+        let reference = foreign.type_ref(foreign.number());
+        let mut target = crate::TypeTermArena::with_text(text);
+        let mut program = KernelProjectProgramInput {
+            owners: vec![value_owner(KernelOwnerNodeKind::KnownPacked(reference))]
+                .into_boxed_slice(),
+        };
+        let error = crate::pack_project_closed_type_roots(&mut program, &mut target)
+            .expect_err("an in-range term from another arena must fail closed");
+        assert!(error.to_string().contains("another project authority"));
+    }
+
+    #[test]
+    fn packed_closed_roots_reject_same_authority_solver_variables() {
+        let text =
+            crate::text::compatibility_project_text_snapshot(&[], &[], &KernelAbiInput::default())
+                .unwrap();
+        let mut terms = crate::TypeTermArena::with_text(text);
+        let variable = terms.variable(crate::TypeVariableId(7));
+        let reference = terms.type_ref(variable);
+        let mut program = KernelProjectProgramInput {
+            owners: vec![value_owner(KernelOwnerNodeKind::KnownPacked(reference))]
+                .into_boxed_slice(),
+        };
+
+        let error = crate::pack_project_closed_type_roots(&mut program, &mut terms)
+            .expect_err("a packed project-input root with variables must fail closed");
+        assert!(error.to_string().contains("solver variables"));
+    }
+
+    #[test]
+    fn failed_preparation_replays_the_original_error_after_consuming_construction() {
+        let mut invalid = value_owner(KernelOwnerNodeKind::Number);
+        invalid.result = crate::KernelExpressionId(1);
+        let project = KernelProjectInput::new(
+            KernelProjectProgramInput {
+                owners: vec![invalid].into_boxed_slice(),
+            },
+            vec![KernelDefinitionFactsInput::default()].into_boxed_slice(),
+            vec![StableCheckOwnerKey::UnitRoot(
+                SourceUnitId::from_path("invalid-result.bn").unwrap(),
+            )]
+            .into_boxed_slice(),
+        )
+        .expect("project construction defers dense result validation to preparation");
+        let mut session = KernelSession::new(project);
+
+        let first = session
+            .check(CheckDemand::Diagnostics)
+            .expect_err("the out-of-range result must fail preparation");
+        let second = session
+            .check(CheckDemand::Diagnostics)
+            .expect_err("a repeated check must replay the same terminal failure");
+        assert_eq!(second, first);
+        assert!(
+            !second
+                .to_string()
+                .contains("construction authority was consumed")
+        );
+    }
+
+    #[test]
     fn project_input_rejects_cross_unit_definition_relocations() {
         let definition_unit = SourceUnitId::from_path("definition.bn").unwrap();
         let foreign_unit = SourceUnitId::from_path("foreign.bn").unwrap();
@@ -1121,6 +1424,16 @@ mod tests {
                 "diagnostics and checked-image demands must share callable formal authorities"
             );
         }
+        assert_eq!(
+            session.prepare().unwrap(),
+            checked.compile_work,
+            "preparation profiling must reuse a published checked image"
+        );
+        assert_eq!(
+            session.solve_graph().unwrap(),
+            checked.compile_work,
+            "graph profiling must reuse a published checked image"
+        );
 
         let repeated = session
             .check(CheckDemand::Diagnostics)

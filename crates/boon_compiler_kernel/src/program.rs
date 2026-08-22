@@ -700,8 +700,20 @@ pub struct ComponentProgramBuilder {
 
 impl ComponentProgramBuilder {
     pub fn with_text(text: ProjectTextSnapshot) -> Self {
+        Self::with_terms(TypeTermArena::with_text(text))
+    }
+
+    /// Continue construction with the one mutable type authority prepared by
+    /// the project-input builder.
+    ///
+    /// Project compilation is consuming: externally supplied closed roots are
+    /// interned into this arena once, then the solver extends and ultimately
+    /// freezes the same columns. Keeping that ownership explicit prevents a
+    /// future packed-input producer from freezing a prelude store only to
+    /// import every term into a second solver store.
+    pub(crate) fn with_terms(terms: TypeTermArena) -> Self {
         Self {
-            terms: TypeTermArena::with_text(text),
+            terms,
             variables: Vec::new(),
             operations: PackedOperationBuilder::default(),
             residual_frames: Vec::new(),

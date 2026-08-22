@@ -172,6 +172,9 @@ impl TextCollector<'_> {
                 KernelOwnerNodeKind::Known(ty)
                 | KernelOwnerNodeKind::Source(ty)
                 | KernelOwnerNodeKind::FixedAbiCall { result: ty } => self.ty(ty)?,
+                KernelOwnerNodeKind::KnownPacked(_)
+                | KernelOwnerNodeKind::SourcePacked(_)
+                | KernelOwnerNodeKind::FixedAbiCallPacked { .. } => {}
                 KernelOwnerNodeKind::Tag(tag) => self.symbol(tag)?,
                 KernelOwnerNodeKind::Record { tag: Some(tag) } => self.symbol(tag)?,
                 KernelOwnerNodeKind::FormalRead { fields, .. }

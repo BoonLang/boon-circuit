@@ -12,10 +12,10 @@ use crate::{
     PackedCallTypeSubstitution, PackedCallableTypeParameter, PackedDiagnosticTypes,
     PackedExpressionRef, PackedFlow, PackedPublishedState,
     PackedResourceProjectionRequirementInput, PackedSourceReadInput, PublishMode, TypeTerm,
-    TypeTermHead, TypeTermId, TypeVariableId, UnsealedComponentArtifact, VariantTerm,
-    build_borrowed_snapshot_receipts, build_snapshot_receipts,
-    collect_packed_callable_type_parameter_sources, definition_basis_fingerprint,
-    definition_basis_fingerprint_with_buffer, solve_component,
+    TypeTermHead, TypeTermId, TypeTermImportScratch, TypeTermImportSession, TypeVariableId,
+    UnsealedComponentArtifact, VariantTerm, build_borrowed_snapshot_receipts,
+    build_snapshot_receipts, collect_packed_callable_type_parameter_sources,
+    definition_basis_fingerprint, definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedParameterKind, CheckedStateKind, FlowMode, FlowType,
@@ -252,6 +252,17 @@ pub enum KernelOwnerNodeKind {
     /// authored call row survives for runtime/intrinsic consumers.
     FieldProjection {
         field: Box<str>,
+    },
+    /// Process-local consuming forms are appended after every stable V14/V16
+    /// variant so adding them cannot renumber the historical serialization
+    /// schema. They are never themselves serialized.
+    #[serde(skip)]
+    KnownPacked(crate::KernelTypeRef),
+    #[serde(skip)]
+    SourcePacked(crate::KernelTypeRef),
+    #[serde(skip)]
+    FixedAbiCallPacked {
+        result: crate::KernelTypeRef,
     },
 }
 
@@ -782,6 +793,12 @@ pub enum KernelTextTemplateSegment {
 pub struct KernelCallSyntaxInput {
     pub expression: KernelExpressionId,
     pub occurrence: StableOccurrenceKey,
+    /// Parser-sealed checked identity consumed directly by RuntimePacked after
+    /// one allocation-reusing project-boundary validation against `occurrence`.
+    /// The rich occurrence remains in the historical V14/V17 serialization
+    /// domains until the packed occurrence catalog can replay them exactly.
+    #[serde(skip)]
+    pub authored_site_digest_v4: [u8; 32],
     pub function: Box<str>,
     pub pipe_input: Option<KernelExpressionId>,
     pub arguments: Box<[KernelCallSyntaxArgument]>,
@@ -930,6 +947,139 @@ pub enum KernelExternalTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelProjectProgramInput {
     pub owners: Box<[KernelOwnerProgramInput]>,
+}
+
+/// Consume compatibility-only recursive closed roots into the one live type
+/// arena owned by this project revision.
+///
+/// This runs after the rich rows have supplied the text catalog and legacy
+/// basis fingerprint, but before `KernelProjectInput` is retained. Every
+/// successful production row therefore carries only a branded fixed-size
+/// reference. The packed variants are internal post-fingerprint forms. A
+/// future direct producer must construct them through a builder-owned arena
+/// and provide an exact stable V14 basis; process-local references themselves
+/// must never enter that hash contract.
+pub(crate) fn pack_project_closed_type_roots(
+    program: &mut KernelProjectProgramInput,
+    terms: &mut crate::TypeTermArena,
+) -> Result<(), KernelOwnerBuildError> {
+    fn import_closed(
+        terms: &mut crate::TypeTermArena,
+        ty: &Type,
+        owner: usize,
+        expression: usize,
+        label: &str,
+    ) -> Result<crate::KernelTypeRef, KernelOwnerBuildError> {
+        if !type_is_recursively_closed(ty) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel definition {owner} expression {expression} {label} imports a non-closed type {ty:?}"
+            )));
+        }
+        let term = terms.import_checked_type(ty, &mut |_| {
+            unreachable!("a recursively closed input type has no variable")
+        });
+        Ok(terms.type_ref(term))
+    }
+
+    fn validate_packed_closed(
+        terms: &crate::TypeTermArena,
+        reference: crate::KernelTypeRef,
+        owner: usize,
+        expression: usize,
+    ) -> Result<crate::KernelTypeRef, KernelOwnerBuildError> {
+        let Some(term) = terms.resolve_type_ref(reference) else {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel definition {owner} expression {expression} carries a closed type from another project authority"
+            )));
+        };
+        if terms.has_variable(term) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel definition {owner} expression {expression} carries a packed type with solver variables"
+            )));
+        }
+        Ok(reference)
+    }
+
+    for (owner, input) in program.owners.iter_mut().enumerate() {
+        for (expression, node) in input.nodes.iter_mut().enumerate() {
+            let kind = std::mem::replace(&mut node.kind, KernelOwnerNodeKind::Unknown);
+            node.kind = match kind {
+                KernelOwnerNodeKind::Known(ty) => KernelOwnerNodeKind::KnownPacked(import_closed(
+                    terms,
+                    &ty,
+                    owner,
+                    expression,
+                    "known value",
+                )?),
+                KernelOwnerNodeKind::Source(ty) => KernelOwnerNodeKind::SourcePacked(
+                    import_closed(terms, &ty, owner, expression, "SOURCE payload")?,
+                ),
+                KernelOwnerNodeKind::FixedAbiCall { result } => {
+                    KernelOwnerNodeKind::FixedAbiCallPacked {
+                        result: import_closed(
+                            terms,
+                            &result,
+                            owner,
+                            expression,
+                            "fixed ABI result",
+                        )?,
+                    }
+                }
+                KernelOwnerNodeKind::KnownPacked(reference) => KernelOwnerNodeKind::KnownPacked(
+                    validate_packed_closed(terms, reference, owner, expression)?,
+                ),
+                KernelOwnerNodeKind::SourcePacked(reference) => KernelOwnerNodeKind::SourcePacked(
+                    validate_packed_closed(terms, reference, owner, expression)?,
+                ),
+                KernelOwnerNodeKind::FixedAbiCallPacked { result } => {
+                    KernelOwnerNodeKind::FixedAbiCallPacked {
+                        result: validate_packed_closed(terms, result, owner, expression)?,
+                    }
+                }
+                other => other,
+            };
+        }
+    }
+    Ok(())
+}
+
+/// Capture the stable V14 structural basis while compatibility-only rich
+/// input rows still exist. Packed project input deliberately cannot be
+/// serialized back through that historical hash domain: its branded term
+/// references are process-local coordinates, not stable identities.
+pub(crate) fn project_definition_basis_fingerprints(
+    program: &KernelProjectProgramInput,
+    facts: &[KernelDefinitionFactsInput],
+) -> Result<Box<[[u8; 32]]>, KernelOwnerBuildError> {
+    if program.owners.len() != facts.len() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel project has {} owners but {} definition-fact tables",
+            program.owners.len(),
+            facts.len()
+        )));
+    }
+    for (owner, input) in program.owners.iter().enumerate() {
+        if let Some((expression, _)) = input.nodes.iter().enumerate().find(|(_, node)| {
+            matches!(
+                node.kind,
+                KernelOwnerNodeKind::KnownPacked(_)
+                    | KernelOwnerNodeKind::SourcePacked(_)
+                    | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
+            )
+        }) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel definition {owner} expression {expression} supplies an internal packed type before the stable V14 basis is sealed",
+            )));
+        }
+    }
+    let mut scratch = Vec::new();
+    program
+        .owners
+        .iter()
+        .zip(facts)
+        .map(|(owner, facts)| definition_basis_fingerprint_with_buffer(owner, facts, &mut scratch))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Vec::into_boxed_slice)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1557,7 +1707,8 @@ fn kernel_call_target_ref(kind: &KernelOwnerNodeKind) -> Option<KernelCallTarget
         KernelOwnerNodeKind::PureBuiltin { kind } => {
             Some(KernelCallTargetRef::PureBuiltin { kind: *kind })
         }
-        KernelOwnerNodeKind::FixedAbiCall { .. } => Some(KernelCallTargetRef::FixedAbi),
+        KernelOwnerNodeKind::FixedAbiCall { .. }
+        | KernelOwnerNodeKind::FixedAbiCallPacked { .. } => Some(KernelCallTargetRef::FixedAbi),
         KernelOwnerNodeKind::HostEffect { operation } => Some(KernelCallTargetRef::HostEffect {
             operation: operation.as_ref(),
         }),
@@ -1622,6 +1773,7 @@ fn kernel_call_input_role_ref<'a>(
             KernelOwnerNodeKind::RenderConstructor { .. }
             | KernelOwnerNodeKind::PureBuiltin { .. }
             | KernelOwnerNodeKind::FixedAbiCall { .. }
+            | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
             | KernelOwnerNodeKind::HostEffect { .. }
             | KernelOwnerNodeKind::FieldProjection { .. },
             KernelOwnerEdgeRole::AbiArgument { name },
@@ -2869,8 +3021,8 @@ pub enum KernelExpressionKindRef<'a> {
 impl<'a> From<&'a KernelOwnerNodeKind> for KernelExpressionKindRef<'a> {
     fn from(kind: &'a KernelOwnerNodeKind) -> Self {
         match kind {
-            KernelOwnerNodeKind::Known(_) => Self::Known,
-            KernelOwnerNodeKind::Source(_) => Self::Source,
+            KernelOwnerNodeKind::Known(_) | KernelOwnerNodeKind::KnownPacked(_) => Self::Known,
+            KernelOwnerNodeKind::Source(_) | KernelOwnerNodeKind::SourcePacked(_) => Self::Source,
             KernelOwnerNodeKind::Absent => Self::Absent,
             KernelOwnerNodeKind::Text => Self::Text,
             KernelOwnerNodeKind::TextTemplate => Self::TextTemplate,
@@ -2918,7 +3070,8 @@ impl<'a> From<&'a KernelOwnerNodeKind> for KernelExpressionKindRef<'a> {
             },
             KernelOwnerNodeKind::RenderConstructor { kind } => Self::RenderConstructor { kind },
             KernelOwnerNodeKind::PureBuiltin { kind } => Self::PureBuiltin { kind: *kind },
-            KernelOwnerNodeKind::FixedAbiCall { .. } => Self::FixedAbiCall,
+            KernelOwnerNodeKind::FixedAbiCall { .. }
+            | KernelOwnerNodeKind::FixedAbiCallPacked { .. } => Self::FixedAbiCall,
             KernelOwnerNodeKind::HostEffect { operation } => Self::HostEffect { operation },
             KernelOwnerNodeKind::Latest => Self::Latest,
             KernelOwnerNodeKind::When => Self::When,
@@ -3023,8 +3176,8 @@ pub enum KernelExpressionArtifactKind {
 impl From<&KernelOwnerNodeKind> for KernelExpressionArtifactKind {
     fn from(kind: &KernelOwnerNodeKind) -> Self {
         match kind {
-            KernelOwnerNodeKind::Known(_) => Self::Known,
-            KernelOwnerNodeKind::Source(_) => Self::Source,
+            KernelOwnerNodeKind::Known(_) | KernelOwnerNodeKind::KnownPacked(_) => Self::Known,
+            KernelOwnerNodeKind::Source(_) | KernelOwnerNodeKind::SourcePacked(_) => Self::Source,
             KernelOwnerNodeKind::Absent => Self::Absent,
             KernelOwnerNodeKind::Text => Self::Text,
             KernelOwnerNodeKind::TextTemplate => Self::TextTemplate,
@@ -3077,7 +3230,8 @@ impl From<&KernelOwnerNodeKind> for KernelExpressionArtifactKind {
                 Self::RenderConstructor { kind: kind.clone() }
             }
             KernelOwnerNodeKind::PureBuiltin { kind } => Self::PureBuiltin { kind: *kind },
-            KernelOwnerNodeKind::FixedAbiCall { .. } => Self::FixedAbiCall,
+            KernelOwnerNodeKind::FixedAbiCall { .. }
+            | KernelOwnerNodeKind::FixedAbiCallPacked { .. } => Self::FixedAbiCall,
             KernelOwnerNodeKind::HostEffect { operation } => Self::HostEffect {
                 operation: operation.clone(),
             },
@@ -5510,6 +5664,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             | KernelOwnerNodeKind::RenderConstructor { .. }
             | KernelOwnerNodeKind::PureBuiltin { .. }
             | KernelOwnerNodeKind::FixedAbiCall { .. }
+            | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
             | KernelOwnerNodeKind::HostEffect { .. }
             | KernelOwnerNodeKind::FieldProjection { .. } => {
                 if let Some(call) = self.call(expression) {
@@ -5737,6 +5892,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             | KernelOwnerNodeKind::RenderConstructor { .. }
             | KernelOwnerNodeKind::PureBuiltin { .. }
             | KernelOwnerNodeKind::FixedAbiCall { .. }
+            | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
             | KernelOwnerNodeKind::HostEffect { .. }
             | KernelOwnerNodeKind::FieldProjection { .. } => {
                 if let Some(call) = self.call(expression) {
@@ -6404,14 +6560,24 @@ fn build_definition_code_builder(
         );
         expression_kind_types.clear();
         for expression in &program.owners[owner_index].nodes {
-            let ty = match &expression.kind {
+            let term = match &expression.kind {
                 KernelOwnerNodeKind::Known(ty)
                 | KernelOwnerNodeKind::Source(ty)
-                | KernelOwnerNodeKind::FixedAbiCall { result: ty } => Some(ty),
+                | KernelOwnerNodeKind::FixedAbiCall { result: ty } => {
+                    Some(import_post_solve_type(artifact.terms_mut(), ty))
+                }
+                KernelOwnerNodeKind::KnownPacked(reference)
+                | KernelOwnerNodeKind::SourcePacked(reference)
+                | KernelOwnerNodeKind::FixedAbiCallPacked { result: reference } => Some(
+                    artifact.terms().resolve_type_ref(*reference).ok_or_else(|| {
+                        KernelSolveError::new(
+                            "kernel expression type reference belongs to another project authority",
+                        )
+                    })?,
+                ),
                 _ => None,
             };
-            expression_kind_types
-                .push(ty.map(|ty| import_post_solve_type(artifact.terms_mut(), ty)));
+            expression_kind_types.push(term);
         }
         declaration_flows.clear();
         for declaration in &definition_facts[owner_index].declarations {
@@ -8808,10 +8974,12 @@ fn merge_kernel_effects(
 
 fn local_expression_effect(kind: &KernelOwnerNodeKind) -> KernelEffectSummary {
     match kind {
-        KernelOwnerNodeKind::Source(_) => KernelEffectSummary {
-            emits_source: true,
-            ..KernelEffectSummary::default()
-        },
+        KernelOwnerNodeKind::Source(_) | KernelOwnerNodeKind::SourcePacked(_) => {
+            KernelEffectSummary {
+                emits_source: true,
+                ..KernelEffectSummary::default()
+            }
+        }
         KernelOwnerNodeKind::Hold
         | KernelOwnerNodeKind::Latest
         | KernelOwnerNodeKind::PureBuiltin {
@@ -9928,10 +10096,7 @@ fn project_call_facts_and_diagnostics(
                             ))))
                     && result_is_concrete,
                 span: presentation.span,
-                authored_site_digest_v4: boon_checked::checked_structural_call_site_digest_v4(
-                    &syntax.occurrence,
-                )
-                .map_err(KernelSolveError::new)?,
+                authored_site_digest_v4: syntax.authored_site_digest_v4,
             });
         }
         diagnostics.sort_unstable_by(|left, right| left.metadata.site().cmp(right.metadata.site()));
@@ -10512,10 +10677,26 @@ fn validate_definition_linker_facts(
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
     definition: Option<usize>,
+    call_digest_scratch: &mut Vec<u8>,
 ) -> Result<(), KernelOwnerBuildError> {
     let label = definition
         .map(|definition| format!("definition {definition}"))
         .unwrap_or_else(|| "standalone definition".to_owned());
+    for syntax in &facts.call_syntax {
+        let recomputed =
+            boon_syntax::checked_structural_call_site_digest_v4_from_parts_with_buffer(
+                &syntax.occurrence.source_unit_id,
+                &syntax.occurrence.route,
+                call_digest_scratch,
+            )
+            .map_err(KernelOwnerBuildError::new)?;
+        if recomputed != syntax.authored_site_digest_v4 {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel {label} call `{}` parser-sealed V4 identity differs from its rich occurrence",
+                syntax.function,
+            )));
+        }
+    }
     let relocations = &facts.relocations;
     if !relocations.is_empty() {
         if !relocations.is_complete_for(input.nodes.len(), facts.statements.len()) {
@@ -10616,6 +10797,7 @@ fn validate_definition_linker_facts(
                 KernelExpressionSemanticPayload::LexicalPath(_) => matches!(
                     &node.kind,
                     KernelOwnerNodeKind::Known(_)
+                        | KernelOwnerNodeKind::KnownPacked(_)
                         | KernelOwnerNodeKind::FormalRead { .. }
                         | KernelOwnerNodeKind::ContextRead { .. }
                         | KernelOwnerNodeKind::LexicalRead { .. }
@@ -10655,6 +10837,7 @@ fn validate_definition_linker_facts(
                     | KernelOwnerNodeKind::RenderConstructor { .. }
                     | KernelOwnerNodeKind::PureBuiltin { .. }
                     | KernelOwnerNodeKind::FixedAbiCall { .. }
+                    | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
                     | KernelOwnerNodeKind::HostEffect { .. }
             )
         })
@@ -10704,6 +10887,7 @@ fn validate_definition_linker_facts(
                     | KernelOwnerNodeKind::RenderConstructor { .. }
                     | KernelOwnerNodeKind::PureBuiltin { .. }
                     | KernelOwnerNodeKind::FixedAbiCall { .. }
+                    | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
                     | KernelOwnerNodeKind::HostEffect { .. }
             )
         {
@@ -11399,7 +11583,8 @@ fn compile_owner_program_with_definition_facts_and_text(
     facts: &KernelDefinitionFactsInput,
     text: ProjectTextSnapshot,
 ) -> Result<KernelOwnerProgram, KernelOwnerBuildError> {
-    validate_definition_linker_facts(input, facts, None)?;
+    let mut call_digest_scratch = Vec::new();
+    validate_definition_linker_facts(input, facts, None, &mut call_digest_scratch)?;
     let basis_fingerprint_v14 = definition_basis_fingerprint(input, facts)?;
     if !input.external_expressions.is_empty() {
         return Err(KernelOwnerBuildError::new(
@@ -11459,6 +11644,7 @@ fn compile_owner_program_with_definition_facts_and_text(
     let result = checked_expression_index(input.result, input.nodes.len(), "owner result")?;
     let mut builder = ComponentProgramBuilder::with_text(text.clone());
     let mut mode_builder = ModeProgramBuilder::default();
+    let mut packed_input_imports = TypeTermImportScratch::default();
     let formal_static_variants = vec![None; input.formal_count as usize];
     let formal_dependent_expressions = [owner_expressions_depend_on_formals(input)];
     let formal_dependent_results = [formal_dependent_expressions[0][result]];
@@ -11490,6 +11676,7 @@ fn compile_owner_program_with_definition_facts_and_text(
         external_variables: None,
         syntax_selected_calls: None,
         direct_summaries: &[],
+        packed_input_types: None,
     };
     let specialization = OwnerSpecialization {
         static_variants: principal.static_variants.clone(),
@@ -11503,6 +11690,8 @@ fn compile_owner_program_with_definition_facts_and_text(
     };
     let module = compile_residual_type_module(
         &text,
+        None,
+        &mut packed_input_imports,
         KernelOwnerId(0),
         input,
         None,
@@ -12220,7 +12409,10 @@ fn collect_resource_artifacts(
                 owner.nodes.len(),
                 "kernel SOURCE expression",
             )?;
-            if !matches!(owner.nodes[expression].kind, KernelOwnerNodeKind::Source(_)) {
+            if !matches!(
+                owner.nodes[expression].kind,
+                KernelOwnerNodeKind::Source(_) | KernelOwnerNodeKind::SourcePacked(_)
+            ) {
                 return Err(KernelOwnerBuildError::new(format!(
                     "kernel SOURCE row {index} expression {expression} is not a literal SOURCE"
                 )));
@@ -12389,7 +12581,10 @@ fn validate_project_resource_inputs(
             owner.nodes.len(),
             "kernel SOURCE expression",
         )?;
-        if !matches!(owner.nodes[expression].kind, KernelOwnerNodeKind::Source(_)) {
+        if !matches!(
+            owner.nodes[expression].kind,
+            KernelOwnerNodeKind::Source(_) | KernelOwnerNodeKind::SourcePacked(_)
+        ) {
             return Err(KernelOwnerBuildError::new(format!(
                 "kernel SOURCE row {index} expression {expression} is not a literal SOURCE"
             )));
@@ -13266,7 +13461,10 @@ fn collect_call_artifacts(
                 KernelOwnerNodeKind::PureBuiltin { kind } => {
                     (KernelCallTarget::PureBuiltin { kind: *kind }, true)
                 }
-                KernelOwnerNodeKind::FixedAbiCall { .. } => (KernelCallTarget::FixedAbi, true),
+                KernelOwnerNodeKind::FixedAbiCall { .. }
+                | KernelOwnerNodeKind::FixedAbiCallPacked { .. } => {
+                    (KernelCallTarget::FixedAbi, true)
+                }
                 KernelOwnerNodeKind::HostEffect { operation } => (
                     KernelCallTarget::HostEffect {
                         operation: operation.clone(),
@@ -13330,6 +13528,7 @@ fn validate_project_call_inputs(
             KernelOwnerNodeKind::RenderConstructor { .. }
             | KernelOwnerNodeKind::PureBuiltin { .. }
             | KernelOwnerNodeKind::FixedAbiCall { .. }
+            | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
             | KernelOwnerNodeKind::HostEffect { .. }
             | KernelOwnerNodeKind::FieldProjection { .. } => true,
             _ => continue,
@@ -13368,6 +13567,7 @@ fn collect_project_call_solve_rows(
                     | KernelOwnerNodeKind::RenderConstructor { .. }
                     | KernelOwnerNodeKind::PureBuiltin { .. }
                     | KernelOwnerNodeKind::FixedAbiCall { .. }
+                    | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
                     | KernelOwnerNodeKind::HostEffect { .. }
                     | KernelOwnerNodeKind::FieldProjection { .. }
             )
@@ -13730,6 +13930,35 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
     abi: Arc<crate::KernelAbiInput>,
     text: ProjectTextSnapshot,
 ) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
+    let basis_fingerprints = Arc::from(project_definition_basis_fingerprints(&input, &facts)?);
+    let terms = crate::TypeTermArena::with_text(text.clone());
+    compile_project_program_with_definition_facts_abi_text_and_terms(
+        input,
+        facts,
+        abi,
+        text,
+        terms,
+        0,
+        basis_fingerprints,
+    )
+}
+
+/// Compile one project by consuming the exact mutable type authority prepared
+/// for this revision.
+///
+/// Compatibility entry points above still create an empty arena from their
+/// frozen text snapshot. Direct packed input instead interns its closed roots
+/// before this call and moves the same arena here; there is no cloneable or
+/// separately frozen prelude type store between input and solver.
+pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
+    input: Arc<KernelProjectProgramInput>,
+    facts: Arc<[KernelDefinitionFactsInput]>,
+    abi: Arc<crate::KernelAbiInput>,
+    text: ProjectTextSnapshot,
+    terms: crate::TypeTermArena,
+    packed_input_term_count: usize,
+    basis_fingerprints: Arc<[[u8; 32]]>,
+) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
     let program = Arc::clone(&input);
     let input = input.as_ref();
     if facts.len() != input.owners.len() {
@@ -13737,6 +13966,19 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
             "kernel project has {} owners but {} definition-fact tables",
             input.owners.len(),
             facts.len()
+        )));
+    }
+    if basis_fingerprints.len() != input.owners.len() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel project has {} owners but {} definition-basis fingerprints",
+            input.owners.len(),
+            basis_fingerprints.len()
+        )));
+    }
+    if packed_input_term_count > terms.len() {
+        return Err(KernelOwnerBuildError::new(format!(
+            "kernel packed-input term prefix {packed_input_term_count} exceeds the {}-term source arena",
+            terms.len(),
         )));
     }
     let validate_project_declaration = |reference: KernelDeclarationReference,
@@ -13769,8 +14011,14 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
         }
         Ok(())
     };
+    let mut call_digest_scratch = Vec::new();
     for (definition, facts) in facts.iter().enumerate() {
-        validate_definition_linker_facts(&input.owners[definition], facts, Some(definition))?;
+        validate_definition_linker_facts(
+            &input.owners[definition],
+            facts,
+            Some(definition),
+            &mut call_digest_scratch,
+        )?;
         if let Some(reference) = facts.linkage.public_declaration {
             validate_project_declaration(
                 reference,
@@ -13828,11 +14076,11 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
             validate_resource_statement_owner(list.statement, "LIST statement")?;
         }
     }
-    let mut builder = ComponentProgramBuilder::with_text(text.clone());
+    let mut builder = ComponentProgramBuilder::with_terms(terms);
     let mut mode_builder = ModeProgramBuilder::default();
     let mut invocations = HashMap::new();
     let mut specializations = HashMap::new();
-    let mut residual_modules = HashMap::new();
+    let mut residual_modules = ResidualModuleCache::new(packed_input_term_count);
     let mut compile_work = KernelCompileWork {
         definition_modules: input.owners.len() as u64,
         principal_expressions: input
@@ -13963,6 +14211,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
             external_variables: None,
             syntax_selected_calls: None,
             direct_summaries: &direct_summaries,
+            packed_input_types: None,
         };
         let mut stack = vec![owner_id];
         let specialization = OwnerSpecialization {
@@ -13977,6 +14226,8 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
         };
         let module = compile_residual_type_module(
             &text,
+            Some(builder.terms()),
+            &mut residual_modules.packed_type_imports,
             owner_id,
             owner,
             Some(input),
@@ -14024,7 +14275,6 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
         }
     }
     let modes = mode_builder.solve();
-    let mut basis_fingerprint_scratch = Vec::new();
     let owners = input
         .owners
         .iter()
@@ -14069,11 +14319,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
                     &syntax_discriminated_call_root_outputs[owner_index],
                 ),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
-                basis_fingerprint_v14: definition_basis_fingerprint_with_buffer(
-                    owner,
-                    &facts[owner_index],
-                    &mut basis_fingerprint_scratch,
-                )?,
+                basis_fingerprint_v14: basis_fingerprints[owner_index],
             })
         })
         .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?;
@@ -14086,7 +14332,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
                 compile_work.acyclic_residual_frames.saturating_add(1);
         }
     }
-    for (key, module) in &residual_modules {
+    for (key, module) in &residual_modules.modules {
         let operations = module.component.operation_count() as u64;
         let frames = frame_counts
             .get(&Arc::as_ptr(&module.component))
@@ -14260,6 +14506,21 @@ struct ResidualTypeModule {
     calls: Box<[usize]>,
 }
 
+#[derive(Debug, Default)]
+struct ResidualModuleCache {
+    modules: HashMap<SpecializationKey, Arc<ResidualTypeModule>>,
+    packed_type_imports: TypeTermImportScratch,
+}
+
+impl ResidualModuleCache {
+    fn new(packed_input_term_count: usize) -> Self {
+        Self {
+            modules: HashMap::new(),
+            packed_type_imports: TypeTermImportScratch::with_source_limit(packed_input_term_count),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct ModeVariableId(u32);
 
@@ -14400,7 +14661,8 @@ fn allocate_owner_instance(
     owner: &KernelOwnerProgramInput,
     formal_static_variants: &[Option<StaticVariantSet>],
 ) -> OwnerInstance {
-    let static_variants = infer_static_variants(text, owner, formal_static_variants);
+    let static_variants =
+        infer_static_variants(text, builder.terms(), owner, formal_static_variants);
     allocate_owner_instance_with_static_variants(
         builder,
         mode_builder,
@@ -14550,6 +14812,11 @@ fn allocate_invocation_owner_instance(
     )
 }
 
+#[derive(Clone, Copy)]
+struct PackedInputTypeProjection<'a> {
+    imports: &'a TypeTermImportSession<'a>,
+}
+
 struct OwnerCompileContext<'a> {
     initial_state_surface: bool,
     text: &'a ProjectTextSnapshot,
@@ -14570,6 +14837,11 @@ struct OwnerCompileContext<'a> {
     external_variables: Option<&'a [TypeVariableId]>,
     syntax_selected_calls: Option<&'a [bool]>,
     direct_summaries: &'a [Option<Arc<CompiledDirectSummary>>],
+    /// Closed project-input roots relocated once into a separately owned
+    /// residual module. Principal compilation uses the original authority and
+    /// therefore leaves this empty. The scoped import session prevents another
+    /// module from advancing the reusable table while these IDs are live.
+    packed_input_types: Option<PackedInputTypeProjection<'a>>,
 }
 
 fn validate_owner_input(
@@ -14625,6 +14897,7 @@ fn edge_static_variants(
 
 fn infer_static_variants(
     text: &ProjectTextSnapshot,
+    terms: &crate::TypeTermArena,
     owner: &KernelOwnerProgramInput,
     formal_static_variants: &[Option<StaticVariantSet>],
 ) -> Vec<Option<StaticVariantSet>> {
@@ -14639,6 +14912,15 @@ fn infer_static_variants(
                     }
                 }),
             )),
+            KernelOwnerNodeKind::KnownPacked(reference)
+            | KernelOwnerNodeKind::SourcePacked(reference) => terms
+                .resolve_type_ref(*reference)
+                .and_then(|term| match terms.term(term) {
+                    TypeTerm::VariantSet(values) => {
+                        Some(static_variant_set(values.iter().map(VariantTerm::tag)))
+                    }
+                    _ => None,
+                }),
             KernelOwnerNodeKind::Tag(tag) => {
                 Some(static_variant_set([static_variant_symbol(text, tag)]))
             }
@@ -15079,8 +15361,71 @@ fn owner_expressions_depend_on_formals(owner: &KernelOwnerProgramInput) -> Box<[
     }
 }
 
+fn import_residual_packed_input_types<'a>(
+    builder: &mut ComponentProgramBuilder,
+    source: &'a crate::TypeTermArena,
+    owner: &KernelOwnerProgramInput,
+    specialization: &OwnerSpecialization,
+    invocation_dependencies: Option<&[bool]>,
+    transparent_type_providers: Option<&[Option<usize>]>,
+    term_cache: &'a mut TypeTermImportScratch,
+) -> Result<Option<TypeTermImportSession<'a>>, KernelOwnerBuildError> {
+    let packed_reference = |index: usize| {
+        if invocation_dependencies.is_some_and(|dependencies| !dependencies[index])
+            || transparent_type_providers.is_some_and(|providers| providers[index].is_some())
+        {
+            return None;
+        }
+        owner.nodes.get(index).and_then(|node| match node.kind {
+            KernelOwnerNodeKind::KnownPacked(reference)
+            | KernelOwnerNodeKind::SourcePacked(reference)
+            | KernelOwnerNodeKind::FixedAbiCallPacked { result: reference } => Some(reference),
+            _ => None,
+        })
+    };
+    if !specialization
+        .reachable
+        .iter()
+        .copied()
+        .any(|index| packed_reference(index).is_some())
+    {
+        return Ok(None);
+    }
+
+    let mut session = term_cache.begin(source, builder.terms());
+    for reference in specialization
+        .reachable
+        .iter()
+        .copied()
+        .filter_map(packed_reference)
+    {
+        let term = source.resolve_type_ref(reference).ok_or_else(|| {
+            KernelOwnerBuildError::new(
+                "residual module closed type belongs to another project authority",
+            )
+        })?;
+        if source.has_variable(term) {
+            return Err(KernelOwnerBuildError::new(
+                "residual module project-input type unexpectedly contains solver variables",
+            ));
+        }
+        if session.imported_ref(builder.terms(), reference).is_none() {
+            builder.terms_mut().import_mapped_term_reusing(
+                source,
+                term,
+                &mut |_| unreachable!("closed project-input type has no variable"),
+                &mut session,
+                false,
+            );
+        }
+    }
+    Ok(Some(session))
+}
+
 fn compile_residual_type_module(
     text: &ProjectTextSnapshot,
+    packed_input_source: Option<&crate::TypeTermArena>,
+    packed_input_imports: &mut TypeTermImportScratch,
     owner_id: KernelOwnerId,
     owner: &KernelOwnerProgramInput,
     project: Option<&KernelProjectProgramInput>,
@@ -15092,8 +15437,6 @@ fn compile_residual_type_module(
     invocation_dependencies: Option<&[bool]>,
     initial_state_surface: bool,
 ) -> Result<Arc<ResidualTypeModule>, KernelOwnerBuildError> {
-    let mut builder = ComponentProgramBuilder::with_text(text.clone());
-    let mut mode_builder = ModeProgramBuilder::default();
     let residual_transparent_type_providers = invocation_dependencies.map(|dependencies| {
         specialization
             .transparent_type_providers
@@ -15108,6 +15451,22 @@ fn compile_residual_type_module(
             })
             .collect::<Vec<_>>()
     });
+    let mut builder = ComponentProgramBuilder::with_text(text.clone());
+    let packed_input_types = packed_input_source
+        .map(|source| {
+            import_residual_packed_input_types(
+                &mut builder,
+                source,
+                owner,
+                specialization,
+                invocation_dependencies,
+                residual_transparent_type_providers.as_deref(),
+                packed_input_imports,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let mut mode_builder = ModeProgramBuilder::default();
     let local = allocate_owner_instance_with_static_variants(
         &mut builder,
         &mut mode_builder,
@@ -15141,10 +15500,13 @@ fn compile_residual_type_module(
         external_variables: Some(&external_variables),
         syntax_selected_calls: Some(&specialization.syntax_selected_calls),
         direct_summaries: &[],
+        packed_input_types: packed_input_types
+            .as_ref()
+            .map(|imports| PackedInputTypeProjection { imports }),
     };
     let mut invocations = HashMap::new();
     let mut specializations = HashMap::new();
-    let mut residual_modules = HashMap::new();
+    let mut residual_modules = ResidualModuleCache::default();
     let mut compile_work = KernelCompileWork::default();
     let mut stack = vec![owner_id];
     let mut calls = Vec::new();
@@ -15318,6 +15680,7 @@ fn specialize_owner(
     specializations: &mut HashMap<SpecializationKey, OwnerSpecialization>,
     compile_work: &mut KernelCompileWork,
     text: &ProjectTextSnapshot,
+    terms: &crate::TypeTermArena,
     project: &KernelProjectProgramInput,
     formal_dependent_expressions: &[Box<[bool]>],
     target: KernelOwnerId,
@@ -15333,6 +15696,7 @@ fn specialize_owner(
         specializations,
         compile_work,
         text,
+        terms,
         project,
         formal_dependent_expressions,
         target,
@@ -15345,6 +15709,7 @@ fn specialize_owner_static(
     specializations: &mut HashMap<SpecializationKey, OwnerSpecialization>,
     compile_work: &mut KernelCompileWork,
     text: &ProjectTextSnapshot,
+    terms: &crate::TypeTermArena,
     project: &KernelProjectProgramInput,
     formal_dependent_expressions: &[Box<[bool]>],
     target: KernelOwnerId,
@@ -15364,7 +15729,7 @@ fn specialize_owner_static(
             compile_work.reused_specialization_plans.saturating_add(1);
         return Ok((key, specialization.clone()));
     }
-    let static_variants = infer_static_variants(text, owner, &formal_static_variants);
+    let static_variants = infer_static_variants(text, terms, owner, &formal_static_variants);
     let result =
         checked_expression_index(owner.result, owner.nodes.len(), "specialized owner result")?;
     let reachable = reachable_owner_nodes(text, owner, result, &static_variants)
@@ -15414,7 +15779,7 @@ fn instantiate_owner(
     mode_builder: &mut ModeProgramBuilder,
     invocations: &mut HashMap<InvocationKey, OwnerInstance>,
     specializations: &mut HashMap<SpecializationKey, OwnerSpecialization>,
-    residual_modules: &mut HashMap<SpecializationKey, Arc<ResidualTypeModule>>,
+    residual_modules: &mut ResidualModuleCache,
     compile_work: &mut KernelCompileWork,
     text: &ProjectTextSnapshot,
     project: &KernelProjectProgramInput,
@@ -15502,11 +15867,13 @@ fn instantiate_owner(
                 .filter(|index| !expression_dependencies[**index])
                 .count() as u64,
         );
-    let module = if let Some(module) = residual_modules.get(&specialization_key) {
+    let module = if let Some(module) = residual_modules.modules.get(&specialization_key) {
         Arc::clone(module)
     } else {
         let module = compile_residual_type_module(
             text,
+            Some(builder.terms()),
+            &mut residual_modules.packed_type_imports,
             target,
             owner,
             Some(project),
@@ -15525,7 +15892,9 @@ fn instantiate_owner(
         compile_work.residual_module_terms = compile_work
             .residual_module_terms
             .saturating_add(module.component.terms().len() as u64);
-        residual_modules.insert(specialization_key, Arc::clone(&module));
+        residual_modules
+            .modules
+            .insert(specialization_key, Arc::clone(&module));
         module
     };
     let external_variables = principal_external_variables(owner, project, principals)?;
@@ -15551,6 +15920,7 @@ fn instantiate_owner(
             external_variables: None,
             syntax_selected_calls: Some(&specialization.syntax_selected_calls),
             direct_summaries,
+            packed_input_types: None,
         };
         append_residual_type_frame(builder, &module, &instance, &external_variables)?;
         compile_work.residual_frames = compile_work.residual_frames.saturating_add(1);
@@ -15625,6 +15995,9 @@ fn direct_result_summary_supported(
     let supported = match &node.kind {
         KernelOwnerNodeKind::Known(ty) | KernelOwnerNodeKind::Source(ty) => {
             type_is_recursively_closed(ty)
+        }
+        KernelOwnerNodeKind::KnownPacked(_) | KernelOwnerNodeKind::SourcePacked(_) => {
+            node.inputs.is_empty()
         }
         KernelOwnerNodeKind::Absent
         | KernelOwnerNodeKind::Text
@@ -16093,6 +16466,11 @@ impl DirectSummaryPlanCompiler<'_> {
                     let value = self.builder.terms_mut().import_checked_type(ty, &mut |_| {
                         unreachable!("compiled direct-summary ABI type is closed")
                     });
+                    Some(term_value(self, value))
+                }
+                KernelOwnerNodeKind::KnownPacked(reference)
+                | KernelOwnerNodeKind::SourcePacked(reference) => {
+                    let value = self.builder.terms().resolve_type_ref(*reference)?;
                     Some(term_value(self, value))
                 }
                 KernelOwnerNodeKind::Absent => {
@@ -18040,12 +18418,34 @@ fn emit_compiled_direct_summary(
     Ok(())
 }
 
+fn resolve_packed_input_type(
+    builder: &ComponentProgramBuilder,
+    context: &OwnerCompileContext<'_>,
+    reference: crate::KernelTypeRef,
+    index: usize,
+    label: &str,
+) -> Result<TypeTermId, KernelOwnerBuildError> {
+    builder
+        .terms()
+        .resolve_type_ref(reference)
+        .or_else(|| {
+            context
+                .packed_input_types
+                .and_then(|types| types.imports.imported_ref(builder.terms(), reference))
+        })
+        .ok_or_else(|| {
+            KernelOwnerBuildError::new(format!(
+                "kernel owner node {index} carries a {label} from another project authority"
+            ))
+        })
+}
+
 fn compile_node(
     builder: &mut ComponentProgramBuilder,
     mode_builder: &mut ModeProgramBuilder,
     invocations: &mut HashMap<InvocationKey, OwnerInstance>,
     specializations: &mut HashMap<SpecializationKey, OwnerSpecialization>,
-    residual_modules: &mut HashMap<SpecializationKey, Arc<ResidualTypeModule>>,
+    residual_modules: &mut ResidualModuleCache,
     compile_work: &mut KernelCompileWork,
     context: &OwnerCompileContext<'_>,
     stack: &mut Vec<KernelOwnerId>,
@@ -18067,6 +18467,12 @@ fn compile_node(
             let provider = builder
                 .terms_mut()
                 .import_checked_type(ty, &mut |_| unreachable!("closed ABI type has no variable"));
+            builder.add_publish(output, [provider], PublishMode::Replace);
+        }
+        KernelOwnerNodeKind::KnownPacked(reference)
+        | KernelOwnerNodeKind::SourcePacked(reference) => {
+            let provider =
+                resolve_packed_input_type(builder, context, *reference, index, "closed type")?;
             builder.add_publish(output, [provider], PublishMode::Replace);
         }
         KernelOwnerNodeKind::Absent => {
@@ -18516,6 +18922,7 @@ fn compile_node(
                 specializations,
                 compile_work,
                 context.text,
+                builder.terms(),
                 project,
                 context.formal_dependent_expressions,
                 *target,
@@ -19024,6 +19431,16 @@ fn compile_node(
             let result = builder.terms_mut().import_checked_type(result, &mut |_| {
                 unreachable!("closed fixed ABI type has no variable")
             });
+            builder.add_publish(output, [result], PublishMode::Replace);
+        }
+        KernelOwnerNodeKind::FixedAbiCallPacked { result } => {
+            if !node.inputs.is_empty() {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel owner node {index} fixed ABI call has explicit inputs"
+                )));
+            }
+            let result =
+                resolve_packed_input_type(builder, context, *result, index, "fixed ABI result")?;
             builder.add_publish(output, [result], PublishMode::Replace);
         }
         KernelOwnerNodeKind::HostEffect { operation } => {
@@ -19610,7 +20027,9 @@ fn node_mode_equation(
             "kernel owner node {node_index} user-call mode must come from its invocation"
         ))),
         KernelOwnerNodeKind::Known(_)
+        | KernelOwnerNodeKind::KnownPacked(_)
         | KernelOwnerNodeKind::Source(_)
+        | KernelOwnerNodeKind::SourcePacked(_)
         | KernelOwnerNodeKind::Absent
         | KernelOwnerNodeKind::Text
         | KernelOwnerNodeKind::TextTemplate
@@ -19624,6 +20043,7 @@ fn node_mode_equation(
         | KernelOwnerNodeKind::RenderConstructor { .. }
         | KernelOwnerNodeKind::PureBuiltin { .. }
         | KernelOwnerNodeKind::FixedAbiCall { .. }
+        | KernelOwnerNodeKind::FixedAbiCallPacked { .. }
         | KernelOwnerNodeKind::HostEffect { .. }
         | KernelOwnerNodeKind::Then
         | KernelOwnerNodeKind::Infix { .. }
@@ -22815,16 +23235,20 @@ mod tests {
             external_expressions: Box::new([]),
             result: KernelExpressionId(2),
         };
+        let occurrence = boon_syntax::StableOccurrenceKey {
+            source_unit_id: boon_syntax::SourceUnitId::from_path("call-surface.bn").unwrap(),
+            route: boon_syntax::StableOccurrenceRoute {
+                owner: None,
+                statement_route: Vec::new(),
+                expression_route: Vec::new(),
+            },
+        };
+        let authored_site_digest_v4 =
+            boon_checked::checked_structural_call_site_digest_v4(&occurrence).unwrap();
         let syntax = KernelCallSyntaxInput {
             expression: KernelExpressionId(2),
-            occurrence: boon_syntax::StableOccurrenceKey {
-                source_unit_id: boon_syntax::SourceUnitId::from_path("call-surface.bn").unwrap(),
-                route: boon_syntax::StableOccurrenceRoute {
-                    owner: None,
-                    statement_route: Vec::new(),
-                    expression_route: Vec::new(),
-                },
-            },
+            occurrence,
+            authored_site_digest_v4,
             function: "Text/concat".into(),
             pipe_input: Some(KernelExpressionId(0)),
             arguments: vec![KernelCallSyntaxArgument {
@@ -22841,6 +23265,12 @@ mod tests {
             call_syntax: vec![syntax.clone()].into_boxed_slice(),
             ..KernelDefinitionFactsInput::default()
         };
+        let mut forged_digest = facts.clone();
+        forged_digest.call_syntax[0].authored_site_digest_v4 = [0xa5; 32];
+        let error = compile_owner_program_with_definition_facts(&input, &forged_digest)
+            .expect_err("a call identity from another occurrence must fail closed");
+        assert!(error.to_string().contains("parser-sealed V4 identity"));
+
         let solved = compile_owner_program_with_definition_facts(&input, &facts)
             .unwrap()
             .solve()
@@ -22888,6 +23318,11 @@ mod tests {
         let mut moved_occurrence = facts.clone();
         moved_occurrence.call_syntax[0].occurrence.source_unit_id =
             boon_syntax::SourceUnitId::from_path("moved/call-surface.bn").unwrap();
+        moved_occurrence.call_syntax[0].authored_site_digest_v4 =
+            boon_checked::checked_structural_call_site_digest_v4(
+                &moved_occurrence.call_syntax[0].occurrence,
+            )
+            .unwrap();
         let moved_occurrence =
             compile_owner_program_with_definition_facts(&input, &moved_occurrence)
                 .unwrap()
@@ -26828,12 +27263,15 @@ mod tests {
                 expression_route: Vec::new(),
             },
         };
+        let authored_site_digest_v4 =
+            boon_checked::checked_structural_call_site_digest_v4(&occurrence).unwrap();
         let facts = [
             KernelDefinitionFactsInput::default(),
             KernelDefinitionFactsInput {
                 call_syntax: vec![KernelCallSyntaxInput {
                     expression: KernelExpressionId(0),
                     occurrence,
+                    authored_site_digest_v4,
                     function: "List/length".into(),
                     pipe_input: Some(KernelExpressionId(1)),
                     arguments: Box::new([]),
@@ -26994,10 +27432,13 @@ mod tests {
                 expression_route: Vec::new(),
             },
         };
+        let authored_site_digest_v4 =
+            boon_checked::checked_structural_call_site_digest_v4(&occurrence).unwrap();
         let facts = [KernelDefinitionFactsInput {
             call_syntax: vec![KernelCallSyntaxInput {
                 expression: KernelExpressionId(2),
                 occurrence,
+                authored_site_digest_v4,
                 function: "List/append".into(),
                 pipe_input: Some(KernelExpressionId(0)),
                 arguments: vec![KernelCallSyntaxArgument {
@@ -27437,7 +27878,9 @@ mod tests {
             &crate::KernelAbiInput::default(),
         )
         .unwrap();
-        let wrapper_variants = infer_static_variants(&wrapper_text, &wrapper, &[None]);
+        let wrapper_terms = crate::TypeTermArena::with_text(wrapper_text.clone());
+        let wrapper_variants =
+            infer_static_variants(&wrapper_text, &wrapper_terms, &wrapper, &[None]);
         assert!(
             wrapper_variants[0].is_none(),
             "the nested selector must remain unknown to the compile-time root-tag shortcut",

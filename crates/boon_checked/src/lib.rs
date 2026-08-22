@@ -2377,23 +2377,14 @@ pub enum CheckedImageRowDomainV2 {
     Diagnostic,
 }
 
-#[derive(Serialize)]
-struct CheckedStructuralCallSiteDigestV4<'a> {
-    occurrence: &'a StableOccurrenceKey,
-}
-
 /// Shared structural-call digest used by direct kernel publication and the
-/// independent rich-row replay. Keeping this at the checked-model boundary
-/// prevents the two publishers from silently choosing different call keys.
+/// independent rich-row replay. The parser-owned syntax model is the hashing
+/// authority so it can seal the same digest without cloning a rich key.
 #[doc(hidden)]
 pub fn checked_structural_call_site_digest_v4(
     occurrence: &StableOccurrenceKey,
 ) -> Result<[u8; 32], String> {
-    boon_contract::canonical_serde_hash_v1(
-        b"boon.checked-structural-call-site.v4\0",
-        &CheckedStructuralCallSiteDigestV4 { occurrence },
-    )
-    .map_err(|error| format!("failed to hash checked call site: {error}"))
+    boon_syntax::checked_structural_call_site_digest_v4(occurrence)
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -4172,6 +4163,57 @@ fn compare_joined_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syntax_owned_structural_call_digest_v4_is_byte_identical_to_legacy_checked_hash() {
+        #[derive(Serialize)]
+        struct LegacyCheckedStructuralCallSiteDigestV4<'a> {
+            occurrence: &'a StableOccurrenceKey,
+        }
+
+        let occurrence = StableOccurrenceKey {
+            source_unit_id: boon_syntax::SourceUnitId::from_path("app/RUN.bn").unwrap(),
+            route: boon_syntax::StableOccurrenceRoute {
+                owner: Some(boon_syntax::StableItemRoute::__parser_from_segments(vec![
+                    boon_syntax::StableItemRouteSegment {
+                        kind: boon_syntax::UnitItemKind::Function,
+                        names: vec!["render".to_owned()],
+                        matching_sibling_ordinal: 0,
+                    },
+                ])),
+                statement_route: vec![boon_syntax::StableStatementRouteSegment {
+                    kind: boon_syntax::StableStatementKind::Expression,
+                    names: Vec::new(),
+                    matching_sibling_reverse_ordinal: 1,
+                }],
+                expression_route: vec![boon_syntax::StableExpressionRouteSegment {
+                    role: boon_syntax::StableExpressionChildRole::CallArgument,
+                    label: Some("value".to_owned()),
+                    matching_sibling_reverse_ordinal: 0,
+                }],
+            },
+        };
+        let legacy = boon_contract::canonical_serde_hash_v1(
+            b"boon.checked-structural-call-site.v4\0",
+            &LegacyCheckedStructuralCallSiteDigestV4 {
+                occurrence: &occurrence,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            checked_structural_call_site_digest_v4(&occurrence).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            boon_syntax::checked_structural_call_site_digest_v4_from_parts(
+                &occurrence.source_unit_id,
+                &occurrence.route,
+            )
+            .unwrap(),
+            legacy
+        );
+    }
 
     fn tag(name: &str) -> Variant {
         Variant::Tag(name.to_owned())

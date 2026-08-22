@@ -29,6 +29,162 @@ pub struct DiagnosticTextId(u32);
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TypeTermId(pub u32);
 
+#[derive(Clone, Copy, Debug)]
+struct StampedTypeTermImport {
+    generation: u32,
+    imported: TypeTermId,
+}
+
+impl Default for StampedTypeTermImport {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            imported: TypeTermId(0),
+        }
+    }
+}
+
+/// Construction-only source-term remap reused across residual modules.
+///
+/// The vector is bounded by the immutable packed-input prefix captured before
+/// the solver starts extending the source arena. Starting a new destination
+/// advances a generation instead of allocating or clearing that prefix for
+/// every residual module.
+#[derive(Debug, Default)]
+pub(crate) struct TypeTermImportScratch {
+    generation: u32,
+    source_limit: usize,
+    slots: Vec<StampedTypeTermImport>,
+}
+
+impl TypeTermImportScratch {
+    pub(crate) const fn with_source_limit(source_limit: usize) -> Self {
+        Self {
+            generation: 0,
+            source_limit,
+            slots: Vec::new(),
+        }
+    }
+
+    pub(crate) fn begin<'a>(
+        &'a mut self,
+        source: &'a TypeTermArena,
+        destination: &TypeTermArena,
+    ) -> TypeTermImportSession<'a> {
+        assert!(
+            self.source_limit <= source.len(),
+            "packed-input term prefix exceeds its source arena"
+        );
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            for slot in &mut self.slots {
+                slot.generation = 0;
+            }
+            self.generation = 1;
+        }
+        self.slots
+            .resize(self.source_limit, StampedTypeTermImport::default());
+        TypeTermImportSession {
+            generation: self.generation,
+            source_limit: self.source_limit,
+            source,
+            destination_authority: destination.authority,
+            scratch: self,
+        }
+    }
+}
+
+/// One scoped destination mapping borrowed from the reusable import scratch.
+///
+/// Holding the mutable scratch borrow prevents a second module from advancing
+/// the generation while the current residual compiler can still resolve its
+/// imported roots.
+#[derive(Debug)]
+pub(crate) struct TypeTermImportSession<'a> {
+    generation: u32,
+    source_limit: usize,
+    source: &'a TypeTermArena,
+    destination_authority: TypeStoreAuthorityId,
+    scratch: &'a mut TypeTermImportScratch,
+}
+
+impl TypeTermImportSession<'_> {
+    pub(crate) fn imported_ref(
+        &self,
+        destination: &TypeTermArena,
+        reference: KernelTypeRef,
+    ) -> Option<TypeTermId> {
+        if self.scratch.generation != self.generation
+            || destination.authority != self.destination_authority
+        {
+            return None;
+        }
+        let source = self.source.resolve_type_ref(reference)?;
+        if source.0 as usize >= self.source_limit {
+            return None;
+        }
+        let slot = self.scratch.slots.get(source.0 as usize)?;
+        (slot.generation == self.generation).then_some(slot.imported)
+    }
+
+    fn assert_arenas(&self, source: &TypeTermArena, destination: &TypeTermArena) {
+        assert_eq!(
+            self.source.authority, source.authority,
+            "term import scratch belongs to another source arena"
+        );
+        assert_eq!(
+            self.destination_authority, destination.authority,
+            "term import scratch belongs to another destination arena"
+        );
+    }
+}
+
+trait TypeTermImportCache {
+    fn imported(&self, source: TypeTermId) -> Option<TypeTermId>;
+    fn record(&mut self, source: TypeTermId, imported: TypeTermId);
+}
+
+impl TypeTermImportCache for [Option<TypeTermId>] {
+    fn imported(&self, source: TypeTermId) -> Option<TypeTermId> {
+        self[source.0 as usize]
+    }
+
+    fn record(&mut self, source: TypeTermId, imported: TypeTermId) {
+        self[source.0 as usize] = Some(imported);
+    }
+}
+
+impl TypeTermImportCache for TypeTermImportSession<'_> {
+    fn imported(&self, source: TypeTermId) -> Option<TypeTermId> {
+        assert!(
+            (source.0 as usize) < self.source_limit,
+            "term import reached beyond the packed-input prefix"
+        );
+        let slot = self
+            .scratch
+            .slots
+            .get(source.0 as usize)
+            .expect("term import source belongs to the begun arena");
+        (slot.generation == self.generation).then_some(slot.imported)
+    }
+
+    fn record(&mut self, source: TypeTermId, imported: TypeTermId) {
+        assert!(
+            (source.0 as usize) < self.source_limit,
+            "term import reached beyond the packed-input prefix"
+        );
+        let slot = self
+            .scratch
+            .slots
+            .get_mut(source.0 as usize)
+            .expect("term import source belongs to the begun arena");
+        *slot = StampedTypeTermImport {
+            generation: self.generation,
+            imported,
+        };
+    }
+}
+
 /// One type coordinate qualified by the exact project store that owns it.
 ///
 /// The authority is process-local and deliberately has no serialization or
@@ -715,6 +871,14 @@ impl TypeTermArena {
 
     fn accepts(&self, reference: KernelTypeRef) -> bool {
         reference.authority == self.authority && (reference.term.0 as usize) < self.headers.len()
+    }
+
+    /// Resolve a branded project-input type only inside the arena that issued
+    /// it. Raw `TypeTermId` values are intentionally not accepted across this
+    /// boundary: an in-range coordinate from another revision must fail
+    /// closed instead of binding to an unrelated term.
+    pub(crate) fn resolve_type_ref(&self, reference: KernelTypeRef) -> Option<TypeTermId> {
+        self.accepts(reference).then_some(reference.term)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1728,11 +1892,50 @@ impl TypeTermArena {
         term_cache: &mut [Option<TypeTermId>],
         retain_variable_lookup: bool,
     ) -> TypeTermId {
+        self.import_mapped_term_cached(
+            source,
+            term,
+            map_variable,
+            term_cache,
+            retain_variable_lookup,
+        )
+    }
+
+    /// Import through a generation-stamped scratch table shared by successive
+    /// destination arenas. The scratch owner fixes the immutable source prefix
+    /// once, then calls `begin` for each destination so coordinates from an
+    /// earlier module cannot leak.
+    pub(crate) fn import_mapped_term_reusing(
+        &mut self,
+        source: &TypeTermArena,
+        term: TypeTermId,
+        map_variable: &mut impl FnMut(TypeVariableId) -> TypeVariableId,
+        term_cache: &mut TypeTermImportSession<'_>,
+        retain_variable_lookup: bool,
+    ) -> TypeTermId {
+        term_cache.assert_arenas(source, self);
+        self.import_mapped_term_cached(
+            source,
+            term,
+            map_variable,
+            term_cache,
+            retain_variable_lookup,
+        )
+    }
+
+    fn import_mapped_term_cached<C: TypeTermImportCache + ?Sized>(
+        &mut self,
+        source: &TypeTermArena,
+        term: TypeTermId,
+        map_variable: &mut impl FnMut(TypeVariableId) -> TypeVariableId,
+        term_cache: &mut C,
+        retain_variable_lookup: bool,
+    ) -> TypeTermId {
         assert!(
             self.text_catalog.same_authority(&source.text_catalog),
             "copied type modules must share one text authority"
         );
-        if let Some(imported) = term_cache[term.0 as usize] {
+        if let Some(imported) = term_cache.imported(term) {
             return imported;
         }
         let imported = match source.term(term) {
@@ -1747,7 +1950,7 @@ impl TypeTermArena {
                         VariantTerm::Tag(tag) => VariantTerm::Tag(tag),
                         VariantTerm::Tagged { tag, fields } => VariantTerm::Tagged {
                             tag,
-                            fields: self.import_mapped_term(
+                            fields: self.import_mapped_term_cached(
                                 source,
                                 fields,
                                 map_variable,
@@ -1766,7 +1969,7 @@ impl TypeTermArena {
                 for field in fields.iter().copied() {
                     imported.push(ObjectFieldTerm {
                         name: field.name,
-                        ty: self.import_mapped_term(
+                        ty: self.import_mapped_term_cached(
                             source,
                             field.ty,
                             map_variable,
@@ -1782,7 +1985,7 @@ impl TypeTermArena {
             TypeTerm::OpenObjectPlaceholder => self.open_object(),
             TypeTerm::RenderContract => self.render_contract(),
             TypeTerm::List(item) => {
-                let item = self.import_mapped_term(
+                let item = self.import_mapped_term_cached(
                     source,
                     item,
                     map_variable,
@@ -1798,7 +2001,7 @@ impl TypeTermArena {
             } => {
                 let mut imported_args = self.term_id_scratch.take();
                 for argument in args {
-                    imported_args.push(self.import_mapped_term(
+                    imported_args.push(self.import_mapped_term_cached(
                         source,
                         *argument,
                         map_variable,
@@ -1806,7 +2009,7 @@ impl TypeTermArena {
                         retain_variable_lookup,
                     ));
                 }
-                let result = self.import_mapped_term(
+                let result = self.import_mapped_term_cached(
                     source,
                     result,
                     map_variable,
@@ -1837,7 +2040,7 @@ impl TypeTermArena {
             TypeTerm::Union(members) => {
                 let mut imported = self.term_id_scratch.take();
                 for member in members {
-                    imported.push(self.import_mapped_term(
+                    imported.push(self.import_mapped_term_cached(
                         source,
                         *member,
                         map_variable,
@@ -1850,14 +2053,14 @@ impl TypeTermArena {
                 term
             }
             TypeTerm::Map { key, value } => {
-                let key = self.import_mapped_term(
+                let key = self.import_mapped_term_cached(
                     source,
                     key,
                     map_variable,
                     term_cache,
                     retain_variable_lookup,
                 );
-                let value = self.import_mapped_term(
+                let value = self.import_mapped_term_cached(
                     source,
                     value,
                     map_variable,
@@ -1867,7 +2070,7 @@ impl TypeTermArena {
                 self.map(key, value)
             }
             TypeTerm::Set(item) => {
-                let item = self.import_mapped_term(
+                let item = self.import_mapped_term_cached(
                     source,
                     item,
                     map_variable,
@@ -1878,7 +2081,7 @@ impl TypeTermArena {
             }
             TypeTerm::Bits(width) => self.bits(width),
         };
-        term_cache[term.0 as usize] = Some(imported);
+        term_cache.record(term, imported);
         imported
     }
 
@@ -2938,6 +3141,89 @@ mod tests {
         assert!(arena.has_variable(variable));
         assert!(arena.has_variable(open));
         assert!(arena.has_variable(nested));
+    }
+
+    #[test]
+    fn residual_term_import_scratch_is_scoped_reused_and_authority_checked() {
+        let mut source = TypeTermArena::new();
+        let field = source.intern_name("value");
+        let item = source.list(source.number());
+        let root = source.object([(field, item)], false);
+        let reference = source.type_ref(root);
+        let packed_input_term_count = source.len();
+        let later_solver_term = source.bits(913);
+        let later_solver_reference = source.type_ref(later_solver_term);
+        let text = source.text_snapshot().clone();
+
+        let foreign_source = TypeTermArena::with_text(text.clone());
+        let foreign_reference = foreign_source.type_ref(foreign_source.number());
+        let foreign_destination = TypeTermArena::with_text(text.clone());
+        let mut first = TypeTermArena::with_text(text.clone());
+        let _unrelated = first.bits(913);
+        let mut scratch = TypeTermImportScratch::with_source_limit(packed_input_term_count);
+
+        {
+            let mut session = scratch.begin(&source, &first);
+            assert_eq!(session.imported_ref(&first, reference), None);
+            let imported = first.import_mapped_term_reusing(
+                &source,
+                root,
+                &mut |_| unreachable!("test root is closed"),
+                &mut session,
+                false,
+            );
+            assert_eq!(session.imported_ref(&first, reference), Some(imported));
+            assert_eq!(
+                first.export_checked_type(imported),
+                source.export_checked_type(root)
+            );
+
+            let term_count = first.len();
+            assert_eq!(
+                first.import_mapped_term_reusing(
+                    &source,
+                    root,
+                    &mut |_| unreachable!("test root is closed"),
+                    &mut session,
+                    false,
+                ),
+                imported
+            );
+            assert_eq!(first.len(), term_count);
+            assert_eq!(session.imported_ref(&first, foreign_reference), None);
+            assert_eq!(session.imported_ref(&foreign_destination, reference), None);
+            assert_eq!(session.imported_ref(&first, later_solver_reference), None);
+        }
+
+        let retained_slots = scratch.slots.len();
+        assert_eq!(retained_slots, packed_input_term_count);
+        assert!(retained_slots < source.len());
+        let mut second = TypeTermArena::with_text(text.clone());
+        {
+            let mut session = scratch.begin(&source, &second);
+            assert_eq!(session.imported_ref(&second, reference), None);
+            let imported = second.import_mapped_term_reusing(
+                &source,
+                root,
+                &mut |_| unreachable!("test root is closed"),
+                &mut session,
+                false,
+            );
+            assert_eq!(session.imported_ref(&second, reference), Some(imported));
+            assert_eq!(
+                second.export_checked_type(imported),
+                source.export_checked_type(root)
+            );
+        }
+        assert_eq!(scratch.slots.len(), retained_slots);
+
+        // Exercise the only clearing path: generation one from the first
+        // session must not become visible again after u32 wraparound.
+        scratch.generation = u32::MAX;
+        let third = TypeTermArena::with_text(text);
+        let session = scratch.begin(&source, &third);
+        assert_eq!(session.generation, 1);
+        assert_eq!(session.imported_ref(&third, reference), None);
     }
 
     #[test]

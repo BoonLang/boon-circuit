@@ -15,10 +15,10 @@ use boon_syntax::{
     StableExpressionRouteSegment, StableItemRoute, StableItemRouteSegment, StableOccurrenceKey,
     StableOccurrenceRoute, StableOwnerKey, StableStatementKey, StableStatementKind,
     StableStatementRoute, StableStatementRouteSegment, SyntaxUnitNamespace, UnitCheckOwnerSlot,
-    UnitChildOwnerBoundary, UnitExpressionParentEdge, UnitItemIndex, UnitItemIndexEntry,
-    UnitItemKind, UnitItemParameter, UnitLocalExpressionId, UnitLocalStatementId, UnitOwnerIndex,
-    UnitOwnerIndexEntry, UnitOwnerRoute, UnitStatementLocator, is_program_role_root,
-    is_reserved_standard_root,
+    UnitCheckedCallSiteV4, UnitChildOwnerBoundary, UnitExpressionParentEdge, UnitItemIndex,
+    UnitItemIndexEntry, UnitItemKind, UnitItemParameter, UnitLocalExpressionId,
+    UnitLocalStatementId, UnitOwnerIndex, UnitOwnerIndexEntry, UnitOwnerRoute,
+    UnitStatementLocator, is_program_role_root, is_reserved_standard_root,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -481,6 +481,34 @@ impl<'a> UnitOwnerSyntaxView<'a> {
             .get(expression.as_usize())
             .copied()
             .flatten()
+    }
+
+    /// Copy the exact checked structural-call V4 digest sealed by the parser.
+    /// Non-call expressions and invalid unit-local ids return `None`.
+    pub fn checked_structural_call_site_digest_v4(
+        &self,
+        expression: UnitLocalExpressionId,
+    ) -> Option<[u8; 32]> {
+        self.fields
+            .checked_call_sites_v4
+            .binary_search_by_key(&expression, |row| row.expression)
+            .ok()
+            .map(|index| self.fields.checked_call_sites_v4[index].digest)
+    }
+
+    /// Copy the parser-sealed V4 call identity by packed syntax id.
+    pub fn checked_structural_call_site_digest_v4_for_syntax(
+        &self,
+        expression_id: usize,
+    ) -> Option<[u8; 32]> {
+        let local = if let Some(expected) = self.namespace {
+            let (namespace, local) = __parser_unpack_syntax_node_id(expression_id)?;
+            (namespace == expected).then_some(local)?
+        } else {
+            expression_id
+        };
+        UnitLocalExpressionId::__parser_new(local)
+            .and_then(|expression| self.checked_structural_call_site_digest_v4(expression))
     }
 
     pub fn statement_locator(
@@ -1391,6 +1419,19 @@ impl UnitSyntaxSnapshot {
             source_unit_id: self.source_unit_id.clone(),
             route: self.occurrence_routes.get(local)?.clone()?,
         })
+    }
+
+    /// Copy the exact checked structural-call V4 digest by unit-local id.
+    /// This performs neither stable-route construction nor allocation.
+    pub fn checked_structural_call_site_digest_v4_local(
+        &self,
+        expression: UnitLocalExpressionId,
+    ) -> Option<[u8; 32]> {
+        self.fields
+            .checked_call_sites_v4
+            .binary_search_by_key(&expression, |row| row.expression)
+            .ok()
+            .map(|index| self.fields.checked_call_sites_v4[index].digest)
     }
 
     pub fn stable_expression_key(&self, expression_id: usize) -> Option<StableExpressionKey> {
@@ -2758,7 +2799,8 @@ fn parse_normalized_source_unit_syntax(
     validate_source_unit_boundary_with_work(&path, &source, &ast, &validation_index, work)?;
     let declared_functions = collect_raw_declared_functions_with_work(&ast.statements, work);
     let item_index = build_unit_item_index(&ast.statements);
-    let expression_identities = build_unit_expression_identities(&path, &ast, &item_index)?;
+    let expression_identities =
+        build_unit_expression_identities(&path, &source_unit_id, &ast, &item_index)?;
     work.source_unit_parsed();
 
     Ok((
@@ -2771,6 +2813,7 @@ fn parse_normalized_source_unit_syntax(
             item_index,
             owner_index: expression_identities.owner_index,
             occurrence_routes: expression_identities.occurrence_routes,
+            checked_call_sites_v4: expression_identities.checked_call_sites_v4,
             occurrence_route_digests_v1: expression_identities.occurrence_route_digests_v1,
             expression_route_digests_v1: expression_identities.expression_route_digests_v1,
         }),
@@ -3572,6 +3615,7 @@ fn assemble_canonical_parsed_source_units(
             item_index: _item_index,
             owner_index: _owner_index,
             occurrence_routes: unit_occurrence_routes,
+            checked_call_sites_v4: _unit_checked_call_sites_v4,
             occurrence_route_digests_v1: _unit_occurrence_route_digests_v1,
             expression_route_digests_v1: unit_expression_route_digests_v1,
         } = unit.fields;
@@ -9152,6 +9196,7 @@ const STABLE_OCCURRENCE_ROUTE_DOMAIN_V1: &[u8] = b"boon.stable-occurrence-route.
 struct UnitExpressionIdentities {
     owner_index: UnitOwnerIndex,
     occurrence_routes: Vec<Option<StableOccurrenceRoute>>,
+    checked_call_sites_v4: Vec<UnitCheckedCallSiteV4>,
     occurrence_route_digests_v1: Vec<Option<[u8; 32]>>,
     expression_route_digests_v1: Vec<Option<[u8; 32]>>,
 }
@@ -9336,6 +9381,49 @@ fn stable_occurrence_route_digests_v1(
     Ok(digests)
 }
 
+fn checked_structural_call_sites_v4(
+    path: &str,
+    source_unit_id: &SourceUnitId,
+    routes: &[Option<StableOccurrenceRoute>],
+) -> Result<Vec<UnitCheckedCallSiteV4>, ParseError> {
+    let mut rows = Vec::new();
+    let mut bytes = Vec::new();
+    for (expression, route) in routes.iter().enumerate() {
+        let Some(route) = route else {
+            continue;
+        };
+        let expression = UnitLocalExpressionId::__parser_new(expression).ok_or_else(|| {
+            parsed_source_unit_invariant_error(path, "call expression id exceeds u32")
+        })?;
+        let digest = boon_syntax::checked_structural_call_site_digest_v4_from_parts_with_buffer(
+            source_unit_id,
+            route,
+            &mut bytes,
+        )
+        .map_err(|error| parsed_source_unit_invariant_error(path, error))?;
+        rows.push(UnitCheckedCallSiteV4 { expression, digest });
+    }
+    rows.sort_unstable_by(|left, right| {
+        left.digest
+            .cmp(&right.digest)
+            .then_with(|| left.expression.cmp(&right.expression))
+    });
+    for pair in rows.windows(2) {
+        if pair[0].digest == pair[1].digest {
+            return Err(parsed_source_unit_invariant_error(
+                path,
+                format!(
+                    "checked structural call-site digest V4 collision between expressions {} and {}",
+                    pair[0].expression.as_usize(),
+                    pair[1].expression.as_usize(),
+                ),
+            ));
+        }
+    }
+    rows.sort_unstable_by_key(|row| row.expression);
+    Ok(rows)
+}
+
 fn stable_expression_child_digest(
     parent: [u8; 32],
     segment: &StableExpressionRouteSegment,
@@ -9488,6 +9576,7 @@ fn stable_expression_owner_slots(
 
 fn build_unit_expression_identities(
     path: &str,
+    source_unit_id: &SourceUnitId,
     ast: &AstProgram,
     item_index: &UnitItemIndex,
 ) -> Result<UnitExpressionIdentities, ParseError> {
@@ -9943,9 +10032,12 @@ fn build_unit_expression_identities(
         occurrence_routes[expression.id] = Some(base);
     }
     let occurrence_route_digests_v1 = stable_occurrence_route_digests_v1(path, &occurrence_routes)?;
+    let checked_call_sites_v4 =
+        checked_structural_call_sites_v4(path, source_unit_id, &occurrence_routes)?;
     Ok(UnitExpressionIdentities {
         owner_index,
         occurrence_routes,
+        checked_call_sites_v4,
         occurrence_route_digests_v1,
         expression_route_digests_v1,
     })
@@ -11053,6 +11145,114 @@ document:
         assert_equivalent(&occurrences);
         assert!(!statements.is_empty());
         assert!(!occurrences.is_empty());
+    }
+
+    #[test]
+    fn parser_seals_exact_checked_call_site_v4_digests_only_for_call_rows() {
+        let project = parse_project_syntax(
+            "app/RUN.bn",
+            [(
+                "app/RUN.bn".to_owned(),
+                "value: helper(input: 10)\nplain: 20\nFUNCTION helper(input) {\n    input\n}\n"
+                    .to_owned(),
+            )],
+        )
+        .unwrap();
+        let unit = &project.units()[0];
+        let root = unit.owner_view(&UnitOwnerRoute::UnitRoot).unwrap();
+        let mut call_count = 0;
+        let mut non_call_count = 0;
+
+        for (local, expression) in unit.ast.expressions.iter().enumerate() {
+            let local = UnitLocalExpressionId::__parser_new(local).unwrap();
+            let compact = root.checked_structural_call_site_digest_v4(local);
+            assert_eq!(
+                compact,
+                unit.checked_structural_call_site_digest_v4_local(local)
+            );
+            match &expression.kind {
+                AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
+                    let rich = unit.stable_occurrence_key(expression.id).unwrap();
+                    assert_eq!(
+                        compact,
+                        Some(boon_syntax::checked_structural_call_site_digest_v4(&rich).unwrap())
+                    );
+                    assert!(root.occurrence_route_digest_v1(local).is_some());
+                    call_count += 1;
+                }
+                _ => {
+                    assert_eq!(compact, None);
+                    non_call_count += 1;
+                }
+            }
+        }
+
+        let out_of_range = UnitLocalExpressionId::__parser_new(unit.ast.expressions.len()).unwrap();
+        assert_eq!(
+            root.checked_structural_call_site_digest_v4(out_of_range),
+            None
+        );
+        assert_eq!(
+            unit.checked_structural_call_site_digest_v4_local(out_of_range),
+            None
+        );
+        assert!(call_count > 0);
+        assert!(non_call_count > 0);
+    }
+
+    #[test]
+    fn checked_call_site_v4_digests_survive_stable_edits_and_change_on_renames() {
+        fn helper_calls(path: &str, source: &str) -> BTreeMap<String, [u8; 32]> {
+            let parsed = parse_project_source_unit(path, source).unwrap();
+            let root = parsed.owner_view(&UnitOwnerRoute::UnitRoot).unwrap();
+            parsed
+                .ast
+                .expressions
+                .iter()
+                .filter(|expression| {
+                    matches!(&expression.kind, AstExprKind::Call { function, .. } if function == "helper")
+                })
+                .filter_map(|expression| {
+                    let rich = parsed.stable_occurrence_key(expression.id)?;
+                    let owner = rich
+                        .route
+                        .owner
+                        .as_ref()?
+                        .segments()
+                        .last()?
+                        .names
+                        .first()?
+                        .clone();
+                    if !["left", "right", "renamed"].contains(&owner.as_str()) {
+                        return None;
+                    }
+                    let local = UnitLocalExpressionId::__parser_new(expression.id)?;
+                    Some((
+                        owner,
+                        root.checked_structural_call_site_digest_v4(local)?,
+                    ))
+                })
+                .collect()
+        }
+
+        let baseline = "left: helper(value: 10)\nright: helper(value: 20)\n\nFUNCTION helper(value) {\n    value\n}\n";
+        let edited = "earlier: helper(value: 999)\nleft : helper(value: 11)\nright: helper(value: 21)\n\nFUNCTION helper(value) {\n    value + 0\n}\n";
+        let baseline_digests = helper_calls("app/RUN.bn", baseline);
+        assert_eq!(helper_calls("app/RUN.bn", edited), baseline_digests);
+
+        let renamed_unit = helper_calls("app/RENAMED.bn", baseline);
+        assert!(baseline_digests.iter().all(|(owner, digest)| {
+            renamed_unit
+                .get(owner)
+                .is_some_and(|renamed| renamed != digest)
+        }));
+
+        let renamed_owner = helper_calls(
+            "app/RUN.bn",
+            "renamed: helper(value: 10)\nFUNCTION helper(value) {\n    value\n}\n",
+        );
+        assert_ne!(renamed_owner["renamed"], baseline_digests["left"]);
+        assert_eq!(baseline_digests.len(), 2);
     }
 
     #[test]

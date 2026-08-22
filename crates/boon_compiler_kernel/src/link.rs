@@ -2411,15 +2411,21 @@ impl KernelSemanticInputConstructionV1 {
                         })?,
                 },
             };
-            if packed_binding != rich.context_binding
-                || code.call_authored_site_digest_v4(ordinal)
-                    != Some(
-                        boon_checked::checked_structural_call_site_digest_v4(occurrence)
-                            .map_err(KernelCheckedLinkError::new)?,
-                    )
+            if packed_binding != rich.context_binding {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel packed call {} PASS binding differs from rich topology",
+                    id.0,
+                )));
+            }
+            #[cfg(debug_assertions)]
+            if code.call_authored_site_digest_v4(ordinal)
+                != Some(
+                    boon_checked::checked_structural_call_site_digest_v4(occurrence)
+                        .map_err(KernelCheckedLinkError::new)?,
+                )
             {
                 return Err(KernelCheckedLinkError::new(format!(
-                    "kernel packed call {} PASS binding or authored identity differs from rich topology",
+                    "kernel packed call {} authored identity differs from rich topology",
                     id.0,
                 )));
             }
@@ -8404,6 +8410,7 @@ impl KernelCheckedLinkLayout {
                         | crate::KernelOwnerNodeKind::RenderConstructor { .. }
                         | crate::KernelOwnerNodeKind::PureBuiltin { .. }
                         | crate::KernelOwnerNodeKind::FixedAbiCall { .. }
+                        | crate::KernelOwnerNodeKind::FixedAbiCallPacked { .. }
                         | crate::KernelOwnerNodeKind::HostEffect { .. }
                         | crate::KernelOwnerNodeKind::FieldProjection { .. }
                 ) {
@@ -9453,7 +9460,9 @@ fn checked_expression_kind(
     };
 
     Ok(match &expression.kind {
-        crate::KernelOwnerNodeKind::Source(_) => CheckedExpressionKind::Source,
+        crate::KernelOwnerNodeKind::Source(_) | crate::KernelOwnerNodeKind::SourcePacked(_) => {
+            CheckedExpressionKind::Source
+        }
         crate::KernelOwnerNodeKind::Absent => CheckedExpressionKind::Absent,
         crate::KernelOwnerNodeKind::Text => CheckedExpressionKind::Text {
             value: match payload {
@@ -9717,6 +9726,7 @@ fn checked_expression_kind(
             },
         },
         crate::KernelOwnerNodeKind::Known(_)
+        | crate::KernelOwnerNodeKind::KnownPacked(_)
         | crate::KernelOwnerNodeKind::FormalRead { .. }
         | crate::KernelOwnerNodeKind::ContextRead { .. }
         | crate::KernelOwnerNodeKind::LexicalRead { .. }
@@ -9741,6 +9751,7 @@ fn checked_expression_kind(
         | crate::KernelOwnerNodeKind::RenderConstructor { .. }
         | crate::KernelOwnerNodeKind::PureBuiltin { .. }
         | crate::KernelOwnerNodeKind::FixedAbiCall { .. }
+        | crate::KernelOwnerNodeKind::FixedAbiCallPacked { .. }
         | crate::KernelOwnerNodeKind::HostEffect { .. } => {
             return Err(KernelCheckedLinkError::new(format!(
                 "kernel definition {} call expression {} has no call artifact",
@@ -11289,16 +11300,20 @@ mod tests {
         }]
         .into_boxed_slice();
         let mut consumer_facts = facts(&unit, &consumer_key, "consumer");
+        let occurrence = StableOccurrenceKey {
+            source_unit_id: unit.clone(),
+            route: boon_syntax::StableOccurrenceRoute {
+                owner: None,
+                statement_route: Vec::new(),
+                expression_route: Vec::new(),
+            },
+        };
+        let authored_site_digest_v4 =
+            boon_checked::checked_structural_call_site_digest_v4(&occurrence).unwrap();
         consumer_facts.call_syntax = vec![crate::KernelCallSyntaxInput {
             expression: KernelExpressionId(0),
-            occurrence: StableOccurrenceKey {
-                source_unit_id: unit.clone(),
-                route: boon_syntax::StableOccurrenceRoute {
-                    owner: None,
-                    statement_route: Vec::new(),
-                    expression_route: Vec::new(),
-                },
-            },
+            occurrence,
+            authored_site_digest_v4,
             function: "Generic/union".into(),
             pipe_input: Some(KernelExpressionId(1)),
             arguments: Box::new([]),
@@ -11355,12 +11370,12 @@ mod tests {
             abi,
         )
         .unwrap();
-        let mut session = KernelSession::new(project.clone());
+        let mut session = KernelSession::new(project);
         let checked = session.check(CheckDemand::CheckedImage).unwrap();
         let KernelCheckProduct::CheckedImage(snapshot) = checked.product else {
             unreachable!()
         };
-        let layout = KernelCheckedLinkLayout::new(&project, &snapshot).unwrap();
+        let layout = KernelCheckedLinkLayout::new(session.project(), &snapshot).unwrap();
         let [abi_layout] = layout.abi_callables() else {
             panic!("generic union fixture must allocate one ABI callable")
         };
@@ -11388,7 +11403,7 @@ mod tests {
         );
         let rows = layout
             .materialize_rows(
-                &project,
+                session.project(),
                 &snapshot,
                 SourceBundleDigestV1::new(
                     "generic-union.bn",
@@ -11480,12 +11495,12 @@ mod tests {
             vec![provider_key, consumer_key].into_boxed_slice(),
         )
         .unwrap();
-        let mut session = KernelSession::new(project.clone());
+        let mut session = KernelSession::new(project);
         let checked = session.check(CheckDemand::CheckedImage).unwrap();
         let KernelCheckProduct::CheckedImage(snapshot) = checked.product else {
             unreachable!()
         };
-        let layout = KernelCheckedLinkLayout::new(&project, &snapshot).unwrap();
+        let layout = KernelCheckedLinkLayout::new(session.project(), &snapshot).unwrap();
         assert_eq!(layout.totals().expressions, 2);
         assert_eq!(layout.totals().scopes, 1);
         assert_eq!(layout.totals().statements, 2);
@@ -11505,7 +11520,7 @@ mod tests {
         );
         let rows = layout
             .materialize_rows(
-                &project,
+                session.project(),
                 &snapshot,
                 SourceBundleDigestV1::new(
                     "kernel-link-test.bn",
@@ -11600,7 +11615,7 @@ mod tests {
             owner: KernelOwnerId(0),
             scope: crate::KernelScopeId(0),
         };
-        let scoped_layout = KernelCheckedLinkLayout::new(&project, &scoped)
+        let scoped_layout = KernelCheckedLinkLayout::new(session.project(), &scoped)
             .expect("a nested owner must inherit its enclosing compact scope");
         assert_eq!(scoped_layout.totals().scopes, 2);
         assert_eq!(
@@ -11677,7 +11692,7 @@ mod tests {
             owner: KernelOwnerId(0),
             scope: crate::KernelScopeId(99),
         };
-        let error = KernelCheckedLinkLayout::new(&project, &missing_scope)
+        let error = KernelCheckedLinkLayout::new(session.project(), &missing_scope)
             .expect_err("a missing enclosing scope must fail before row materialization");
         assert!(error.to_string().contains("containing scope"));
 
@@ -11685,7 +11700,7 @@ mod tests {
         Arc::make_mut(&mut delegated.definition_facts)[1]
             .linkage
             .public_declaration = Some(KernelDeclarationReference::OwnerPublic(KernelOwnerId(0)));
-        let delegated_layout = KernelCheckedLinkLayout::new(&project, &delegated)
+        let delegated_layout = KernelCheckedLinkLayout::new(session.project(), &delegated)
             .expect("a nested definition may share its enclosing public declaration");
         assert_eq!(
             delegated_layout.definitions()[1].public_declaration,
@@ -11695,14 +11710,14 @@ mod tests {
         Arc::make_mut(&mut delegated.definition_facts)[0]
             .linkage
             .public_declaration = Some(KernelDeclarationReference::OwnerPublic(KernelOwnerId(1)));
-        let error = KernelCheckedLinkLayout::new(&project, &delegated)
+        let error = KernelCheckedLinkLayout::new(session.project(), &delegated)
             .expect_err("public declaration authority cycles must fail closed");
         assert!(error.to_string().contains("contain a cycle"));
 
         let mut invalid = (*snapshot).clone();
         Arc::make_mut(&mut invalid.program).owners[1].external_expressions[0].owner =
             KernelOwnerId(99);
-        let error = KernelCheckedLinkLayout::new(&project, &invalid)
+        let error = KernelCheckedLinkLayout::new(session.project(), &invalid)
             .expect_err("an unlinked external owner must fail before row allocation");
         assert!(error.to_string().contains("missing definition 99"));
     }

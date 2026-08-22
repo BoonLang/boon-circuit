@@ -4,11 +4,10 @@ use crate::{
     KernelCollectionProjectionKind, KernelOperationRef, KernelPattern, KernelRecordEntry,
     KernelSelectArm, KernelSolveWork, KernelSummaryCallInput, KernelSummaryDefinitionWork,
     KernelSummaryNode, KernelSummaryProgram, KernelSummaryRecordEntry, OperationId,
-    PackedOperationTable, ProgramConsumer, ProgramOperationRef, ProjectedArtifactOutput,
-    PublishMode, ResidualOperationFrame, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId,
+    PackedOperationTable, ProgramConsumer, ProgramOperationRef, PublishMode,
+    ResidualOperationFrame, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId,
     UnsealedComponentArtifact, VariantTerm,
 };
-use boon_checked::FlowType;
 use boon_contract::SymbolId;
 use std::collections::VecDeque;
 use std::error::Error;
@@ -109,7 +108,7 @@ impl ComponentSolveSession {
     pub(crate) fn solve_outputs(
         &mut self,
         demanded: &[crate::OutputId],
-    ) -> Result<ComponentOutputSnapshot, KernelSolveError> {
+    ) -> Result<ComponentOutputSnapshot<'_>, KernelSolveError> {
         let enabled = self.demanded_work_items(demanded)?;
         self.solver.enable(&self.execution, &enabled)?;
         self.solver.mark_outputs_available(demanded)?;
@@ -657,11 +656,11 @@ impl ComponentSolver {
         self.program.available_outputs.fill(true);
     }
 
-    fn snapshot(&mut self) -> ComponentOutputSnapshot {
-        let outputs = self.materialize_projected_outputs();
+    fn snapshot(&mut self) -> ComponentOutputSnapshot<'_> {
+        let outputs = self.materialize_packed_outputs();
         self.update_term_work();
         self.finish_summary_definition_ranking();
-        ComponentOutputSnapshot::new(outputs, self.work)
+        ComponentOutputSnapshot::new(outputs, &mut self.program.terms, self.work)
     }
 
     fn finish_unsealed(mut self) -> Result<UnsealedComponentArtifact, KernelSolveError> {
@@ -695,28 +694,6 @@ impl ComponentSolver {
         let mut outputs = Vec::with_capacity(self.program.outputs.len());
         for index in 0..self.program.outputs.len() {
             outputs.push(self.resolve_output(index));
-        }
-        outputs.into_boxed_slice()
-    }
-
-    fn materialize_projected_outputs(&mut self) -> Box<[Option<ProjectedArtifactOutput>]> {
-        let mut outputs = Vec::with_capacity(self.program.outputs.len());
-        for index in 0..self.program.outputs.len() {
-            let Some(output) = self.resolve_output(index) else {
-                outputs.push(None);
-                continue;
-            };
-            self.work.rich_output_flow_exports =
-                self.work.rich_output_flow_exports.saturating_add(1);
-            outputs.push(Some(ProjectedArtifactOutput {
-                id: output.id,
-                flow_type: Some(FlowType {
-                    mode: output.flow.mode(),
-                    ty: self.program.terms.export_checked_type(output.flow.term()),
-                }),
-                syntax_selected_here: output.syntax_selected_here,
-                call_syntax_selected: output.call_syntax_selected,
-            }));
         }
         outputs.into_boxed_slice()
     }
@@ -3081,8 +3058,13 @@ mod tests {
         let mut session = ComponentSolveSession::new(builder.finish()).unwrap();
         let interface = session.solve_outputs(&[text_output]).unwrap();
         assert_eq!(interface.available_output_count(), 1);
-        assert_eq!(interface.flow_type(text_output).unwrap().ty, Type::Text);
-        assert!(interface.flow_type(number_output).is_none());
+        assert_eq!(
+            interface
+                .terms()
+                .export_checked_type(interface.flow(text_output).unwrap().term),
+            Type::Text,
+        );
+        assert!(interface.flow(number_output).is_none());
         assert_eq!(interface.work.scheduled_work_items, 1);
         assert_eq!(interface.work.activations, 1);
 

@@ -929,6 +929,129 @@ impl TypeTermArena {
         }
     }
 
+    /// Append direct child terms in the exact public/semantic traversal order.
+    ///
+    /// This is the common packed-DAG primitive for phase-local walkers.  It
+    /// deliberately borrows the caller's reusable stack rather than returning
+    /// a freshly allocated child vector.  Object children follow authored
+    /// semantic order; algorithms whose contract is lexical lookup (such as
+    /// assignability and first-mismatch reporting) use `canonical_iter`
+    /// directly instead.
+    pub(crate) fn append_term_children(&self, term: TypeTermId, children: &mut Vec<TypeTermId>) {
+        match self.term(term) {
+            TypeTerm::VariantSet(variants) => {
+                children.extend(variants.iter().filter_map(|variant| match variant {
+                    VariantTerm::Tag(_) => None,
+                    VariantTerm::Tagged { fields, .. } => Some(*fields),
+                }));
+            }
+            TypeTerm::Object { fields, .. } => {
+                children.extend(fields.iter().map(|field| field.ty));
+            }
+            TypeTerm::List(item) | TypeTerm::Set(item) => children.push(item),
+            TypeTerm::Function { args, result, .. } => {
+                children.extend_from_slice(args);
+                children.push(result);
+            }
+            TypeTerm::Union(members) => children.extend_from_slice(members),
+            TypeTerm::Map { key, value } => {
+                children.push(key);
+                children.push(value);
+            }
+            TypeTerm::Text
+            | TypeTerm::Number
+            | TypeTerm::Bytes(_)
+            | TypeTerm::Absent
+            | TypeTerm::OpenObjectPlaceholder
+            | TypeTerm::RenderContract
+            | TypeTerm::UnresolvedShape(_)
+            | TypeTerm::Variable(_)
+            | TypeTerm::Unknown
+            | TypeTerm::Bits(_) => {}
+        }
+    }
+
+    /// Rebuild one term from already-remapped direct children.
+    ///
+    /// `children` must use [`Self::append_term_children`] order.  Returning the
+    /// original ID when no edge changed is important: generic call
+    /// instantiation then performs no interning or allocation for the usual
+    /// closed surface.  When rebuilding is required, the arena's existing
+    /// scratch pools preserve object/variant/argument storage and exact
+    /// authored field and union ordering.
+    pub(crate) fn rebuild_term_from_children(
+        &mut self,
+        term: TypeTermId,
+        children: &[TypeTermId],
+    ) -> TypeTermId {
+        let mut source_children = self.term_id_scratch.take();
+        self.append_term_children(term, &mut source_children);
+        assert_eq!(
+            source_children.len(),
+            children.len(),
+            "packed type remap supplied the wrong direct-child count"
+        );
+        if source_children == children {
+            self.term_id_scratch.recycle(source_children);
+            return term;
+        }
+        self.term_id_scratch.recycle(source_children);
+
+        match self.term_head(term) {
+            TypeTermHead::VariantSet(span) => {
+                let mut variants = self.variant_scratch.take();
+                variants.extend_from_slice(self.variant_terms(span));
+                let mut child = 0usize;
+                for variant in &mut variants {
+                    if let VariantTerm::Tagged { fields, .. } = variant {
+                        *fields = children[child];
+                        child += 1;
+                    }
+                }
+                debug_assert_eq!(child, children.len());
+                let rebuilt = self.variant_set_preserving_order(variants.iter().copied());
+                self.variant_scratch.recycle(variants);
+                rebuilt
+            }
+            TypeTermHead::Object { shape, open } => {
+                let mut fields = self.object_field_scratch.take();
+                fields.extend(self.object_fields_for_shape(shape).iter().copied());
+                for (field, ty) in fields.iter_mut().zip(children) {
+                    field.ty = *ty;
+                }
+                let rebuilt = self.intern_object(&fields, open);
+                self.object_field_scratch.recycle(fields);
+                rebuilt
+            }
+            TypeTermHead::List(_) => self.list(children[0]),
+            TypeTermHead::Set(_) => self.set(children[0]),
+            TypeTermHead::Function {
+                args, result_mode, ..
+            } => {
+                let argument_count = args.len();
+                self.function(
+                    children[..argument_count].iter().copied(),
+                    result_mode,
+                    children[argument_count],
+                )
+            }
+            TypeTermHead::Union(_) => self.union(children.iter().copied()),
+            TypeTermHead::Map { .. } => self.map(children[0], children[1]),
+            TypeTermHead::Text
+            | TypeTermHead::Number
+            | TypeTermHead::Bytes(_)
+            | TypeTermHead::Absent
+            | TypeTermHead::OpenObjectPlaceholder
+            | TypeTermHead::RenderContract
+            | TypeTermHead::UnresolvedShape(_)
+            | TypeTermHead::Variable(_)
+            | TypeTermHead::Unknown
+            | TypeTermHead::Bits(_) => {
+                unreachable!("a leaf packed type cannot have remapped children")
+            }
+        }
+    }
+
     pub(crate) fn lookup_object_field(&self, shape: u32, name: SymbolId) -> Option<TypeTermId> {
         let shape = self.object_shapes[shape as usize];
         let fields = &self.object_fields[shape.canonical_fields.range()];
@@ -1541,9 +1664,34 @@ impl TypeTermArena {
         variables: &[TypeVariableId],
         term_cache: &mut [Option<TypeTermId>],
     ) -> TypeTermId {
+        self.import_mapped_term(
+            source,
+            term,
+            &mut |variable| {
+                *variables
+                    .get(variable.0 as usize)
+                    .expect("residual module variable belongs to its frame")
+            },
+            term_cache,
+            true,
+        )
+    }
+
+    /// Copy one reachable immutable term DAG while assigning destination-local
+    /// variable IDs lazily. The caller owns the mapping policy, so a compact
+    /// diagnostics snapshot can retain only variables actually reached by its
+    /// public roots instead of reserving the complete solver namespace.
+    pub(crate) fn import_mapped_term(
+        &mut self,
+        source: &TypeTermArena,
+        term: TypeTermId,
+        map_variable: &mut impl FnMut(TypeVariableId) -> TypeVariableId,
+        term_cache: &mut [Option<TypeTermId>],
+        retain_variable_lookup: bool,
+    ) -> TypeTermId {
         assert!(
             self.text_catalog.same_authority(&source.text_catalog),
-            "residual type modules must share one text authority"
+            "copied type modules must share one text authority"
         );
         if let Some(imported) = term_cache[term.0 as usize] {
             return imported;
@@ -1560,7 +1708,13 @@ impl TypeTermArena {
                         VariantTerm::Tag(tag) => VariantTerm::Tag(tag),
                         VariantTerm::Tagged { tag, fields } => VariantTerm::Tagged {
                             tag,
-                            fields: self.import_rebased_term(source, fields, variables, term_cache),
+                            fields: self.import_mapped_term(
+                                source,
+                                fields,
+                                map_variable,
+                                term_cache,
+                                retain_variable_lookup,
+                            ),
                         },
                     });
                 }
@@ -1573,7 +1727,13 @@ impl TypeTermArena {
                 for field in fields.iter().copied() {
                     imported.push(ObjectFieldTerm {
                         name: field.name,
-                        ty: self.import_rebased_term(source, field.ty, variables, term_cache),
+                        ty: self.import_mapped_term(
+                            source,
+                            field.ty,
+                            map_variable,
+                            term_cache,
+                            retain_variable_lookup,
+                        ),
                     });
                 }
                 let term = self.intern_object(&imported, open);
@@ -1583,7 +1743,13 @@ impl TypeTermArena {
             TypeTerm::OpenObjectPlaceholder => self.open_object(),
             TypeTerm::RenderContract => self.render_contract(),
             TypeTerm::List(item) => {
-                let item = self.import_rebased_term(source, item, variables, term_cache);
+                let item = self.import_mapped_term(
+                    source,
+                    item,
+                    map_variable,
+                    term_cache,
+                    retain_variable_lookup,
+                );
                 self.list(item)
             }
             TypeTerm::Function {
@@ -1593,10 +1759,21 @@ impl TypeTermArena {
             } => {
                 let mut imported_args = self.term_id_scratch.take();
                 for argument in args {
-                    imported_args
-                        .push(self.import_rebased_term(source, *argument, variables, term_cache));
+                    imported_args.push(self.import_mapped_term(
+                        source,
+                        *argument,
+                        map_variable,
+                        term_cache,
+                        retain_variable_lookup,
+                    ));
                 }
-                let result = self.import_rebased_term(source, result, variables, term_cache);
+                let result = self.import_mapped_term(
+                    source,
+                    result,
+                    map_variable,
+                    term_cache,
+                    retain_variable_lookup,
+                );
                 let term = self.intern_raw(TypeTerm::Function {
                     args: &imported_args,
                     result_mode,
@@ -1609,28 +1786,55 @@ impl TypeTermArena {
                 let reason = source.diagnostic_text(reason).to_owned();
                 self.unresolved_shape(reason)
             }
-            TypeTerm::Variable(variable) => self.variable(
-                *variables
-                    .get(variable.0 as usize)
-                    .expect("residual module variable belongs to its frame"),
-            ),
+            TypeTerm::Variable(variable) => {
+                let variable = map_variable(variable);
+                if retain_variable_lookup {
+                    self.variable(variable)
+                } else {
+                    self.intern_raw(TypeTerm::Variable(variable))
+                }
+            }
             TypeTerm::Unknown => self.unknown(),
             TypeTerm::Union(members) => {
                 let mut imported = self.term_id_scratch.take();
                 for member in members {
-                    imported.push(self.import_rebased_term(source, *member, variables, term_cache));
+                    imported.push(self.import_mapped_term(
+                        source,
+                        *member,
+                        map_variable,
+                        term_cache,
+                        retain_variable_lookup,
+                    ));
                 }
                 let term = self.union(imported.iter().copied());
                 self.term_id_scratch.recycle(imported);
                 term
             }
             TypeTerm::Map { key, value } => {
-                let key = self.import_rebased_term(source, key, variables, term_cache);
-                let value = self.import_rebased_term(source, value, variables, term_cache);
+                let key = self.import_mapped_term(
+                    source,
+                    key,
+                    map_variable,
+                    term_cache,
+                    retain_variable_lookup,
+                );
+                let value = self.import_mapped_term(
+                    source,
+                    value,
+                    map_variable,
+                    term_cache,
+                    retain_variable_lookup,
+                );
                 self.map(key, value)
             }
             TypeTerm::Set(item) => {
-                let item = self.import_rebased_term(source, item, variables, term_cache);
+                let item = self.import_mapped_term(
+                    source,
+                    item,
+                    map_variable,
+                    term_cache,
+                    retain_variable_lookup,
+                );
                 self.set(item)
             }
             TypeTerm::Bits(width) => self.bits(width),

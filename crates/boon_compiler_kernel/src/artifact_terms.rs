@@ -5,6 +5,7 @@ use boon_checked::{ArtifactFlowTermV1, ArtifactTypeModuleBuilderV1};
 use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::collections::BTreeMap;
+use std::fmt;
 #[cfg(test)]
 use std::hash::{Hash, Hasher};
 
@@ -416,18 +417,406 @@ impl DefinitionTermProofScratch {
 /// roots keeps existing receipts exact without rebuilding a rich type module
 /// for every definition. A future artifact schema can replace this textual
 /// compatibility order with one shared structural comparator.
-fn legacy_checked_union_order(source: &TypeTermArena, members: &[TypeTermId]) -> Vec<TypeTermId> {
+pub(crate) fn legacy_checked_union_order(
+    source: &TypeTermArena,
+    members: &[TypeTermId],
+) -> Vec<TypeTermId> {
     let mut keyed = members
         .iter()
         .copied()
         .map(|member| {
-            let projected = source.export_checked_type(member);
-            (format!("{projected:?}"), projected, member)
+            (
+                format!("{:?}", CheckedProjectionDebug::new(source, member)),
+                member,
+            )
         })
         .collect::<Vec<_>>();
     keyed.sort_by(|left, right| left.0.cmp(&right.0));
-    keyed.dedup_by(|left, right| left.1 == right.1);
-    keyed.into_iter().map(|(_, _, member)| member).collect()
+    // Derived Debug is a lossless structural rendering for the checked Type
+    // model. Equal checked projections therefore have the same key, including
+    // the inference-only open-object placeholder and an actual open empty
+    // object. This removes the former recursive rich Type construction from
+    // every reachable union while retaining the V1 ordering contract.
+    keyed.dedup_by(|left, right| left.0 == right.0);
+    keyed.into_iter().map(|(_, member)| member).collect()
+}
+
+#[derive(Clone, Copy)]
+struct CheckedProjectionDebug<'a> {
+    source: &'a TypeTermArena,
+    term: TypeTermId,
+}
+
+impl<'a> CheckedProjectionDebug<'a> {
+    const fn new(source: &'a TypeTermArena, term: TypeTermId) -> Self {
+        Self { source, term }
+    }
+}
+
+impl fmt::Debug for CheckedProjectionDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.source.term(self.term) {
+            TypeTerm::Text => formatter.write_str("Text"),
+            TypeTerm::Number => formatter.write_str("Number"),
+            TypeTerm::Bytes(bytes) => formatter
+                .debug_tuple("Bytes")
+                .field(&CheckedBytesDebug(bytes))
+                .finish(),
+            TypeTerm::Absent => formatter.write_str("Absent"),
+            TypeTerm::VariantSet(variants) => formatter
+                .debug_tuple("VariantSet")
+                .field(&CheckedVariantSetDebug {
+                    source: self.source,
+                    variants,
+                })
+                .finish(),
+            TypeTerm::Object { fields, open } => formatter
+                .debug_tuple("Object")
+                .field(&CheckedSharedObjectDebug {
+                    source: self.source,
+                    fields,
+                    open,
+                })
+                .finish(),
+            TypeTerm::OpenObjectPlaceholder => formatter
+                .debug_tuple("Object")
+                .field(&CheckedOpenObjectDebug)
+                .finish(),
+            TypeTerm::RenderContract => formatter.write_str("RenderContract"),
+            TypeTerm::List(item) => formatter
+                .debug_tuple("List")
+                .field(&CheckedSharedTypeDebug::new(self.source, item))
+                .finish(),
+            TypeTerm::Function {
+                args,
+                result_mode,
+                result,
+            } => formatter
+                .debug_struct("Function")
+                .field(
+                    "args",
+                    &CheckedTypeListDebug {
+                        source: self.source,
+                        terms: args,
+                    },
+                )
+                .field(
+                    "result",
+                    &CheckedFlowDebug {
+                        source: self.source,
+                        mode: result_mode,
+                        term: result,
+                    },
+                )
+                .finish(),
+            TypeTerm::UnresolvedShape(reason) => formatter
+                .debug_struct("UnresolvedShape")
+                .field("reason", &self.source.diagnostic_text(reason))
+                .finish(),
+            TypeTerm::Variable(variable) => formatter
+                .debug_tuple("Var")
+                .field(&CheckedTypeVarDebug(variable))
+                .finish(),
+            TypeTerm::Unknown => formatter.write_str("Unknown"),
+            TypeTerm::Union(members) => {
+                let members = legacy_checked_union_order(self.source, members);
+                match members.as_slice() {
+                    [] => formatter.write_str("Absent"),
+                    [member] => Self::new(self.source, *member).fmt(formatter),
+                    members => formatter
+                        .debug_tuple("Union")
+                        .field(&CheckedTypeListDebug {
+                            source: self.source,
+                            terms: members,
+                        })
+                        .finish(),
+                }
+            }
+            TypeTerm::Map { key, value } => formatter
+                .debug_struct("Map")
+                .field("key", &Self::new(self.source, key))
+                .field("value", &Self::new(self.source, value))
+                .finish(),
+            TypeTerm::Set(item) => formatter
+                .debug_tuple("Set")
+                .field(&CheckedSharedTypeDebug::new(self.source, item))
+                .finish(),
+            TypeTerm::Bits(width) => formatter
+                .debug_struct("Bits")
+                .field("width", &width)
+                .finish(),
+        }
+    }
+}
+
+struct CheckedBytesDebug(BytesTerm);
+
+impl fmt::Debug for CheckedBytesDebug {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            BytesTerm::Dynamic => formatter.write_str("Dynamic"),
+            BytesTerm::Fixed(size) => formatter.debug_tuple("Fixed").field(&size).finish(),
+        }
+    }
+}
+
+struct CheckedTypeVarDebug(TypeVariableId);
+
+impl fmt::Debug for CheckedTypeVarDebug {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("TypeVar").field(&self.0.0).finish()
+    }
+}
+
+struct CheckedSharedTypeDebug<'a>(CheckedProjectionDebug<'a>);
+
+impl<'a> CheckedSharedTypeDebug<'a> {
+    const fn new(source: &'a TypeTermArena, term: TypeTermId) -> Self {
+        Self(CheckedProjectionDebug::new(source, term))
+    }
+}
+
+impl fmt::Debug for CheckedSharedTypeDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("SharedType").field(&self.0).finish()
+    }
+}
+
+struct CheckedFlowDebug<'a> {
+    source: &'a TypeTermArena,
+    mode: boon_checked::FlowMode,
+    term: TypeTermId,
+}
+
+impl fmt::Debug for CheckedFlowDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FlowType")
+            .field("mode", &self.mode)
+            .field("ty", &CheckedProjectionDebug::new(self.source, self.term))
+            .finish()
+    }
+}
+
+struct CheckedTypeListDebug<'a, T: AsRef<[TypeTermId]>> {
+    source: &'a TypeTermArena,
+    terms: T,
+}
+
+impl<T: AsRef<[TypeTermId]>> fmt::Debug for CheckedTypeListDebug<'_, T> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_list()
+            .entries(
+                self.terms
+                    .as_ref()
+                    .iter()
+                    .copied()
+                    .map(|term| CheckedProjectionDebug::new(self.source, term)),
+            )
+            .finish()
+    }
+}
+
+struct CheckedVariantSetDebug<'a> {
+    source: &'a TypeTermArena,
+    variants: &'a [crate::VariantTerm],
+}
+
+impl fmt::Debug for CheckedVariantSetDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("SharedVariantSet")
+            .field(&CheckedVariantListDebug {
+                source: self.source,
+                variants: self.variants,
+            })
+            .finish()
+    }
+}
+
+struct CheckedVariantListDebug<'a> {
+    source: &'a TypeTermArena,
+    variants: &'a [crate::VariantTerm],
+}
+
+impl fmt::Debug for CheckedVariantListDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.variants.iter().map(|variant| CheckedVariantDebug {
+                source: self.source,
+                variant,
+            }))
+            .finish()
+    }
+}
+
+struct CheckedVariantDebug<'a> {
+    source: &'a TypeTermArena,
+    variant: &'a crate::VariantTerm,
+}
+
+impl fmt::Debug for CheckedVariantDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.variant {
+            crate::VariantTerm::Tag(tag) => formatter
+                .debug_tuple("Tag")
+                .field(&self.source.name(*tag))
+                .finish(),
+            crate::VariantTerm::Tagged { tag, fields } => formatter
+                .debug_struct("Tagged")
+                .field("tag", &self.source.name(*tag))
+                .field(
+                    "fields",
+                    &CheckedObjectFromTermDebug {
+                        source: self.source,
+                        term: *fields,
+                    },
+                )
+                .finish(),
+        }
+    }
+}
+
+struct CheckedObjectFromTermDebug<'a> {
+    source: &'a TypeTermArena,
+    term: TypeTermId,
+}
+
+impl fmt::Debug for CheckedObjectFromTermDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.source.term(self.term) {
+            TypeTerm::Object { fields, open } => CheckedSharedObjectDebug {
+                source: self.source,
+                fields,
+                open,
+            }
+            .fmt(formatter),
+            TypeTerm::OpenObjectPlaceholder => CheckedOpenObjectDebug.fmt(formatter),
+            _ => unreachable!("kernel tagged payload is always an object"),
+        }
+    }
+}
+
+struct CheckedSharedObjectDebug<'a> {
+    source: &'a TypeTermArena,
+    fields: crate::ObjectFields<'a>,
+    open: bool,
+}
+
+impl fmt::Debug for CheckedSharedObjectDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("SharedObjectShape")
+            .field(&CheckedObjectShapeDebug {
+                source: self.source,
+                fields: self.fields,
+                open: self.open,
+            })
+            .finish()
+    }
+}
+
+struct CheckedOpenObjectDebug;
+
+impl fmt::Debug for CheckedOpenObjectDebug {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("SharedObjectShape")
+            .field(&CheckedEmptyObjectShapeDebug)
+            .finish()
+    }
+}
+
+struct CheckedObjectShapeDebug<'a> {
+    source: &'a TypeTermArena,
+    fields: crate::ObjectFields<'a>,
+    open: bool,
+}
+
+impl fmt::Debug for CheckedObjectShapeDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectShape")
+            .field(
+                "fields",
+                &CheckedObjectFieldMapDebug {
+                    source: self.source,
+                    fields: self.fields,
+                },
+            )
+            .field(
+                "field_order",
+                &CheckedObjectFieldOrderDebug {
+                    source: self.source,
+                    fields: self.fields,
+                },
+            )
+            .field("open", &self.open)
+            .finish()
+    }
+}
+
+struct CheckedEmptyObjectShapeDebug;
+
+impl fmt::Debug for CheckedEmptyObjectShapeDebug {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ObjectShape")
+            .field("fields", &CheckedEmptyMapDebug)
+            .field("field_order", &CheckedEmptyListDebug)
+            .field("open", &true)
+            .finish()
+    }
+}
+
+struct CheckedObjectFieldMapDebug<'a> {
+    source: &'a TypeTermArena,
+    fields: crate::ObjectFields<'a>,
+}
+
+impl fmt::Debug for CheckedObjectFieldMapDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut map = formatter.debug_map();
+        for field in self.fields.canonical_iter() {
+            map.entry(
+                &self.source.name(field.name),
+                &CheckedProjectionDebug::new(self.source, field.ty),
+            );
+        }
+        map.finish()
+    }
+}
+
+struct CheckedObjectFieldOrderDebug<'a> {
+    source: &'a TypeTermArena,
+    fields: crate::ObjectFields<'a>,
+}
+
+impl fmt::Debug for CheckedObjectFieldOrderDebug<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_list()
+            .entries(self.fields.iter().map(|field| self.source.name(field.name)))
+            .finish()
+    }
+}
+
+struct CheckedEmptyMapDebug;
+
+impl fmt::Debug for CheckedEmptyMapDebug {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_map().finish()
+    }
+}
+
+struct CheckedEmptyListDebug;
+
+impl fmt::Debug for CheckedEmptyListDebug {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().finish()
+    }
 }
 
 #[cfg(test)]
@@ -766,6 +1155,13 @@ mod tests {
             .enumerate()
             .map(|(index, term)| (*term, modes[index % modes.len()]))
             .collect::<Vec<_>>();
+        for term in roots {
+            assert_eq!(
+                format!("{:?}", CheckedProjectionDebug::new(&source, term)),
+                format!("{:?}", source.export_checked_type(term)),
+                "packed checked Debug projection differs for term {term:?}",
+            );
+        }
         let expression_flows = expression_roots
             .iter()
             .map(|(term, mode)| FlowType {
@@ -830,5 +1226,28 @@ mod tests {
         );
         assert_eq!(direct.module_stable_digest, rich.module_stable_digest);
         assert_eq!(direct.stable_digest, rich.stable_digest);
+    }
+
+    #[test]
+    fn packed_checked_debug_preserves_legacy_raw_variable_union_order() {
+        let mut source = TypeTermArena::new();
+        let variable_2 = source.variable(TypeVariableId(2));
+        let variable_10 = source.variable(TypeVariableId(10));
+        let open_placeholder = source.open_object();
+        let open_object = source.object([], true);
+        let variables = source.union([variable_2, variable_10]);
+        let projected_duplicates = source.union([open_placeholder, open_object, variables]);
+
+        for term in [variables, projected_duplicates] {
+            assert_eq!(
+                format!("{:?}", CheckedProjectionDebug::new(&source, term)),
+                format!("{:?}", source.export_checked_type(term)),
+            );
+        }
+        assert_eq!(
+            legacy_checked_union_order(&source, &[open_placeholder, open_object]).len(),
+            1,
+            "inference-only and real open-empty objects have one checked projection",
+        );
     }
 }

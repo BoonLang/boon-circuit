@@ -1284,7 +1284,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     let interface_projection_started = Instant::now();
                     let interfaces = solved.interface_snapshot();
                     interface_projection_us = elapsed_us(interface_projection_started.elapsed());
-                    debug_assert_eq!(interfaces.public_results.len(), active.len());
+                    debug_assert_eq!(interfaces.definition_count(), active.len());
                 }
                 let checked_image_started = Instant::now();
                 let checked = solved
@@ -1473,9 +1473,9 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
             let interface = snapshot.interface();
             let result_by_owner = active
                 .iter()
-                .zip(interface.public_results.iter())
+                .zip(interface.materialize_public_results())
                 .map(|(prepared_index, result)| {
-                    (prepared[*prepared_index].owner.clone(), result.clone())
+                    (prepared[*prepared_index].owner.clone(), result)
                 })
                 .collect::<BTreeMap<_, _>>();
             let exported_public_children = prepared
@@ -1993,10 +1993,11 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                         })
                         .collect::<Vec<_>>()
                         .into_boxed_slice();
-                    let diagnostics = interface
-                        .diagnostics
+                    let interface_diagnostics = interface
+                        .diagnostics_for(dense_owner)
+                        .expect("kernel interface retains owner diagnostics");
+                    let diagnostics = interface_diagnostics
                         .iter()
-                        .filter(|diagnostic| diagnostic.owner == dense_owner)
                         .map(|diagnostic| {
                             let site = match &diagnostic.site {
                                 KernelDiagnosticSite::Expression { expression } => {
@@ -2204,8 +2205,12 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     KernelOwnerOracleEntry {
                         owner: owner.owner.clone(),
                         result_expression: owner.result_expression.clone(),
-                        formals: interface.callable_formals[dense_index].clone(),
-                        result: interface.public_results[dense_index].clone(),
+                        formals: interface
+                            .materialize_formal_flows(dense_owner)
+                            .expect("kernel interface retains callable formals"),
+                        result: interface
+                            .materialize_result_flow(dense_owner)
+                            .expect("kernel interface retains a public result"),
                         expressions,
                         presentation_scope_count,
                         execution_shape_count,
@@ -2412,10 +2417,10 @@ pub(crate) fn compiler_diagnostics_from_kernel(
     let KernelCheckProduct::Diagnostics(interfaces) = checked.product else {
         unreachable!("diagnostics demand returns an interface snapshot")
     };
-    if interfaces.public_results.len() != dense_owner_count {
+    if interfaces.definition_count() != dense_owner_count {
         return Err(format!(
             "dense kernel diagnostics publish {} of {} definition interfaces",
-            interfaces.public_results.len(),
+            interfaces.definition_count(),
             dense_owner_count
         ));
     }
@@ -2735,10 +2740,10 @@ fn checked_construction_from_kernel(
     let KernelCheckProduct::Diagnostics(interfaces) = diagnostics_product.product else {
         unreachable!("diagnostics demand returns an interface snapshot")
     };
-    if interfaces.public_results.len() != dense_owner_count {
+    if interfaces.definition_count() != dense_owner_count {
         return Err(format!(
             "dense kernel checked construction publishes {} of {} definition interfaces",
-            interfaces.public_results.len(),
+            interfaces.definition_count(),
             dense_owner_count
         ));
     }
@@ -3041,8 +3046,8 @@ fn present_kernel_project_diagnostics(
         .links()
         .definitions()
         .iter()
-        .zip(interfaces.public_results.iter())
-        .filter_map(|(owner, result)| {
+        .enumerate()
+        .filter_map(|(dense_owner, owner)| {
             let StableCheckOwnerKey::Item(key) = owner else {
                 return None;
             };
@@ -3053,7 +3058,9 @@ fn present_kernel_project_diagnostics(
             if container.names.first().map(String::as_str) == Some("outputs")
                 && output.kind == UnitItemKind::Field
             {
-                Some((output.names.first()?.clone(), result.ty.clone()))
+                let result =
+                    interfaces.materialize_result_flow(KernelOwnerId(dense_owner as u32))?;
+                Some((output.names.first()?.clone(), result.ty))
             } else {
                 None
             }
@@ -3064,15 +3071,13 @@ fn present_kernel_project_diagnostics(
         project,
         &output_types,
     ));
-    for diagnostic in interfaces.diagnostics.iter() {
+    for diagnostic in interfaces.diagnostic_refs() {
         diagnostics.push(present_kernel_interface_diagnostic(
             project, input, diagnostic,
         )?);
     }
     diagnostics.extend(project_kernel_interface_render_slot_diagnostics(
-        project,
-        input,
-        &interfaces.diagnostic_values,
+        project, input, interfaces,
     )?);
     diagnostics.sort_by(|left, right| {
         left.line
@@ -3088,13 +3093,14 @@ fn present_kernel_project_diagnostics(
 fn present_kernel_interface_diagnostic(
     project: &ProjectSyntaxSnapshot,
     input: &KernelProjectInput,
-    diagnostic: &boon_compiler_kernel::KernelDiagnosticArtifact,
+    diagnostic: boon_compiler_kernel::KernelInterfaceDiagnosticRef<'_>,
 ) -> Result<TypeDiagnostic, String> {
-    let owner = kernel_project_definition_key(input, diagnostic.owner)?;
+    let diagnostic_owner = diagnostic.owner();
+    let owner = kernel_project_definition_key(input, diagnostic_owner)?;
     let expression = |expression: KernelExpressionId| {
-        kernel_project_expression_key(input, diagnostic.owner, expression).cloned()
+        kernel_project_expression_key(input, diagnostic_owner, expression).cloned()
     };
-    let site = match &diagnostic.site {
+    let site = match diagnostic.site() {
         KernelDiagnosticSite::Expression { expression: value } => {
             KernelOwnerOracleDiagnosticSite::Expression(expression(*value)?)
         }
@@ -3123,26 +3129,36 @@ fn present_kernel_interface_diagnostic(
             }
         }
     };
-    let diagnostic = KernelOwnerOracleDiagnostic {
-        severity: diagnostic.severity,
-        site,
-        kind: diagnostic.kind.clone(),
+    let boon_compiler_kernel::KernelInterfaceDiagnosticKindRef::CallInputType {
+        actual,
+        expected,
+        mismatch,
+    } = diagnostic.kind()
+    else {
+        let boon_compiler_kernel::KernelInterfaceDiagnosticKindRef::Plain(kind) = diagnostic.kind()
+        else {
+            unreachable!()
+        };
+        if matches!(site, KernelOwnerOracleDiagnosticSite::CallInput { .. }) {
+            return Err("kernel call-input diagnostic has a non-call-input payload".to_owned());
+        }
+        return present_kernel_source_diagnostic(
+            project,
+            owner,
+            &KernelOwnerOracleDiagnostic {
+                severity: diagnostic.severity(),
+                site,
+                kind: kind.clone(),
+            },
+        );
     };
     let KernelOwnerOracleDiagnosticSite::CallInput {
         call,
         target,
         formal_ordinal,
-    } = &diagnostic.site
+    } = &site
     else {
-        return present_kernel_source_diagnostic(project, owner, &diagnostic);
-    };
-    let KernelDiagnosticKind::CallInputType {
-        actual,
-        expected,
-        mismatch,
-    } = &diagnostic.kind
-    else {
-        return Err("kernel call-input diagnostic has a non-call-input payload".to_owned());
+        return Err("kernel call-input type payload has a non-call-input site".to_owned());
     };
     let target_dense = input
         .links()
@@ -3171,9 +3187,9 @@ fn present_kernel_interface_diagnostic(
         owner,
         call,
         target,
-        diagnostic.severity,
-        actual,
-        expected,
+        diagnostic.severity(),
+        &actual.materialize_checked(),
+        &expected.materialize_checked(),
         mismatch,
         parameter_name,
     )
@@ -3182,33 +3198,37 @@ fn present_kernel_interface_diagnostic(
 fn project_kernel_interface_render_slot_diagnostics(
     project: &ProjectSyntaxSnapshot,
     input: &KernelProjectInput,
-    values: &[boon_compiler_kernel::KernelDiagnosticValueArtifact],
+    interfaces: &KernelInterfaceSnapshot,
 ) -> Result<Vec<TypeDiagnostic>, String> {
     let expected_values = input
         .definition_facts()
         .iter()
         .map(|facts| facts.diagnostic_values.len())
         .sum::<usize>();
-    if values.len() != expected_values {
+    if interfaces.diagnostic_value_count() != expected_values {
         return Err(format!(
             "kernel diagnostics published {} of {expected_values} render-contract values",
-            values.len()
+            interfaces.diagnostic_value_count()
         ));
     }
     let mut diagnostics = Vec::new();
-    for value in values {
-        let owner = kernel_project_definition_key(input, value.owner)?;
+    for value in interfaces.diagnostic_value_refs() {
+        let value_owner = value.owner();
+        let owner = kernel_project_definition_key(input, value_owner)?;
         let slot_name =
-            kernel_project_render_slot_name(project, input, value.owner, value.ordinal as usize)?;
-        let Some(message) =
-            boon_typecheck::project_render_slot_type_diagnostic(slot_name, &value.ty)
-        else {
+            kernel_project_render_slot_name(project, input, value_owner, value.ordinal() as usize)?;
+        if boon_typecheck::render_slot_accepts_type_view(slot_name, value.ty()) {
             continue;
-        };
-        let (source_owner, source_expression) = match value.value {
+        }
+        let rich_type = value.ty().materialize_checked();
+        let message = boon_typecheck::project_render_slot_type_diagnostic(slot_name, &rich_type)
+            .ok_or_else(|| {
+                "packed and rich render-slot validation disagree for one interface value".to_owned()
+            })?;
+        let (source_owner, source_expression) = match value.value() {
             KernelValueReference::Local(expression) => (
                 owner,
-                kernel_project_expression_key(input, value.owner, expression)?,
+                kernel_project_expression_key(input, value_owner, expression)?,
             ),
             KernelValueReference::External(external) => {
                 let target = kernel_project_definition_key(input, external.owner)?;

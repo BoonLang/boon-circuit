@@ -870,16 +870,20 @@ mod tests {
         let KernelCheckProduct::Diagnostics(snapshot) = &result.product else {
             panic!("diagnostics demand returned another product")
         };
-        assert_eq!(snapshot.public_results.len(), 3);
-        assert_eq!(snapshot.callable_formals.len(), 3);
-        assert!(
+        assert_eq!(snapshot.definition_count(), 3);
+        assert!((0..snapshot.definition_count()).all(|owner| {
             snapshot
-                .callable_formals
-                .iter()
-                .all(|formals| formals.is_empty())
+                .materialize_formal_flows(KernelOwnerId(owner as u32))
+                .is_some_and(|formals| formals.is_empty())
+        }));
+        assert_eq!(
+            snapshot
+                .materialize_result_flow(KernelOwnerId(2))
+                .unwrap()
+                .ty,
+            Type::Number
         );
-        assert_eq!(snapshot.public_results[2].ty, Type::Number);
-        assert!(snapshot.diagnostics.is_empty());
+        assert_eq!(snapshot.diagnostic_count(), 0);
         assert_eq!(result.product.published_definition_count(), 0);
         assert_eq!(result.product.sealed_definition_count(), 0);
         assert!(!result.reused);
@@ -903,15 +907,21 @@ mod tests {
             panic!("checked-image demand returned another product")
         };
         assert_eq!(
-            snapshot.public_results.as_ref(),
-            checked_snapshot.interface.public_results.as_ref(),
+            snapshot.materialize_public_results().collect::<Vec<_>>(),
+            checked_snapshot
+                .interface
+                .materialize_public_results()
+                .collect::<Vec<_>>(),
             "diagnostics and checked-image demands must share one public interface authority"
         );
-        assert_eq!(
-            snapshot.callable_formals.as_ref(),
-            checked_snapshot.interface.callable_formals.as_ref(),
-            "diagnostics and checked-image demands must share callable formal authorities"
-        );
+        for owner in 0..snapshot.definition_count() {
+            let owner = KernelOwnerId(owner as u32);
+            assert_eq!(
+                snapshot.materialize_formal_flows(owner),
+                checked_snapshot.interface.materialize_formal_flows(owner),
+                "diagnostics and checked-image demands must share callable formal authorities"
+            );
+        }
 
         let repeated = session
             .check(CheckDemand::Diagnostics)
@@ -929,7 +939,8 @@ mod tests {
         let KernelCheckProduct::Diagnostics(diagnostics) = &result.product else {
             panic!("diagnostics demand returned another product")
         };
-        let [diagnostic] = diagnostics.diagnostics.as_ref() else {
+        let materialized_diagnostics = diagnostics.materialize_diagnostics();
+        let [diagnostic] = materialized_diagnostics.as_ref() else {
             panic!("diagnostics demand must publish one call failure")
         };
         assert_eq!(
@@ -959,8 +970,8 @@ mod tests {
             panic!("checked demand returned another product")
         };
         assert_eq!(
-            checked.interface.diagnostics.as_ref(),
-            diagnostics.diagnostics.as_ref(),
+            checked.interface.materialize_diagnostics(),
+            materialized_diagnostics,
             "one graph evaluation owns both diagnostics-only and checked-image facts"
         );
     }
@@ -989,8 +1000,10 @@ mod tests {
         );
         assert_eq!(definitions[0].owner(), &first);
         assert!(definitions.iter().all(|definition| {
-            snapshot.interface().public_results[definition.dense_owner().0 as usize].ty
-                == Type::Text
+            snapshot
+                .interface()
+                .materialize_result_flow(definition.dense_owner())
+                .is_some_and(|result| result.ty == Type::Text)
         }));
         assert_eq!(result.product.published_definition_count(), 2);
         assert_eq!(result.product.sealed_definition_count(), 0);
@@ -1067,6 +1080,12 @@ mod tests {
         let KernelCheckProduct::Diagnostics(snapshot) = second.product else {
             panic!("replacement diagnostics returned another product")
         };
-        assert_eq!(snapshot.public_results[2].ty, Type::Text);
+        assert_eq!(
+            snapshot
+                .materialize_result_flow(KernelOwnerId(2))
+                .unwrap()
+                .ty,
+            Type::Text
+        );
     }
 }

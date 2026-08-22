@@ -46,11 +46,13 @@ pub struct KernelSolveWork {
     pub structural_widen_requests: u64,
     pub structural_widen_hits: u64,
     pub dynamic_dependency_edges: u64,
-    /// Zero for diagnostics-only solves, which do not retain a frozen store.
+    /// Layout of the frozen type authority retained by the published product.
+    /// Diagnostics retain an exact reachable-root store; checked demand shares
+    /// the complete definition-code store.
     pub frozen_type_store: FrozenTypeStoreLayout,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ArtifactOutput {
     pub id: OutputId,
     /// Resolved flow qualified by the exact frozen store retained by the
@@ -100,20 +102,18 @@ pub(crate) struct UnsealedComponentArtifact {
     work: KernelSolveWork,
 }
 
-/// Lean output-only view used by diagnostics before checked definition terms
-/// are demanded. It intentionally owns no clone of the solved type arena.
-#[derive(Clone, Debug)]
-pub(crate) struct ComponentOutputSnapshot {
-    outputs: Box<[Option<ProjectedArtifactOutput>]>,
+/// Phase-local packed view over demanded outputs in the live solver arena.
+///
+/// Diagnostics may add derived call-instantiation roots while this borrow is
+/// active, but the arena remains owned by the staged solve session.  The
+/// final interface projector copies only retained roots into its immutable
+/// snapshot, so diagnostics-to-checked promotion neither freezes nor clones
+/// the live solver graph.
+#[derive(Debug)]
+pub(crate) struct ComponentOutputSnapshot<'a> {
+    outputs: Box<[Option<ArtifactOutput>]>,
+    terms: &'a mut TypeTermArena,
     pub work: KernelSolveWork,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct ProjectedArtifactOutput {
-    pub(crate) id: OutputId,
-    pub(crate) flow_type: Option<FlowType>,
-    pub(crate) syntax_selected_here: bool,
-    pub(crate) call_syntax_selected: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -122,47 +122,30 @@ pub(crate) struct ArtifactOutputFlags {
     pub(crate) call_syntax_selected: bool,
 }
 
-impl ComponentOutputSnapshot {
+impl<'a> ComponentOutputSnapshot<'a> {
     pub(crate) fn new(
-        outputs: Box<[Option<ProjectedArtifactOutput>]>,
+        outputs: Box<[Option<ArtifactOutput>]>,
+        terms: &'a mut TypeTermArena,
         work: KernelSolveWork,
     ) -> Self {
-        Self { outputs, work }
+        Self {
+            outputs,
+            terms,
+            work,
+        }
     }
 
-    /// Temporary rich compatibility projection while the packed arena is
-    /// still mutable. This lets every derived type root be interned before the
-    /// one permanent freeze. The projection is phase-local and is dropped
-    /// before the sealed project is published.
-    pub(crate) fn project_unsealed(
-        artifact: &UnsealedComponentArtifact,
-        demanded: &[OutputId],
-    ) -> Self {
-        let mut outputs = vec![None; artifact.outputs.len()];
-        let mut work = artifact.work;
-        for id in demanded.iter().copied() {
-            let index = id.0 as usize;
-            let Some(slot) = outputs.get_mut(index) else {
-                continue;
-            };
-            if slot.is_some() {
-                continue;
-            }
-            let Some(output) = artifact.output(id) else {
-                continue;
-            };
-            *slot = Some(ProjectedArtifactOutput {
-                id,
-                flow_type: Some(FlowType {
-                    mode: output.flow.mode(),
-                    ty: artifact.terms.export_checked_type(output.term()),
-                }),
-                syntax_selected_here: output.syntax_selected_here,
-                call_syntax_selected: output.call_syntax_selected,
-            });
-            work.rich_output_flow_exports = work.rich_output_flow_exports.saturating_add(1);
-        }
-        Self::new(outputs.into_boxed_slice(), work)
+    /// Borrow a sparse packed view while the complete artifact remains
+    /// mutable. Derived roots are interned through [`Self::terms_mut`] before
+    /// the one permanent freeze.
+    pub(crate) fn project_unsealed(artifact: &'a mut UnsealedComponentArtifact) -> Self {
+        // A complete solve has already made every output available and later
+        // definition-code publication consumes all of them. Borrow the flat
+        // rows directly; a second sparse-demand calculation would omit
+        // occurrence-only syntax flags without reducing the boxed column.
+        let outputs = artifact.outputs.clone();
+        let work = artifact.work;
+        Self::new(outputs, &mut artifact.terms, work)
     }
 
     #[cfg(test)]
@@ -173,12 +156,19 @@ impl ComponentOutputSnapshot {
             .count()
     }
 
-    pub(crate) fn flow_type(&self, id: OutputId) -> Option<&FlowType> {
+    pub(crate) fn flow(&self, id: OutputId) -> Option<crate::PackedFlow> {
         self.outputs
             .get(id.0 as usize)
             .and_then(Option::as_ref)
             .filter(|output| output.id == id)
-            .and_then(|output| output.flow_type.as_ref())
+            .map(|output| crate::PackedFlow {
+                mode: output.flow.mode(),
+                term: output.term(),
+            })
+    }
+
+    pub(crate) fn term(&self, id: OutputId) -> Option<crate::TypeTermId> {
+        self.flow(id).map(|flow| flow.term)
     }
 
     pub(crate) fn output_flags(&self, id: OutputId) -> Option<ArtifactOutputFlags> {
@@ -194,6 +184,14 @@ impl ComponentOutputSnapshot {
 
     pub(crate) const fn work(&self) -> KernelSolveWork {
         self.work
+    }
+
+    pub(crate) fn terms(&self) -> &TypeTermArena {
+        self.terms
+    }
+
+    pub(crate) fn terms_mut(&mut self) -> &mut TypeTermArena {
+        self.terms
     }
 }
 

@@ -169,7 +169,6 @@ struct DefinitionCode {
     expression_kind_types: Span32,
     declaration_flows: Span32,
     calls: Span32,
-    diagnostic_types: Span32,
     source_payload_types: Span32,
     states: Span32,
     list_item_types: Span32,
@@ -202,7 +201,6 @@ pub struct DefinitionCodeStore {
     declaration_flows: Box<[Option<PackedFlow>]>,
     calls: Box<[PackedCallFacts]>,
     call_substitutions: Box<[PackedCallTypeSubstitution]>,
-    diagnostic_types: Box<[Option<PackedDiagnosticTypes>]>,
     source_payload_types: Box<[crate::TypeTermId]>,
     states: Box<[PackedPublishedState]>,
     list_item_types: Box<[crate::TypeTermId]>,
@@ -563,11 +561,6 @@ impl DefinitionCodeStore {
                 ),
                 ("call", definition.calls, self.calls.len()),
                 (
-                    "diagnostic-type",
-                    definition.diagnostic_types,
-                    self.diagnostic_types.len(),
-                ),
-                (
                     "SOURCE-payload",
                     definition.source_payload_types,
                     self.source_payload_types.len(),
@@ -761,16 +754,6 @@ impl DefinitionCodeStore {
                     .iter()
                     .copied(),
             );
-            for diagnostic in definition
-                .diagnostic_types
-                .get(&self.diagnostic_types)
-                .expect("validated diagnostic-type span")
-                .iter()
-                .flatten()
-            {
-                stack.push(diagnostic.actual);
-                stack.push(diagnostic.expected);
-            }
             stack.extend(
                 definition
                     .states
@@ -1262,10 +1245,6 @@ impl<'a> DefinitionCodeRef<'a> {
             .copied()
             .flatten()?;
         Some(self.materialize_packed_flow(flow))
-    }
-
-    pub(crate) fn diagnostic_count(self) -> usize {
-        self.code.diagnostic_types.len as usize
     }
 
     pub fn materialize_call_facts(self, ordinal: usize) -> Option<MaterializedCallFacts> {
@@ -1780,7 +1759,6 @@ pub(crate) struct DefinitionAdditionalTypeRoots<'a> {
     pub(crate) declaration_flows: &'a [Option<PackedFlow>],
     pub(crate) calls: &'a [PackedCallFactsInput],
     pub(crate) call_substitutions: &'a [PackedCallTypeSubstitution],
-    pub(crate) diagnostic_types: &'a [Option<PackedDiagnosticTypes>],
     pub(crate) source_payload_types: &'a [crate::TypeTermId],
     /// Number of authored state candidates in the immutable definition facts.
     /// Published rows retain dense input ordinals into that authority.
@@ -1821,7 +1799,6 @@ pub(crate) struct DefinitionCodeBuilder {
     declaration_flows: Vec<Option<PackedFlow>>,
     calls: Vec<PackedCallFacts>,
     call_substitutions: Vec<PackedCallTypeSubstitution>,
-    diagnostic_types: Vec<Option<PackedDiagnosticTypes>>,
     source_payload_types: Vec<crate::TypeTermId>,
     states: Vec<PackedPublishedState>,
     list_item_types: Vec<crate::TypeTermId>,
@@ -1852,7 +1829,6 @@ impl DefinitionCodeBuilder {
             declaration_flows: Vec::new(),
             calls: Vec::new(),
             call_substitutions: Vec::new(),
-            diagnostic_types: Vec::new(),
             source_payload_types: Vec::new(),
             states: Vec::new(),
             list_item_types: Vec::new(),
@@ -2326,10 +2302,6 @@ impl DefinitionCodeBuilder {
         }
         self.execution_node_by_call
             .extend((0..calls.len).map(|_| MISSING_EXECUTION_ROW));
-        let diagnostic_types = Span32::append(
-            &mut self.diagnostic_types,
-            additional.diagnostic_types.iter().copied(),
-        )?;
         let source_payload_types = Span32::append(
             &mut self.source_payload_types,
             additional.source_payload_types.iter().copied(),
@@ -2489,7 +2461,6 @@ impl DefinitionCodeBuilder {
             expression_kind_types,
             declaration_flows,
             calls,
-            diagnostic_types,
             source_payload_types,
             states,
             list_item_types,
@@ -2523,7 +2494,6 @@ impl DefinitionCodeBuilder {
             declaration_flows: self.declaration_flows.into_boxed_slice(),
             calls: self.calls.into_boxed_slice(),
             call_substitutions: self.call_substitutions.into_boxed_slice(),
-            diagnostic_types: self.diagnostic_types.into_boxed_slice(),
             source_payload_types: self.source_payload_types.into_boxed_slice(),
             states: self.states.into_boxed_slice(),
             list_item_types: self.list_item_types.into_boxed_slice(),
@@ -2603,7 +2573,6 @@ mod tests {
                     declaration_flows: &[],
                     calls: &calls,
                     call_substitutions: &[],
-                    diagnostic_types: &[],
                     source_payload_types: &source_payload_types,
                     state_input_count: state_count,
                     states: &states,
@@ -2818,7 +2787,6 @@ mod tests {
                     declaration_flows: &declarations,
                     calls: &[],
                     call_substitutions: &[],
-                    diagnostic_types: &[],
                     source_payload_types: &[],
                     state_input_count: states.len(),
                     states: &states,
@@ -2897,7 +2865,6 @@ mod tests {
                     declaration_flows: &[],
                     calls: &invalid_call,
                     call_substitutions: &[],
-                    diagnostic_types: &[],
                     source_payload_types: &[],
                     state_input_count: 0,
                     states: &[],
@@ -2935,7 +2902,6 @@ mod tests {
                     declaration_flows: &[],
                     calls: &[],
                     call_substitutions: &[],
-                    diagnostic_types: &[],
                     source_payload_types: &[],
                     state_input_count: 1,
                     states: &invalid_state,
@@ -3002,7 +2968,6 @@ mod tests {
                     declaration_flows: &[],
                     calls: &[],
                     call_substitutions: &[],
-                    diagnostic_types: &[],
                     source_payload_types: &[],
                     state_input_count: 0,
                     states: &[],

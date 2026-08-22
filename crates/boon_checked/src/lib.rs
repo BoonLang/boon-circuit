@@ -66,6 +66,60 @@ pub enum Type {
     },
 }
 
+/// Borrowed structural view used by policy layers that only need to inspect a
+/// checked type.
+///
+/// Implementations may be ordinary rich [`Type`] references or scoped packed
+/// term references. Keeping this interface read-only lets validation avoid
+/// reconstructing recursive `Type`, `String`, and collection owners merely to
+/// answer a structural predicate.
+pub trait CheckedTypeView: Copy {
+    fn list_item(self) -> Option<Self>;
+    fn is_text(self) -> bool;
+    fn is_number(self) -> bool;
+    fn is_render_contract(self) -> bool;
+    fn object_field(self, name: &str) -> Option<Self>;
+    fn all_variants_are_bare_tags(self, predicate: impl FnMut(&str) -> bool) -> bool;
+}
+
+impl CheckedTypeView for &Type {
+    fn list_item(self) -> Option<Self> {
+        match self {
+            Type::List(item) => Some(item.as_ref()),
+            _ => None,
+        }
+    }
+
+    fn is_text(self) -> bool {
+        matches!(self, Type::Text)
+    }
+
+    fn is_number(self) -> bool {
+        matches!(self, Type::Number)
+    }
+
+    fn is_render_contract(self) -> bool {
+        matches!(self, Type::RenderContract)
+    }
+
+    fn object_field(self, name: &str) -> Option<Self> {
+        match self {
+            Type::Object(shape) => shape.fields.get(name),
+            _ => None,
+        }
+    }
+
+    fn all_variants_are_bare_tags(self, mut predicate: impl FnMut(&str) -> bool) -> bool {
+        match self {
+            Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
+                Variant::Tag(tag) => predicate(tag),
+                Variant::Tagged { .. } => false,
+            }),
+            _ => false,
+        }
+    }
+}
+
 impl Type {
     /// Seal an owned object shape into a cheaply cloneable type node.
     pub fn object(shape: ObjectShape) -> Self {

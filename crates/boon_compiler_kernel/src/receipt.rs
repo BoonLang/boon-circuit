@@ -1,14 +1,16 @@
 #[cfg(test)]
 use crate::DefinitionArtifact;
 use crate::{
-    DefinitionCodeRef, DefinitionCodeStore, KernelCallInputRoleRef, KernelCallTarget,
+    BytesTerm, DefinitionCodeRef, DefinitionCodeStore, KernelCallInputRoleRef, KernelCallTarget,
     KernelCallTargetRef, KernelDeclarationReference, KernelDefinitionFactsInput,
     KernelDefinitionRef, KernelDiagnosticArtifact, KernelDiagnosticKind, KernelExpressionId,
     KernelExpressionKindRef, KernelExternalExpression, KernelExternalTarget,
     KernelInterfaceSnapshot, KernelLexicalBindingTarget, KernelLexicalBindingTargetRef,
     KernelOwnerBuildError, KernelOwnerId, KernelOwnerNodeKind, KernelOwnerProgramInput,
     KernelProjectProgramInput, KernelSolveError, KernelStatePathRef, KernelStatementChildReference,
-    KernelStatementReference, KernelValueReference, RichDefinitionArtifact,
+    KernelStatementReference, KernelValueReference, PackedDiagnosticMetadata,
+    PackedDiagnosticTypes, PackedFlow, RichDefinitionArtifact, TypeTerm, TypeTermArena, TypeTermId,
+    TypeVariableId, VariantTerm,
 };
 use boon_checked::{FlowType, ObjectShape, SharedObjectShape, Type, TypeVar, Variant};
 use boon_effect_schema::{
@@ -16,6 +18,7 @@ use boon_effect_schema::{
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -336,22 +339,19 @@ pub(crate) fn build_packed_snapshot_receipts(
     if definitions.len() != definition_facts.len()
         || definitions.len() != basis_fingerprints.len()
         || definitions.len() != code.definition_count()
-        || definitions.len() != interface.public_results.len()
-        || definitions.len() != interface.callable_formals.len()
+        || definitions.len() != interface.definition_count()
     {
         return Err(KernelSolveError::new(format!(
-            "kernel packed snapshot has {} definitions, {} fact rows, {} code rows, {} results, {} formal rows, and {} basis fingerprints",
+            "kernel packed snapshot has {} definitions, {} fact rows, {} code rows, {} interface rows, and {} basis fingerprints",
             definitions.len(),
             definition_facts.len(),
             code.definition_count(),
-            interface.public_results.len(),
-            interface.callable_formals.len(),
+            interface.definition_count(),
             basis_fingerprints.len(),
         )));
     }
-    let diagnostic_offsets = packed_diagnostic_offsets(code, interface)?;
-    let dependency_graph =
-        build_packed_dependency_graph(definitions, code, interface, &diagnostic_offsets)?;
+    validate_packed_interface_diagnostic_layout(code, interface)?;
+    let dependency_graph = build_packed_dependency_graph(definitions, code, interface)?;
     let mut imported_expressions = vec![BTreeSet::new(); definitions.len()];
     for dependency in dependency_graph.dependencies.iter() {
         if let KernelDependencyTarget::Expression { owner, expression } = dependency.target {
@@ -365,7 +365,6 @@ pub(crate) fn build_packed_snapshot_receipts(
             definition_facts,
             code,
             interface,
-            &diagnostic_offsets,
             &imported_expressions,
         )
     })?;
@@ -401,25 +400,18 @@ pub(crate) fn build_borrowed_snapshot_receipts(
     let definition_count = program.owners.len();
     if definition_count != definition_facts.len()
         || definition_count != code.definition_count()
-        || definition_count != interface.public_results.len()
-        || definition_count != interface.callable_formals.len()
+        || definition_count != interface.definition_count()
     {
         return Err(KernelSolveError::new(format!(
-            "kernel borrowed snapshot has {definition_count} program rows, {} fact rows, {} code rows, {} results, and {} formal rows",
+            "kernel borrowed snapshot has {definition_count} program rows, {} fact rows, {} code rows, and {} interface rows",
             definition_facts.len(),
             code.definition_count(),
-            interface.public_results.len(),
-            interface.callable_formals.len(),
+            interface.definition_count(),
         )));
     }
-    let diagnostic_offsets = packed_diagnostic_offsets(code, interface)?;
-    let dependency_graph = build_borrowed_dependency_graph(
-        program,
-        definition_facts,
-        code,
-        interface,
-        &diagnostic_offsets,
-    )?;
+    validate_packed_interface_diagnostic_layout(code, interface)?;
+    let dependency_graph =
+        build_borrowed_dependency_graph(program, definition_facts, code, interface)?;
     let mut imported_expressions = vec![BTreeSet::new(); definition_count];
     for dependency in dependency_graph.dependencies.iter() {
         if let KernelDependencyTarget::Expression { owner, expression } = dependency.target {
@@ -433,7 +425,6 @@ pub(crate) fn build_borrowed_snapshot_receipts(
             definition_facts,
             code,
             interface,
-            &diagnostic_offsets,
             &imported_expressions,
         )
     })?;
@@ -452,35 +443,61 @@ pub(crate) fn build_borrowed_snapshot_receipts(
     Ok((dependency_graph, receipts.into_boxed_slice()))
 }
 
-fn packed_diagnostic_offsets(
+fn validate_packed_interface_diagnostic_layout(
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
-) -> Result<Box<[u32]>, KernelSolveError> {
-    let mut offsets = Vec::with_capacity(code.definition_count() + 1);
-    offsets.push(0);
+) -> Result<(), KernelSolveError> {
+    if interface.diagnostics.len() != interface.diagnostic_types.len() {
+        return Err(KernelSolveError::new(format!(
+            "kernel interface has {} diagnostic metadata rows but {} diagnostic type rows",
+            interface.diagnostics.len(),
+            interface.diagnostic_types.len()
+        )));
+    }
     let mut cursor = 0usize;
     for owner in 0..code.definition_count() {
         let owner_id = KernelOwnerId(
             u32::try_from(owner).expect("kernel definition count exceeds dense u32 namespace"),
         );
-        let definition = code.definition(owner_id).ok_or_else(|| {
+        code.definition(owner_id).ok_or_else(|| {
             KernelSolveError::new(format!("kernel definition code omits owner {owner}"))
         })?;
-        let end = cursor
-            .checked_add(definition.diagnostic_count())
-            .ok_or_else(|| KernelSolveError::new("kernel diagnostic offset overflowed usize"))?;
-        let rows = interface.diagnostics.get(cursor..end).ok_or_else(|| {
+        let interface_definition = interface.definitions.get(owner).ok_or_else(|| {
+            KernelSolveError::new(format!("kernel interface omits owner {owner}"))
+        })?;
+        let range = interface_definition.diagnostics.range();
+        if range.start != cursor {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition {owner} diagnostic span {range:?} does not continue at {cursor}",
+            )));
+        }
+        let rows = interface.diagnostics.get(range.clone()).ok_or_else(|| {
             KernelSolveError::new(format!(
                 "kernel definition {owner} diagnostic code exceeds its interface rows"
             ))
         })?;
-        if rows.iter().any(|diagnostic| diagnostic.owner != owner_id) {
+        if rows.iter().any(|diagnostic| diagnostic.owner() != owner_id) {
             return Err(KernelSolveError::new(format!(
                 "kernel definition {owner} diagnostic rows are not owner-contiguous"
             )));
         }
-        cursor = end;
-        offsets.push(checked_u32(cursor, "kernel diagnostic row count")?);
+        for (metadata, types) in rows.iter().zip(&interface.diagnostic_types[range.clone()]) {
+            let aligned = matches!(metadata, PackedDiagnosticMetadata::CallInputType { .. })
+                == types.is_some();
+            let plain_call_input = matches!(
+                metadata,
+                PackedDiagnosticMetadata::Plain(KernelDiagnosticArtifact {
+                    kind: KernelDiagnosticKind::CallInputType { .. },
+                    ..
+                })
+            );
+            if !aligned || plain_call_input {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition {owner} diagnostic metadata and packed type rows differ"
+                )));
+            }
+        }
+        cursor = range.end;
     }
     if cursor != interface.diagnostics.len() {
         return Err(KernelSolveError::new(format!(
@@ -488,7 +505,326 @@ fn packed_diagnostic_offsets(
             interface.diagnostics.len()
         )));
     }
-    Ok(offsets.into_boxed_slice())
+    Ok(())
+}
+
+/// Reusable alpha-renaming state for direct hashes of packed checked types.
+///
+/// Public-result V1 starts from an empty scope and assigns variables in the
+/// projected checked traversal order. Definition-artifact V17 starts from the
+/// callable interface's already-established alpha scope so diagnostic types
+/// receive the same ordinals as the former rich compatibility projection.
+#[derive(Default)]
+struct PackedAlphaHashScratch {
+    variables: RefCell<Vec<(TypeVariableId, u32)>>,
+    exact_scope: Cell<bool>,
+}
+
+impl PackedAlphaHashScratch {
+    fn begin_fresh(&self) {
+        self.variables.borrow_mut().clear();
+        self.exact_scope.set(false);
+    }
+
+    fn begin_exact(&self, sources: &[TypeVariableId]) {
+        let mut variables = self.variables.borrow_mut();
+        variables.clear();
+        variables.extend(
+            sources
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(ordinal, source)| {
+                    (
+                        source,
+                        u32::try_from(ordinal)
+                            .expect("kernel interface alpha-variable count exceeds u32"),
+                    )
+                }),
+        );
+        self.exact_scope.set(true);
+    }
+
+    fn ordinal(&self, variable: TypeVariableId) -> u32 {
+        let mut variables = self.variables.borrow_mut();
+        if let Some((_, ordinal)) = variables.iter().find(|(source, _)| *source == variable) {
+            return *ordinal;
+        }
+        assert!(
+            !self.exact_scope.get(),
+            "packed receipt type reaches variable {} outside its sealed callable alpha scope",
+            variable.0
+        );
+        let ordinal = u32::try_from(variables.len())
+            .expect("kernel packed receipt alpha-variable count exceeds u32");
+        variables.push((variable, ordinal));
+        ordinal
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Hash)]
+enum CheckedTypeHashTag {
+    Text,
+    Number,
+    Bytes,
+    Absent,
+    VariantSet,
+    Object,
+    RenderContract,
+    List,
+    Function,
+    UnresolvedShape,
+    Var,
+    Unknown,
+    Union,
+    Map,
+    Set,
+    Bits,
+}
+
+#[allow(dead_code)]
+#[derive(Hash)]
+enum CheckedBytesHashTag {
+    Dynamic,
+    Fixed,
+}
+
+#[allow(dead_code)]
+#[derive(Hash)]
+enum CheckedVariantHashTag {
+    Tag,
+    Tagged,
+}
+
+#[allow(dead_code)]
+#[derive(Hash)]
+enum KernelDiagnosticKindHashTag {
+    InvalidExpression,
+    InvalidPattern,
+    InvalidNumberLiteral,
+    InvalidBitsLiteral,
+    ByteLiteralOutsideBytes,
+    DuplicateRecordField,
+    MissingPassedContext,
+    UnresolvedValue,
+    CallableUsedAsValue,
+    AmbiguousValue,
+    UnresolvedCallable,
+    AmbiguousCallable,
+    PipeWithoutValueInput,
+    UnexpectedCallEntry,
+    MisorderedCallEntry,
+    MissingCallEntry,
+    BareOrdinaryInput,
+    PassOnAuthoritativeCallable,
+    MissingPassContext,
+    CallInputType,
+}
+
+struct PackedCheckedFlowHash<'a> {
+    arena: &'a TypeTermArena,
+    flow: PackedFlow,
+    alpha: &'a PackedAlphaHashScratch,
+}
+
+impl Hash for PackedCheckedFlowHash<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.flow.mode.hash(state);
+        hash_packed_checked_type(self.arena, self.flow.term, self.alpha, state);
+    }
+}
+
+struct PackedDiagnosticsHash<'a> {
+    arena: &'a TypeTermArena,
+    metadata: &'a [PackedDiagnosticMetadata],
+    types: &'a [Option<PackedDiagnosticTypes>],
+    alpha: &'a PackedAlphaHashScratch,
+}
+
+impl Hash for PackedDiagnosticsHash<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        assert_eq!(
+            self.metadata.len(),
+            self.types.len(),
+            "sealed packed diagnostic metadata and type columns differ"
+        );
+        self.metadata.len().hash(state);
+        for (metadata, types) in self.metadata.iter().zip(self.types) {
+            match metadata {
+                PackedDiagnosticMetadata::Plain(diagnostic) => {
+                    assert!(
+                        types.is_none(),
+                        "plain packed diagnostic unexpectedly retains type roots"
+                    );
+                    assert!(
+                        !matches!(diagnostic.kind, KernelDiagnosticKind::CallInputType { .. }),
+                        "call-input type diagnostic escaped the packed type column"
+                    );
+                    diagnostic.hash(state);
+                }
+                PackedDiagnosticMetadata::CallInputType {
+                    owner,
+                    severity,
+                    site,
+                    mismatch,
+                } => {
+                    let types = types.expect(
+                        "packed call-input diagnostic retains actual and expected type roots",
+                    );
+                    owner.hash(state);
+                    severity.hash(state);
+                    site.hash(state);
+                    KernelDiagnosticKindHashTag::CallInputType.hash(state);
+                    hash_packed_checked_type(self.arena, types.actual, self.alpha, state);
+                    hash_packed_checked_type(self.arena, types.expected, self.alpha, state);
+                    mismatch.hash(state);
+                }
+            }
+        }
+    }
+}
+
+fn hash_packed_checked_type<H: Hasher>(
+    arena: &TypeTermArena,
+    term: TypeTermId,
+    alpha: &PackedAlphaHashScratch,
+    state: &mut H,
+) {
+    match arena.term(term) {
+        TypeTerm::Text => CheckedTypeHashTag::Text.hash(state),
+        TypeTerm::Number => CheckedTypeHashTag::Number.hash(state),
+        TypeTerm::Bytes(bytes) => {
+            CheckedTypeHashTag::Bytes.hash(state);
+            match bytes {
+                BytesTerm::Dynamic => CheckedBytesHashTag::Dynamic.hash(state),
+                BytesTerm::Fixed(size) => {
+                    CheckedBytesHashTag::Fixed.hash(state);
+                    size.hash(state);
+                }
+            }
+        }
+        TypeTerm::Absent => CheckedTypeHashTag::Absent.hash(state),
+        TypeTerm::VariantSet(variants) => {
+            CheckedTypeHashTag::VariantSet.hash(state);
+            variants.len().hash(state);
+            for variant in variants {
+                match variant {
+                    VariantTerm::Tag(tag) => {
+                        CheckedVariantHashTag::Tag.hash(state);
+                        arena.name(*tag).hash(state);
+                    }
+                    VariantTerm::Tagged { tag, fields } => {
+                        CheckedVariantHashTag::Tagged.hash(state);
+                        arena.name(*tag).hash(state);
+                        hash_packed_object_shape(arena, *fields, alpha, state);
+                    }
+                }
+            }
+        }
+        TypeTerm::Object { fields, open } => {
+            CheckedTypeHashTag::Object.hash(state);
+            hash_packed_object_fields(arena, fields, open, alpha, state);
+        }
+        TypeTerm::OpenObjectPlaceholder => {
+            CheckedTypeHashTag::Object.hash(state);
+            0usize.hash(state);
+            0usize.hash(state);
+            true.hash(state);
+        }
+        TypeTerm::RenderContract => CheckedTypeHashTag::RenderContract.hash(state),
+        TypeTerm::List(item) => {
+            CheckedTypeHashTag::List.hash(state);
+            hash_packed_checked_type(arena, item, alpha, state);
+        }
+        TypeTerm::Function {
+            args,
+            result_mode,
+            result,
+        } => {
+            CheckedTypeHashTag::Function.hash(state);
+            args.len().hash(state);
+            for argument in args {
+                hash_packed_checked_type(arena, *argument, alpha, state);
+            }
+            result_mode.hash(state);
+            hash_packed_checked_type(arena, result, alpha, state);
+        }
+        TypeTerm::UnresolvedShape(reason) => {
+            CheckedTypeHashTag::UnresolvedShape.hash(state);
+            arena.diagnostic_text(reason).hash(state);
+        }
+        TypeTerm::Variable(variable) => {
+            CheckedTypeHashTag::Var.hash(state);
+            alpha.ordinal(variable).hash(state);
+        }
+        TypeTerm::Unknown => CheckedTypeHashTag::Unknown.hash(state),
+        TypeTerm::Union(members) => {
+            let members = crate::legacy_checked_union_order(arena, members);
+            match members.as_slice() {
+                [] => CheckedTypeHashTag::Absent.hash(state),
+                [member] => hash_packed_checked_type(arena, *member, alpha, state),
+                members => {
+                    CheckedTypeHashTag::Union.hash(state);
+                    members.len().hash(state);
+                    for member in members {
+                        hash_packed_checked_type(arena, *member, alpha, state);
+                    }
+                }
+            }
+        }
+        TypeTerm::Map { key, value } => {
+            CheckedTypeHashTag::Map.hash(state);
+            hash_packed_checked_type(arena, key, alpha, state);
+            hash_packed_checked_type(arena, value, alpha, state);
+        }
+        TypeTerm::Set(item) => {
+            CheckedTypeHashTag::Set.hash(state);
+            hash_packed_checked_type(arena, item, alpha, state);
+        }
+        TypeTerm::Bits(width) => {
+            CheckedTypeHashTag::Bits.hash(state);
+            width.hash(state);
+        }
+    }
+}
+
+fn hash_packed_object_shape<H: Hasher>(
+    arena: &TypeTermArena,
+    term: TypeTermId,
+    alpha: &PackedAlphaHashScratch,
+    state: &mut H,
+) {
+    match arena.term(term) {
+        TypeTerm::Object { fields, open } => {
+            hash_packed_object_fields(arena, fields, open, alpha, state)
+        }
+        TypeTerm::OpenObjectPlaceholder => {
+            0usize.hash(state);
+            0usize.hash(state);
+            true.hash(state);
+        }
+        _ => unreachable!("kernel tagged payload is always an object"),
+    }
+}
+
+fn hash_packed_object_fields<H: Hasher>(
+    arena: &TypeTermArena,
+    fields: crate::ObjectFields<'_>,
+    open: bool,
+    alpha: &PackedAlphaHashScratch,
+    state: &mut H,
+) {
+    fields.len().hash(state);
+    for field in fields.canonical_iter() {
+        arena.name(field.name).hash(state);
+        hash_packed_checked_type(arena, field.ty, alpha, state);
+    }
+    fields.len().hash(state);
+    for field in fields {
+        arena.name(field.name).hash(state);
+    }
+    open.hash(state);
 }
 
 #[cfg(test)]
@@ -498,11 +834,12 @@ fn fingerprint_packed_definition_range(
     definition_facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
-    diagnostic_offsets: &[u32],
     imported_expressions: &[BTreeSet<KernelExpressionId>],
 ) -> Result<Vec<DefinitionFingerprints>, KernelSolveError> {
     let mut fingerprints = Vec::with_capacity(range.len());
     let mut hash_scratch = Vec::new();
+    let alpha_scratch = PackedAlphaHashScratch::default();
+    let type_arena = interface.types.as_arena();
     for definition_index in range {
         let owner = KernelOwnerId(
             u32::try_from(definition_index)
@@ -515,21 +852,69 @@ fn fingerprint_packed_definition_range(
                 "kernel definition code omits owner {definition_index}"
             ))
         })?;
-        let public_result = hash_normalized_flow_type(
+        let interface_definition =
+            interface.definitions.get(definition_index).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel interface omits definition {definition_index}"
+                ))
+            })?;
+        alpha_scratch.begin_fresh();
+        let public_result = stable_fingerprint(
             KERNEL_PUBLIC_RESULT_DOMAIN_V1,
-            &interface.public_results[definition_index],
+            &PackedCheckedFlowHash {
+                arena: type_arena,
+                flow: interface_definition.result,
+                alpha: &alpha_scratch,
+            },
+            &mut hash_scratch,
+        );
+        let rich_public_result = hash_normalized_flow_type(
+            KERNEL_PUBLIC_RESULT_DOMAIN_V1,
+            &interface.materialize_result_flow(owner).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel interface omits public result for definition {definition_index}"
+                ))
+            })?,
             &mut hash_scratch,
         )?;
-        let diagnostic_start = diagnostic_offsets[definition_index] as usize;
-        let diagnostic_end = diagnostic_offsets[definition_index + 1] as usize;
+        assert_eq!(
+            public_result, rich_public_result,
+            "packed V1 public-result hash must match the rich checked projection for definition {definition_index}",
+        );
+        alpha_scratch
+            .begin_exact(&interface.alpha_variables[interface_definition.alpha_variables.range()]);
+        let diagnostic_range = interface_definition.diagnostics.range();
         let artifact = stable_fingerprint(
             KERNEL_DEFINITION_ARTIFACT_DOMAIN_V17,
             &(
                 PackedDefinitionHash { definition, facts },
                 code.stable_digest(),
-                &interface.diagnostics[diagnostic_start..diagnostic_end],
+                PackedDiagnosticsHash {
+                    arena: type_arena,
+                    metadata: &interface.diagnostics[diagnostic_range.clone()],
+                    types: &interface.diagnostic_types[diagnostic_range],
+                    alpha: &alpha_scratch,
+                },
             ),
             &mut hash_scratch,
+        );
+        let rich_diagnostics = interface.diagnostics_for(owner).ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel interface omits diagnostics for definition {definition_index}"
+            ))
+        })?;
+        let rich_artifact = stable_fingerprint(
+            KERNEL_DEFINITION_ARTIFACT_DOMAIN_V17,
+            &(
+                PackedDefinitionHash { definition, facts },
+                code.stable_digest(),
+                rich_diagnostics.as_ref(),
+            ),
+            &mut hash_scratch,
+        );
+        assert_eq!(
+            artifact, rich_artifact,
+            "packed V17 artifact hash must match the rich checked projection for definition {definition_index}",
         );
         let mut expressions = BTreeMap::new();
         for expression in imported_expressions[definition_index].iter().copied() {
@@ -565,11 +950,12 @@ fn fingerprint_borrowed_definition_range(
     definition_facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
-    diagnostic_offsets: &[u32],
     imported_expressions: &[BTreeSet<KernelExpressionId>],
 ) -> Result<Vec<DefinitionFingerprints>, KernelSolveError> {
     let mut fingerprints = Vec::with_capacity(range.len());
     let mut hash_scratch = Vec::new();
+    let alpha_scratch = PackedAlphaHashScratch::default();
+    let type_arena = interface.types.as_arena();
     for definition_index in range {
         let owner = KernelOwnerId(
             u32::try_from(definition_index)
@@ -582,19 +968,36 @@ fn fingerprint_borrowed_definition_range(
                         "kernel borrowed authorities omit owner {definition_index}"
                     ))
                 })?;
-        let public_result = hash_normalized_flow_type(
+        let interface_definition =
+            interface.definitions.get(definition_index).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel interface omits definition {definition_index}"
+                ))
+            })?;
+        alpha_scratch.begin_fresh();
+        let public_result = stable_fingerprint(
             KERNEL_PUBLIC_RESULT_DOMAIN_V1,
-            &interface.public_results[definition_index],
+            &PackedCheckedFlowHash {
+                arena: type_arena,
+                flow: interface_definition.result,
+                alpha: &alpha_scratch,
+            },
             &mut hash_scratch,
-        )?;
-        let diagnostic_start = diagnostic_offsets[definition_index] as usize;
-        let diagnostic_end = diagnostic_offsets[definition_index + 1] as usize;
+        );
+        alpha_scratch
+            .begin_exact(&interface.alpha_variables[interface_definition.alpha_variables.range()]);
+        let diagnostic_range = interface_definition.diagnostics.range();
         let artifact = stable_fingerprint(
             KERNEL_DEFINITION_ARTIFACT_DOMAIN_V17,
             &(
                 BorrowedDefinitionHash { definition },
                 definition.code().stable_digest(),
-                &interface.diagnostics[diagnostic_start..diagnostic_end],
+                PackedDiagnosticsHash {
+                    arena: type_arena,
+                    metadata: &interface.diagnostics[diagnostic_range.clone()],
+                    types: &interface.diagnostic_types[diagnostic_range],
+                    alpha: &alpha_scratch,
+                },
             ),
             &mut hash_scratch,
         );
@@ -1438,7 +1841,6 @@ fn build_packed_dependency_graph(
     definitions: &[DefinitionArtifact],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
-    diagnostic_offsets: &[u32],
 ) -> Result<KernelDefinitionDependencyGraph, KernelSolveError> {
     let mut rows = Vec::with_capacity(definitions.len());
     for (definition_index, definition) in definitions.iter().enumerate() {
@@ -1446,7 +1848,6 @@ fn build_packed_dependency_graph(
             definitions,
             code,
             interface,
-            diagnostic_offsets,
             definition_index,
             definition,
         )?;
@@ -1475,7 +1876,6 @@ fn build_borrowed_dependency_graph(
     facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
-    diagnostic_offsets: &[u32],
 ) -> Result<KernelDefinitionDependencyGraph, KernelSolveError> {
     let mut rows = Vec::with_capacity(program.owners.len());
     for definition_index in 0..program.owners.len() {
@@ -1494,7 +1894,6 @@ fn build_borrowed_dependency_graph(
             facts,
             code,
             interface,
-            diagnostic_offsets,
             definition_index,
             definition,
         )?;
@@ -1520,14 +1919,12 @@ fn validate_borrowed_definition_diagnostics(
     facts: &[KernelDefinitionFactsInput],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
-    diagnostic_offsets: &[u32],
     owner_index: usize,
     definition: KernelDefinitionRef<'_>,
 ) -> Result<(), KernelSolveError> {
-    let start = diagnostic_offsets[owner_index] as usize;
-    let end = diagnostic_offsets[owner_index + 1] as usize;
-    for diagnostic in &interface.diagnostics[start..end] {
-        match diagnostic.site {
+    let diagnostic_range = interface.definitions[owner_index].diagnostics.range();
+    for diagnostic in &interface.diagnostics[diagnostic_range.clone()] {
+        match *diagnostic.site() {
             crate::KernelDiagnosticSite::Expression { expression }
             | crate::KernelDiagnosticSite::CallArgument {
                 call: expression, ..
@@ -1603,13 +2000,6 @@ fn validate_borrowed_definition_diagnostics(
                 }
             }
         }
-    }
-    if diagnostic_offsets[owner_index + 1] - diagnostic_offsets[owner_index]
-        != definition.code().diagnostic_count() as u32
-    {
-        return Err(KernelSolveError::new(format!(
-            "kernel definition {owner_index} diagnostic metadata and type rows differ"
-        )));
     }
     Ok(())
 }
@@ -1867,18 +2257,12 @@ fn validate_packed_definition_diagnostics(
     definitions: &[DefinitionArtifact],
     code: &DefinitionCodeStore,
     interface: &KernelInterfaceSnapshot,
-    diagnostic_offsets: &[u32],
     owner_index: usize,
     definition: &DefinitionArtifact,
 ) -> Result<(), KernelSolveError> {
-    let owner = KernelOwnerId(
-        u32::try_from(owner_index)
-            .expect("kernel definition count exceeds the dense u32 namespace"),
-    );
-    let start = diagnostic_offsets[owner_index] as usize;
-    let end = diagnostic_offsets[owner_index + 1] as usize;
-    for diagnostic in &interface.diagnostics[start..end] {
-        match diagnostic.site {
+    let diagnostic_range = interface.definitions[owner_index].diagnostics.range();
+    for diagnostic in &interface.diagnostics[diagnostic_range.clone()] {
+        match *diagnostic.site() {
             crate::KernelDiagnosticSite::Expression { expression } => {
                 if definition
                     .expressions
@@ -1952,16 +2336,6 @@ fn validate_packed_definition_diagnostics(
                 }
             }
         }
-    }
-    if diagnostic_offsets[owner_index + 1] - diagnostic_offsets[owner_index]
-        != code
-            .definition(owner)
-            .expect("validated packed definition code exists")
-            .diagnostic_count() as u32
-    {
-        return Err(KernelSolveError::new(format!(
-            "kernel definition {owner_index} diagnostic metadata and type rows differ"
-        )));
     }
     Ok(())
 }
@@ -2566,43 +2940,6 @@ pub(crate) fn alpha_normalize_public_flow(flow_type: &FlowType) -> FlowType {
     alpha_normalize_flow_type(flow_type, &mut BTreeMap::new(), &mut 0)
 }
 
-/// Normalize one public callable surface and its definition-local diagnostics
-/// in one stable variable namespace. This is the diagnostics-only counterpart
-/// of `alpha_normalize_definition`; it never materializes checked rows.
-pub(crate) fn alpha_normalize_callable_interface_and_diagnostics(
-    formals: &[FlowType],
-    result: &FlowType,
-    diagnostics: &[KernelDiagnosticArtifact],
-    diagnostic_values: &[Type],
-) -> (
-    Box<[FlowType]>,
-    FlowType,
-    Box<[KernelDiagnosticArtifact]>,
-    Box<[Type]>,
-) {
-    let mut variables = BTreeMap::new();
-    let mut next = 0;
-    let formals = formals
-        .iter()
-        .map(|formal| alpha_normalize_flow_type(formal, &mut variables, &mut next))
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    let result = alpha_normalize_flow_type(result, &mut variables, &mut next);
-    let mut diagnostics = diagnostics.to_vec();
-    alpha_normalize_diagnostics(&mut diagnostics, &mut variables, &mut next);
-    let diagnostic_values = diagnostic_values
-        .iter()
-        .map(|ty| alpha_normalize_type(ty, &mut variables, &mut next))
-        .collect::<Vec<_>>()
-        .into_boxed_slice();
-    (
-        formals,
-        result,
-        diagnostics.into_boxed_slice(),
-        diagnostic_values,
-    )
-}
-
 fn alpha_normalize_diagnostics(
     diagnostics: &mut [KernelDiagnosticArtifact],
     variables: &mut BTreeMap<TypeVar, TypeVar>,
@@ -2929,6 +3266,93 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn packed_checked_hash_stream_matches_rich_projection_for_every_type_kind() {
+        let mut arena = TypeTermArena::new();
+        let text = arena.text();
+        let number = arena.number();
+        let dynamic_bytes = arena.bytes(BytesTerm::Dynamic);
+        let fixed_bytes = arena.bytes(BytesTerm::Fixed(17));
+        let absent = arena.absent();
+        let render_contract = arena.render_contract();
+        let open_placeholder = arena.open_object();
+        let open_object = arena.object([], true);
+        let unknown = arena.unknown();
+        let variable_2 = arena.variable(TypeVariableId(2));
+        let variable_10 = arena.variable(TypeVariableId(10));
+        let bits = arena.bits(37);
+        let unresolved = arena.unresolved_shape("receipt-only unresolved shape");
+
+        let z = arena.intern_name("z");
+        let a = arena.intern_name("a");
+        let record = arena.object([(z, variable_2), (a, fixed_bytes)], true);
+        let tagged_fields = arena.object([(a, text), (z, bits)], false);
+        let idle = arena.variant_tag("Idle");
+        let ready = arena.tagged_variant("Ready", tagged_fields);
+        let variants = arena.variant_set_preserving_order([ready, idle]);
+        let list = arena.list(record);
+        let set = arena.set(variants);
+        let map = arena.map(dynamic_bytes, list);
+        let union = arena.union([number, text, variable_2, variable_10, variants]);
+        let projected_duplicate_union = arena.union([open_placeholder, open_object]);
+        let function = arena.function([record, set, union], FlowMode::PresentOrAbsent, map);
+        let roots = [
+            text,
+            number,
+            dynamic_bytes,
+            fixed_bytes,
+            absent,
+            variants,
+            record,
+            open_placeholder,
+            open_object,
+            render_contract,
+            list,
+            unresolved,
+            variable_2,
+            variable_10,
+            unknown,
+            union,
+            projected_duplicate_union,
+            map,
+            set,
+            bits,
+            function,
+        ];
+        let modes = [
+            FlowMode::Continuous,
+            FlowMode::TickPresent,
+            FlowMode::PresentOrAbsent,
+            FlowMode::Absent,
+        ];
+        let alpha = PackedAlphaHashScratch::default();
+        for (ordinal, term) in roots.into_iter().enumerate() {
+            let mode = modes[ordinal % modes.len()];
+            alpha.begin_fresh();
+            let mut packed_bytes = Vec::new();
+            let packed = stable_fingerprint(
+                b"packed-checked-hash-parity\0",
+                &PackedCheckedFlowHash {
+                    arena: &arena,
+                    flow: PackedFlow { mode, term },
+                    alpha: &alpha,
+                },
+                &mut packed_bytes,
+            );
+            let rich = alpha_normalize_public_flow(&FlowType {
+                mode,
+                ty: arena.export_checked_type(term),
+            });
+            let mut rich_bytes = Vec::new();
+            let rich = stable_fingerprint(b"packed-checked-hash-parity\0", &rich, &mut rich_bytes);
+            assert_eq!(
+                packed_bytes, rich_bytes,
+                "hash event stream for term {term:?}"
+            );
+            assert_eq!(packed, rich, "hash digest for term {term:?}");
+        }
+    }
+
     fn value_owner(nodes: Vec<KernelOwnerNode>) -> KernelOwnerProgramInput {
         KernelOwnerProgramInput {
             nodes: nodes.into_boxed_slice(),
@@ -3133,7 +3557,6 @@ mod tests {
                 declaration_flows: &[],
                 calls: &[],
                 call_substitutions: &[],
-                diagnostic_types: &[],
                 source_payload_types: &[],
                 state_input_count: 0,
                 states: &[],

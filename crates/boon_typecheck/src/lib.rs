@@ -30927,21 +30927,22 @@ impl RenderContractRegistry {
         }
     }
 
-    fn slot_accepts_type(&self, slot_name: &str, ty: &Type) -> bool {
+    fn slot_accepts_type<T: CheckedTypeView>(&self, slot_name: &str, ty: T) -> bool {
         match slot_name {
-            "items" | "children" => match ty {
-                Type::List(item) => self.accepts_renderable_type(item),
-                _ => false,
-            },
-            "child" => self.accepts_renderable_type(ty) || matches!(ty, Type::Text | Type::Number),
+            "items" | "children" => ty
+                .list_item()
+                .is_some_and(|item| self.accepts_renderable_type(item)),
+            "child" => self.accepts_renderable_type(ty) || ty.is_text() || ty.is_number(),
             _ => self.accepts_renderable_type(ty),
         }
     }
 
-    fn accepts_renderable_type(&self, ty: &Type) -> bool {
-        matches!(ty, Type::RenderContract)
+    fn accepts_renderable_type<T: CheckedTypeView>(&self, ty: T) -> bool {
+        ty.is_render_contract()
             || self.is_renderable_object_type(ty)
-            || is_no_element_type(ty)
+            // `NoElement` is a convention of the built-in document/scene UI
+            // contracts, not a Boon type-system or kernel special case.
+            || ty.all_variants_are_bare_tags(|tag| tag == "NoElement")
     }
 
     fn constructor_shape(
@@ -30968,23 +30969,14 @@ impl RenderContractRegistry {
         Type::object(ObjectShape::from_ordered_fields(ordered_fields, false))
     }
 
-    fn is_renderable_object_type(&self, ty: &Type) -> bool {
-        let Type::Object(shape) = ty else {
+    fn is_renderable_object_type<T: CheckedTypeView>(&self, ty: T) -> bool {
+        let Some(kind) = ty.object_field("kind") else {
             return false;
         };
         let Some(root) = self.roots.get(self.active_root) else {
             return false;
         };
-        matches!(
-            shape.fields.get("kind"),
-            Some(Type::VariantSet(variants))
-                if variants.iter().all(|variant| {
-                    matches!(
-                        variant,
-                        Variant::Tag(tag) if root.renderable_kinds.contains(tag.as_str())
-                    )
-                })
-        )
+        kind.all_variants_are_bare_tags(|tag| root.renderable_kinds.contains(tag))
     }
 
     fn is_any_renderable_object_type(&self, ty: &Type) -> bool {
@@ -31320,13 +31312,22 @@ pub fn is_registered_element_constructor(function: &str) -> bool {
 /// Returns the project-level render-slot type diagnostic without constructing
 /// checked rows or running inference.
 pub fn project_render_slot_type_diagnostic(slot_name: &str, actual_type: &Type) -> Option<String> {
-    (!RenderContractRegistry::default().slot_accepts_type(slot_name, actual_type)).then(|| {
+    (!render_slot_accepts_type_view(slot_name, actual_type)).then(|| {
         if type_contains_absence(actual_type) {
             "\u{60}SKIP\u{60} cannot be used as a render value".to_owned()
         } else {
             render_slot_type_error(slot_name, actual_type)
         }
     })
+}
+
+/// Check one render slot through a borrowed structural type view.
+///
+/// The UI contract stays in this policy layer. Packed compiler stores can
+/// implement [`CheckedTypeView`] without teaching the language kernel about
+/// document-specific tags or allocating a rich recursive [`Type`].
+pub fn render_slot_accepts_type_view<T: CheckedTypeView>(slot_name: &str, actual_type: T) -> bool {
+    RenderContractRegistry::default().slot_accepts_type(slot_name, actual_type)
 }
 
 fn type_accepts_true_false(ty: &Type) -> bool {

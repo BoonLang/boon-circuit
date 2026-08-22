@@ -11,9 +11,8 @@ use crate::{
     PackedCallTypeSubstitution, PackedDiagnosticTypes, PackedExpressionRef, PackedFlow,
     PackedPublishedState, PackedResourceProjectionRequirementInput, PackedSourceReadInput,
     PublishMode, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId, UnsealedComponentArtifact,
-    VariantTerm, alpha_normalize_callable_interface_and_diagnostics,
-    build_borrowed_snapshot_receipts, build_snapshot_receipts, definition_basis_fingerprint,
-    definition_basis_fingerprint_with_buffer, solve_component,
+    VariantTerm, build_borrowed_snapshot_receipts, build_snapshot_receipts,
+    definition_basis_fingerprint, definition_basis_fingerprint_with_buffer, solve_component,
 };
 use boon_checked::{
     BytesType, CheckedListKeyPolicy, CheckedParameterKind, CheckedStateKind, FlowMode, FlowType,
@@ -1639,10 +1638,52 @@ pub enum KernelCallInputRoleRef<'a> {
     Abi { name: &'a str },
 }
 
+#[derive(Debug)]
+struct SolvedDefinitionCallFacts {
+    calls: Box<[PackedCallFactsInput]>,
+    substitutions: Box<[PackedCallTypeSubstitution]>,
+}
+
+/// Phase-local diagnostic row before it is appended to the packed interface
+/// columns. Non-type diagnostics can reuse their existing metadata verbatim;
+/// call-input diagnostics keep recursive types exclusively in the parallel
+/// term-ID column.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum PackedDiagnosticMetadata {
+    Plain(KernelDiagnosticArtifact),
+    CallInputType {
+        owner: KernelOwnerId,
+        severity: KernelDiagnosticSeverity,
+        site: KernelDiagnosticSite,
+        mismatch: KernelTypeMismatch,
+    },
+}
+
+impl PackedDiagnosticMetadata {
+    pub(crate) const fn owner(&self) -> KernelOwnerId {
+        match self {
+            Self::Plain(diagnostic) => diagnostic.owner,
+            Self::CallInputType { owner, .. } => *owner,
+        }
+    }
+
+    pub(crate) const fn site(&self) -> &KernelDiagnosticSite {
+        match self {
+            Self::Plain(diagnostic) => &diagnostic.site,
+            Self::CallInputType { site, .. } => site,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
-struct SolvedKernelCallFacts {
-    type_substitutions: Box<[KernelCallTypeSubstitution]>,
-    syntax_discriminated_result: bool,
+struct SolvedKernelDiagnostic {
+    metadata: PackedDiagnosticMetadata,
+    types: Option<PackedDiagnosticTypes>,
+}
+
+#[derive(Clone, Debug)]
+struct SolvedDefinitionDiagnostics {
+    rows: Box<[SolvedKernelDiagnostic]>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -3218,8 +3259,9 @@ pub struct KernelCheckedSnapshot {
     /// flow roots. The checked linker consumes this directly; rich artifacts
     /// no longer retain one boxed flow sidecar per definition.
     pub(crate) definition_code: Arc<DefinitionCodeStore>,
-    /// The only retained rich type surface: public callable interfaces and
-    /// user-facing diagnostics. Definition bodies remain packed.
+    /// Packed public callable interfaces and typed diagnostic roots. Rich
+    /// checked types are materialized only at explicit compatibility and
+    /// presentation boundaries.
     pub(crate) interface: Arc<KernelInterfaceSnapshot>,
     pub dependencies: crate::KernelDefinitionDependencyGraph,
     pub currentness: Box<[crate::KernelPackedDefinitionCurrentnessReceipt]>,
@@ -3267,15 +3309,12 @@ impl KernelCheckedSnapshot {
         self.work
     }
 
-    pub fn result_flow(&self, owner: KernelOwnerId) -> Option<&FlowType> {
-        self.interface.public_results.get(owner.0 as usize)
+    pub fn materialize_result_flow(&self, owner: KernelOwnerId) -> Option<FlowType> {
+        self.interface.materialize_result_flow(owner)
     }
 
-    pub fn formal_flows(&self, owner: KernelOwnerId) -> Option<&[FlowType]> {
-        self.interface
-            .callable_formals
-            .get(owner.0 as usize)
-            .map(Box::as_ref)
+    pub fn materialize_formal_flows(&self, owner: KernelOwnerId) -> Option<Box<[FlowType]>> {
+        self.interface.materialize_formal_flows(owner)
     }
 
     pub fn expression_flow(
@@ -3298,27 +3337,8 @@ impl KernelCheckedSnapshot {
             .materialize_call_facts(ordinal)
     }
 
-    pub fn diagnostics_for(&self, owner: KernelOwnerId) -> Option<&[KernelDiagnosticArtifact]> {
-        let owner = owner.0 as usize;
-        if owner >= self.definition_count() {
-            return None;
-        }
-        let start = (0..owner).try_fold(0usize, |start, index| {
-            Some(
-                start
-                    + self
-                        .definition_code
-                        .definition(KernelOwnerId(index as u32))?
-                        .diagnostic_count(),
-            )
-        })?;
-        let len = self
-            .definition_code
-            .definition(KernelOwnerId(owner as u32))?
-            .diagnostic_count();
-        self.interface
-            .diagnostics
-            .get(start..start.checked_add(len)?)
+    pub fn diagnostics_for(&self, owner: KernelOwnerId) -> Option<Box<[KernelDiagnosticArtifact]>> {
+        self.interface.diagnostics_for(owner)
     }
 }
 
@@ -3327,18 +3347,424 @@ impl KernelCheckedSnapshot {
 /// This deliberately contains no expression, statement, resource, dependency,
 /// or currentness rows. A diagnostics-only request must be able to stop here
 /// without paying to construct and fingerprint a checked image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedInterfaceSpan {
+    pub(crate) start: u32,
+    pub(crate) len: u32,
+}
+
+impl PackedInterfaceSpan {
+    pub(crate) fn range(self) -> std::ops::Range<usize> {
+        self.start as usize..self.start as usize + self.len as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedInterfaceDefinition {
+    pub(crate) result: PackedFlow,
+    pub(crate) formals: PackedInterfaceSpan,
+    pub(crate) diagnostics: PackedInterfaceSpan,
+    pub(crate) diagnostic_values: PackedInterfaceSpan,
+    pub(crate) alpha_variables: PackedInterfaceSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedDiagnosticValue {
+    pub(crate) value: KernelValueReference,
+    pub(crate) term: TypeTermId,
+}
+
+/// Definition-scoped borrowed view of one packed interface type.
+///
+/// The definition scope is part of the reference because raw type-variable
+/// ordinals are never project-global. Structural policy checks can borrow this
+/// view without allocating; explicit compatibility callers can materialize it
+/// with the same alpha mapping as the interface publication.
+#[derive(Clone, Copy)]
+pub struct KernelInterfaceTypeRef<'a> {
+    interface: &'a KernelInterfaceSnapshot,
+    definition: &'a PackedInterfaceDefinition,
+    term: TypeTermId,
+}
+
+impl KernelInterfaceTypeRef<'_> {
+    pub fn materialize_checked(self) -> Type {
+        self.interface.materialize_type(self.definition, self.term)
+    }
+
+    fn with_term(self, term: TypeTermId) -> Self {
+        Self { term, ..self }
+    }
+}
+
+impl boon_checked::CheckedTypeView for KernelInterfaceTypeRef<'_> {
+    fn list_item(self) -> Option<Self> {
+        match self.interface.types.as_arena().term(self.term) {
+            TypeTerm::List(item) => Some(self.with_term(item)),
+            _ => None,
+        }
+    }
+
+    fn is_text(self) -> bool {
+        matches!(
+            self.interface.types.as_arena().term(self.term),
+            TypeTerm::Text
+        )
+    }
+
+    fn is_number(self) -> bool {
+        matches!(
+            self.interface.types.as_arena().term(self.term),
+            TypeTerm::Number
+        )
+    }
+
+    fn is_render_contract(self) -> bool {
+        matches!(
+            self.interface.types.as_arena().term(self.term),
+            TypeTerm::RenderContract
+        )
+    }
+
+    fn object_field(self, name: &str) -> Option<Self> {
+        let TypeTerm::Object { fields, .. } = self.interface.types.as_arena().term(self.term)
+        else {
+            return None;
+        };
+        fields
+            .canonical_iter()
+            .find(|field| self.interface.types.as_arena().name(field.name) == name)
+            .map(|field| self.with_term(field.ty))
+    }
+
+    fn all_variants_are_bare_tags(self, mut predicate: impl FnMut(&str) -> bool) -> bool {
+        let TypeTerm::VariantSet(variants) = self.interface.types.as_arena().term(self.term) else {
+            return false;
+        };
+        variants.iter().all(|variant| match variant {
+            VariantTerm::Tag(tag) => predicate(self.interface.types.as_arena().name(*tag)),
+            VariantTerm::Tagged { .. } => false,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct KernelInterfaceDiagnosticValueRef<'a> {
+    owner: KernelOwnerId,
+    ordinal: u32,
+    value: KernelValueReference,
+    ty: KernelInterfaceTypeRef<'a>,
+}
+
+impl<'a> KernelInterfaceDiagnosticValueRef<'a> {
+    pub const fn owner(self) -> KernelOwnerId {
+        self.owner
+    }
+
+    pub const fn ordinal(self) -> u32 {
+        self.ordinal
+    }
+
+    pub const fn value(self) -> KernelValueReference {
+        self.value
+    }
+
+    pub const fn ty(self) -> KernelInterfaceTypeRef<'a> {
+        self.ty
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum KernelInterfaceDiagnosticKindRef<'a> {
+    Plain(&'a KernelDiagnosticKind),
+    CallInputType {
+        actual: KernelInterfaceTypeRef<'a>,
+        expected: KernelInterfaceTypeRef<'a>,
+        mismatch: &'a KernelTypeMismatch,
+    },
+}
+
+#[derive(Clone, Copy)]
+pub struct KernelInterfaceDiagnosticRef<'a> {
+    owner: KernelOwnerId,
+    severity: KernelDiagnosticSeverity,
+    site: &'a KernelDiagnosticSite,
+    kind: KernelInterfaceDiagnosticKindRef<'a>,
+}
+
+impl<'a> KernelInterfaceDiagnosticRef<'a> {
+    pub const fn owner(self) -> KernelOwnerId {
+        self.owner
+    }
+
+    pub const fn severity(self) -> KernelDiagnosticSeverity {
+        self.severity
+    }
+
+    pub const fn site(self) -> &'a KernelDiagnosticSite {
+        self.site
+    }
+
+    pub const fn kind(self) -> KernelInterfaceDiagnosticKindRef<'a> {
+        self.kind
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelInterfaceSnapshot {
-    pub public_results: Box<[FlowType]>,
-    pub callable_formals: Box<[Box<[FlowType]>]>,
-    /// Fully typed diagnostics computed directly from the quiescent graph.
-    /// No checked definition rows are materialized for this product.
-    pub diagnostics: Box<[KernelDiagnosticArtifact]>,
-    /// Sparse solved values explicitly demanded by diagnostic contracts.
-    pub diagnostic_values: Box<[KernelDiagnosticValueArtifact]>,
+    pub(crate) types: Arc<FrozenTypeStore>,
+    pub(crate) definitions: Box<[PackedInterfaceDefinition]>,
+    pub(crate) flows: Box<[PackedFlow]>,
+    pub(crate) diagnostics: Box<[PackedDiagnosticMetadata]>,
+    pub(crate) diagnostic_types: Box<[Option<PackedDiagnosticTypes>]>,
+    pub(crate) diagnostic_values: Box<[PackedDiagnosticValue]>,
+    pub(crate) alpha_variables: Box<[TypeVariableId]>,
     pub work: KernelSolveWork,
 }
 
+impl KernelInterfaceSnapshot {
+    pub fn definition_count(&self) -> usize {
+        self.definitions.len()
+    }
+
+    pub fn diagnostic_count(&self) -> usize {
+        self.diagnostics.len()
+    }
+
+    pub fn diagnostic_value_count(&self) -> usize {
+        self.diagnostic_values.len()
+    }
+
+    pub fn diagnostic_refs(&self) -> impl Iterator<Item = KernelInterfaceDiagnosticRef<'_>> + '_ {
+        self.definitions.iter().flat_map(move |definition| {
+            definition.diagnostics.range().map(move |ordinal| {
+                let kind = match &self.diagnostics[ordinal] {
+                    PackedDiagnosticMetadata::Plain(diagnostic) => {
+                        debug_assert!(!matches!(
+                            diagnostic.kind,
+                            KernelDiagnosticKind::CallInputType { .. }
+                        ));
+                        KernelInterfaceDiagnosticKindRef::Plain(&diagnostic.kind)
+                    }
+                    PackedDiagnosticMetadata::CallInputType { mismatch, .. } => {
+                        let types = self.diagnostic_types[ordinal].expect(
+                            "packed call-input diagnostic retains actual and expected roots",
+                        );
+                        KernelInterfaceDiagnosticKindRef::CallInputType {
+                            actual: KernelInterfaceTypeRef {
+                                interface: self,
+                                definition,
+                                term: types.actual,
+                            },
+                            expected: KernelInterfaceTypeRef {
+                                interface: self,
+                                definition,
+                                term: types.expected,
+                            },
+                            mismatch,
+                        }
+                    }
+                };
+                let metadata = &self.diagnostics[ordinal];
+                let (owner, severity, site) = match metadata {
+                    PackedDiagnosticMetadata::Plain(diagnostic) => {
+                        (diagnostic.owner, diagnostic.severity, &diagnostic.site)
+                    }
+                    PackedDiagnosticMetadata::CallInputType {
+                        owner,
+                        severity,
+                        site,
+                        ..
+                    } => (*owner, *severity, site),
+                };
+                KernelInterfaceDiagnosticRef {
+                    owner,
+                    severity,
+                    site,
+                    kind,
+                }
+            })
+        })
+    }
+
+    pub fn diagnostic_value_refs(
+        &self,
+    ) -> impl Iterator<Item = KernelInterfaceDiagnosticValueRef<'_>> + '_ {
+        self.definitions
+            .iter()
+            .enumerate()
+            .flat_map(move |(owner, definition)| {
+                self.diagnostic_values[definition.diagnostic_values.range()]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(move |(ordinal, value)| KernelInterfaceDiagnosticValueRef {
+                        owner: KernelOwnerId(owner as u32),
+                        ordinal: ordinal as u32,
+                        value: value.value,
+                        ty: KernelInterfaceTypeRef {
+                            interface: self,
+                            definition,
+                            term: value.term,
+                        },
+                    })
+            })
+    }
+
+    pub fn materialize_result_flow(&self, owner: KernelOwnerId) -> Option<FlowType> {
+        let definition = self.definitions.get(owner.0 as usize)?;
+        Some(self.materialize_flow(definition, definition.result))
+    }
+
+    pub fn materialize_formal_flows(&self, owner: KernelOwnerId) -> Option<Box<[FlowType]>> {
+        let definition = self.definitions.get(owner.0 as usize)?;
+        Some(
+            self.flows[definition.formals.range()]
+                .iter()
+                .copied()
+                .map(|flow| self.materialize_flow(definition, flow))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    }
+
+    pub fn materialize_public_results(&self) -> impl ExactSizeIterator<Item = FlowType> + '_ {
+        self.definitions
+            .iter()
+            .map(|definition| self.materialize_flow(definition, definition.result))
+    }
+
+    #[cfg(test)]
+    pub fn materialize_diagnostics(&self) -> Box<[KernelDiagnosticArtifact]> {
+        let mut materialized = Vec::with_capacity(self.diagnostics.len());
+        for definition in &self.definitions {
+            for ordinal in definition.diagnostics.range() {
+                let metadata = &self.diagnostics[ordinal];
+                let diagnostic = match metadata {
+                    PackedDiagnosticMetadata::Plain(diagnostic) => diagnostic.clone(),
+                    PackedDiagnosticMetadata::CallInputType {
+                        owner,
+                        severity,
+                        site,
+                        mismatch,
+                    } => {
+                        let types = self.diagnostic_types[ordinal].expect(
+                            "packed call-input diagnostic retains actual and expected roots",
+                        );
+                        KernelDiagnosticArtifact {
+                            owner: *owner,
+                            severity: *severity,
+                            site: site.clone(),
+                            kind: KernelDiagnosticKind::CallInputType {
+                                actual: self.materialize_type(definition, types.actual),
+                                expected: self.materialize_type(definition, types.expected),
+                                mismatch: mismatch.clone(),
+                            },
+                        }
+                    }
+                };
+                materialized.push(diagnostic);
+            }
+        }
+        materialized.into_boxed_slice()
+    }
+
+    pub fn diagnostics_for(&self, owner: KernelOwnerId) -> Option<Box<[KernelDiagnosticArtifact]>> {
+        let definition = self.definitions.get(owner.0 as usize)?;
+        let mut materialized = Vec::with_capacity(definition.diagnostics.len as usize);
+        for ordinal in definition.diagnostics.range() {
+            let metadata = &self.diagnostics[ordinal];
+            materialized.push(match metadata {
+                PackedDiagnosticMetadata::Plain(diagnostic) => diagnostic.clone(),
+                PackedDiagnosticMetadata::CallInputType {
+                    owner,
+                    severity,
+                    site,
+                    mismatch,
+                } => {
+                    let types = self.diagnostic_types[ordinal]
+                        .expect("packed call-input diagnostic retains actual and expected roots");
+                    KernelDiagnosticArtifact {
+                        owner: *owner,
+                        severity: *severity,
+                        site: site.clone(),
+                        kind: KernelDiagnosticKind::CallInputType {
+                            actual: self.materialize_type(definition, types.actual),
+                            expected: self.materialize_type(definition, types.expected),
+                            mismatch: mismatch.clone(),
+                        },
+                    }
+                }
+            });
+        }
+        Some(materialized.into_boxed_slice())
+    }
+
+    #[cfg(test)]
+    pub fn materialize_diagnostic_values(&self) -> Box<[KernelDiagnosticValueArtifact]> {
+        let mut materialized = Vec::with_capacity(self.diagnostic_values.len());
+        for (owner, definition) in self.definitions.iter().enumerate() {
+            for (ordinal, value) in self.diagnostic_values[definition.diagnostic_values.range()]
+                .iter()
+                .copied()
+                .enumerate()
+            {
+                materialized.push(KernelDiagnosticValueArtifact {
+                    owner: KernelOwnerId(owner as u32),
+                    ordinal: ordinal as u32,
+                    value: value.value,
+                    ty: self.materialize_type(definition, value.term),
+                });
+            }
+        }
+        materialized.into_boxed_slice()
+    }
+
+    fn materialize_flow(
+        &self,
+        definition: &PackedInterfaceDefinition,
+        flow: PackedFlow,
+    ) -> FlowType {
+        FlowType {
+            mode: flow.mode,
+            ty: self.materialize_type(definition, flow.term),
+        }
+    }
+
+    fn materialize_type(&self, definition: &PackedInterfaceDefinition, term: TypeTermId) -> Type {
+        let sources = &self.alpha_variables[definition.alpha_variables.range()];
+        let mut variables = sources
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(ordinal, source)| {
+                (
+                    boon_checked::TypeVar(source.0),
+                    boon_checked::TypeVar(ordinal as u32),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut next = sources.len() as u32;
+        let materialized = self.types.as_arena().export_checked_type(term);
+        let materialized = crate::alpha_normalize_flow_type(
+            &FlowType {
+                mode: FlowMode::Continuous,
+                ty: materialized,
+            },
+            &mut variables,
+            &mut next,
+        )
+        .ty;
+        assert_eq!(
+            next,
+            sources.len() as u32,
+            "packed interface alpha scope omitted a reached variable"
+        );
+        materialized
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDiagnosticValueArtifact {
     pub owner: KernelOwnerId,
@@ -3608,7 +4034,7 @@ impl KernelProjectSolveSession {
 
     pub(crate) fn solve_interfaces(&mut self) -> Result<KernelInterfaceSnapshot, KernelSolveError> {
         let demand = interface_output_demand(&self.program, &self.definition_facts, &self.owners);
-        let artifact = self.component.solve_outputs(&demand)?;
+        let mut artifact = self.component.solve_outputs(&demand)?;
         let public_results = project_public_results(&self.owners, &artifact);
         let public_formals = project_public_formals(&self.owners, &artifact);
         let (_, diagnostics) = project_call_facts_and_diagnostics(
@@ -3616,13 +4042,12 @@ impl KernelProjectSolveSession {
             &self.definition_facts,
             &self.owners,
             &self.abi,
-            &artifact,
-            None,
+            &mut artifact,
             &public_results,
             &public_formals,
             false,
         );
-        Ok(project_interface_snapshot(
+        let interface = project_interface_snapshot(
             &self.program,
             &self.definition_facts,
             &self.owners,
@@ -3630,7 +4055,8 @@ impl KernelProjectSolveSession {
             &public_results,
             &public_formals,
             &diagnostics,
-        ))
+        )?;
+        Ok(interface.finish_reachable(artifact.terms()))
     }
 
     pub(crate) fn finish_graph(self) -> Result<KernelSolvedProject, KernelSolveError> {
@@ -3639,10 +4065,7 @@ impl KernelProjectSolveSession {
         let mut artifact = self.component.solve_all_unsealed()?;
         let solve_us = solve_started.elapsed().as_micros();
         let finalize_started = Instant::now();
-        let projected = ComponentOutputSnapshot::project_unsealed(
-            &artifact,
-            &checked_output_demand(&self.program, &self.definition_facts, &self.owners),
-        );
+        let mut projected = ComponentOutputSnapshot::project_unsealed(&mut artifact);
         let public_results = project_public_results(&self.owners, &projected);
         let public_formals = project_public_formals(&self.owners, &projected);
         let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
@@ -3650,13 +4073,12 @@ impl KernelProjectSolveSession {
             &self.definition_facts,
             &self.owners,
             &self.abi,
-            &projected,
-            Some(&artifact),
+            &mut projected,
             &public_results,
             &public_formals,
             true,
         );
-        let interface = Arc::new(project_interface_snapshot(
+        let interface = project_interface_snapshot(
             &self.program,
             &self.definition_facts,
             &self.owners,
@@ -3664,7 +4086,8 @@ impl KernelProjectSolveSession {
             &public_results,
             &public_formals,
             &diagnostics,
-        ));
+        )?;
+        drop(projected);
         let flush_terms =
             project_expression_flush_terms(&self.program, &self.owners, &mut artifact)?;
         let resource_projection_facts = project_resource_projection_facts(
@@ -3686,7 +4109,9 @@ impl KernelProjectSolveSession {
             &resource_projection_facts,
         )?;
         let artifact = artifact.seal();
-        let definition_code = Arc::new(definition_code.finish(artifact.type_store())?);
+        let types = artifact.type_store();
+        let interface = Arc::new(interface.finish(Arc::clone(&types)));
+        let definition_code = Arc::new(definition_code.finish(types)?);
         let finalize_us = finalize_started.elapsed().as_micros();
         if trace {
             eprintln!(
@@ -5876,8 +6301,8 @@ fn build_definition_code_builder(
     abi: &crate::KernelAbiInput,
     artifact: &mut UnsealedComponentArtifact,
     flush_terms: &ProjectExpressionFlushTerms,
-    call_facts: Box<[Box<[SolvedKernelCallFacts]>]>,
-    diagnostics: &[Box<[KernelDiagnosticArtifact]>],
+    call_facts: Box<[SolvedDefinitionCallFacts]>,
+    diagnostics: &[SolvedDefinitionDiagnostics],
     resource_projection_facts: &[DefinitionResourceProjectionFacts],
 ) -> Result<DefinitionCodeBuilder, KernelSolveError> {
     if call_facts.len() != owners.len()
@@ -5900,8 +6325,6 @@ fn build_definition_code_builder(
     let mut packed_expression_flows = Vec::new();
     let mut expression_kind_types = Vec::new();
     let mut declaration_flows = Vec::new();
-    let mut packed_calls = Vec::new();
-    let mut packed_call_substitutions = Vec::new();
     let mut packed_diagnostic_types = Vec::new();
     let mut source_payload_types = Vec::new();
     let mut state_flows = Vec::new();
@@ -5915,6 +6338,10 @@ fn build_definition_code_builder(
     for (owner_index, (owner, owner_call_facts)) in
         owners.iter().zip(call_facts.into_vec()).enumerate()
     {
+        let SolvedDefinitionCallFacts {
+            calls: packed_calls,
+            substitutions: packed_call_substitutions,
+        } = owner_call_facts;
         let resource_projection_facts = &resource_projection_facts[owner_index];
         formal_roots.clear();
         formal_roots.extend(
@@ -5968,53 +6395,29 @@ fn build_definition_code_builder(
                 }
             }));
         }
-        if owner_call_facts.len() != owner.calls.len() {
+        if packed_calls.len() != owner.calls.len() {
             return Err(KernelSolveError::new(format!(
                 "kernel definition-code owner {owner_index} has {} calls and {} solved call rows",
                 owner.calls.len(),
-                owner_call_facts.len()
+                packed_calls.len()
             )));
         }
-        packed_calls.clear();
-        packed_call_substitutions.clear();
-        for (solve, call) in owner.calls.iter().zip(&owner_call_facts) {
-            let substitution_start =
-                u32::try_from(packed_call_substitutions.len()).map_err(|_| {
-                    KernelSolveError::new(
-                        "kernel definition-code local call-substitution start exceeds u32",
-                    )
-                })?;
-            for substitution in &call.type_substitutions {
-                packed_call_substitutions.push(PackedCallTypeSubstitution {
-                    variable: substitution.variable,
-                    term: import_post_solve_type(artifact.terms_mut(), &substitution.value),
-                });
-            }
-            let substitution_end =
-                u32::try_from(packed_call_substitutions.len()).map_err(|_| {
-                    KernelSolveError::new(
-                        "kernel definition-code local call-substitution end exceeds u32",
-                    )
-                })?;
-            packed_calls.push(PackedCallFactsInput {
-                expression: solve.expression,
-                substitution_start,
-                substitution_len: substitution_end - substitution_start,
-                syntax_discriminated_result: call.syntax_discriminated_result,
-            });
+        if packed_calls
+            .iter()
+            .zip(&owner.calls)
+            .any(|(facts, solve)| facts.expression != solve.expression)
+        {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition-code owner {owner_index} call rows lost expression alignment",
+            )));
         }
         packed_diagnostic_types.clear();
-        for diagnostic in &diagnostics[owner_index] {
-            packed_diagnostic_types.push(match &diagnostic.kind {
-                KernelDiagnosticKind::CallInputType {
-                    actual, expected, ..
-                } => Some(PackedDiagnosticTypes {
-                    actual: import_post_solve_type(artifact.terms_mut(), actual),
-                    expected: import_post_solve_type(artifact.terms_mut(), expected),
-                }),
-                _ => None,
-            });
-        }
+        packed_diagnostic_types.extend(
+            diagnostics[owner_index]
+                .rows
+                .iter()
+                .map(|diagnostic| diagnostic.types),
+        );
         source_payload_types.clear();
         for source in &definition_facts[owner_index].sources {
             let output = owner.expressions[source.expression.0 as usize];
@@ -6237,7 +6640,6 @@ fn build_definition_code_builder(
                 declaration_flows: &declaration_flows,
                 calls: &packed_calls,
                 call_substitutions: &packed_call_substitutions,
-                diagnostic_types: &packed_diagnostic_types,
                 source_payload_types: &source_payload_types,
                 state_input_count: definition_facts[owner_index].states.len(),
                 states: &published_states,
@@ -7954,15 +8356,14 @@ fn materialize_project_definition_structures(
 
 fn project_public_results(
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &ComponentOutputSnapshot,
-) -> Box<[FlowType]> {
+    artifact: &ComponentOutputSnapshot<'_>,
+) -> Box<[PackedFlow]> {
     owners
         .iter()
         .map(|owner| {
             let mut result = artifact
-                .flow_type(owner.result)
-                .expect("project owner result belongs to its component")
-                .clone();
+                .flow(owner.result)
+                .expect("project owner result belongs to its component");
             let result_index = owner
                 .expressions
                 .iter()
@@ -8312,8 +8713,8 @@ fn solve_flush_graph(bases: Vec<Vec<Type>>, dependencies: Vec<Vec<usize>>) -> Ve
 
 fn project_public_formals(
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &ComponentOutputSnapshot,
-) -> Box<[Box<[FlowType]>]> {
+    artifact: &ComponentOutputSnapshot<'_>,
+) -> Box<[Box<[PackedFlow]>]> {
     owners
         .iter()
         .map(|owner| {
@@ -8323,9 +8724,8 @@ fn project_public_formals(
                 .zip(owner.formal_modes.iter().copied())
                 .map(|(output, mode)| {
                     let mut flow = artifact
-                        .flow_type(*output)
-                        .expect("project owner formal belongs to its component")
-                        .clone();
+                        .flow(*output)
+                        .expect("project owner formal belongs to its component");
                     flow.mode = mode;
                     flow
                 })
@@ -8541,106 +8941,227 @@ fn interface_output_demand(
     outputs.into_boxed_slice()
 }
 
-/// Add the solved result of the collection mutators whose generic ABI result
-/// can be wider than every individual input. Checked-call substitutions must
-/// publish that result type even when the source ignores the call value, while
-/// the diagnostics-only interface demand deliberately remains smaller.
-fn checked_output_demand(
-    program: &KernelProjectProgramInput,
-    definition_facts: &[KernelDefinitionFactsInput],
-    owners: &[KernelProjectOwnerOutputs],
-) -> Box<[OutputId]> {
-    let mut outputs = interface_output_demand(program, definition_facts, owners).into_vec();
-    let definitions = KernelProjectDefinitionRefs::new(program, definition_facts, owners)
-        .expect("validated definition authorities remain aligned");
-    for definition in definitions.definitions() {
-        for call in definition.calls() {
-            if matches!(
-                call.target(),
-                KernelCallTargetRef::PureBuiltin {
-                    kind: KernelPureBuiltinKind::ListAppend
-                        | KernelPureBuiltinKind::MapUpsert
-                        | KernelPureBuiltinKind::SetAdd,
-                }
-            ) && let Some(output) = definition
-                .outputs
-                .expressions
-                .get(call.expression().0 as usize)
-            {
-                outputs.push(*output);
-            }
+#[derive(Debug)]
+struct KernelInterfaceBuilder {
+    definitions: Vec<PackedInterfaceDefinition>,
+    flows: Vec<PackedFlow>,
+    diagnostics: Vec<PackedDiagnosticMetadata>,
+    diagnostic_types: Vec<Option<PackedDiagnosticTypes>>,
+    diagnostic_values: Vec<PackedDiagnosticValue>,
+    alpha_variables: Vec<TypeVariableId>,
+    work: KernelSolveWork,
+}
+
+impl KernelInterfaceBuilder {
+    fn finish(mut self, types: Arc<FrozenTypeStore>) -> KernelInterfaceSnapshot {
+        self.work.frozen_type_store = types.layout();
+        KernelInterfaceSnapshot {
+            types,
+            definitions: self.definitions.into_boxed_slice(),
+            flows: self.flows.into_boxed_slice(),
+            diagnostics: self.diagnostics.into_boxed_slice(),
+            diagnostic_types: self.diagnostic_types.into_boxed_slice(),
+            diagnostic_values: self.diagnostic_values.into_boxed_slice(),
+            alpha_variables: self.alpha_variables.into_boxed_slice(),
+            work: self.work,
         }
     }
-    outputs.sort_unstable();
-    outputs.dedup();
-    outputs.into_boxed_slice()
+
+    /// Seal only the exact public/diagnostic root DAGs into a compact store.
+    /// The source remains the live staged solver arena, so a subsequent
+    /// checked-image demand can continue from the same quiescent graph.
+    fn finish_reachable(mut self, source: &crate::TypeTermArena) -> KernelInterfaceSnapshot {
+        let mut compact = crate::TypeTermArena::with_text(source.text_snapshot().clone());
+        let mut term_cache = vec![None; source.len()];
+        {
+            // Preserve raw IDs until the legacy checked-union Debug ordering
+            // contract is replaced. Reordering `Var(10)` and `Var(2)` before
+            // interface alpha-normalization would change canonical unions.
+            let mut map_variable = |variable: TypeVariableId| variable;
+            for definition in &mut self.definitions {
+                for flow in &mut self.flows[definition.formals.range()] {
+                    flow.term = compact.import_mapped_term(
+                        source,
+                        flow.term,
+                        &mut map_variable,
+                        &mut term_cache,
+                        false,
+                    );
+                }
+                definition.result.term = compact.import_mapped_term(
+                    source,
+                    definition.result.term,
+                    &mut map_variable,
+                    &mut term_cache,
+                    false,
+                );
+                for types in self.diagnostic_types[definition.diagnostics.range()]
+                    .iter_mut()
+                    .flatten()
+                {
+                    types.actual = compact.import_mapped_term(
+                        source,
+                        types.actual,
+                        &mut map_variable,
+                        &mut term_cache,
+                        false,
+                    );
+                    types.expected = compact.import_mapped_term(
+                        source,
+                        types.expected,
+                        &mut map_variable,
+                        &mut term_cache,
+                        false,
+                    );
+                }
+                for value in &mut self.diagnostic_values[definition.diagnostic_values.range()] {
+                    value.term = compact.import_mapped_term(
+                        source,
+                        value.term,
+                        &mut map_variable,
+                        &mut term_cache,
+                        false,
+                    );
+                }
+            }
+        }
+        self.finish(Arc::new(compact.freeze()))
+    }
+}
+
+fn append_interface_span<T>(
+    rows: &mut Vec<T>,
+    additional: impl IntoIterator<Item = T>,
+    context: &str,
+) -> Result<PackedInterfaceSpan, KernelSolveError> {
+    let start = u32::try_from(rows.len())
+        .map_err(|_| KernelSolveError::new(format!("kernel {context} start exceeds u32")))?;
+    rows.extend(additional);
+    let end = u32::try_from(rows.len())
+        .map_err(|_| KernelSolveError::new(format!("kernel {context} end exceeds u32")))?;
+    Ok(PackedInterfaceSpan {
+        start,
+        len: end - start,
+    })
 }
 
 fn project_interface_snapshot(
     program: &KernelProjectProgramInput,
     definition_facts: &[KernelDefinitionFactsInput],
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &ComponentOutputSnapshot,
-    solved_results: &[FlowType],
-    solved_formals: &[Box<[FlowType]>],
-    solved_diagnostics: &[Box<[KernelDiagnosticArtifact]>],
-) -> KernelInterfaceSnapshot {
-    let mut public_results = Vec::with_capacity(solved_results.len());
-    let mut callable_formals = Vec::with_capacity(solved_formals.len());
+    artifact: &ComponentOutputSnapshot<'_>,
+    solved_results: &[PackedFlow],
+    solved_formals: &[Box<[PackedFlow]>],
+    solved_diagnostics: &[SolvedDefinitionDiagnostics],
+) -> Result<KernelInterfaceBuilder, KernelSolveError> {
+    if solved_results.len() != owners.len()
+        || solved_formals.len() != owners.len()
+        || solved_diagnostics.len() != owners.len()
+    {
+        return Err(KernelSolveError::new(
+            "kernel interface projection received incomplete definition columns",
+        ));
+    }
+    let mut definitions = Vec::with_capacity(owners.len());
+    let mut flows = Vec::new();
     let mut diagnostics = Vec::new();
+    let mut diagnostic_types = Vec::new();
     let mut diagnostic_values = Vec::new();
-    for (owner, (formals, result)) in solved_formals.iter().zip(solved_results).enumerate() {
-        let owner_values = definition_facts[owner]
-            .diagnostic_values
-            .iter()
-            .copied()
-            .map(|value| {
-                kernel_value_reference(&program.owners[owner], value, value.0 as usize)
-                    .expect("validated diagnostic value remains in its definition namespace")
-            })
-            .collect::<Vec<_>>();
-        let owner_value_types = owner_values
-            .iter()
-            .map(|value| {
-                project_call_value_type(owner, *value, owners, artifact, solved_results)
-                    .expect("validated diagnostic value has a solved provider")
-                    .clone()
-            })
-            .collect::<Vec<_>>();
-        let (formals, result, owner_diagnostics, owner_value_types) =
-            alpha_normalize_callable_interface_and_diagnostics(
-                formals,
-                result,
-                &solved_diagnostics[owner],
-                &owner_value_types,
-            );
-        callable_formals.push(formals);
-        public_results.push(result);
-        diagnostics.extend(owner_diagnostics);
-        diagnostic_values.extend(
+    let mut alpha_variables = Vec::new();
+    let mut owner_values = Vec::new();
+    let mut owner_value_types = Vec::new();
+    let mut proof_scratch = DefinitionTermProofScratch::default();
+    for (owner, (packed_formals, packed_result)) in
+        solved_formals.iter().zip(solved_results).enumerate()
+    {
+        owner_values.clear();
+        owner_values.extend(
+            definition_facts[owner]
+                .diagnostic_values
+                .iter()
+                .copied()
+                .map(|value| {
+                    kernel_value_reference(&program.owners[owner], value, value.0 as usize)
+                        .expect("validated diagnostic value remains in its definition namespace")
+                }),
+        );
+        owner_value_types.clear();
+        owner_value_types.extend(owner_values.iter().map(|value| {
+            project_call_value_term(owner, *value, owners, artifact, solved_results)
+                .expect("validated diagnostic value has a solved provider")
+        }));
+
+        proof_scratch.begin_alpha_variables(artifact.terms());
+        for flow in packed_formals {
+            proof_scratch.visit_alpha_root(artifact.terms(), flow.term)?;
+        }
+        proof_scratch.visit_alpha_root(artifact.terms(), packed_result.term)?;
+        for diagnostic in &solved_diagnostics[owner].rows {
+            if let Some(types) = diagnostic.types {
+                proof_scratch.visit_alpha_root(artifact.terms(), types.actual)?;
+                proof_scratch.visit_alpha_root(artifact.terms(), types.expected)?;
+            }
+        }
+        for term in owner_value_types.iter().copied() {
+            proof_scratch.visit_alpha_root(artifact.terms(), term)?;
+        }
+
+        let formals = append_interface_span(
+            &mut flows,
+            packed_formals.iter().copied(),
+            "interface formal",
+        )?;
+        let diagnostic_start = diagnostics.len();
+        diagnostics.extend(
+            solved_diagnostics[owner]
+                .rows
+                .iter()
+                .map(|diagnostic| diagnostic.metadata.clone()),
+        );
+        diagnostic_types.extend(
+            solved_diagnostics[owner]
+                .rows
+                .iter()
+                .map(|diagnostic| diagnostic.types),
+        );
+        let diagnostic_end = diagnostics.len();
+        let diagnostic_span = PackedInterfaceSpan {
+            start: u32::try_from(diagnostic_start)
+                .map_err(|_| KernelSolveError::new("kernel diagnostic start exceeds u32"))?,
+            len: u32::try_from(diagnostic_end - diagnostic_start)
+                .map_err(|_| KernelSolveError::new("kernel diagnostic count exceeds u32"))?,
+        };
+        let diagnostic_value_span = append_interface_span(
+            &mut diagnostic_values,
             owner_values
                 .iter()
                 .copied()
-                .zip(owner_value_types)
-                .enumerate()
-                .map(|(ordinal, (value, ty))| KernelDiagnosticValueArtifact {
-                    owner: KernelOwnerId(
-                        u32::try_from(owner).expect("kernel diagnostic owner count exceeds u32"),
-                    ),
-                    ordinal: u32::try_from(ordinal)
-                        .expect("kernel diagnostic value count exceeds u32"),
-                    value,
-                    ty,
-                }),
-        );
+                .zip(owner_value_types.iter().copied())
+                .map(|(value, term)| PackedDiagnosticValue { value, term }),
+            "diagnostic value",
+        )?;
+        let alpha_span = append_interface_span(
+            &mut alpha_variables,
+            proof_scratch.alpha_variable_sources().iter().copied(),
+            "interface alpha-variable",
+        )?;
+        definitions.push(PackedInterfaceDefinition {
+            result: *packed_result,
+            formals,
+            diagnostics: diagnostic_span,
+            diagnostic_values: diagnostic_value_span,
+            alpha_variables: alpha_span,
+        });
     }
-    KernelInterfaceSnapshot {
-        public_results: public_results.into_boxed_slice(),
-        callable_formals: callable_formals.into_boxed_slice(),
-        diagnostics: diagnostics.into_boxed_slice(),
-        diagnostic_values: diagnostic_values.into_boxed_slice(),
+    Ok(KernelInterfaceBuilder {
+        definitions,
+        flows,
+        diagnostics,
+        diagnostic_types,
+        diagnostic_values,
+        alpha_variables,
         work: artifact.work(),
-    }
+    })
 }
 
 /// Project reusable call facts and user-facing type failures directly from the
@@ -8655,17 +9176,25 @@ fn project_call_facts_and_diagnostics(
     definition_facts: &[KernelDefinitionFactsInput],
     owners: &[KernelProjectOwnerOutputs],
     abi: &crate::KernelAbiInput,
-    artifact: &ComponentOutputSnapshot,
-    packed_artifact: Option<&UnsealedComponentArtifact>,
-    public_results: &[FlowType],
-    public_formals: &[Box<[FlowType]>],
+    artifact: &mut ComponentOutputSnapshot<'_>,
+    public_results: &[PackedFlow],
+    public_formals: &[Box<[PackedFlow]>],
     retain_call_facts: bool,
 ) -> (
-    Box<[Box<[SolvedKernelCallFacts]>]>,
-    Box<[Box<[KernelDiagnosticArtifact]>]>,
+    Box<[SolvedDefinitionCallFacts]>,
+    Box<[SolvedDefinitionDiagnostics]>,
 ) {
+    let packed_abi = retain_call_facts.then(|| {
+        let first_projection_variable = u32::try_from(artifact.work().variables)
+            .expect("kernel solver variable namespace exceeds u32");
+        pack_abi_call_surfaces(abi, artifact.terms_mut(), first_projection_variable)
+    });
     let mut project_call_facts = Vec::with_capacity(owners.len());
     let mut project_diagnostics = Vec::with_capacity(owners.len());
+    let mut call_scratch = crate::PackedCallTypeScratch::default();
+    let mut actuals = Vec::new();
+    let mut substitutions = Vec::new();
+    let mut mismatch_path = Vec::new();
     let definitions = KernelProjectDefinitionRefs::new(program, definition_facts, owners)
         .expect("validated definition authorities remain aligned");
     for definition in definitions.definitions() {
@@ -8673,13 +9202,21 @@ fn project_call_facts_and_diagnostics(
         let owner_id = definition.owner;
         let owner = definition.outputs;
         let mut owner_call_facts = Vec::with_capacity(owner.calls.len());
+        let mut owner_call_substitutions = Vec::new();
         let mut diagnostics =
             collect_definition_diagnostic_artifacts(owner_id, definition.input, definition.facts)
                 .expect("validated definition diagnostics remain structurally valid")
-                .into_vec();
+                .into_vec()
+                .into_iter()
+                .map(|diagnostic| SolvedKernelDiagnostic {
+                    metadata: PackedDiagnosticMetadata::Plain(diagnostic),
+                    types: None,
+                })
+                .collect::<Vec<_>>();
         for call in definition.calls() {
             let call_target = call.target();
-            let substitutions = if let KernelCallTargetRef::User { target, .. } = call_target {
+            substitutions.clear();
+            if let KernelCallTargetRef::User { target, .. } = call_target {
                 let target_formals = public_formals
                     .get(target.0 as usize)
                     .expect("validated kernel call target has public formals");
@@ -8687,25 +9224,25 @@ fn project_call_facts_and_diagnostics(
                     .get(target.0 as usize)
                     .expect("validated kernel call target has a public result");
 
-                let mut actuals = call
-                    .inputs()
-                    .iter()
-                    .filter_map(|input| {
-                        let Ok(KernelCallInputRoleRef::Formal { ordinal }) = call.input_role(input)
-                        else {
-                            return None;
-                        };
-                        let value = call.input_value(input).ok()?;
-                        project_call_value_type(
-                            owner_index,
-                            value,
-                            owners,
-                            artifact,
-                            public_results,
-                        )
-                        .map(|actual| (ordinal, actual))
-                    })
-                    .collect::<Vec<_>>();
+                actuals.clear();
+                for input in call.inputs() {
+                    let Ok(KernelCallInputRoleRef::Formal { ordinal }) = call.input_role(input)
+                    else {
+                        continue;
+                    };
+                    let Ok(value) = call.input_value(input) else {
+                        continue;
+                    };
+                    if let Some(actual) = project_call_value_term(
+                        owner_index,
+                        value,
+                        owners,
+                        artifact,
+                        public_results,
+                    ) {
+                        actuals.push((ordinal, actual));
+                    }
+                }
                 if let KernelCallTargetRef::User {
                     inherited_formal: Some(inherited),
                     ..
@@ -8714,13 +9251,16 @@ fn project_call_facts_and_diagnostics(
                         .get(owner_index)
                         .and_then(|formals| formals.get(inherited.caller_ordinal as usize))
                 {
-                    actuals.push((inherited.target_ordinal, &actual.ty));
+                    actuals.push((inherited.target_ordinal, actual.term));
                 }
-                let substitutions = derive_kernel_call_type_substitutions_from_refs(
+                crate::derive_packed_call_type_substitutions(
+                    artifact.terms(),
                     target_formals,
-                    target_result,
+                    *target_result,
                     &actuals,
                     None,
+                    &mut call_scratch,
+                    &mut substitutions,
                 );
                 // Inherited context has no authored call-input site. Its
                 // requirements are propagated through the separate formal
@@ -8746,7 +9286,7 @@ fn project_call_facts_and_diagnostics(
                     let Ok(value) = call.input_value(input) else {
                         continue;
                     };
-                    let Some(actual) = project_call_value_type(
+                    let Some(actual) = project_call_value_term(
                         owner_index,
                         value,
                         owners,
@@ -8758,32 +9298,35 @@ fn project_call_facts_and_diagnostics(
                     let Some(expected) = target_formals.get(ordinal as usize) else {
                         continue;
                     };
-                    let expected = instantiate_kernel_call_type(
-                        &expected.ty,
-                        target_formals,
-                        target_result,
+                    let expected = crate::instantiate_packed_call_type(
+                        artifact.terms_mut(),
+                        expected.term,
                         &substitutions,
+                        &mut call_scratch,
                     );
-                    if kernel_type_is_assignable_to(actual, &expected) {
+                    if crate::packed_type_is_assignable_to(artifact.terms(), actual, expected) {
                         continue;
                     }
-                    let mismatch = kernel_type_mismatch(actual, &expected);
-                    diagnostics.push(KernelDiagnosticArtifact {
-                        owner: owner_id,
-                        severity: KernelDiagnosticSeverity::Error,
-                        site: KernelDiagnosticSite::CallInput {
-                            call: call.expression(),
-                            target,
-                            formal_ordinal: ordinal,
-                        },
-                        kind: KernelDiagnosticKind::CallInputType {
+                    let mismatch = packed_kernel_type_mismatch(
+                        artifact.terms(),
+                        actual,
+                        expected,
+                        &mut mismatch_path,
+                    );
+                    diagnostics.push(SolvedKernelDiagnostic {
+                        metadata: PackedDiagnosticMetadata::CallInputType {
+                            owner: owner_id,
+                            severity: KernelDiagnosticSeverity::Error,
+                            site: KernelDiagnosticSite::CallInput {
+                                call: call.expression(),
+                                target,
+                                formal_ordinal: ordinal,
+                            },
                             mismatch,
-                            actual: actual.clone(),
-                            expected,
                         },
+                        types: Some(PackedDiagnosticTypes { actual, expected }),
                     });
                 }
-                substitutions
             } else if retain_call_facts {
                 project_abi_call_type_substitutions(
                     owner_index,
@@ -8792,37 +9335,30 @@ fn project_call_facts_and_diagnostics(
                     abi,
                     artifact,
                     public_results,
-                )
-            } else {
-                Box::new([])
-            };
+                    packed_abi
+                        .as_deref()
+                        .expect("checked call projection packed the ABI surfaces"),
+                    &mut call_scratch,
+                    &mut actuals,
+                    &mut substitutions,
+                );
+            }
             if !retain_call_facts {
                 continue;
             }
+            let substitution_start = u32::try_from(owner_call_substitutions.len())
+                .expect("kernel definition call-substitution start exceeds u32");
+            owner_call_substitutions.extend_from_slice(&substitutions);
+            let substitution_len = u32::try_from(substitutions.len())
+                .expect("kernel definition call-substitution count exceeds u32");
             let result_output = owner.expressions.get(call.expression().0 as usize).copied();
-            let result_is_concrete = result_output.is_some_and(|output| {
-                packed_artifact.map_or_else(
-                    || {
-                        artifact
-                            .flow_type(output)
-                            .is_some_and(|flow| type_has_concrete_outer_shape(&flow.ty))
-                    },
-                    |packed| packed_output_has_concrete_outer_shape(packed, output),
-                )
-            });
+            let result_is_concrete = result_output
+                .and_then(|output| artifact.term(output))
+                .is_some_and(|term| packed_term_has_concrete_outer_shape(artifact.terms(), term));
             let call_syntax_selected = result_output.is_some_and(|output| {
-                packed_artifact.map_or_else(
-                    || {
-                        artifact
-                            .output_flags(output)
-                            .is_some_and(|flags| flags.call_syntax_selected)
-                    },
-                    |packed| {
-                        packed
-                            .output(output)
-                            .is_some_and(|output| output.call_syntax_selected)
-                    },
-                )
+                artifact
+                    .output_flags(output)
+                    .is_some_and(|flags| flags.call_syntax_selected)
             });
             let exact_structural_constructor = matches!(
                 call_target,
@@ -8831,8 +9367,10 @@ fn project_call_facts_and_diagnostics(
                         kind: KernelPureBuiltinKind::RecordConstructor,
                     }
             );
-            owner_call_facts.push(SolvedKernelCallFacts {
-                type_substitutions: substitutions,
+            owner_call_facts.push(PackedCallFactsInput {
+                expression: call.expression(),
+                substitution_start,
+                substitution_len,
                 // CheckedCall exposes one existing exact-occurrence bit to
                 // OutNet. Besides a selected user-call result, a structural
                 // constructor is intrinsically occurrence-owned: its named
@@ -8845,26 +9383,22 @@ fn project_call_facts_and_diagnostics(
                         && (call_syntax_selected
                             || call.solve.syntax_discriminated_root_output.is_some_and(
                                 |output| {
-                                    packed_artifact.map_or_else(
-                                        || {
-                                            artifact
-                                                .output_flags(output)
-                                                .is_some_and(|flags| flags.syntax_selected_here)
-                                        },
-                                        |packed| {
-                                            packed
-                                                .output(output)
-                                                .is_some_and(|output| output.syntax_selected_here)
-                                        },
-                                    )
+                                    artifact
+                                        .output_flags(output)
+                                        .is_some_and(|flags| flags.syntax_selected_here)
                                 },
                             ))))
                     && result_is_concrete,
             });
         }
-        diagnostics.sort_unstable_by(|left, right| left.site.cmp(&right.site));
-        project_call_facts.push(owner_call_facts.into_boxed_slice());
-        project_diagnostics.push(diagnostics.into_boxed_slice());
+        diagnostics.sort_unstable_by(|left, right| left.metadata.site().cmp(right.metadata.site()));
+        project_call_facts.push(SolvedDefinitionCallFacts {
+            calls: owner_call_facts.into_boxed_slice(),
+            substitutions: owner_call_substitutions.into_boxed_slice(),
+        });
+        project_diagnostics.push(SolvedDefinitionDiagnostics {
+            rows: diagnostics.into_boxed_slice(),
+        });
     }
     (
         project_call_facts.into_boxed_slice(),
@@ -8882,9 +9416,13 @@ fn project_abi_call_type_substitutions(
     call: KernelProjectCallRef<'_>,
     owners: &[KernelProjectOwnerOutputs],
     abi: &crate::KernelAbiInput,
-    artifact: &ComponentOutputSnapshot,
-    public_results: &[FlowType],
-) -> Box<[KernelCallTypeSubstitution]> {
+    artifact: &ComponentOutputSnapshot<'_>,
+    public_results: &[PackedFlow],
+    packed_abi: &[PackedAbiCallSurface],
+    scratch: &mut crate::PackedCallTypeScratch,
+    actuals: &mut Vec<(u32, TypeTermId)>,
+    substitutions: &mut Vec<PackedCallTypeSubstitution>,
+) {
     let facts = call.definition.facts;
     let Ok(syntax) = facts
         .call_syntax
@@ -8893,19 +9431,24 @@ fn project_abi_call_type_substitutions(
     else {
         // Lower-level equation tests intentionally omit checked-image syntax.
         // Production linking validates and requires the authored row.
-        return Box::new([]);
+        return;
     };
-    let Some(target) = abi.callable(&syntax.function) else {
+    let Some(target_id) = abi.callable_id(&syntax.function) else {
         // The same lower-level tests may install a builtin equation directly
         // without the project ABI table. A production project cannot reach the
         // checked linker with that incomplete contract.
-        return Box::new([]);
+        return;
     };
-    let actuals = call.inputs().iter().filter_map(|input| {
+    let target = abi
+        .callable_by_id(target_id)
+        .expect("validated ABI callable ID resolves");
+    let packed_target = &packed_abi[target_id.0 as usize];
+    actuals.clear();
+    for input in call.inputs() {
         let Ok(KernelCallInputRoleRef::Abi { name }) = call.input_role(input) else {
-            return None;
+            continue;
         };
-        let parameter = target
+        let Some(parameter) = target
             .parameters
             .iter()
             .find(|parameter| parameter.name.as_ref() == name)
@@ -8915,11 +9458,19 @@ fn project_abi_call_type_substitutions(
                         parameter.kind == boon_checked::CheckedParameterKind::Value
                     })
                 })?
-            })?;
-        let value = call.input_value(input).ok()?;
-        project_call_value_type(owner_index, value, owners, artifact, public_results)
-            .map(|actual| (parameter.ordinal, actual))
-    });
+            })
+        else {
+            continue;
+        };
+        let Ok(value) = call.input_value(input) else {
+            continue;
+        };
+        if let Some(actual) =
+            project_call_value_term(owner_index, value, owners, artifact, public_results)
+        {
+            actuals.push((parameter.ordinal, actual));
+        }
+    }
     let actual_result = matches!(
         call.target(),
         KernelCallTargetRef::PureBuiltin {
@@ -8929,7 +9480,7 @@ fn project_abi_call_type_substitutions(
         }
     )
     .then(|| {
-        project_call_value_type(
+        project_call_value_term(
             owner_index,
             KernelValueReference::Local(call.expression()),
             owners,
@@ -8938,29 +9489,36 @@ fn project_abi_call_type_substitutions(
         )
     })
     .flatten();
-    derive_kernel_abi_call_type_substitutions_from_refs(target, actuals, actual_result)
+    crate::derive_packed_call_type_substitutions(
+        artifact.terms(),
+        &packed_target.formals,
+        packed_target.result,
+        actuals,
+        actual_result,
+        scratch,
+        substitutions,
+    );
 }
 
-fn project_call_value_type<'a>(
+fn project_call_value_term(
     caller: usize,
     value: KernelValueReference,
     owners: &[KernelProjectOwnerOutputs],
-    artifact: &'a ComponentOutputSnapshot,
-    public_results: &'a [FlowType],
-) -> Option<&'a Type> {
+    artifact: &ComponentOutputSnapshot<'_>,
+    public_results: &[PackedFlow],
+) -> Option<TypeTermId> {
     match value {
         KernelValueReference::Local(expression) => owners
             .get(caller)?
             .expressions
             .get(expression.0 as usize)
-            .and_then(|output| artifact.flow_type(*output))
-            .map(|output| &output.ty),
+            .and_then(|output| artifact.term(*output)),
         KernelValueReference::External(KernelExternalExpression {
             owner,
             target: KernelExternalTarget::Result,
         }) => public_results
             .get(owner.0 as usize)
-            .map(|result| &result.ty),
+            .map(|result| result.term),
         KernelValueReference::External(KernelExternalExpression {
             owner,
             target: KernelExternalTarget::Expression(expression),
@@ -8968,11 +9526,83 @@ fn project_call_value_type<'a>(
             .get(owner.0 as usize)?
             .expressions
             .get(expression.0 as usize)
-            .and_then(|output| artifact.flow_type(*output))
-            .map(|output| &output.ty),
+            .and_then(|output| artifact.term(*output)),
     }
 }
 
+#[derive(Debug)]
+struct PackedAbiCallSurface {
+    formals: Box<[PackedFlow]>,
+    result: PackedFlow,
+}
+
+fn pack_abi_call_surfaces(
+    abi: &crate::KernelAbiInput,
+    terms: &mut crate::TypeTermArena,
+    mut next_variable: u32,
+) -> Box<[PackedAbiCallSurface]> {
+    abi.callables()
+        .iter()
+        .map(|callable| {
+            let base = next_variable;
+            let mut variable_count = 0_u32;
+            let mut import = |ty: &Type| {
+                terms.import_checked_type(ty, &mut |source| {
+                    variable_count = variable_count.max(source.0.saturating_add(1));
+                    TypeVariableId(
+                        base.checked_add(source.0)
+                            .expect("kernel ABI projection variable namespace exceeds u32"),
+                    )
+                })
+            };
+            let formals = callable
+                .parameters
+                .iter()
+                .map(|parameter| PackedFlow {
+                    mode: parameter.flow_type.mode,
+                    term: import(&parameter.flow_type.ty),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let result = PackedFlow {
+                mode: callable.result.mode,
+                term: import(&callable.result.ty),
+            };
+            next_variable = next_variable
+                .checked_add(variable_count)
+                .expect("kernel ABI projection variable namespace exceeds u32");
+            PackedAbiCallSurface { formals, result }
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn packed_kernel_type_mismatch(
+    terms: &crate::TypeTermArena,
+    actual: TypeTermId,
+    expected: TypeTermId,
+    path: &mut Vec<SymbolId>,
+) -> KernelTypeMismatch {
+    match crate::packed_type_mismatch(terms, actual, expected, path) {
+        crate::PackedTypeMismatchKind::Type => KernelTypeMismatch::Type,
+        crate::PackedTypeMismatchKind::MissingField => KernelTypeMismatch::MissingField(
+            path.iter()
+                .map(|field| terms.name(*field))
+                .collect::<Vec<_>>()
+                .join(".")
+                .into_boxed_str(),
+        ),
+        crate::PackedTypeMismatchKind::IncompatibleField => KernelTypeMismatch::IncompatibleField(
+            path.iter()
+                .map(|field| terms.name(*field))
+                .collect::<Vec<_>>()
+                .join(".")
+                .into_boxed_str(),
+        ),
+    }
+}
+
+#[cfg(test)]
 fn instantiate_kernel_call_type(
     ty: &Type,
     target_formals: &[FlowType],
@@ -8991,6 +9621,7 @@ fn instantiate_kernel_call_type(
     substitute_kernel_call_type(ty, &parameter_ids, &substitutions)
 }
 
+#[cfg(test)]
 fn substitute_kernel_call_type(
     ty: &Type,
     parameter_ids: &BTreeMap<boon_checked::TypeVar, KernelTypeParameterId>,
@@ -9094,6 +9725,7 @@ fn substitute_kernel_call_type(
     }
 }
 
+#[cfg(test)]
 fn kernel_type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
     if actual == expected {
         return true;
@@ -9189,6 +9821,7 @@ fn kernel_type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
     }
 }
 
+#[cfg(test)]
 fn kernel_variant_is_assignable_to(actual: &Variant, expected: &Variant) -> bool {
     match (actual, expected) {
         (Variant::Tag(actual), Variant::Tag(expected)) => actual == expected,
@@ -9212,6 +9845,7 @@ fn kernel_variant_is_assignable_to(actual: &Variant, expected: &Variant) -> bool
     }
 }
 
+#[cfg(test)]
 fn kernel_type_mismatch(actual: &Type, expected: &Type) -> KernelTypeMismatch {
     if let Some(field) = kernel_missing_field_name(actual, expected) {
         KernelTypeMismatch::MissingField(field.into_boxed_str())
@@ -9222,6 +9856,7 @@ fn kernel_type_mismatch(actual: &Type, expected: &Type) -> KernelTypeMismatch {
     }
 }
 
+#[cfg(test)]
 fn kernel_missing_field_name(actual: &Type, expected: &Type) -> Option<String> {
     let (Type::Object(actual), Type::Object(expected)) = (actual, expected) else {
         return None;
@@ -9235,6 +9870,7 @@ fn kernel_missing_field_name(actual: &Type, expected: &Type) -> Option<String> {
     })
 }
 
+#[cfg(test)]
 fn kernel_incompatible_field_name(actual: &Type, expected: &Type) -> Option<String> {
     let (Type::Object(actual), Type::Object(expected)) = (actual, expected) else {
         return None;
@@ -11570,29 +12206,6 @@ fn derive_kernel_call_type_substitutions_iter<'a>(
     )
 }
 
-fn derive_kernel_abi_call_type_substitutions_from_refs<'a>(
-    target: &crate::KernelCallableAbiInput,
-    actuals: impl IntoIterator<Item = (u32, &'a Type)>,
-    actual_result: Option<&Type>,
-) -> Box<[KernelCallTypeSubstitution]> {
-    derive_kernel_call_type_substitutions_from_lookup(
-        target
-            .parameters
-            .iter()
-            .map(|parameter| &parameter.flow_type),
-        |ordinal| {
-            target
-                .parameters
-                .iter()
-                .find(|parameter| parameter.ordinal == ordinal)
-                .map(|parameter| &parameter.flow_type)
-        },
-        &target.result,
-        actuals,
-        actual_result,
-    )
-}
-
 fn derive_kernel_call_type_substitutions_from_lookup<'formal, 'actual>(
     target_formals: impl IntoIterator<Item = &'formal FlowType>,
     target_formal: impl Fn(u32) -> Option<&'formal FlowType>,
@@ -12185,6 +12798,11 @@ fn validate_definition_diagnostic_inputs(
     facts: &KernelDefinitionFactsInput,
 ) -> Result<(), KernelOwnerBuildError> {
     for diagnostic in &facts.diagnostics {
+        if matches!(&diagnostic.kind, KernelDiagnosticKind::CallInputType { .. }) {
+            return Err(KernelOwnerBuildError::new(
+                "definition diagnostic inputs cannot supply solved call-input type payloads",
+            ));
+        }
         match diagnostic.site {
             KernelDiagnosticSite::Expression { expression } => {
                 checked_expression_index(
@@ -13525,14 +14143,8 @@ fn type_has_concrete_outer_shape(ty: &Type) -> bool {
     }
 }
 
-fn packed_output_has_concrete_outer_shape(
-    artifact: &UnsealedComponentArtifact,
-    output: OutputId,
-) -> bool {
-    let Some(output) = artifact.output(output) else {
-        return false;
-    };
-    match artifact.terms().term_head(output.term()) {
+fn packed_term_has_concrete_outer_shape(terms: &crate::TypeTermArena, term: TypeTermId) -> bool {
+    match terms.term_head(term) {
         TypeTermHead::VariantSet(variants) | TypeTermHead::Union(variants) => variants.len() != 0,
         TypeTermHead::OpenObjectPlaceholder
         | TypeTermHead::UnresolvedShape(_)
@@ -20259,15 +20871,15 @@ mod tests {
         }
     }
 
-    fn project_result(snapshot: &KernelCheckedSnapshot, owner: u32) -> &FlowType {
+    fn project_result(snapshot: &KernelCheckedSnapshot, owner: u32) -> FlowType {
         snapshot
-            .result_flow(KernelOwnerId(owner))
+            .materialize_result_flow(KernelOwnerId(owner))
             .expect("project result is present")
     }
 
-    fn project_formals(snapshot: &KernelCheckedSnapshot, owner: u32) -> &[FlowType] {
+    fn project_formals(snapshot: &KernelCheckedSnapshot, owner: u32) -> Box<[FlowType]> {
         snapshot
-            .formal_flows(KernelOwnerId(owner))
+            .materialize_formal_flows(KernelOwnerId(owner))
             .expect("project formals are present")
     }
 
@@ -20492,6 +21104,242 @@ mod tests {
     }
 
     #[test]
+    fn packed_call_substitution_and_instantiation_match_the_rich_oracle() {
+        let variable = TypeVar(7);
+        let admin = Type::VariantSet(vec![Variant::Tag("Admin".to_owned())].into());
+        let editor = Type::VariantSet(vec![Variant::Tag("Editor".to_owned())].into());
+        let widened = Type::VariantSet(
+            vec![
+                Variant::Tag("Admin".to_owned()),
+                Variant::Tag("Editor".to_owned()),
+            ]
+            .into(),
+        );
+        let formals = [
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Set(Type::shared(Type::Var(variable))),
+            },
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Var(variable),
+            },
+        ];
+        let result = FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Set(Type::shared(Type::Var(variable))),
+        };
+        let actuals = [(0, Type::Set(Type::shared(admin))), (1, editor)];
+
+        let mut arena = crate::TypeTermArena::for_test_symbols(["Admin", "Editor"]);
+        let packed_formals = formals
+            .iter()
+            .map(|formal| crate::PackedFlow {
+                mode: formal.mode,
+                term: arena
+                    .import_checked_type(&formal.ty, &mut |source| crate::TypeVariableId(source.0)),
+            })
+            .collect::<Vec<_>>();
+        let packed_result = crate::PackedFlow {
+            mode: result.mode,
+            term: arena
+                .import_checked_type(&result.ty, &mut |source| crate::TypeVariableId(source.0)),
+        };
+        let packed_actuals = actuals
+            .iter()
+            .map(|(ordinal, actual)| {
+                (
+                    *ordinal,
+                    arena.import_checked_type(actual, &mut |source| {
+                        crate::TypeVariableId(source.0.saturating_add(1_000))
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let packed_actual_result = arena
+            .import_checked_type(&Type::Set(Type::shared(widened.clone())), &mut |source| {
+                crate::TypeVariableId(source.0.saturating_add(1_000))
+            });
+        let rich = derive_kernel_call_type_substitutions(
+            &formals,
+            &result,
+            &actuals,
+            Some(&Type::Set(Type::shared(widened))),
+        );
+        let mut scratch = crate::PackedCallTypeScratch::default();
+        let mut packed = Vec::new();
+        crate::derive_packed_call_type_substitutions(
+            &arena,
+            &packed_formals,
+            packed_result,
+            &packed_actuals,
+            Some(packed_actual_result),
+            &mut scratch,
+            &mut packed,
+        );
+        assert_eq!(packed.len(), rich.len());
+        for (packed, rich) in packed.iter().zip(&rich) {
+            assert_eq!(packed.variable, rich.variable);
+            assert_eq!(arena.export_checked_type(packed.term), rich.value);
+        }
+
+        let packed_instantiated = crate::instantiate_packed_call_type(
+            &mut arena,
+            packed_result.term,
+            &packed,
+            &mut scratch,
+        );
+        assert_eq!(
+            arena.export_checked_type(packed_instantiated),
+            instantiate_kernel_call_type(&result.ty, &formals, &result, &rich),
+        );
+    }
+
+    #[test]
+    fn packed_call_assignability_matches_rich_kernel_semantics() {
+        let closed = |fields: &[(&str, Type)]| {
+            Type::object(ObjectShape::from_ordered_fields(
+                fields
+                    .iter()
+                    .map(|(name, ty)| ((*name).to_owned(), ty.clone())),
+                false,
+            ))
+        };
+        let open = |fields: &[(&str, Type)]| {
+            Type::object(ObjectShape::from_ordered_fields(
+                fields
+                    .iter()
+                    .map(|(name, ty)| ((*name).to_owned(), ty.clone())),
+                true,
+            ))
+        };
+        let pairs = vec![
+            (Type::Text, Type::Text),
+            (Type::Text, Type::Number),
+            (Type::Unknown, Type::Number),
+            (open(&[]), Type::Number),
+            (closed(&[("a", Type::Number)]), open(&[("a", Type::Number)])),
+            (open(&[]), closed(&[("a", Type::Number)])),
+            (
+                closed(&[("a", Type::Number), ("z", Type::Text)]),
+                closed(&[("a", Type::Number)]),
+            ),
+            (
+                Type::Union(vec![Type::Text, Type::Number].into()),
+                Type::Union(vec![Type::Text, Type::Number, Type::Absent].into()),
+            ),
+            (
+                Type::Function {
+                    args: vec![Type::Number],
+                    result: Box::new(FlowType {
+                        mode: FlowMode::Continuous,
+                        ty: Type::Text,
+                    }),
+                },
+                Type::Function {
+                    args: vec![Type::Number],
+                    result: Box::new(FlowType {
+                        mode: FlowMode::Continuous,
+                        ty: Type::Text,
+                    }),
+                },
+            ),
+            (
+                Type::VariantSet(
+                    vec![Variant::tagged(
+                        "Item".to_owned(),
+                        ObjectShape::from_ordered_fields(
+                            [("value".to_owned(), Type::Number)],
+                            false,
+                        ),
+                    )]
+                    .into(),
+                ),
+                closed(&[("value", Type::Number)]),
+            ),
+            (
+                Type::VariantSet(vec![Variant::Tag("NoElement".to_owned())].into()),
+                Type::RenderContract,
+            ),
+        ];
+
+        for (actual, expected) in pairs {
+            let mut arena = crate::TypeTermArena::new();
+            let packed_actual = arena.import_checked_type(&actual, &mut |source| {
+                crate::TypeVariableId(source.0.saturating_add(1_000))
+            });
+            let packed_expected =
+                arena.import_checked_type(&expected, &mut |source| crate::TypeVariableId(source.0));
+            assert_eq!(
+                crate::packed_type_is_assignable_to(&arena, packed_actual, packed_expected),
+                kernel_type_is_assignable_to(&actual, &expected),
+                "packed assignability diverged for actual {actual:?}, expected {expected:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn packed_call_mismatch_uses_the_rich_lexical_nested_path() {
+        let actual = Type::object(ObjectShape::from_ordered_fields(
+            [
+                (
+                    "z".to_owned(),
+                    Type::object(ObjectShape::from_ordered_fields([], false)),
+                ),
+                (
+                    "a".to_owned(),
+                    Type::object(ObjectShape::from_ordered_fields([], false)),
+                ),
+            ],
+            false,
+        ));
+        let expected = Type::object(ObjectShape::from_ordered_fields(
+            [
+                (
+                    "z".to_owned(),
+                    Type::object(ObjectShape::from_ordered_fields(
+                        [("later".to_owned(), Type::Text)],
+                        false,
+                    )),
+                ),
+                (
+                    "a".to_owned(),
+                    Type::object(ObjectShape::from_ordered_fields(
+                        [("first".to_owned(), Type::Number)],
+                        false,
+                    )),
+                ),
+            ],
+            false,
+        ));
+        let rich = kernel_type_mismatch(&actual, &expected);
+        let mut arena = crate::TypeTermArena::for_test_symbols(["z", "a", "later", "first"]);
+        let actual = arena.import_checked_type(&actual, &mut |source| {
+            crate::TypeVariableId(source.0.saturating_add(1_000))
+        });
+        let expected =
+            arena.import_checked_type(&expected, &mut |source| crate::TypeVariableId(source.0));
+        let mut path = Vec::new();
+        let mismatch = crate::packed_type_mismatch(&arena, actual, expected, &mut path);
+        let path = path
+            .iter()
+            .map(|symbol| arena.name(*symbol))
+            .collect::<Vec<_>>()
+            .join(".");
+        let packed = match mismatch {
+            crate::PackedTypeMismatchKind::MissingField => {
+                KernelTypeMismatch::MissingField(path.into_boxed_str())
+            }
+            crate::PackedTypeMismatchKind::IncompatibleField => {
+                KernelTypeMismatch::IncompatibleField(path.into_boxed_str())
+            }
+            crate::PackedTypeMismatchKind::Type => KernelTypeMismatch::Type,
+        };
+        assert_eq!(packed, rich);
+        assert_eq!(packed, KernelTypeMismatch::MissingField("a.first".into()));
+    }
+
+    #[test]
     fn callback_requirements_shape_a_local_formal_item_without_coalescing_channels() {
         let mut builder = ComponentProgramBuilder::new();
         let formal = builder.new_contextual_hole();
@@ -20663,7 +21511,7 @@ mod tests {
             .solve_graph()
             .expect("source diagnostic program solves");
         let interfaces = solved.interface_snapshot();
-        assert_eq!(interfaces.diagnostics.len(), 5);
+        assert_eq!(interfaces.diagnostic_count(), 5);
         let checked = solved
             .checked_snapshot()
             .expect("source diagnostics seal into checked image");
@@ -20671,13 +21519,59 @@ mod tests {
             Arc::ptr_eq(&interfaces, &checked.interface),
             "diagnostics and checked publication must share one interface allocation",
         );
+        assert!(
+            Arc::ptr_eq(
+                &checked.interface.types,
+                checked.definition_code.type_store()
+            ),
+            "checked interface and definition code must share one frozen type authority",
+        );
         assert_eq!(
             checked
                 .diagnostics_for(KernelOwnerId(0))
                 .expect("owner diagnostics are present"),
-            interfaces.diagnostics.as_ref()
+            interfaces.materialize_diagnostics()
         );
         assert!(checked.definitions[0].statements.is_empty());
+    }
+
+    #[test]
+    fn source_diagnostics_cannot_supply_solved_call_input_types() {
+        let program = KernelProjectProgramInput {
+            owners: vec![KernelOwnerProgramInput {
+                nodes: Box::new([KernelOwnerNode {
+                    kind: KernelOwnerNodeKind::Unknown,
+                    inputs: Box::new([]),
+                    mode: FlowMode::Continuous,
+                }]),
+                formal_count: 0,
+                external_expressions: Box::new([]),
+                result: KernelExpressionId(0),
+            }]
+            .into_boxed_slice(),
+        };
+        let facts = vec![KernelDefinitionFactsInput {
+            diagnostics: Box::new([KernelDiagnosticInput {
+                severity: KernelDiagnosticSeverity::Error,
+                site: KernelDiagnosticSite::Expression {
+                    expression: KernelExpressionId(0),
+                },
+                kind: KernelDiagnosticKind::CallInputType {
+                    actual: Type::Number,
+                    expected: Type::Text,
+                    mismatch: KernelTypeMismatch::Type,
+                },
+            }]),
+            ..KernelDefinitionFactsInput::default()
+        }]
+        .into_boxed_slice();
+        let error = compile_project_program_with_definition_facts(&program, &facts)
+            .expect_err("source-supplied solved call-input types must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot supply solved call-input type payloads")
+        );
     }
 
     #[test]
@@ -23101,7 +23995,7 @@ mod tests {
 
         let artifact = compile_project_program(&input).unwrap().solve().unwrap();
         assert_eq!(
-            project_formals(&artifact, 0),
+            project_formals(&artifact, 0).as_ref(),
             [FlowType {
                 mode: FlowMode::Continuous,
                 ty: Type::Text,
@@ -23109,7 +24003,7 @@ mod tests {
         );
         assert_eq!(
             project_result(&artifact, 0),
-            &FlowType {
+            FlowType {
                 mode: FlowMode::Continuous,
                 ty: Type::Number,
             }
@@ -23183,11 +24077,14 @@ mod tests {
             mode: FlowMode::Continuous,
             ty: Type::Text,
         };
-        assert_eq!(project_formals(&artifact, 0), [text_formal.clone()]);
-        assert_eq!(project_formals(&artifact, 1), [text_formal]);
+        assert_eq!(
+            project_formals(&artifact, 0).as_ref(),
+            [text_formal.clone()]
+        );
+        assert_eq!(project_formals(&artifact, 1).as_ref(), [text_formal]);
         assert_eq!(
             project_result(&artifact, 1),
-            &FlowType {
+            FlowType {
                 mode: FlowMode::Continuous,
                 ty: Type::Number,
             }
@@ -23255,10 +24152,11 @@ mod tests {
         .solve_graph()
         .unwrap();
         let interfaces = solved.interface_snapshot();
-        let [diagnostic] = interfaces.diagnostics.as_ref() else {
+        let interface_diagnostics = interfaces.materialize_diagnostics();
+        let [diagnostic] = interface_diagnostics.as_ref() else {
             panic!(
                 "diagnostics-only projection must emit one typed call failure: {:#?}",
-                interfaces.diagnostics
+                interface_diagnostics
             )
         };
         assert_eq!(diagnostic.owner, KernelOwnerId(1));
@@ -23288,7 +24186,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            checked.diagnostics_for(KernelOwnerId(1)).unwrap(),
+            checked.diagnostics_for(KernelOwnerId(1)).unwrap().as_ref(),
             [diagnostic.clone()]
         );
     }
@@ -23515,9 +24413,9 @@ mod tests {
             .solve_interfaces()
             .unwrap();
         assert!(
-            interfaces.diagnostics.is_empty(),
+            interfaces.diagnostic_count() == 0,
             "mutually exclusive field requirements must remain conditional through direct and wrapper calls: {:#?}",
-            interfaces.diagnostics
+            interfaces.materialize_diagnostics()
         );
     }
 
@@ -23549,7 +24447,8 @@ mod tests {
         .unwrap();
 
         let interfaces = solved.interface_snapshot();
-        let [value] = interfaces.diagnostic_values.as_ref() else {
+        let interface_values = interfaces.materialize_diagnostic_values();
+        let [value] = interface_values.as_ref() else {
             panic!("one sparse diagnostic value must be projected")
         };
         assert_eq!(value.owner, KernelOwnerId(0));
@@ -23559,11 +24458,11 @@ mod tests {
             KernelValueReference::Local(KernelExpressionId(0))
         );
         assert_eq!(value.ty, Type::Number);
-        assert!(interfaces.diagnostics.is_empty());
+        assert_eq!(interfaces.diagnostic_count(), 0);
 
         let checked = solved.checked_snapshot().unwrap();
         assert_eq!(
-            checked.interface.diagnostic_values.as_ref(),
+            checked.interface.materialize_diagnostic_values().as_ref(),
             [value.clone()]
         );
         assert_eq!(checked.definitions.len(), 1);
@@ -23615,9 +24514,9 @@ mod tests {
         .solve_interfaces()
         .unwrap();
         assert!(
-            interfaces.diagnostics.is_empty(),
+            interfaces.diagnostic_count() == 0,
             "a concrete generic occurrence satisfies its instantiated formal: {:#?}",
-            interfaces.diagnostics
+            interfaces.materialize_diagnostics()
         );
     }
 
@@ -23982,7 +24881,8 @@ mod tests {
         .unwrap()
         .solve_interfaces()
         .unwrap();
-        let [diagnostic] = interfaces.diagnostics.as_ref() else {
+        let interface_diagnostics = interfaces.materialize_diagnostics();
+        let [diagnostic] = interface_diagnostics.as_ref() else {
             panic!("missing-field call must emit one diagnostic")
         };
         assert!(matches!(

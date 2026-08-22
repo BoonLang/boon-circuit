@@ -727,6 +727,11 @@ impl ComponentSolver {
         self.work.term_intern_hits = term_work.intern_hits;
         self.work.term_intern_requests_by_kind = term_work.intern_requests_by_kind;
         self.work.term_intern_hits_by_kind = term_work.intern_hits_by_kind;
+        self.work.nonempty_object_intern_requests = term_work.nonempty_object_intern_requests;
+        self.work.scratch_vector_misses = term_work.scratch_vector_misses;
+        self.work.scratch_vector_reuses = term_work.scratch_vector_reuses;
+        self.work.scratch_max_pool_depth = term_work.scratch_max_pool_depth;
+        self.work.scratch_retained_capacity_bytes = term_work.scratch_retained_capacity_bytes;
         self.work.structural_widen_requests = term_work.structural_widen_requests;
         self.work.structural_widen_hits = term_work.structural_widen_hits;
     }
@@ -1149,8 +1154,10 @@ impl ComponentSolver {
         }
         let object = self.program.terms.object(fields, false);
         let provider = if let Some(tag) = tag {
-            let tag = self.program.terms.name(tag).to_owned();
-            let variant = self.program.terms.tagged_variant(tag, object);
+            let variant = VariantTerm::Tagged {
+                tag,
+                fields: object,
+            };
             self.program.terms.variant_set([variant])
         } else {
             object
@@ -1642,8 +1649,10 @@ impl ComponentSolver {
         }
         let object = self.program.terms.object(fields, false);
         let provider = if let Some(tag) = tag {
-            let tag = self.program.terms.name(tag).to_owned();
-            let variant = self.program.terms.tagged_variant(tag, object);
+            let variant = VariantTerm::Tagged {
+                tag,
+                fields: object,
+            };
             self.program.terms.variant_set([variant])
         } else {
             object
@@ -2031,8 +2040,10 @@ impl ComponentSolver {
                 }
                 let object = self.program.terms.object(fields, false);
                 let term = if let Some(tag) = tag {
-                    let tag = self.program.terms.name(*tag).to_owned();
-                    let variant = self.program.terms.tagged_variant(tag, object);
+                    let variant = VariantTerm::Tagged {
+                        tag: *tag,
+                        fields: object,
+                    };
                     self.program.terms.variant_set([variant])
                 } else {
                     object

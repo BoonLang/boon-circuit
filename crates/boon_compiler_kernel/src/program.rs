@@ -1211,6 +1211,11 @@ impl ComponentProgramBuilder {
             &dependency_offsets,
             &forward_dependencies,
         );
+        // Residual modules are retained behind `Arc<ComponentProgram>`. Their
+        // construction scratch is not executable state and must not multiply
+        // retained capacities by the module count. The main solver starts a
+        // fresh, separately measured scratch phase after this boundary too.
+        self.terms.clear_scratch_storage();
         ComponentProgram {
             terms: self.terms,
             variables: self.variables.into_boxed_slice(),
@@ -1700,6 +1705,18 @@ pub(crate) fn collect_term_variables(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finished_program_drops_phase_local_type_scratch() {
+        let mut builder = ComponentProgramBuilder::new();
+        let value = builder.terms_mut().intern_name("value");
+        let number = builder.terms().number();
+        let _record = builder.terms_mut().object([(value, number)], false);
+        assert!(builder.terms().work().scratch_retained_capacity_bytes > 0);
+
+        let program = builder.finish();
+        assert_eq!(program.terms().work().scratch_retained_capacity_bytes, 0);
+    }
 
     #[test]
     fn reverse_index_is_dense_and_deterministic() {

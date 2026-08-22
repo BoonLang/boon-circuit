@@ -260,6 +260,11 @@ pub(crate) struct KernelSolveWorkSample {
     pub(crate) term_intern_hits: u64,
     pub(crate) term_intern_requests_by_kind: [u64; 8],
     pub(crate) term_intern_hits_by_kind: [u64; 8],
+    pub(crate) nonempty_object_intern_requests: u64,
+    pub(crate) scratch_vector_misses: u64,
+    pub(crate) scratch_vector_reuses: u64,
+    pub(crate) scratch_max_pool_depth: u64,
+    pub(crate) scratch_retained_capacity_bytes: u64,
     pub(crate) structural_widen_requests: u64,
     pub(crate) structural_widen_hits: u64,
     pub(crate) dynamic_dependency_edges: u64,
@@ -293,11 +298,13 @@ impl WorkSample {
             && self.typecheck.owner_expressions > 0
             && self.typecheck.owner_local_constraints > 0
             && self.typecheck.owner_unification_steps > 0;
+        let kernel_output_work = self.kernel_solve.rich_output_flow_exports > 0
+            || self.kernel_solve.frozen_type_store.term_rows > 0;
         let kernel_work = self.kernel_compile.definition_modules > 0
             && self.kernel_compile.linked_operations > 0
             && self.kernel_solve.operations > 0
             && self.kernel_solve.activations > 0
-            && self.kernel_solve.rich_output_flow_exports > 0;
+            && kernel_output_work;
         self.source_units > 0
             && self
                 .parse
@@ -319,5 +326,63 @@ impl WorkSample {
             && self.parse.source_units_attempted == self.source_units
             && self.parse.source_units_parsed == self.source_units
             && self.parse.source_units_reused == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn complete_kernel_work() -> WorkSample {
+        WorkSample {
+            source_units: 1,
+            parse: ParserWorkSample {
+                source_units_attempted: 1,
+                source_units_parsed: 1,
+                source_bytes_inspected: 1,
+                token_inspections: 1,
+                statement_visits: 1,
+                expression_visits: 1,
+                validation_visits: 1,
+                ..ParserWorkSample::default()
+            },
+            typecheck: TypeCheckWorkSample {
+                owner_statements: 1,
+                owner_expressions: 1,
+                owner_local_constraints: 1,
+                owner_unification_steps: 1,
+                ..TypeCheckWorkSample::default()
+            },
+            kernel_compile: KernelCompileWorkSample {
+                definition_modules: 1,
+                linked_operations: 1,
+                ..KernelCompileWorkSample::default()
+            },
+            kernel_solve: KernelSolveWorkSample {
+                operations: 1,
+                activations: 1,
+                ..KernelSolveWorkSample::default()
+            },
+            ..WorkSample::default()
+        }
+    }
+
+    #[test]
+    fn complete_frontend_accepts_rich_diagnostics_publication() {
+        let mut work = complete_kernel_work();
+        work.kernel_solve.rich_output_flow_exports = 1;
+        assert!(work.has_cold_complete_frontend_work());
+    }
+
+    #[test]
+    fn complete_frontend_accepts_packed_verified_publication() {
+        let mut work = complete_kernel_work();
+        work.kernel_solve.frozen_type_store.term_rows = 1;
+        assert!(work.has_cold_complete_frontend_work());
+    }
+
+    #[test]
+    fn complete_frontend_rejects_missing_output_publication() {
+        assert!(!complete_kernel_work().has_complete_frontend_work());
     }
 }

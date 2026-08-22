@@ -16,7 +16,7 @@ use crate::{
     ProducerConfiguration, compiler_allocation_counters, reset_compiler_allocation_counters,
 };
 
-const FORMAT_VERSION: u16 = 9;
+const FORMAT_VERSION: u16 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -460,6 +460,11 @@ struct KernelSolveWorkSample {
     term_intern_hits: u64,
     term_intern_requests_by_kind: [u64; 8],
     term_intern_hits_by_kind: [u64; 8],
+    nonempty_object_intern_requests: u64,
+    scratch_vector_misses: u64,
+    scratch_vector_reuses: u64,
+    scratch_max_pool_depth: u64,
+    scratch_retained_capacity_bytes: u64,
     structural_widen_requests: u64,
     structural_widen_hits: u64,
     dynamic_dependency_edges: u64,
@@ -653,6 +658,11 @@ macro_rules! kernel_solve_work_sample {
             term_intern_hits: work.term_intern_hits,
             term_intern_requests_by_kind: work.term_intern_requests_by_kind,
             term_intern_hits_by_kind: work.term_intern_hits_by_kind,
+            nonempty_object_intern_requests: work.nonempty_object_intern_requests,
+            scratch_vector_misses: work.scratch_vector_misses,
+            scratch_vector_reuses: work.scratch_vector_reuses,
+            scratch_max_pool_depth: work.scratch_max_pool_depth,
+            scratch_retained_capacity_bytes: work.scratch_retained_capacity_bytes,
             structural_widen_requests: work.structural_widen_requests,
             structural_widen_hits: work.structural_widen_hits,
             dynamic_dependency_edges: work.dynamic_dependency_edges,

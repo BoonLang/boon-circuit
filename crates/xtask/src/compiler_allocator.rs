@@ -16,7 +16,7 @@ use crate::report_v2::{
 };
 
 const FORMAT_VERSION: u16 = 3;
-const PRODUCER_FORMAT_VERSION: u16 = 9;
+const PRODUCER_FORMAT_VERSION: u16 = 10;
 const CONTRACT: &str = "boon-compiler-allocator-tournament-v3";
 const DEFAULT_REPORT: &str = "target/reports/compiler-performance/compiler-allocator.json";
 const SYSTEM_PATH: &str = "target/release/boon_cli_system";

@@ -21197,7 +21197,7 @@ FUNCTION stateful_row(row) {
             let retained_snapshot_total_us = source_abi_us.saturating_add(timings.total_us);
             let candidate_total_us = parse_us.saturating_add(retained_snapshot_total_us);
             eprintln!(
-                "kernel-novywave candidate_only=true parity=not_run profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} kernel_total_us={} compile_us={} solve_us={} graph_solve_us={} interface_projection_us={} checked_image_us={} checked_link_layout_us={} checked_link_references={} solved_owners={} container_owners={} unsupported_owners={} residual_modules={} residual_frames={} acyclic_residual_frames={} invocation_frames={} direct_result_summaries={} summary_definition_nodes={} summary_constant_folded_nodes={} summary_selector_fused_records={} summary_deduplicated_nodes={} summary_pruned_nodes={} summary_pruned_inputs={} summary_invoke_nodes={} linked_operations={} scheduled_work_items={} acyclic_initial_work_items={} dominant_module_owner={} dominant_module_operations={} dominant_module_frames={} dominant_module_linked_operations={} variables={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} summary_call_activations={} summary_node_evaluations={} mutations={} rich_output_flow_exports={} term_intern_requests={} term_intern_hits={} term_intern_requests_by_kind={:?} term_intern_hits_by_kind={:?} structural_widen_requests={} structural_widen_hits={} dynamic_edges={}",
+                "kernel-novywave candidate_only=true parity=not_run profile={} bundle_us={} parse_us={} source_abi_us={} retained_snapshot_total_us={} candidate_total_us={} kernel_total_us={} compile_us={} solve_us={} graph_solve_us={} interface_projection_us={} checked_image_us={} checked_link_layout_us={} checked_link_references={} solved_owners={} container_owners={} unsupported_owners={} residual_modules={} residual_frames={} acyclic_residual_frames={} invocation_frames={} direct_result_summaries={} summary_definition_nodes={} summary_constant_folded_nodes={} summary_selector_fused_records={} summary_deduplicated_nodes={} summary_pruned_nodes={} summary_pruned_inputs={} summary_invoke_nodes={} linked_operations={} scheduled_work_items={} acyclic_initial_work_items={} dominant_module_owner={} dominant_module_operations={} dominant_module_frames={} dominant_module_linked_operations={} variables={} activations={} unify_activations={} publish_activations={} projection_activations={} select_activations={} record_activations={} summary_call_activations={} summary_node_evaluations={} mutations={} rich_output_flow_exports={} term_intern_requests={} term_intern_hits={} term_intern_requests_by_kind={:?} term_intern_hits_by_kind={:?} nonempty_object_intern_requests={} scratch_vector_misses={} scratch_vector_reuses={} scratch_max_pool_depth={} scratch_retained_capacity_bytes={} structural_widen_requests={} structural_widen_hits={} dynamic_edges={}",
                 if cfg!(debug_assertions) {
                     "debug"
                 } else {
@@ -21253,6 +21253,11 @@ FUNCTION stateful_row(row) {
                 report.work.term_intern_hits,
                 report.work.term_intern_requests_by_kind,
                 report.work.term_intern_hits_by_kind,
+                report.work.nonempty_object_intern_requests,
+                report.work.scratch_vector_misses,
+                report.work.scratch_vector_reuses,
+                report.work.scratch_max_pool_depth,
+                report.work.scratch_retained_capacity_bytes,
                 report.work.structural_widen_requests,
                 report.work.structural_widen_hits,
                 report.work.dynamic_dependency_edges,

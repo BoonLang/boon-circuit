@@ -288,6 +288,88 @@ struct DiagnosticTextRow {
     fingerprint: u64,
 }
 
+/// Phase-local vectors recycled across recursive type construction.
+///
+/// A single scratch vector is insufficient because structural widening and
+/// import recurse while retaining an outer candidate.  A small free-list
+/// keeps those lifetimes explicit: nested calls acquire another vector, and
+/// completed calls return their capacity for the next operation.  Frozen
+/// stores drop the pools' backing allocations.
+#[derive(Debug)]
+struct ScratchPool<T> {
+    available: Vec<Vec<T>>,
+    checked_out: usize,
+    misses: u64,
+    reuses: u64,
+    max_checked_out: u64,
+}
+
+impl<T> Default for ScratchPool<T> {
+    fn default() -> Self {
+        Self {
+            available: Vec::new(),
+            checked_out: 0,
+            misses: 0,
+            reuses: 0,
+            max_checked_out: 0,
+        }
+    }
+}
+
+impl<T> ScratchPool<T> {
+    fn take(&mut self) -> Vec<T> {
+        self.checked_out = self
+            .checked_out
+            .checked_add(1)
+            .expect("type scratch checkout count exceeds usize");
+        self.max_checked_out = self
+            .max_checked_out
+            .max(u64::try_from(self.checked_out).expect("type scratch checkout count exceeds u64"));
+        let mut values = if let Some(values) = self.available.pop() {
+            self.reuses = self.reuses.saturating_add(1);
+            values
+        } else {
+            self.misses = self.misses.saturating_add(1);
+            Vec::new()
+        };
+        values.clear();
+        values
+    }
+
+    fn recycle(&mut self, mut values: Vec<T>) {
+        self.checked_out = self
+            .checked_out
+            .checked_sub(1)
+            .expect("type scratch vector recycled without a checkout");
+        values.clear();
+        self.available.push(values);
+    }
+
+    fn clear_storage(&mut self) {
+        debug_assert_eq!(self.checked_out, 0, "type scratch escaped its phase");
+        self.available = Vec::new();
+    }
+
+    fn reset_work(&mut self) {
+        debug_assert_eq!(self.checked_out, 0, "type scratch escaped its operation");
+        self.misses = 0;
+        self.reuses = 0;
+        self.max_checked_out = 0;
+    }
+
+    fn retained_capacity_bytes(&self) -> usize {
+        self.available
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Vec<T>>())
+            .saturating_add(
+                self.available
+                    .iter()
+                    .map(|values| values.capacity().saturating_mul(std::mem::size_of::<T>()))
+                    .sum::<usize>(),
+            )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TypeTermHead {
     Text,
@@ -341,6 +423,10 @@ pub struct TypeTermArena {
     lookup_fingerprint_mask: u64,
     variable_terms: Vec<Option<TypeTermId>>,
     structural_widen_cache: HashMap<(TypeTermId, TypeTermId), TypeTermId>,
+    object_field_scratch: ScratchPool<ObjectFieldTerm>,
+    term_id_scratch: ScratchPool<TypeTermId>,
+    variant_scratch: ScratchPool<VariantTerm>,
+    semantic_order_scratch: ScratchPool<u32>,
     absent: TypeTermId,
     unknown: TypeTermId,
     text: TypeTermId,
@@ -481,6 +567,14 @@ pub(crate) struct TypeTermArenaWork {
     /// Variable, object, variant, union, list/set, map, function, scalar.
     pub intern_requests_by_kind: [u64; 8],
     pub intern_hits_by_kind: [u64; 8],
+    /// Object candidates that actually contain fields.  This separates the
+    /// allocation-relevant workload from allocation-free empty scaffolds.
+    pub nonempty_object_intern_requests: u64,
+    pub scratch_vector_misses: u64,
+    pub scratch_vector_reuses: u64,
+    /// Maximum simultaneous checkouts from any one typed pool.
+    pub scratch_max_pool_depth: u64,
+    pub scratch_retained_capacity_bytes: u64,
     pub structural_widen_requests: u64,
     pub structural_widen_hits: u64,
 }
@@ -563,6 +657,10 @@ impl TypeTermArena {
             lookup_fingerprint_mask,
             variable_terms: Vec::new(),
             structural_widen_cache: HashMap::new(),
+            object_field_scratch: ScratchPool::default(),
+            term_id_scratch: ScratchPool::default(),
+            variant_scratch: ScratchPool::default(),
+            semantic_order_scratch: ScratchPool::default(),
             absent: placeholder,
             unknown: placeholder,
             text: placeholder,
@@ -637,10 +735,50 @@ impl TypeTermArena {
 
     pub(crate) fn reset_work(&mut self) {
         self.work = TypeTermArenaWork::default();
+        self.object_field_scratch.reset_work();
+        self.term_id_scratch.reset_work();
+        self.variant_scratch.reset_work();
+        self.semantic_order_scratch.reset_work();
     }
 
-    pub(crate) const fn work(&self) -> TypeTermArenaWork {
-        self.work
+    pub(crate) fn work(&self) -> TypeTermArenaWork {
+        let mut work = self.work;
+        work.scratch_vector_misses = self
+            .object_field_scratch
+            .misses
+            .saturating_add(self.term_id_scratch.misses)
+            .saturating_add(self.variant_scratch.misses)
+            .saturating_add(self.semantic_order_scratch.misses);
+        work.scratch_vector_reuses = self
+            .object_field_scratch
+            .reuses
+            .saturating_add(self.term_id_scratch.reuses)
+            .saturating_add(self.variant_scratch.reuses)
+            .saturating_add(self.semantic_order_scratch.reuses);
+        work.scratch_max_pool_depth = self
+            .object_field_scratch
+            .max_checked_out
+            .max(self.term_id_scratch.max_checked_out)
+            .max(self.variant_scratch.max_checked_out)
+            .max(self.semantic_order_scratch.max_checked_out);
+        work.scratch_retained_capacity_bytes = u64::try_from(
+            self.object_field_scratch
+                .retained_capacity_bytes()
+                .saturating_add(self.term_id_scratch.retained_capacity_bytes())
+                .saturating_add(self.variant_scratch.retained_capacity_bytes())
+                .saturating_add(self.semantic_order_scratch.retained_capacity_bytes()),
+        )
+        .unwrap_or(u64::MAX);
+        work
+    }
+
+    /// Drop phase-local construction buffers before this arena becomes an
+    /// immutable residual module or frozen checked artifact.
+    pub(crate) fn clear_scratch_storage(&mut self) {
+        self.object_field_scratch.clear_storage();
+        self.term_id_scratch.clear_storage();
+        self.variant_scratch.clear_storage();
+        self.semantic_order_scratch.clear_storage();
     }
 
     fn frozen_layout(&self) -> FrozenTypeStoreLayout {
@@ -696,6 +834,7 @@ impl TypeTermArena {
         self.term_slots = Vec::new();
         self.variable_terms = Vec::new();
         self.structural_widen_cache = HashMap::new();
+        self.clear_scratch_storage();
         FrozenTypeStore(self)
     }
 
@@ -894,12 +1033,15 @@ impl TypeTermArena {
         result_mode: FlowMode,
         result: TypeTermId,
     ) -> TypeTermId {
-        let args = args.into_iter().collect::<Vec<_>>();
-        self.intern_raw(TypeTerm::Function {
-            args: &args,
+        let mut scratch = self.term_id_scratch.take();
+        scratch.extend(args);
+        let term = self.intern_raw(TypeTerm::Function {
+            args: &scratch,
             result_mode,
             result,
-        })
+        });
+        self.term_id_scratch.recycle(scratch);
+        term
     }
 
     pub fn object(
@@ -907,7 +1049,7 @@ impl TypeTermArena {
         fields: impl IntoIterator<Item = (SymbolId, TypeTermId)>,
         open: bool,
     ) -> TypeTermId {
-        let mut ordered = Vec::<ObjectFieldTerm>::new();
+        let mut ordered = self.object_field_scratch.take();
         for (name, ty) in fields {
             if let Some(index) = ordered.iter().position(|field| field.name == name) {
                 ordered[index].ty = ty;
@@ -915,7 +1057,9 @@ impl TypeTermArena {
                 ordered.push(ObjectFieldTerm { name, ty });
             }
         }
-        self.intern_object(ordered, open)
+        let term = self.intern_object(&ordered, open);
+        self.object_field_scratch.recycle(ordered);
+        term
     }
 
     pub fn variant_tag(&mut self, tag: impl AsRef<str>) -> VariantTerm {
@@ -946,7 +1090,7 @@ impl TypeTermArena {
         variants: impl IntoIterator<Item = VariantTerm>,
         canonicalize: bool,
     ) -> TypeTermId {
-        let mut merged = Vec::<VariantTerm>::new();
+        let mut merged = self.variant_scratch.take();
         for incoming in variants {
             let tag = incoming.tag();
             let Some(index) = merged.iter().position(|variant| variant.tag() == tag) else {
@@ -977,7 +1121,9 @@ impl TypeTermArena {
         if canonicalize {
             merged.sort_by(|left, right| self.compare_variants_canonically(left, right));
         }
-        self.intern_raw(TypeTerm::VariantSet(&merged))
+        let term = self.intern_raw(TypeTerm::VariantSet(&merged));
+        self.variant_scratch.recycle(merged);
+        term
     }
 
     fn compare_variants_canonically(&self, left: &VariantTerm, right: &VariantTerm) -> Ordering {
@@ -1016,9 +1162,10 @@ impl TypeTermArena {
     }
 
     pub fn union(&mut self, candidates: impl IntoIterator<Item = TypeTermId>) -> TypeTermId {
-        let mut pending = candidates.into_iter().collect::<Vec<_>>();
-        let mut members = Vec::<TypeTermId>::new();
-        let mut variants = Vec::<VariantTerm>::new();
+        let mut pending = self.term_id_scratch.take();
+        pending.extend(candidates);
+        let mut members = self.term_id_scratch.take();
+        let mut variants = self.variant_scratch.take();
         while let Some(candidate) = pending.pop() {
             match self.term_head(candidate) {
                 TypeTermHead::Absent => {}
@@ -1033,16 +1180,20 @@ impl TypeTermArena {
             }
         }
         if !variants.is_empty() {
-            let variants = self.variant_set(variants);
-            members.push(variants);
+            let variant_set = self.variant_set(variants.iter().copied());
+            members.push(variant_set);
         }
         members.sort_by(|left, right| self.compare_terms(*left, *right));
         members.dedup();
-        match members.as_slice() {
+        let term = match members.as_slice() {
             [] => self.absent,
             [member] => *member,
             _ => self.intern_raw(TypeTerm::Union(&members)),
-        }
+        };
+        self.variant_scratch.recycle(variants);
+        self.term_id_scratch.recycle(members);
+        self.term_id_scratch.recycle(pending);
+        term
     }
 
     pub fn structural_widen(&mut self, left: TypeTermId, right: TypeTermId) -> TypeTermId {
@@ -1068,24 +1219,33 @@ impl TypeTermArena {
         match (left_term, right_term) {
             (TypeTermHead::Absent, _) => right,
             (_, TypeTermHead::Absent) => left,
-            (TypeTermHead::Union(members), _) => self
-                .term_ids(members)
-                .to_vec()
-                .into_iter()
-                .fold(right, |widened, member| {
-                    self.structural_widen(widened, member)
-                }),
-            (_, TypeTermHead::Union(members)) => self
-                .term_ids(members)
-                .to_vec()
-                .into_iter()
-                .fold(left, |widened, member| {
-                    self.structural_widen(widened, member)
-                }),
+            (TypeTermHead::Union(members), _) => {
+                let mut scratch = self.term_id_scratch.take();
+                scratch.extend_from_slice(self.term_ids(members));
+                let mut widened = right;
+                for member in scratch.iter().copied() {
+                    widened = self.structural_widen(widened, member);
+                }
+                self.term_id_scratch.recycle(scratch);
+                widened
+            }
+            (_, TypeTermHead::Union(members)) => {
+                let mut scratch = self.term_id_scratch.take();
+                scratch.extend_from_slice(self.term_ids(members));
+                let mut widened = left;
+                for member in scratch.iter().copied() {
+                    widened = self.structural_widen(widened, member);
+                }
+                self.term_id_scratch.recycle(scratch);
+                widened
+            }
             (TypeTermHead::VariantSet(left), TypeTermHead::VariantSet(right)) => {
-                let left = self.variant_terms(left).to_vec();
-                let right = self.variant_terms(right).to_vec();
-                self.variant_set(left.into_iter().chain(right))
+                let mut variants = self.variant_scratch.take();
+                variants.extend_from_slice(self.variant_terms(left));
+                variants.extend_from_slice(self.variant_terms(right));
+                let widened = self.variant_set(variants.iter().copied());
+                self.variant_scratch.recycle(variants);
+                widened
             }
             (TypeTermHead::Bytes(left), TypeTermHead::Bytes(right)) => {
                 let bytes = if left == right {
@@ -1130,19 +1290,21 @@ impl TypeTermArena {
                     open: right_open,
                 },
             ) => {
-                let mut fields = self.object_fields_for_shape(left_shape).into_vec();
-                let right_fields = self.object_fields_for_shape(right_shape).into_vec();
-                for right in right_fields {
+                let mut fields = self.object_field_scratch.take();
+                fields.extend(self.object_fields_for_shape(left_shape).iter().copied());
+                let mut right_fields = self.object_field_scratch.take();
+                right_fields.extend(self.object_fields_for_shape(right_shape).iter().copied());
+                for right in right_fields.iter().copied() {
                     if let Some(index) = fields.iter().position(|left| left.name == right.name) {
                         fields[index].ty = self.structural_widen(fields[index].ty, right.ty);
                     } else {
                         fields.push(right);
                     }
                 }
-                self.object(
-                    fields.into_iter().map(|field| (field.name, field.ty)),
-                    left_open || right_open,
-                )
+                let widened = self.intern_object(&fields, left_open || right_open);
+                self.object_field_scratch.recycle(right_fields);
+                self.object_field_scratch.recycle(fields);
+                widened
             }
             (left_term, right_term) if left_term == right_term => left,
             _ => self.object([], true),
@@ -1160,52 +1322,40 @@ impl TypeTermArena {
             Type::Bytes(BytesType::Fixed(size)) => self.bytes(BytesTerm::Fixed(*size)),
             Type::Absent => self.absent,
             Type::VariantSet(variants) => {
-                let variants = variants
-                    .iter()
-                    .map(|variant| match variant {
+                let mut scratch = self.variant_scratch.take();
+                for variant in variants {
+                    scratch.push(match variant {
                         Variant::Tag(tag) => self.variant_tag(tag),
                         Variant::Tagged { tag, fields } => {
-                            let ordered = fields
-                                .ordered_fields()
-                                .into_iter()
-                                .map(|(name, ty)| {
-                                    let name = self.intern_name(name);
-                                    let ty = self.import_checked_type(ty, variable);
-                                    (name, ty)
-                                })
-                                .collect::<Vec<_>>();
-                            let fields = self.object(ordered, fields.open);
+                            let fields = self.import_checked_object_shape(fields, variable);
                             self.tagged_variant(tag, fields)
                         }
-                    })
-                    .collect::<Vec<_>>();
-                self.variant_set_preserving_order(variants)
+                    });
+                }
+                let term = self.variant_set_preserving_order(scratch.iter().copied());
+                self.variant_scratch.recycle(scratch);
+                term
             }
             Type::Object(shape) if shape.open && shape.fields.is_empty() => self.open_object,
-            Type::Object(shape) => {
-                let fields = shape
-                    .ordered_fields()
-                    .into_iter()
-                    .map(|(name, ty)| {
-                        let name = self.intern_name(name);
-                        let ty = self.import_checked_type(ty, variable);
-                        (name, ty)
-                    })
-                    .collect::<Vec<_>>();
-                self.object(fields, shape.open)
-            }
+            Type::Object(shape) => self.import_checked_object_shape(shape, variable),
             Type::RenderContract => self.render_contract,
             Type::List(item) => {
                 let item = self.import_checked_type(item, variable);
                 self.list(item)
             }
             Type::Function { args, result } => {
-                let args = args
-                    .iter()
-                    .map(|argument| self.import_checked_type(argument, variable))
-                    .collect::<Vec<_>>();
+                let mut arguments = self.term_id_scratch.take();
+                for argument in args {
+                    arguments.push(self.import_checked_type(argument, variable));
+                }
                 let result_ty = self.import_checked_type(&result.ty, variable);
-                self.function(args, result.mode, result_ty)
+                let term = self.intern_raw(TypeTerm::Function {
+                    args: &arguments,
+                    result_mode: result.mode,
+                    result: result_ty,
+                });
+                self.term_id_scratch.recycle(arguments);
+                term
             }
             Type::UnresolvedShape { reason } => self.unresolved_shape(reason),
             Type::Var(source) => {
@@ -1214,11 +1364,13 @@ impl TypeTermArena {
             }
             Type::Unknown => self.unknown,
             Type::Union(members) => {
-                let members = members
-                    .iter()
-                    .map(|member| self.import_checked_type(member, variable))
-                    .collect::<Vec<_>>();
-                self.union(members)
+                let mut imported = self.term_id_scratch.take();
+                for member in members {
+                    imported.push(self.import_checked_type(member, variable));
+                }
+                let term = self.union(imported.iter().copied());
+                self.term_id_scratch.recycle(imported);
+                term
             }
             Type::Map { key, value } => {
                 let key = self.import_checked_type(key, variable);
@@ -1231,6 +1383,50 @@ impl TypeTermArena {
             }
             Type::Bits { width } => self.bits(*width),
         }
+    }
+
+    fn import_checked_object_shape<F>(
+        &mut self,
+        shape: &ObjectShape,
+        variable: &mut F,
+    ) -> TypeTermId
+    where
+        F: FnMut(TypeVar) -> TypeVariableId,
+    {
+        let mut fields = self.object_field_scratch.take();
+        // `ObjectShape::ordered_fields` allocates a set and vector.  The
+        // source order is normally tiny, so preserving its exact duplicate /
+        // missing-name behavior with bounded linear scans is cheaper and
+        // keeps checked-type import allocation-free after scratch warm-up.
+        for name in &shape.field_order {
+            let Some(ty) = shape.fields.get(name) else {
+                continue;
+            };
+            let field = ObjectFieldTerm {
+                name: self.intern_name(name),
+                ty: self.import_checked_type(ty, variable),
+            };
+            if let Some(existing) = fields
+                .iter_mut()
+                .find(|existing| existing.name == field.name)
+            {
+                *existing = field;
+            } else {
+                fields.push(field);
+            }
+        }
+        for (name, ty) in &shape.fields {
+            if shape.field_order.iter().any(|ordered| ordered == name) {
+                continue;
+            }
+            fields.push(ObjectFieldTerm {
+                name: self.intern_name(name),
+                ty: self.import_checked_type(ty, variable),
+            });
+        }
+        let term = self.intern_object(&fields, shape.open);
+        self.object_field_scratch.recycle(fields);
+        term
     }
 
     pub fn export_checked_type(&self, term: TypeTermId) -> Type {
@@ -1358,31 +1554,31 @@ impl TypeTermArena {
             TypeTerm::Bytes(bytes) => self.bytes(bytes),
             TypeTerm::Absent => self.absent(),
             TypeTerm::VariantSet(variants) => {
-                let variants = variants
-                    .to_vec()
-                    .into_iter()
-                    .map(|variant| match variant {
+                let mut imported = self.variant_scratch.take();
+                for variant in variants.iter().copied() {
+                    imported.push(match variant {
                         VariantTerm::Tag(tag) => VariantTerm::Tag(tag),
                         VariantTerm::Tagged { tag, fields } => VariantTerm::Tagged {
                             tag,
                             fields: self.import_rebased_term(source, fields, variables, term_cache),
                         },
-                    })
-                    .collect::<Vec<_>>();
-                self.variant_set_preserving_order(variants)
+                    });
+                }
+                let term = self.variant_set_preserving_order(imported.iter().copied());
+                self.variant_scratch.recycle(imported);
+                term
             }
             TypeTerm::Object { fields, open } => {
-                let fields = fields
-                    .into_vec()
-                    .into_iter()
-                    .map(|field| {
-                        (
-                            field.name,
-                            self.import_rebased_term(source, field.ty, variables, term_cache),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                self.object(fields, open)
+                let mut imported = self.object_field_scratch.take();
+                for field in fields.iter().copied() {
+                    imported.push(ObjectFieldTerm {
+                        name: field.name,
+                        ty: self.import_rebased_term(source, field.ty, variables, term_cache),
+                    });
+                }
+                let term = self.intern_object(&imported, open);
+                self.object_field_scratch.recycle(imported);
+                term
             }
             TypeTerm::OpenObjectPlaceholder => self.open_object(),
             TypeTerm::RenderContract => self.render_contract(),
@@ -1395,14 +1591,19 @@ impl TypeTermArena {
                 result_mode,
                 result,
             } => {
-                let args = args
-                    .iter()
-                    .map(|argument| {
-                        self.import_rebased_term(source, *argument, variables, term_cache)
-                    })
-                    .collect::<Vec<_>>();
+                let mut imported_args = self.term_id_scratch.take();
+                for argument in args {
+                    imported_args
+                        .push(self.import_rebased_term(source, *argument, variables, term_cache));
+                }
                 let result = self.import_rebased_term(source, result, variables, term_cache);
-                self.function(args, result_mode, result)
+                let term = self.intern_raw(TypeTerm::Function {
+                    args: &imported_args,
+                    result_mode,
+                    result,
+                });
+                self.term_id_scratch.recycle(imported_args);
+                term
             }
             TypeTerm::UnresolvedShape(reason) => {
                 let reason = source.diagnostic_text(reason).to_owned();
@@ -1415,11 +1616,13 @@ impl TypeTermArena {
             ),
             TypeTerm::Unknown => self.unknown(),
             TypeTerm::Union(members) => {
-                let members = members
-                    .iter()
-                    .map(|member| self.import_rebased_term(source, *member, variables, term_cache))
-                    .collect::<Vec<_>>();
-                self.union(members)
+                let mut imported = self.term_id_scratch.take();
+                for member in members {
+                    imported.push(self.import_rebased_term(source, *member, variables, term_cache));
+                }
+                let term = self.union(imported.iter().copied());
+                self.term_id_scratch.recycle(imported);
+                term
             }
             TypeTerm::Map { key, value } => {
                 let key = self.import_rebased_term(source, key, variables, term_cache);
@@ -1654,26 +1857,29 @@ impl TypeTermArena {
         self.append_term(header, hash)
     }
 
-    fn intern_object(&mut self, semantic_fields: Vec<ObjectFieldTerm>, open: bool) -> TypeTermId {
+    fn intern_object(&mut self, semantic_fields: &[ObjectFieldTerm], open: bool) -> TypeTermId {
         const OBJECT_WORK_KIND: usize = 1;
         self.work.intern_requests = self.work.intern_requests.saturating_add(1);
         self.work.intern_requests_by_kind[OBJECT_WORK_KIND] =
             self.work.intern_requests_by_kind[OBJECT_WORK_KIND].saturating_add(1);
-        let mut canonical_fields = semantic_fields.clone();
+        if !semantic_fields.is_empty() {
+            self.work.nonempty_object_intern_requests =
+                self.work.nonempty_object_intern_requests.saturating_add(1);
+        }
+        let mut canonical_fields = self.object_field_scratch.take();
+        canonical_fields.extend_from_slice(semantic_fields);
         canonical_fields
             .sort_unstable_by(|left, right| self.name(left.name).cmp(self.name(right.name)));
-        let semantic_order = semantic_fields
-            .iter()
-            .map(|field| {
-                u32::try_from(
-                    canonical_fields
-                        .iter()
-                        .position(|candidate| candidate.name == field.name)
-                        .expect("semantic object field exists in canonical fields"),
-                )
-                .expect("kernel object field count exceeds u32")
-            })
-            .collect::<Vec<_>>();
+        let mut semantic_order = self.semantic_order_scratch.take();
+        semantic_order.extend(semantic_fields.iter().map(|field| {
+            u32::try_from(
+                canonical_fields
+                    .iter()
+                    .position(|candidate| candidate.name == field.name)
+                    .expect("semantic object field exists in canonical fields"),
+            )
+            .expect("kernel object field count exceeds u32")
+        }));
         let candidate_fields = ObjectFields {
             canonical: &canonical_fields,
             semantic_order: &semantic_order,
@@ -1687,6 +1893,8 @@ impl TypeTermArena {
             self.work.intern_hits = self.work.intern_hits.saturating_add(1);
             self.work.intern_hits_by_kind[OBJECT_WORK_KIND] =
                 self.work.intern_hits_by_kind[OBJECT_WORK_KIND].saturating_add(1);
+            self.semantic_order_scratch.recycle(semantic_order);
+            self.object_field_scratch.recycle(canonical_fields);
             return id;
         }
         let canonical_span = TermSpan::new(
@@ -1711,7 +1919,7 @@ impl TypeTermArena {
             .iter()
             .any(|field| self.has_variable(field.ty));
         let flags = u8::from(has_variable) * TERM_HAS_VARIABLE | u8::from(open) * TERM_OBJECT_OPEN;
-        self.append_term(
+        let term = self.append_term(
             term_header(
                 TypeTermTag::Object,
                 u64::from(shape),
@@ -1719,7 +1927,10 @@ impl TypeTermArena {
                 TermSpan { start: 0, len: 0 },
             ),
             hash,
-        )
+        );
+        self.semantic_order_scratch.recycle(semantic_order);
+        self.object_field_scratch.recycle(canonical_fields);
+        term
     }
 
     fn find_diagnostic_text(&self, fingerprint: u64, bytes: &[u8]) -> Option<DiagnosticTextId> {
@@ -2199,6 +2410,10 @@ mod tests {
         let value = arena.intern_name("value");
         let variable = arena.variable(TypeVariableId(73));
         let record = arena.object([(value, variable)], true);
+        let tag = arena.variant_tag("Pair");
+        let variant = arena.variant_set([tag]);
+        let function = arena.function([record, variant], FlowMode::Continuous, record);
+        let _union = arena.union([record, function]);
         let number = arena.number();
         let widened = arena.structural_widen(record, number);
         assert!(arena.text_snapshot().symbol_count() > 0);
@@ -2206,9 +2421,15 @@ mod tests {
         assert!(!arena.term_fingerprints.is_empty());
         assert!(!arena.variable_terms.is_empty());
         assert!(!arena.structural_widen_cache.is_empty());
+        assert!(arena.work().scratch_retained_capacity_bytes > 0);
 
         let frozen = arena.freeze();
         assert_eq!(frozen.construction_storage_entries(), 0);
+        assert_eq!(frozen.0.work().scratch_retained_capacity_bytes, 0);
+        assert_eq!(frozen.0.object_field_scratch.available.capacity(), 0);
+        assert_eq!(frozen.0.term_id_scratch.available.capacity(), 0);
+        assert_eq!(frozen.0.variant_scratch.available.capacity(), 0);
+        assert_eq!(frozen.0.semantic_order_scratch.available.capacity(), 0);
         let layout = frozen.layout();
         assert_eq!(layout.term_rows, frozen.len() as u64);
         assert!(layout.term_capacity >= layout.term_rows);
@@ -2224,6 +2445,41 @@ mod tests {
             ))
         );
         assert!(matches!(frozen.term(widened), TypeTerm::Object { .. }));
+    }
+
+    #[test]
+    fn recursive_type_scratch_reuses_peak_depth_instead_of_request_count() {
+        let mut arena =
+            TypeTermArena::for_test_symbols_with_lookup_mask(["value", "kind", "Pair", "Ready"], 0);
+        let value = arena.intern_name("value");
+        let kind = arena.intern_name("kind");
+
+        let exercise = |arena: &mut TypeTermArena| {
+            let number = arena.number();
+            let text = arena.text();
+            let record = arena.object([(value, number), (kind, text)], false);
+            let tagged = VariantTerm::Tagged {
+                tag: arena.intern_name("Pair"),
+                fields: record,
+            };
+            let variants = arena.variant_set_preserving_order([tagged]);
+            let function = arena.function([record, variants], FlowMode::Continuous, variants);
+            arena.union([record, variants, function])
+        };
+
+        let expected = exercise(&mut arena);
+        let warm = arena.work();
+        assert!(warm.scratch_vector_misses > 0);
+        assert!(warm.scratch_max_pool_depth >= 2);
+        for _ in 0..64 {
+            assert_eq!(exercise(&mut arena), expected);
+        }
+        let reused = arena.work();
+        assert_eq!(reused.scratch_vector_misses, warm.scratch_vector_misses);
+        assert!(reused.scratch_vector_reuses > warm.scratch_vector_reuses);
+
+        let frozen = arena.freeze();
+        assert_eq!(frozen.0.work().scratch_retained_capacity_bytes, 0);
     }
 
     #[test]
@@ -2566,6 +2822,30 @@ mod tests {
             *variables.entry(source).or_insert(next)
         });
         assert_eq!(arena.export_checked_type(term), original);
+    }
+
+    #[test]
+    fn checked_object_import_preserves_duplicate_order_callback_semantics() {
+        let original = Type::object(ObjectShape {
+            fields: BTreeMap::from([("value".to_owned(), Type::Var(TypeVar(9)))]),
+            field_order: vec!["value".to_owned(), "value".to_owned()],
+            open: false,
+        });
+        let mut arena = TypeTermArena::new();
+        let mut visits = 0_u32;
+        let term = arena.import_checked_type(&original, &mut |_| {
+            visits += 1;
+            TypeVariableId(visits)
+        });
+
+        assert_eq!(visits, 2, "duplicate authored order entries are visited");
+        assert_eq!(
+            arena.export_checked_type(term),
+            Type::object(ObjectShape::from_ordered_fields(
+                [("value".to_owned(), Type::Var(TypeVar(2)))],
+                false,
+            ))
+        );
     }
 
     #[test]

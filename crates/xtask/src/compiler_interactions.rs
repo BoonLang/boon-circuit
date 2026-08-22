@@ -14,10 +14,10 @@ use crate::report_v2::{
     unix_time_ms,
 };
 
-const FORMAT_VERSION: u16 = 8;
-const PRODUCER_FORMAT_VERSION: u16 = 9;
+const FORMAT_VERSION: u16 = 9;
+const PRODUCER_FORMAT_VERSION: u16 = 10;
 const BUDGET_FORMAT_VERSION: u16 = 3;
-const REPORT_CONTRACT: &str = "boon-compiler-interactions-v7";
+const REPORT_CONTRACT: &str = "boon-compiler-interactions-v8";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;
 const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;

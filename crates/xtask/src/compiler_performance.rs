@@ -15,10 +15,10 @@ use crate::report_v2::{
     unix_time_ms,
 };
 
-const REPORT_FORMAT_VERSION: u16 = 10;
-const PRODUCER_FORMAT_VERSION: u16 = 9;
+const REPORT_FORMAT_VERSION: u16 = 11;
+const PRODUCER_FORMAT_VERSION: u16 = 10;
 const BUDGET_FORMAT_VERSION: u16 = 3;
-const REPORT_CONTRACT: &str = "boon-compiler-performance-v9";
+const REPORT_CONTRACT: &str = "boon-compiler-performance-v10";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;
 const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
@@ -478,6 +478,11 @@ struct WorkSummary {
     kernel_rich_output_flow_exports: CountSummary,
     kernel_term_intern_requests: CountSummary,
     kernel_term_intern_hits: CountSummary,
+    kernel_nonempty_object_intern_requests: CountSummary,
+    kernel_scratch_vector_misses: CountSummary,
+    kernel_scratch_vector_reuses: CountSummary,
+    kernel_scratch_max_pool_depth: CountSummary,
+    kernel_scratch_retained_capacity_bytes: CountSummary,
     kernel_dynamic_dependency_edges: CountSummary,
     kernel_frozen_type_store_term_rows: CountSummary,
     kernel_frozen_type_store_name_rows: CountSummary,
@@ -2211,6 +2216,15 @@ fn summarize_work(samples: &[Sample]) -> WorkSummary {
         }),
         kernel_term_intern_requests: u64_values(|work| work.kernel_solve.term_intern_requests),
         kernel_term_intern_hits: u64_values(|work| work.kernel_solve.term_intern_hits),
+        kernel_nonempty_object_intern_requests: u64_values(|work| {
+            work.kernel_solve.nonempty_object_intern_requests
+        }),
+        kernel_scratch_vector_misses: u64_values(|work| work.kernel_solve.scratch_vector_misses),
+        kernel_scratch_vector_reuses: u64_values(|work| work.kernel_solve.scratch_vector_reuses),
+        kernel_scratch_max_pool_depth: u64_values(|work| work.kernel_solve.scratch_max_pool_depth),
+        kernel_scratch_retained_capacity_bytes: u64_values(|work| {
+            work.kernel_solve.scratch_retained_capacity_bytes
+        }),
         kernel_dynamic_dependency_edges: u64_values(|work| {
             work.kernel_solve.dynamic_dependency_edges
         }),

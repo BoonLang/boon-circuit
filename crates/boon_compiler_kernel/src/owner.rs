@@ -976,6 +976,7 @@ pub struct KernelOwnerProgram {
 #[derive(Debug)]
 pub struct KernelProjectProgram {
     component: ComponentProgram,
+    program: Arc<KernelProjectProgramInput>,
     owners: Box<[KernelProjectOwnerOutputs]>,
     definition_facts: Arc<[KernelDefinitionFactsInput]>,
     /// Exact immutable ABI metadata needed by post-solve packed publication.
@@ -990,6 +991,7 @@ pub struct KernelProjectProgram {
 /// state and immutable equation program.
 pub(crate) struct KernelProjectSolveSession {
     component: ComponentSolveSession,
+    program: Arc<KernelProjectProgramInput>,
     owners: Box<[KernelProjectOwnerOutputs]>,
     definition_facts: Arc<[KernelDefinitionFactsInput]>,
     abi: Arc<crate::KernelAbiInput>,
@@ -1001,10 +1003,11 @@ pub(crate) struct KernelProjectSolveSession {
 /// Keeping this boundary explicit lets one session solve type equations once,
 /// answer diagnostics from public interfaces, and materialize sparse or full
 /// checked artifacts only when a later demand requires them.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct KernelSolvedProject {
     artifact: ComponentArtifact,
     definition_code: Arc<DefinitionCodeStore>,
+    program: Arc<KernelProjectProgramInput>,
     owners: Box<[KernelProjectOwnerOutputs]>,
     definition_facts: Arc<[KernelDefinitionFactsInput]>,
     derived: Arc<KernelSolvedDerived>,
@@ -1079,23 +1082,100 @@ struct KernelProjectOwnerOutputs {
     formal_modes: Box<[FlowMode]>,
     expressions: Box<[OutputId]>,
     expression_modes: Box<[FlowMode]>,
-    expression_artifacts: Box<[PendingKernelExpressionArtifact]>,
-    linkage: KernelDefinitionLinkage,
-    call_syntax: Box<[KernelCallSyntaxArtifact]>,
-    execution_shapes: Box<[KernelExecutionShapeArtifact]>,
-    statements: Box<[KernelStatementArtifact]>,
-    declarations: Box<[RichKernelDeclarationArtifact]>,
-    lexical_bindings: Box<[KernelLexicalBindingArtifact]>,
-    resources: PendingKernelResources,
-    calls: Box<[PendingKernelCallArtifact]>,
-    effects: Box<[KernelHostEffectArtifact]>,
-    diagnostics: Box<[KernelDiagnosticArtifact]>,
-    diagnostic_values: Box<[KernelValueReference]>,
+    calls: Box<[KernelProjectCallSolve]>,
     /// Formals whose public type is an aggregate of branch-local projection
     /// requirements. That aggregate is useful to the solver, but is not a
     /// sound direct assignability contract for call diagnostics.
     syntax_discriminated_formals: Box<[u32]>,
     basis_fingerprint_v14: [u8; 32],
+}
+
+/// Allocation-free structural access to one compiled definition.
+///
+/// Owned solve products keep only dense solver coordinates. Immutable syntax
+/// and linker facts remain in their project-level authorities and are borrowed
+/// for the duration of each projection pass; no reference is stored in an
+/// owned snapshot.
+#[derive(Clone, Copy)]
+struct KernelDefinitionInputRef<'a> {
+    owner: KernelOwnerId,
+    input: &'a KernelOwnerProgramInput,
+    facts: &'a KernelDefinitionFactsInput,
+    outputs: &'a KernelProjectOwnerOutputs,
+}
+
+struct KernelProjectDefinitionRefs<'a> {
+    program: &'a KernelProjectProgramInput,
+    facts: &'a [KernelDefinitionFactsInput],
+    outputs: &'a [KernelProjectOwnerOutputs],
+}
+
+impl<'a> KernelProjectDefinitionRefs<'a> {
+    fn new(
+        program: &'a KernelProjectProgramInput,
+        facts: &'a [KernelDefinitionFactsInput],
+        outputs: &'a [KernelProjectOwnerOutputs],
+    ) -> Result<Self, KernelSolveError> {
+        if program.owners.len() != facts.len() || facts.len() != outputs.len() {
+            return Err(KernelSolveError::new(format!(
+                "kernel definition authorities have {} program, {} fact, and {} solve rows",
+                program.owners.len(),
+                facts.len(),
+                outputs.len(),
+            )));
+        }
+        Ok(Self {
+            program,
+            facts,
+            outputs,
+        })
+    }
+
+    fn definitions(&self) -> impl ExactSizeIterator<Item = KernelDefinitionInputRef<'a>> + '_ {
+        self.program
+            .owners
+            .iter()
+            .zip(self.facts)
+            .zip(self.outputs)
+            .enumerate()
+            .map(
+                |(index, ((input, facts), outputs))| KernelDefinitionInputRef {
+                    owner: KernelOwnerId(
+                        u32::try_from(index).expect("kernel definition count exceeds u32"),
+                    ),
+                    input,
+                    facts,
+                    outputs,
+                },
+            )
+    }
+}
+
+impl<'a> KernelDefinitionInputRef<'a> {
+    fn resolve_value(
+        self,
+        encoded: KernelExpressionId,
+        consumer: usize,
+    ) -> Result<KernelValueReference, KernelOwnerBuildError> {
+        kernel_value_reference(self.input, encoded, consumer)
+    }
+
+    fn call(self, ordinal: usize) -> Option<KernelProjectCallRef<'a>> {
+        let solve = self.outputs.calls.get(ordinal)?;
+        let node = self.input.nodes.get(solve.expression.0 as usize)?;
+        Some(KernelProjectCallRef {
+            definition: self,
+            solve,
+            node,
+        })
+    }
+
+    fn calls(self) -> impl ExactSizeIterator<Item = KernelProjectCallRef<'a>> + 'a {
+        (0..self.outputs.calls.len()).map(move |ordinal| {
+            self.call(ordinal)
+                .expect("validated call sidecar remains aligned with the owner program")
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1114,10 +1194,149 @@ struct PendingKernelCallArtifact {
     /// arm for this authored occurrence. The final solved result still has to
     /// expose a concrete outer shape before this becomes public authority.
     syntax_discriminated_candidate: bool,
-    /// Full-invocation fallback for a result graph that cannot use immutable
-    /// summary bytecode. This observes only a root authored SELECT and cannot
-    /// inherit selection provenance from an argument.
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KernelProjectCallSolve {
+    expression: KernelExpressionId,
+    syntax_discriminated_candidate: bool,
     syntax_discriminated_root_output: Option<OutputId>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum KernelCallTargetRef<'a> {
+    User {
+        target: KernelOwnerId,
+        inherited_formal: Option<KernelInheritedFormal>,
+    },
+    RenderConstructor {
+        kind: &'a KernelRenderConstructorKind,
+    },
+    PureBuiltin {
+        kind: KernelPureBuiltinKind,
+    },
+    FixedAbi,
+    HostEffect {
+        operation: &'a str,
+    },
+    FieldProjection {
+        field: &'a str,
+    },
+}
+
+impl KernelCallTargetRef<'_> {
+    fn to_owned(self) -> KernelCallTarget {
+        match self {
+            Self::User {
+                target,
+                inherited_formal,
+            } => KernelCallTarget::User {
+                target,
+                inherited_formal,
+            },
+            Self::RenderConstructor { kind } => {
+                KernelCallTarget::RenderConstructor { kind: kind.clone() }
+            }
+            Self::PureBuiltin { kind } => KernelCallTarget::PureBuiltin { kind },
+            Self::FixedAbi => KernelCallTarget::FixedAbi,
+            Self::HostEffect { operation } => KernelCallTarget::HostEffect {
+                operation: operation.into(),
+            },
+            Self::FieldProjection { field } => KernelCallTarget::FieldProjection {
+                field: field.into(),
+            },
+        }
+    }
+
+    const fn is_user(self) -> bool {
+        matches!(self, Self::User { .. })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct KernelProjectCallRef<'a> {
+    definition: KernelDefinitionInputRef<'a>,
+    solve: &'a KernelProjectCallSolve,
+    node: &'a KernelOwnerNode,
+}
+
+impl<'a> KernelProjectCallRef<'a> {
+    fn expression(self) -> KernelExpressionId {
+        self.solve.expression
+    }
+
+    fn target(self) -> KernelCallTargetRef<'a> {
+        match &self.node.kind {
+            KernelOwnerNodeKind::UserCall {
+                target,
+                inherited_formal,
+            } => KernelCallTargetRef::User {
+                target: *target,
+                inherited_formal: *inherited_formal,
+            },
+            KernelOwnerNodeKind::RenderConstructor { kind } => {
+                KernelCallTargetRef::RenderConstructor { kind }
+            }
+            KernelOwnerNodeKind::PureBuiltin { kind } => {
+                KernelCallTargetRef::PureBuiltin { kind: *kind }
+            }
+            KernelOwnerNodeKind::FixedAbiCall { .. } => KernelCallTargetRef::FixedAbi,
+            KernelOwnerNodeKind::HostEffect { operation } => KernelCallTargetRef::HostEffect {
+                operation: operation.as_ref(),
+            },
+            KernelOwnerNodeKind::FieldProjection { field } => {
+                KernelCallTargetRef::FieldProjection {
+                    field: field.as_ref(),
+                }
+            }
+            _ => unreachable!("validated project call sidecar points to a non-call node"),
+        }
+    }
+
+    fn inputs(self) -> &'a [KernelOwnerInputEdge] {
+        &self.node.inputs
+    }
+
+    fn input_value(
+        self,
+        edge: &KernelOwnerInputEdge,
+    ) -> Result<KernelValueReference, KernelOwnerBuildError> {
+        self.definition
+            .resolve_value(edge.expression, self.expression().0 as usize)
+    }
+
+    fn input_role(
+        self,
+        edge: &'a KernelOwnerInputEdge,
+    ) -> Result<KernelCallInputRoleRef<'a>, KernelOwnerBuildError> {
+        match (&self.node.kind, &edge.role) {
+            (
+                KernelOwnerNodeKind::UserCall { .. },
+                KernelOwnerEdgeRole::CallArgument { ordinal }
+                | KernelOwnerEdgeRole::CallOutArgument { ordinal },
+            ) => Ok(KernelCallInputRoleRef::Formal { ordinal: *ordinal }),
+            (
+                KernelOwnerNodeKind::RenderConstructor { .. }
+                | KernelOwnerNodeKind::PureBuiltin { .. }
+                | KernelOwnerNodeKind::FixedAbiCall { .. }
+                | KernelOwnerNodeKind::HostEffect { .. }
+                | KernelOwnerNodeKind::FieldProjection { .. },
+                KernelOwnerEdgeRole::AbiArgument { name },
+            ) => Ok(KernelCallInputRoleRef::Abi {
+                name: name.as_ref(),
+            }),
+            (_, role) => Err(KernelOwnerBuildError::new(format!(
+                "kernel call node {} has non-call input role {role:?}",
+                self.expression().0,
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum KernelCallInputRoleRef<'a> {
+    Formal { ordinal: u32 },
+    Abi { name: &'a str },
 }
 
 #[derive(Clone, Debug)]
@@ -2293,8 +2512,8 @@ pub enum KernelExpressionArtifactKind {
     },
 }
 
-impl From<KernelOwnerNodeKind> for KernelExpressionArtifactKind {
-    fn from(kind: KernelOwnerNodeKind) -> Self {
+impl From<&KernelOwnerNodeKind> for KernelExpressionArtifactKind {
+    fn from(kind: &KernelOwnerNodeKind) -> Self {
         match kind {
             KernelOwnerNodeKind::Known(_) => Self::Known,
             KernelOwnerNodeKind::Source(_) => Self::Source,
@@ -2303,57 +2522,75 @@ impl From<KernelOwnerNodeKind> for KernelExpressionArtifactKind {
             KernelOwnerNodeKind::TextTemplate => Self::TextTemplate,
             KernelOwnerNodeKind::Number => Self::Number,
             KernelOwnerNodeKind::Byte => Self::Byte,
-            KernelOwnerNodeKind::Bits(width) => Self::Bits(width),
-            KernelOwnerNodeKind::Tag(tag) => Self::Tag(tag),
-            KernelOwnerNodeKind::Record { tag } => Self::Record { tag },
+            KernelOwnerNodeKind::Bits(width) => Self::Bits(*width),
+            KernelOwnerNodeKind::Tag(tag) => Self::Tag(tag.clone()),
+            KernelOwnerNodeKind::Record { tag } => Self::Record { tag: tag.clone() },
             KernelOwnerNodeKind::Block => Self::Block,
-            KernelOwnerNodeKind::Collection { kind, capacity } => {
-                Self::Collection { kind, capacity }
-            }
+            KernelOwnerNodeKind::Collection { kind, capacity } => Self::Collection {
+                kind: *kind,
+                capacity: *capacity,
+            },
             KernelOwnerNodeKind::MapEntry => Self::MapEntry,
-            KernelOwnerNodeKind::FormalRead { formal, fields } => {
-                Self::FormalRead { formal, fields }
-            }
-            KernelOwnerNodeKind::ContextRead { formal, fields } => {
-                Self::ContextRead { formal, fields }
-            }
-            KernelOwnerNodeKind::LexicalRead { fields } => Self::LexicalRead { fields },
+            KernelOwnerNodeKind::FormalRead { formal, fields } => Self::FormalRead {
+                formal: *formal,
+                fields: fields.clone(),
+            },
+            KernelOwnerNodeKind::ContextRead { formal, fields } => Self::ContextRead {
+                formal: *formal,
+                fields: fields.clone(),
+            },
+            KernelOwnerNodeKind::LexicalRead { fields } => Self::LexicalRead {
+                fields: fields.clone(),
+            },
             KernelOwnerNodeKind::ValueRead {
                 fields,
                 mode_narrowing,
             } => Self::ValueRead {
-                fields,
-                mode_narrowing,
+                fields: fields.clone(),
+                mode_narrowing: *mode_narrowing,
             },
-            KernelOwnerNodeKind::DerivedRead { fields } => Self::DerivedRead { fields },
-            KernelOwnerNodeKind::PatternRead { pattern, fields } => {
-                Self::PatternRead { pattern, fields }
-            }
+            KernelOwnerNodeKind::DerivedRead { fields } => Self::DerivedRead {
+                fields: fields.clone(),
+            },
+            KernelOwnerNodeKind::PatternRead { pattern, fields } => Self::PatternRead {
+                pattern: pattern.clone(),
+                fields: fields.clone(),
+            },
             KernelOwnerNodeKind::CollectionItemRead => Self::CollectionItemRead,
             KernelOwnerNodeKind::FreshOut => Self::FreshOut,
             KernelOwnerNodeKind::UserCall {
                 target,
                 inherited_formal,
             } => Self::UserCall {
-                target,
-                inherited_formal,
+                target: *target,
+                inherited_formal: *inherited_formal,
             },
-            KernelOwnerNodeKind::RenderConstructor { kind } => Self::RenderConstructor { kind },
-            KernelOwnerNodeKind::PureBuiltin { kind } => Self::PureBuiltin { kind },
+            KernelOwnerNodeKind::RenderConstructor { kind } => {
+                Self::RenderConstructor { kind: kind.clone() }
+            }
+            KernelOwnerNodeKind::PureBuiltin { kind } => Self::PureBuiltin { kind: *kind },
             KernelOwnerNodeKind::FixedAbiCall { .. } => Self::FixedAbiCall,
-            KernelOwnerNodeKind::HostEffect { operation } => Self::HostEffect { operation },
+            KernelOwnerNodeKind::HostEffect { operation } => Self::HostEffect {
+                operation: operation.clone(),
+            },
             KernelOwnerNodeKind::Latest => Self::Latest,
             KernelOwnerNodeKind::When => Self::When,
             KernelOwnerNodeKind::Then => Self::Then,
-            KernelOwnerNodeKind::Infix { operation } => Self::Infix { operation },
+            KernelOwnerNodeKind::Infix { operation } => Self::Infix {
+                operation: operation.clone(),
+            },
             KernelOwnerNodeKind::Draining => Self::Draining,
             KernelOwnerNodeKind::Hold => Self::Hold,
-            KernelOwnerNodeKind::MatchArm { pattern } => Self::MatchArm { pattern },
+            KernelOwnerNodeKind::MatchArm { pattern } => Self::MatchArm {
+                pattern: pattern.clone(),
+            },
             KernelOwnerNodeKind::Arrow => Self::Arrow,
             KernelOwnerNodeKind::Delimiter => Self::Delimiter,
             KernelOwnerNodeKind::Unknown => Self::Unknown,
             KernelOwnerNodeKind::Flush => Self::Flush,
-            KernelOwnerNodeKind::FieldProjection { field } => Self::FieldProjection { field },
+            KernelOwnerNodeKind::FieldProjection { field } => Self::FieldProjection {
+                field: field.clone(),
+            },
         }
     }
 }
@@ -2506,6 +2743,10 @@ pub struct KernelDefinitionSnapshot {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCheckedSnapshot {
     pub definitions: Box<[DefinitionArtifact]>,
+    /// Shared normalized owner program retained once for borrowed structural
+    /// views. Published definition rows remain a compatibility product until
+    /// their downstream consumers are moved onto this authority.
+    pub program: Arc<KernelProjectProgramInput>,
     /// Shared immutable syntax/link facts for every dense definition. These
     /// rows are owned once by `KernelProjectInput`; checked publication keeps
     /// the same allocation instead of cloning rich paths and literal values.
@@ -2612,6 +2853,7 @@ pub struct KernelDemandedDefinitionArtifact {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelDemandedDefinitionSnapshot {
     pub definitions: Box<[KernelDemandedDefinitionArtifact]>,
+    pub program: Arc<KernelProjectProgramInput>,
     pub definition_facts: Arc<[KernelDefinitionFactsInput]>,
     pub definition_code: Arc<DefinitionCodeStore>,
     pub type_store: Arc<FrozenTypeStore>,
@@ -2774,6 +3016,7 @@ impl KernelProjectProgram {
     pub(crate) fn into_solve_session(self) -> Result<KernelProjectSolveSession, KernelSolveError> {
         Ok(KernelProjectSolveSession {
             component: ComponentSolveSession::new(self.component)?,
+            program: self.program,
             owners: self.owners,
             definition_facts: self.definition_facts,
             abi: self.abi,
@@ -2796,11 +3039,13 @@ impl KernelProjectSolveSession {
     }
 
     pub(crate) fn solve_interfaces(&mut self) -> Result<KernelInterfaceSnapshot, KernelSolveError> {
-        let demand = interface_output_demand(&self.owners);
+        let demand = interface_output_demand(&self.program, &self.definition_facts, &self.owners);
         let artifact = self.component.solve_outputs(&demand)?;
         let public_results = project_public_results(&self.owners, &artifact);
         let public_formals = project_public_formals(&self.owners, &artifact);
         let (_, diagnostics) = project_call_facts_and_diagnostics(
+            &self.program,
+            &self.definition_facts,
             &self.owners,
             &self.abi,
             &artifact,
@@ -2810,6 +3055,8 @@ impl KernelProjectSolveSession {
             false,
         );
         Ok(project_interface_snapshot(
+            &self.program,
+            &self.definition_facts,
             &self.owners,
             &artifact,
             &public_results,
@@ -2826,11 +3073,13 @@ impl KernelProjectSolveSession {
         let finalize_started = Instant::now();
         let projected = ComponentOutputSnapshot::project_unsealed(
             &artifact,
-            &checked_output_demand(&self.owners),
+            &checked_output_demand(&self.program, &self.definition_facts, &self.owners),
         );
         let public_results = project_public_results(&self.owners, &projected);
         let public_formals = project_public_formals(&self.owners, &projected);
         let (call_facts, diagnostics) = project_call_facts_and_diagnostics(
+            &self.program,
+            &self.definition_facts,
             &self.owners,
             &self.abi,
             &projected,
@@ -2840,20 +3089,25 @@ impl KernelProjectSolveSession {
             true,
         );
         let interface = Arc::new(project_interface_snapshot(
+            &self.program,
+            &self.definition_facts,
             &self.owners,
             &projected,
             &public_results,
             &public_formals,
             &diagnostics,
         ));
-        let flush_terms = project_expression_flush_terms(&self.owners, &mut artifact)?;
+        let flush_terms =
+            project_expression_flush_terms(&self.program, &self.owners, &mut artifact)?;
         let resource_projection_facts = project_resource_projection_facts(
+            &self.program,
             &self.owners,
             &self.definition_facts,
             &self.abi,
             &mut artifact,
         )?;
         let definition_code = build_definition_code_builder(
+            &self.program,
             &self.owners,
             &self.definition_facts,
             &self.abi,
@@ -2874,6 +3128,7 @@ impl KernelProjectSolveSession {
         Ok(KernelSolvedProject {
             artifact,
             definition_code,
+            program: self.program,
             owners: self.owners,
             definition_facts: self.definition_facts,
             derived: Arc::new(KernelSolvedDerived { interface }),
@@ -2887,10 +3142,6 @@ impl KernelSolvedProject {
     }
 
     pub fn checked_snapshot(&self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
-        self.clone().into_checked_snapshot()
-    }
-
-    pub fn into_checked_snapshot(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
         let trace = std::env::var_os("BOON_KERNEL_TRACE").is_some();
         let total_started = Instant::now();
         let type_store = self.artifact.type_store();
@@ -2899,7 +3150,7 @@ impl KernelSolvedProject {
         let interface = Arc::clone(&self.derived.interface);
         let interface_us = interface_started.elapsed().as_micros();
         let effects_started = Instant::now();
-        let owner_effects = project_owner_effect_summaries(&self.owners);
+        let owner_effects = project_owner_effect_summaries(&self.program, &self.definition_facts);
         let effects_us = effects_started.elapsed().as_micros();
         let preparation_started = Instant::now();
         let basis_fingerprints = self
@@ -2907,13 +3158,20 @@ impl KernelSolvedProject {
             .iter()
             .map(|owner| owner.basis_fingerprint_v14)
             .collect::<Vec<_>>();
-        let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
+        let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(
+            &self.program,
+            &self.owners,
+            &self.definition_facts,
+        );
         let preparation_us = preparation_started.elapsed().as_micros();
         let definitions_started = Instant::now();
         let definitions = materialize_project_definition_structures(
-            self.owners,
-            synthetic_state_ordinals,
+            &self.program,
+            &self.definition_facts,
+            &self.owners,
+            &synthetic_state_ordinals,
             &owner_effects,
+            None,
         )?;
         let definitions_us = definitions_started.elapsed().as_micros();
         let receipts_started = Instant::now();
@@ -2933,7 +3191,8 @@ impl KernelSolvedProject {
         }
         Ok(KernelCheckedSnapshot {
             definitions,
-            definition_facts: self.definition_facts,
+            program: Arc::clone(&self.program),
+            definition_facts: Arc::clone(&self.definition_facts),
             definition_code,
             type_store,
             interface,
@@ -2943,15 +3202,12 @@ impl KernelSolvedProject {
         })
     }
 
-    pub fn demanded_definitions(
-        &self,
-        demanded: &[KernelOwnerId],
-    ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
-        self.clone().into_demanded_definitions(demanded)
+    pub fn into_checked_snapshot(self) -> Result<KernelCheckedSnapshot, KernelSolveError> {
+        self.checked_snapshot()
     }
 
-    pub fn into_demanded_definitions(
-        self,
+    pub fn demanded_definitions(
+        &self,
         demanded: &[KernelOwnerId],
     ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
         let type_store = self.artifact.type_store();
@@ -2969,38 +3225,42 @@ impl KernelSolvedProject {
                 owner.0
             )));
         }
-        let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(&self.owners);
-        let owner_effects = project_owner_effect_summaries(&self.owners);
-        let all_definitions = materialize_project_definition_structures(
-            self.owners,
-            synthetic_state_ordinals,
+        let synthetic_state_ordinals = allocate_project_synthetic_state_ordinals(
+            &self.program,
+            &self.owners,
+            &self.definition_facts,
+        );
+        let owner_effects = project_owner_effect_summaries(&self.program, &self.definition_facts);
+        let materialized = materialize_project_definition_structures(
+            &self.program,
+            &self.definition_facts,
+            &self.owners,
+            &synthetic_state_ordinals,
             &owner_effects,
+            Some(&demanded),
         )?;
-        let mut definitions = Vec::with_capacity(demanded.len());
-        let mut demanded_iter = demanded.into_iter().peekable();
-        for (owner_index, definition) in all_definitions.into_vec().into_iter().enumerate() {
-            let dense_owner = KernelOwnerId(
-                u32::try_from(owner_index)
-                    .expect("kernel definition count exceeds the dense u32 namespace"),
-            );
-            if demanded_iter.peek().copied() != Some(dense_owner) {
-                continue;
-            }
-            demanded_iter.next();
-            definitions.push(KernelDemandedDefinitionArtifact {
-                owner: dense_owner,
-                definition,
-            });
-        }
-        debug_assert!(demanded_iter.next().is_none());
+        debug_assert_eq!(materialized.len(), demanded.len());
+        let definitions = demanded
+            .into_iter()
+            .zip(materialized)
+            .map(|(owner, definition)| KernelDemandedDefinitionArtifact { owner, definition })
+            .collect::<Vec<_>>();
         Ok(KernelDemandedDefinitionSnapshot {
             definitions: definitions.into_boxed_slice(),
-            definition_facts: self.definition_facts,
+            program: Arc::clone(&self.program),
+            definition_facts: Arc::clone(&self.definition_facts),
             definition_code,
             type_store,
             interface,
             work: self.artifact.work,
         })
+    }
+
+    pub fn into_demanded_definitions(
+        self,
+        demanded: &[KernelOwnerId],
+    ) -> Result<KernelDemandedDefinitionSnapshot, KernelSolveError> {
+        self.demanded_definitions(demanded)
     }
 }
 
@@ -3268,6 +3528,7 @@ struct ResourceProjectionRequirementFact {
 }
 
 struct ResourceProjectionResolver<'a> {
+    program: &'a KernelProjectProgramInput,
     owners: &'a [KernelProjectOwnerOutputs],
     definition_facts: &'a [KernelDefinitionFactsInput],
     abi: &'a crate::KernelAbiInput,
@@ -3288,34 +3549,34 @@ struct ResourceProjectionResolver<'a> {
 
 impl<'a> ResourceProjectionResolver<'a> {
     fn new(
+        program: &'a KernelProjectProgramInput,
         owners: &'a [KernelProjectOwnerOutputs],
         definition_facts: &'a [KernelDefinitionFactsInput],
         abi: &'a crate::KernelAbiInput,
         text: ProjectTextSnapshot,
     ) -> Result<Self, KernelSolveError> {
-        let authored_projection_edges = owners
+        let authored_projection_edges = definition_facts
             .iter()
-            .map(|owner| {
-                owner
+            .map(|facts| {
+                facts
                     .lexical_bindings
                     .iter()
                     .map(|binding| binding.projection.len())
                     .sum::<usize>()
-                    + owner
-                        .resources
+                    + facts
                         .sources
                         .iter()
-                        .map(|source| source.path.projection.len())
+                        .map(|source| source.projection.len())
                         .sum::<usize>()
             })
             .sum();
         let mut paths = ResourceProjectionArena::with_capacity(authored_projection_edges);
-        let lexical_by_expression = owners
+        let lexical_by_expression = definition_facts
             .iter()
             .enumerate()
-            .map(|(owner_index, owner)| {
-                let mut index = vec![None; owner.expressions.len()];
-                for (ordinal, binding) in owner.lexical_bindings.iter().enumerate() {
+            .map(|(owner_index, facts)| {
+                let mut index = vec![None; owners[owner_index].expressions.len()];
+                for (ordinal, binding) in facts.lexical_bindings.iter().enumerate() {
                     let projection =
                         intern_resource_projection_path(&text, &mut paths, &binding.projection)?;
                     let slot = index
@@ -3373,12 +3634,12 @@ impl<'a> ResourceProjectionResolver<'a> {
             })
             .collect::<Result<Vec<_>, KernelSolveError>>()?
             .into_boxed_slice();
-        let shape_by_expression = owners
+        let shape_by_expression = definition_facts
             .iter()
             .enumerate()
-            .map(|(owner_index, owner)| {
-                let mut index = vec![None; owner.expressions.len()];
-                for (ordinal, shape) in owner.execution_shapes.iter().enumerate() {
+            .map(|(owner_index, facts)| {
+                let mut index = vec![None; owners[owner_index].expressions.len()];
+                for (ordinal, shape) in facts.execution_shapes.iter().enumerate() {
                     let slot = index
                         .get_mut(shape.expression().0 as usize)
                         .ok_or_else(|| {
@@ -3400,6 +3661,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             .into_boxed_slice();
 
         let mut resolver = Self {
+            program,
             owners,
             definition_facts,
             abi,
@@ -3430,12 +3692,22 @@ impl<'a> ResourceProjectionResolver<'a> {
         })
     }
 
-    fn owner(&self, owner: KernelOwnerId) -> Option<&'a KernelProjectOwnerOutputs> {
-        self.owners.get(owner.0 as usize)
+    fn input(&self, owner: KernelOwnerId) -> Option<&'a KernelOwnerProgramInput> {
+        self.program.owners.get(owner.0 as usize)
     }
 
     fn facts(&self, owner: KernelOwnerId) -> Option<&'a KernelDefinitionFactsInput> {
         self.definition_facts.get(owner.0 as usize)
+    }
+
+    fn definition(&self, owner: KernelOwnerId) -> Option<KernelDefinitionInputRef<'a>> {
+        let index = owner.0 as usize;
+        Some(KernelDefinitionInputRef {
+            owner,
+            input: self.program.owners.get(index)?,
+            facts: self.definition_facts.get(index)?,
+            outputs: self.owners.get(index)?,
+        })
     }
 
     fn declaration_key(
@@ -3466,20 +3738,29 @@ impl<'a> ResourceProjectionResolver<'a> {
                 }
                 KernelDeclarationReference::OwnerPublic(target) => {
                     owner = target;
-                    reference = self.owner(target)?.linkage.public_declaration?;
+                    reference = self.facts(target)?.linkage.public_declaration?;
                 }
             }
         }
     }
 
-    fn declaration(
-        &self,
-        key: ResourceDeclarationKey,
-    ) -> Option<&'a RichKernelDeclarationArtifact> {
-        self.owner(key.owner)?
+    fn declaration(&self, key: ResourceDeclarationKey) -> Option<&'a KernelDeclarationInput> {
+        self.facts(key.owner)?
             .declarations
             .get(key.declaration.0 as usize)
             .filter(|declaration| declaration.id == key.declaration)
+    }
+
+    fn declaration_value(
+        &self,
+        key: ResourceDeclarationKey,
+        declaration: &KernelDeclarationInput,
+    ) -> Option<ResourceExpressionKey> {
+        let encoded = declaration.value?;
+        let value =
+            kernel_value_reference(self.input(key.owner)?, encoded, declaration.id.0 as usize)
+                .ok()?;
+        self.expression_key(key.owner, value)
     }
 
     fn expression_key(
@@ -3498,20 +3779,14 @@ impl<'a> ResourceProjectionResolver<'a> {
                 }),
                 KernelExternalTarget::Result => Some(ResourceExpressionKey {
                     owner: external.owner,
-                    expression: self.owner(external.owner)?.linkage.result_expression?,
+                    expression: self.facts(external.owner)?.linkage.result_expression?,
                 }),
             },
         }
     }
 
-    fn expression(
-        &self,
-        key: ResourceExpressionKey,
-    ) -> Option<&'a PendingKernelExpressionArtifact> {
-        self.owner(key.owner)?
-            .expression_artifacts
-            .get(key.expression.0 as usize)
-            .filter(|expression| expression.id == key.expression)
+    fn expression(&self, key: ResourceExpressionKey) -> Option<&'a KernelOwnerNode> {
+        self.input(key.owner)?.nodes.get(key.expression.0 as usize)
     }
 
     fn lexical_index(&self, key: ResourceExpressionKey) -> Option<ResourceLexicalIndex> {
@@ -3522,9 +3797,9 @@ impl<'a> ResourceProjectionResolver<'a> {
             .copied()
     }
 
-    fn lexical(&self, key: ResourceExpressionKey) -> Option<&'a KernelLexicalBindingArtifact> {
+    fn lexical(&self, key: ResourceExpressionKey) -> Option<&'a KernelLexicalBindingInput> {
         let index = self.lexical_index(key)?;
-        self.owner(key.owner)?
+        self.facts(key.owner)?
             .lexical_bindings
             .get(index.ordinal as usize)
     }
@@ -3533,36 +3808,50 @@ impl<'a> ResourceProjectionResolver<'a> {
         self.lexical_index(key).map(|index| index.projection)
     }
 
-    fn call(&self, key: ResourceExpressionKey) -> Option<&'a PendingKernelCallArtifact> {
+    fn call(&self, key: ResourceExpressionKey) -> Option<KernelProjectCallRef<'a>> {
         let ordinal = self
             .call_by_expression
             .get(key.owner.0 as usize)?
             .get(key.expression.0 as usize)?
             .as_ref()
             .copied()?;
-        self.owner(key.owner)?.calls.get(ordinal)
+        self.definition(key.owner)?.call(ordinal)
     }
 
-    fn call_syntax(&self, key: ResourceExpressionKey) -> Option<&'a KernelCallSyntaxArtifact> {
-        self.owner(key.owner)?
+    fn call_syntax(&self, key: ResourceExpressionKey) -> Option<&'a KernelCallSyntaxInput> {
+        self.facts(key.owner)?
             .call_syntax
             .iter()
             .find(|call| call.expression == key.expression)
     }
 
-    fn shape(&self, key: ResourceExpressionKey) -> Option<&'a KernelExecutionShapeArtifact> {
+    fn shape(&self, key: ResourceExpressionKey) -> Option<&'a KernelExecutionShapeInput> {
         let ordinal = self
             .shape_by_expression
             .get(key.owner.0 as usize)?
             .get(key.expression.0 as usize)?
             .as_ref()
             .copied()?;
-        self.owner(key.owner)?.execution_shapes.get(ordinal)
+        self.facts(key.owner)?.execution_shapes.get(ordinal)
     }
 
-    fn inputs(&self, key: ResourceExpressionKey) -> &'a [KernelExpressionInputArtifact] {
+    fn inputs(&self, key: ResourceExpressionKey) -> &'a [KernelOwnerInputEdge] {
         self.expression(key)
             .map_or(&[], |expression| expression.inputs.as_ref())
+    }
+
+    fn input_expression_key(
+        &self,
+        consumer: ResourceExpressionKey,
+        input: &KernelOwnerInputEdge,
+    ) -> Option<ResourceExpressionKey> {
+        let value = kernel_value_reference(
+            self.input(consumer.owner)?,
+            input.expression,
+            consumer.expression.0 as usize,
+        )
+        .ok()?;
+        self.expression_key(consumer.owner, value)
     }
 
     fn first_input(
@@ -3574,7 +3863,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             .inputs
             .iter()
             .find(|input| matches(&input.role))
-            .and_then(|input| self.expression_key(key.owner, input.value))
+            .and_then(|input| self.input_expression_key(key, input))
     }
 
     fn parameter_declaration(
@@ -3582,7 +3871,7 @@ impl<'a> ResourceProjectionResolver<'a> {
         owner: KernelOwnerId,
         ordinal: u32,
     ) -> Option<ResourceDeclarationKey> {
-        let declaration = self.owner(owner)?.declarations.iter().find(|declaration| {
+        let declaration = self.facts(owner)?.declarations.iter().find(|declaration| {
             matches!(
                 declaration.origin,
                 KernelDeclarationOrigin::Parameter {
@@ -3603,7 +3892,7 @@ impl<'a> ResourceProjectionResolver<'a> {
         call: KernelExpressionId,
         ordinal: u32,
     ) -> Option<ResourceDeclarationKey> {
-        let declaration = self.owner(owner)?.declarations.iter().find(|declaration| {
+        let declaration = self.facts(owner)?.declarations.iter().find(|declaration| {
             declaration.origin == KernelDeclarationOrigin::CallbackBinding { call, ordinal }
         })?;
         Some(ResourceDeclarationKey {
@@ -3615,22 +3904,23 @@ impl<'a> ResourceProjectionResolver<'a> {
     fn abi_parameter<'b>(
         &'b self,
         key: ResourceExpressionKey,
-        input: &KernelCallInputArtifact,
+        call: KernelProjectCallRef<'a>,
+        input: &'a KernelOwnerInputEdge,
     ) -> Option<&'b crate::KernelAbiParameterInput> {
         let callable = self.abi.callable(&self.call_syntax(key)?.function)?;
-        match &input.role {
-            KernelCallInputRole::Abi { name } => callable
+        match call.input_role(input).ok()? {
+            KernelCallInputRoleRef::Abi { name } => callable
                 .parameters
                 .iter()
-                .find(|parameter| parameter.name.as_ref() == name.as_ref())
+                .find(|parameter| parameter.name.as_ref() == name)
                 .or_else(|| {
-                    (name.as_ref() == "$pipe").then(|| {
+                    (name == "$pipe").then(|| {
                         callable.parameters.iter().find(|parameter| {
                             parameter.kind == boon_checked::CheckedParameterKind::Value
                         })
                     })?
                 }),
-            KernelCallInputRole::Formal { .. } => None,
+            KernelCallInputRoleRef::Formal { .. } => None,
         }
     }
 
@@ -3639,14 +3929,14 @@ impl<'a> ResourceProjectionResolver<'a> {
         key: ResourceExpressionKey,
         ordinal: u32,
     ) -> Option<ResourceExpressionKey> {
-        self.call(key)?
-            .inputs
+        let call = self.call(key)?;
+        call.inputs()
             .iter()
             .find(|input| {
-                self.abi_parameter(key, input)
+                self.abi_parameter(key, call, input)
                     .is_some_and(|parameter| parameter.ordinal == ordinal)
             })
-            .and_then(|input| self.expression_key(key.owner, input.value))
+            .and_then(|input| self.input_expression_key(key, input))
     }
 
     fn call_input_named(
@@ -3654,45 +3944,52 @@ impl<'a> ResourceProjectionResolver<'a> {
         key: ResourceExpressionKey,
         name: &str,
     ) -> Option<ResourceExpressionKey> {
-        self.call(key)?
-            .inputs
+        let call = self.call(key)?;
+        call.inputs()
             .iter()
             .find(|input| {
-                self.abi_parameter(key, input)
+                self.abi_parameter(key, call, input)
                     .is_some_and(|parameter| parameter.name.as_ref() == name)
             })
-            .and_then(|input| self.expression_key(key.owner, input.value))
+            .and_then(|input| self.input_expression_key(key, input))
     }
 
     fn output_declaration_for_input(
         &self,
         key: ResourceExpressionKey,
-        call: &PendingKernelCallArtifact,
-        input: &KernelCallInputArtifact,
+        call: KernelProjectCallRef<'a>,
+        input: &'a KernelOwnerInputEdge,
         ordinal: u32,
         name: &str,
     ) -> Option<ResourceDeclarationKey> {
         let syntax = self.call_syntax(key)?;
-        let argument = syntax
-            .arguments
-            .iter()
-            .find(|argument| argument.value == input.value && argument.name.as_ref() == name)?;
+        let input_value = call.input_value(input).ok()?;
+        let argument = syntax.arguments.iter().find(|argument| {
+            argument.name.as_ref() == name
+                && kernel_value_reference(
+                    self.input(key.owner).expect("checked call owner"),
+                    argument.value,
+                    call.expression().0 as usize,
+                )
+                .ok()
+                    == Some(input_value)
+        })?;
         match argument.kind {
             KernelCallArgumentKind::BareBinding => {
-                self.callback_declaration(key.owner, call.expression, ordinal)
+                self.callback_declaration(key.owner, call.expression(), ordinal)
             }
             KernelCallArgumentKind::Named => {
-                let KernelValueReference::Local(expression) = input.value else {
+                let KernelValueReference::Local(expression) = input_value else {
                     return None;
                 };
                 let binding = self
-                    .owner(key.owner)?
+                    .facts(key.owner)?
                     .lexical_bindings
                     .iter()
                     .find(|binding| {
                         binding.expression == expression && binding.projection.is_empty()
                     })?;
-                let KernelLexicalBindingTarget::Declaration(target) = binding.target else {
+                let KernelLexicalBindingTargetInput::Declaration(target) = binding.target else {
                     return None;
                 };
                 self.declaration_key(key.owner, target)
@@ -3701,27 +3998,30 @@ impl<'a> ResourceProjectionResolver<'a> {
     }
 
     fn index_calls(&mut self) -> Result<(), KernelSolveError> {
-        for (owner_index, owner) in self.owners.iter().enumerate() {
+        for owner_index in 0..self.owners.len() {
             let owner_id = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
                 KernelSolveError::new("kernel resource provenance owner count exceeds u32")
             })?);
-            for call in &owner.calls {
+            let definition = self.definition(owner_id).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel resource provenance owner {} is missing",
+                    owner_id.0,
+                ))
+            })?;
+            for call in definition.calls() {
                 let key = ResourceExpressionKey {
                     owner: owner_id,
-                    expression: call.expression,
+                    expression: call.expression(),
                 };
-                match call.target {
-                    KernelCallTarget::User { target, .. } => {
-                        for (input_index, input) in call.inputs.iter().enumerate() {
-                            let KernelCallInputRole::Formal { ordinal } = &input.role else {
+                match call.target() {
+                    KernelCallTargetRef::User { target, .. } => {
+                        for (input_index, input) in call.inputs().iter().enumerate() {
+                            let Ok(KernelCallInputRoleRef::Formal { ordinal }) =
+                                call.input_role(input)
+                            else {
                                 continue;
                             };
-                            let ordinal = *ordinal;
-                            if !user_call_input_is_first_for_formal(
-                                &call.inputs,
-                                input_index,
-                                ordinal,
-                            ) {
+                            if !project_call_input_is_first_for_formal(call, input_index, ordinal) {
                                 continue;
                             }
                             // Solver-only unit programs may intentionally omit
@@ -3738,7 +4038,10 @@ impl<'a> ResourceProjectionResolver<'a> {
                             };
                             match declaration.kind {
                                 KernelDeclarationKind::ValueParameter => {
-                                    if let Some(actual) = self.expression_key(owner_id, input.value)
+                                    if let Some(actual) = call
+                                        .input_value(input)
+                                        .ok()
+                                        .and_then(|value| self.expression_key(owner_id, value))
                                     {
                                         self.actual_inputs_by_formal
                                             .entry(formal)
@@ -3764,11 +4067,11 @@ impl<'a> ResourceProjectionResolver<'a> {
                             }
                         }
                     }
-                    KernelCallTarget::RenderConstructor { .. }
-                    | KernelCallTarget::PureBuiltin { .. }
-                    | KernelCallTarget::FixedAbi
-                    | KernelCallTarget::HostEffect { .. }
-                    | KernelCallTarget::FieldProjection { .. } => {
+                    KernelCallTargetRef::RenderConstructor { .. }
+                    | KernelCallTargetRef::PureBuiltin { .. }
+                    | KernelCallTargetRef::FixedAbi
+                    | KernelCallTargetRef::HostEffect { .. }
+                    | KernelCallTargetRef::FieldProjection { .. } => {
                         let Some(contract) = self
                             .call_syntax(key)
                             .and_then(|syntax| self.abi.callable(&syntax.function))
@@ -3784,8 +4087,8 @@ impl<'a> ResourceProjectionResolver<'a> {
                         else {
                             continue;
                         };
-                        for input in &call.inputs {
-                            let Some(parameter) = self.abi_parameter(key, input) else {
+                        for input in call.inputs() {
+                            let Some(parameter) = self.abi_parameter(key, call, input) else {
                                 continue;
                             };
                             if parameter.ordinal != row_ordinal
@@ -3870,11 +4173,11 @@ impl<'a> ResourceProjectionResolver<'a> {
 
     fn index_sources(&mut self) -> Result<(), KernelSolveError> {
         let mut seen = Vec::new();
-        for (owner_index, owner) in self.owners.iter().enumerate() {
+        for (owner_index, facts) in self.definition_facts.iter().enumerate() {
             let owner_id = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
                 KernelSolveError::new("kernel resource provenance owner count exceeds u32")
             })?);
-            for source in &owner.resources.sources {
+            for source in &facts.sources {
                 let read = ResourceSourceRead {
                     owner: owner_id,
                     source: source.id,
@@ -3890,10 +4193,10 @@ impl<'a> ResourceProjectionResolver<'a> {
                 let path = intern_resource_projection_path(
                     &self.text,
                     &mut self.paths,
-                    &source.path.projection,
+                    &source.projection,
                 )?;
                 let anchor = self
-                    .declaration_key(owner_id, source.path.anchor)
+                    .declaration_key(owner_id, source.declaration)
                     .ok_or_else(|| {
                         KernelSolveError::new(format!(
                             "kernel resource provenance SOURCE {} has no path anchor",
@@ -4097,16 +4400,13 @@ impl<'a> ResourceProjectionResolver<'a> {
         ) {
             self.output_sources(paths, target, projection, scratch);
         }
-        if let Some(value) = declaration
-            .value
-            .and_then(|value| self.expression_key(target.owner, value))
-        {
+        if let Some(value) = self.declaration_value(target, declaration) {
             self.expression_sources(paths, value, projection, scratch);
         }
         if declaration.kind == KernelDeclarationKind::Function
             && let Some(result) = self
-                .owner(target.owner)
-                .and_then(|owner| owner.linkage.result_expression)
+                .facts(target.owner)
+                .and_then(|facts| facts.linkage.result_expression)
         {
             self.expression_sources(
                 paths,
@@ -4149,7 +4449,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             return;
         };
         if let Some(binding) = self.lexical(expression)
-            && let KernelLexicalBindingTarget::Declaration(target) = binding.target
+            && let KernelLexicalBindingTargetInput::Declaration(target) = binding.target
             && let Some(target) = self.declaration_key(expression.owner, target)
         {
             let prefix = self
@@ -4163,13 +4463,20 @@ impl<'a> ResourceProjectionResolver<'a> {
         match &row.kind {
             KernelOwnerNodeKind::Record { .. } => {
                 if let Some(projection) = paths.row(projection)
-                    && let Some(KernelExecutionShapeArtifact::Record { fields, .. }) =
+                    && let Some(KernelExecutionShapeInput::Record { fields, .. }) =
                         self.shape(expression)
                 {
                     for candidate in fields.iter().filter(|candidate| {
                         self.text.lookup_symbol(&candidate.name) == Some(projection.head)
                     }) {
-                        if let Some(value) = self.expression_key(expression.owner, candidate.value)
+                        if let Some(value) = kernel_value_reference(
+                            self.input(expression.owner)
+                                .expect("checked expression owner"),
+                            candidate.value,
+                            expression.expression.0 as usize,
+                        )
+                        .ok()
+                        .and_then(|value| self.expression_key(expression.owner, value))
                         {
                             self.expression_sources(paths, value, projection.tail, scratch);
                         }
@@ -4183,11 +4490,11 @@ impl<'a> ResourceProjectionResolver<'a> {
             | KernelOwnerNodeKind::HostEffect { .. }
             | KernelOwnerNodeKind::FieldProjection { .. } => {
                 if let Some(call) = self.call(expression) {
-                    match call.target {
-                        KernelCallTarget::User { target, .. } => {
+                    match call.target() {
+                        KernelCallTargetRef::User { target, .. } => {
                             if let Some(result) = self
-                                .owner(target)
-                                .and_then(|owner| owner.linkage.result_expression)
+                                .facts(target)
+                                .and_then(|facts| facts.linkage.result_expression)
                             {
                                 self.expression_sources(
                                     paths,
@@ -4261,7 +4568,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             KernelOwnerNodeKind::Latest => {
                 for input in self.inputs(expression) {
                     if matches!(input.role, KernelOwnerEdgeRole::LatestBranch)
-                        && let Some(branch) = self.expression_key(expression.owner, input.value)
+                        && let Some(branch) = self.input_expression_key(expression, input)
                     {
                         self.expression_sources(paths, branch, projection, scratch);
                     }
@@ -4270,7 +4577,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             KernelOwnerNodeKind::When => {
                 for input in self.inputs(expression) {
                     if matches!(input.role, KernelOwnerEdgeRole::WhenArm)
-                        && let Some(arm) = self.expression_key(expression.owner, input.value)
+                        && let Some(arm) = self.input_expression_key(expression, input)
                     {
                         self.expression_sources(paths, arm, projection, scratch);
                     }
@@ -4291,11 +4598,18 @@ impl<'a> ResourceProjectionResolver<'a> {
                 }
             }
             KernelOwnerNodeKind::Block => {
-                if let Some(KernelExecutionShapeArtifact::Block {
+                if let Some(KernelExecutionShapeInput::Block {
                     result: Some(result),
                     ..
                 }) = self.shape(expression)
-                    && let Some(result) = self.expression_key(expression.owner, *result)
+                    && let Some(result) = kernel_value_reference(
+                        self.input(expression.owner)
+                            .expect("checked expression owner"),
+                        *result,
+                        expression.expression.0 as usize,
+                    )
+                    .ok()
+                    .and_then(|value| self.expression_key(expression.owner, value))
                 {
                     self.expression_sources(paths, result, projection, scratch);
                 }
@@ -4318,7 +4632,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             } => {
                 for input in self.inputs(expression) {
                     if matches!(input.role, KernelOwnerEdgeRole::MapEntry)
-                        && let Some(entry) = self.expression_key(expression.owner, input.value)
+                        && let Some(entry) = self.input_expression_key(expression, input)
                     {
                         self.expression_sources(paths, entry, projection, scratch);
                     }
@@ -4330,7 +4644,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             } => {
                 for input in self.inputs(expression) {
                     if matches!(input.role, KernelOwnerEdgeRole::CollectionItem)
-                        && let Some(item) = self.expression_key(expression.owner, input.value)
+                        && let Some(item) = self.input_expression_key(expression, input)
                     {
                         self.expression_sources(paths, item, projection, scratch);
                     }
@@ -4365,7 +4679,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             } => {
                 for input in self.inputs(expression) {
                     if matches!(&input.role, KernelOwnerEdgeRole::CollectionItem)
-                        && let Some(item) = self.expression_key(expression.owner, input.value)
+                        && let Some(item) = self.input_expression_key(expression, input)
                     {
                         self.expression_sources(paths, item, projection, scratch);
                     }
@@ -4377,7 +4691,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             }) =>
             {
                 let binding = self.lexical(expression).expect("checked lexical binding");
-                if let KernelLexicalBindingTarget::Declaration(target) = binding.target
+                if let KernelLexicalBindingTargetInput::Declaration(target) = binding.target
                     && let Some(target) = self.declaration_key(expression.owner, target)
                     && let Some(declaration) = self.declaration(target)
                 {
@@ -4391,10 +4705,7 @@ impl<'a> ResourceProjectionResolver<'a> {
                             self.list_item_sources(paths, *actual, projection, scratch);
                         }
                     }
-                    if let Some(value) = declaration
-                        .value
-                        .and_then(|value| self.expression_key(target.owner, value))
-                    {
+                    if let Some(value) = self.declaration_value(target, declaration) {
                         self.list_item_sources(paths, value, projection, scratch);
                     }
                 }
@@ -4406,11 +4717,11 @@ impl<'a> ResourceProjectionResolver<'a> {
             | KernelOwnerNodeKind::HostEffect { .. }
             | KernelOwnerNodeKind::FieldProjection { .. } => {
                 if let Some(call) = self.call(expression) {
-                    match call.target {
-                        KernelCallTarget::User { target, .. } => {
+                    match call.target() {
+                        KernelCallTargetRef::User { target, .. } => {
                             if let Some(result) = self
-                                .owner(target)
-                                .and_then(|owner| owner.linkage.result_expression)
+                                .facts(target)
+                                .and_then(|facts| facts.linkage.result_expression)
                             {
                                 self.list_item_sources(
                                     paths,
@@ -4488,7 +4799,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             KernelOwnerNodeKind::Latest => {
                 for input in self.inputs(expression) {
                     if matches!(&input.role, KernelOwnerEdgeRole::LatestBranch)
-                        && let Some(branch) = self.expression_key(expression.owner, input.value)
+                        && let Some(branch) = self.input_expression_key(expression, input)
                     {
                         self.list_item_sources(paths, branch, projection, scratch);
                     }
@@ -4497,7 +4808,7 @@ impl<'a> ResourceProjectionResolver<'a> {
             KernelOwnerNodeKind::When => {
                 for input in self.inputs(expression) {
                     if matches!(&input.role, KernelOwnerEdgeRole::WhenArm)
-                        && let Some(arm) = self.expression_key(expression.owner, input.value)
+                        && let Some(arm) = self.input_expression_key(expression, input)
                     {
                         self.list_item_sources(paths, arm, projection, scratch);
                     }
@@ -4518,11 +4829,18 @@ impl<'a> ResourceProjectionResolver<'a> {
                 }
             }
             KernelOwnerNodeKind::Block => {
-                if let Some(KernelExecutionShapeArtifact::Block {
+                if let Some(KernelExecutionShapeInput::Block {
                     result: Some(result),
                     ..
                 }) = self.shape(expression)
-                    && let Some(result) = self.expression_key(expression.owner, *result)
+                    && let Some(result) = kernel_value_reference(
+                        self.input(expression.owner)
+                            .expect("checked expression owner"),
+                        *result,
+                        expression.expression.0 as usize,
+                    )
+                    .ok()
+                    .and_then(|value| self.expression_key(expression.owner, value))
                 {
                     self.list_item_sources(paths, result, projection, scratch);
                 }
@@ -4565,6 +4883,7 @@ impl<'a> ResourceProjectionResolver<'a> {
     }
 }
 
+#[cfg(test)]
 fn user_call_input_is_first_for_formal(
     inputs: &[KernelCallInputArtifact],
     input_index: usize,
@@ -4576,6 +4895,21 @@ fn user_call_input_is_first_for_formal(
             KernelCallInputRole::Formal {
                 ordinal: earlier_ordinal,
             } if *earlier_ordinal == ordinal
+        )
+    })
+}
+
+fn project_call_input_is_first_for_formal(
+    call: KernelProjectCallRef<'_>,
+    input_index: usize,
+    ordinal: u32,
+) -> bool {
+    !call.inputs()[..input_index].iter().any(|earlier| {
+        matches!(
+            call.input_role(earlier),
+            Ok(KernelCallInputRoleRef::Formal {
+                ordinal: earlier_ordinal,
+            }) if earlier_ordinal == ordinal
         )
     })
 }
@@ -4764,12 +5098,14 @@ fn packed_resource_projection_type_is_specific(
 }
 
 fn project_resource_projection_facts(
+    program: &KernelProjectProgramInput,
     owners: &[KernelProjectOwnerOutputs],
     definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
     artifact: &mut UnsealedComponentArtifact,
 ) -> Result<Box<[DefinitionResourceProjectionFacts]>, KernelSolveError> {
     let mut resolver = ResourceProjectionResolver::new(
+        program,
         owners,
         definition_facts,
         abi,
@@ -4794,7 +5130,8 @@ fn project_resource_projection_facts(
             }) else {
                 continue;
             };
-            let KernelLexicalBindingTarget::Declaration(target_reference) = binding.target else {
+            let KernelLexicalBindingTargetInput::Declaration(target_reference) = binding.target
+            else {
                 continue;
             };
             let expression_key = ResourceExpressionKey {
@@ -4955,6 +5292,7 @@ fn project_resource_projection_facts(
 }
 
 fn build_definition_code_builder(
+    program: &KernelProjectProgramInput,
     owners: &[KernelProjectOwnerOutputs],
     definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
@@ -5029,7 +5367,7 @@ fn build_definition_code_builder(
                 }),
         );
         expression_kind_types.clear();
-        for expression in &owner.expression_artifacts {
+        for expression in &program.owners[owner_index].nodes {
             let ty = match &expression.kind {
                 KernelOwnerNodeKind::Known(ty)
                 | KernelOwnerNodeKind::Source(ty)
@@ -5040,7 +5378,7 @@ fn build_definition_code_builder(
                 .push(ty.map(|ty| import_post_solve_type(artifact.terms_mut(), ty)));
         }
         declaration_flows.clear();
-        for declaration in &owner.declarations {
+        for declaration in &definition_facts[owner_index].declarations {
             declaration_flows.push(declaration.declared_flow_type.as_ref().map(|flow| {
                 PackedFlow {
                     mode: flow.mode,
@@ -5095,7 +5433,7 @@ fn build_definition_code_builder(
             });
         }
         source_payload_types.clear();
-        for source in &owner.resources.sources {
+        for source in &definition_facts[owner_index].sources {
             let output = owner.expressions[source.expression.0 as usize];
             source_payload_types.push(
                 artifact
@@ -5105,12 +5443,13 @@ fn build_definition_code_builder(
             );
         }
         state_flows.clear();
-        for state in owner
-            .resources
-            .states
-            .iter()
-            .filter(|state| state_candidate_survives(state, &owner.expression_modes))
-        {
+        for state in definition_facts[owner_index].states.iter().filter(|state| {
+            state_input_candidate_survives(
+                &program.owners[owner_index],
+                state,
+                &owner.expression_modes,
+            )
+        }) {
             let expression = state.expression.0 as usize;
             let output = owner.expressions[expression];
             state_flows.push(PackedFlow {
@@ -5122,7 +5461,7 @@ fn build_definition_code_builder(
             });
         }
         list_item_types.clear();
-        for list in &owner.resources.lists {
+        for list in &definition_facts[owner_index].lists {
             let producer = owner.expressions[list.producer.0 as usize];
             let producer = artifact
                 .output(producer)
@@ -5306,7 +5645,7 @@ fn build_definition_code_builder(
             },
         )?;
     }
-    build_definition_execution_code(owners, definition_facts, abi, &mut builder)?;
+    build_definition_execution_code(program, owners, definition_facts, abi, &mut builder)?;
     Ok(builder)
 }
 
@@ -5336,16 +5675,16 @@ fn definition_execution_owner<'a>(
 }
 
 fn definition_execution_expression(
-    owners: &[KernelProjectOwnerOutputs],
+    program: &KernelProjectProgramInput,
     owner: KernelOwnerId,
     expression: KernelExpressionId,
     context: &str,
 ) -> Result<PackedExpressionRef, KernelSolveError> {
-    let definition = definition_execution_owner(owners, owner, context)?;
-    if !definition
-        .expression_artifacts
-        .get(expression.0 as usize)
-        .is_some_and(|row| row.id == expression)
+    if !program
+        .owners
+        .get(owner.0 as usize)
+        .and_then(|definition| definition.nodes.get(expression.0 as usize))
+        .is_some()
     {
         return Err(KernelSolveError::new(format!(
             "kernel packed execution {context} references missing expression {}:{}",
@@ -5356,46 +5695,48 @@ fn definition_execution_expression(
 }
 
 fn definition_execution_value(
-    owners: &[KernelProjectOwnerOutputs],
+    program: &KernelProjectProgramInput,
+    definition_facts: &[KernelDefinitionFactsInput],
     owner: KernelOwnerId,
     value: KernelValueReference,
     context: &str,
 ) -> Result<PackedExpressionRef, KernelSolveError> {
     match value {
         KernelValueReference::Local(expression) => {
-            definition_execution_expression(owners, owner, expression, context)
+            definition_execution_expression(program, owner, expression, context)
         }
         KernelValueReference::External(external) => match external.target {
             KernelExternalTarget::Expression(expression) => {
-                definition_execution_expression(owners, external.owner, expression, context)
+                definition_execution_expression(program, external.owner, expression, context)
             }
             KernelExternalTarget::Result => {
-                let target = definition_execution_owner(owners, external.owner, context)?;
-                let expression = target.linkage.result_expression.ok_or_else(|| {
-                    KernelSolveError::new(format!(
-                        "kernel packed execution {context} references owner {} without a result expression",
-                        external.owner.0,
-                    ))
-                })?;
-                definition_execution_expression(owners, external.owner, expression, context)
+                let expression = definition_facts
+                    .get(external.owner.0 as usize)
+                    .and_then(|facts| facts.linkage.result_expression)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel packed execution {context} references owner {} without a result expression",
+                            external.owner.0,
+                        ))
+                    })?;
+                definition_execution_expression(program, external.owner, expression, context)
             }
         },
     }
 }
 
 fn definition_execution_declaration(
-    owners: &[KernelProjectOwnerOutputs],
+    definition_facts: &[KernelDefinitionFactsInput],
     mut owner: KernelOwnerId,
     mut reference: KernelDeclarationReference,
     context: &str,
 ) -> Result<PackedDeclarationKey, KernelSolveError> {
-    for _ in 0..=owners.len() {
+    for _ in 0..=definition_facts.len() {
         match reference {
             KernelDeclarationReference::Local(declaration) => {
-                let definition = definition_execution_owner(owners, owner, context)?;
-                if !definition
-                    .declarations
-                    .get(declaration.0 as usize)
+                if !definition_facts
+                    .get(owner.0 as usize)
+                    .and_then(|facts| facts.declarations.get(declaration.0 as usize))
                     .is_some_and(|row| row.id == declaration)
                 {
                     return Err(KernelSolveError::new(format!(
@@ -5414,7 +5755,14 @@ fn definition_execution_declaration(
             }
             KernelDeclarationReference::OwnerPublic(target) => {
                 owner = target;
-                reference = definition_execution_owner(owners, target, context)?
+                reference = definition_facts
+                    .get(target.0 as usize)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel packed execution {context} references missing owner {}",
+                            target.0,
+                        ))
+                    })?
                     .linkage
                     .public_declaration
                     .ok_or_else(|| {
@@ -5432,7 +5780,6 @@ fn definition_execution_declaration(
 }
 
 fn definition_execution_scope_callable(
-    owners: &[KernelProjectOwnerOutputs],
     definition_facts: &[KernelDefinitionFactsInput],
     mut owner: KernelOwnerId,
     mut scope: KernelScopeReference,
@@ -5442,7 +5789,7 @@ fn definition_execution_scope_callable(
         .iter()
         .map(|facts| facts.presentation.scopes.len())
         .sum::<usize>()
-        .saturating_add(owners.len())
+        .saturating_add(definition_facts.len())
         .saturating_add(1);
     for _ in 0..scope_limit {
         match scope {
@@ -5488,7 +5835,12 @@ fn definition_execution_scope_callable(
                     return row
                         .owner
                         .map(|declaration| {
-                            definition_execution_declaration(owners, owner, declaration, context)
+                            definition_execution_declaration(
+                                definition_facts,
+                                owner,
+                                declaration,
+                                context,
+                            )
                         })
                         .transpose();
                 }
@@ -5502,12 +5854,19 @@ fn definition_execution_scope_callable(
 }
 
 fn definition_execution_statement<'a>(
-    owners: &'a [KernelProjectOwnerOutputs],
+    definition_facts: &'a [KernelDefinitionFactsInput],
     owner: KernelOwnerId,
     statement: KernelStatementId,
     context: &str,
-) -> Result<&'a KernelStatementArtifact, KernelSolveError> {
-    definition_execution_owner(owners, owner, context)?
+) -> Result<&'a KernelStatementInput, KernelSolveError> {
+    definition_facts
+        .get(owner.0 as usize)
+        .ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed execution {context} references missing owner {}",
+                owner.0,
+            ))
+        })?
         .statements
         .get(statement.0 as usize)
         .filter(|row| row.id == statement)
@@ -5520,7 +5879,7 @@ fn definition_execution_statement<'a>(
 }
 
 fn definition_execution_statement_child(
-    owners: &[KernelProjectOwnerOutputs],
+    definition_facts: &[KernelDefinitionFactsInput],
     owner: KernelOwnerId,
     child: KernelStatementChildReference,
 ) -> Result<PackedStatementRef, KernelSolveError> {
@@ -5528,7 +5887,14 @@ fn definition_execution_statement_child(
         KernelStatementChildReference::Local(statement) => PackedStatementRef { owner, statement },
         KernelStatementChildReference::Owner(owner) => PackedStatementRef {
             owner,
-            statement: definition_execution_owner(owners, owner, "statement child")?
+            statement: definition_facts
+                .get(owner.0 as usize)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel packed execution statement child references missing owner {}",
+                        owner.0,
+                    ))
+                })?
                 .linkage
                 .root_statement
                 .ok_or_else(|| {
@@ -5540,7 +5906,7 @@ fn definition_execution_statement_child(
         },
     };
     definition_execution_statement(
-        owners,
+        definition_facts,
         reference.owner,
         reference.statement,
         "statement child",
@@ -5635,10 +6001,10 @@ fn definition_execution_statement_index(
 }
 
 fn definition_execution_call_syntax<'a>(
-    definition: &'a KernelProjectOwnerOutputs,
+    facts: &'a KernelDefinitionFactsInput,
     expression: KernelExpressionId,
-) -> Result<&'a KernelCallSyntaxArtifact, KernelSolveError> {
-    let mut matching = definition
+) -> Result<&'a KernelCallSyntaxInput, KernelSolveError> {
+    let mut matching = facts
         .call_syntax
         .iter()
         .filter(|syntax| syntax.expression == expression);
@@ -5658,7 +6024,8 @@ fn definition_execution_call_syntax<'a>(
 }
 
 fn append_definition_execution_statement_dependencies(
-    owners: &[KernelProjectOwnerOutputs],
+    program: &KernelProjectProgramInput,
+    definition_facts: &[KernelDefinitionFactsInput],
     expression_offsets: &[u32],
     statement_offsets: &[u32],
     root: PackedExpressionRef,
@@ -5679,7 +6046,7 @@ fn append_definition_execution_statement_dependencies(
         return Ok(());
     };
     let root_row = definition_execution_statement(
-        owners,
+        definition_facts,
         root_statement.owner,
         root_statement.statement,
         "statement dependency root",
@@ -5687,7 +6054,7 @@ fn append_definition_execution_statement_dependencies(
     statement_stack.clear();
     for child in root_row.children.iter().rev().copied() {
         statement_stack.push(definition_execution_statement_child(
-            owners,
+            definition_facts,
             root_statement.owner,
             child,
         )?);
@@ -5702,16 +6069,23 @@ fn append_definition_execution_statement_dependencies(
         }
         *seen = generation;
         let row = definition_execution_statement(
-            owners,
+            definition_facts,
             statement.owner,
             statement.statement,
             "statement dependency",
         )?;
         let value = row
             .value
-            .map(|value| {
+            .map(|encoded| {
+                let value = kernel_value_reference(
+                    &program.owners[statement.owner.0 as usize],
+                    encoded,
+                    statement.statement.0 as usize,
+                )
+                .map_err(|error| KernelSolveError::new(error.to_string()))?;
                 definition_execution_value(
-                    owners,
+                    program,
+                    definition_facts,
                     statement.owner,
                     value,
                     "statement dependency value",
@@ -5726,7 +6100,7 @@ fn append_definition_execution_statement_dependencies(
         }
         for child in row.children.iter().rev().copied() {
             statement_stack.push(definition_execution_statement_child(
-                owners,
+                definition_facts,
                 statement.owner,
                 child,
             )?);
@@ -5736,12 +6110,12 @@ fn append_definition_execution_statement_dependencies(
 }
 
 fn definition_execution_conditional_shape<'a>(
-    definition: &'a KernelProjectOwnerOutputs,
+    facts: &'a KernelDefinitionFactsInput,
     expression: KernelExpressionId,
-) -> Result<Option<&'a KernelExecutionShapeArtifact>, KernelSolveError> {
-    let mut matching = definition.execution_shapes.iter().filter(|shape| {
+) -> Result<Option<&'a KernelExecutionShapeInput>, KernelSolveError> {
+    let mut matching = facts.execution_shapes.iter().filter(|shape| {
         shape.expression() == expression
-            && matches!(shape, KernelExecutionShapeArtifact::Conditional { .. })
+            && matches!(shape, KernelExecutionShapeInput::Conditional { .. })
     });
     let shape = matching.next();
     if matching.next().is_some() {
@@ -5754,12 +6128,11 @@ fn definition_execution_conditional_shape<'a>(
 }
 
 fn definition_execution_block_shape<'a>(
-    definition: &'a KernelProjectOwnerOutputs,
+    facts: &'a KernelDefinitionFactsInput,
     expression: KernelExpressionId,
-) -> Result<&'a KernelExecutionShapeArtifact, KernelSolveError> {
-    let mut matching = definition.execution_shapes.iter().filter(|shape| {
-        shape.expression() == expression
-            && matches!(shape, KernelExecutionShapeArtifact::Block { .. })
+) -> Result<&'a KernelExecutionShapeInput, KernelSolveError> {
+    let mut matching = facts.execution_shapes.iter().filter(|shape| {
+        shape.expression() == expression && matches!(shape, KernelExecutionShapeInput::Block { .. })
     });
     let shape = matching.next().ok_or_else(|| {
         KernelSolveError::new(format!(
@@ -5778,6 +6151,7 @@ fn definition_execution_block_shape<'a>(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_definition_execution_dependencies(
+    program: &KernelProjectProgramInput,
     owners: &[KernelProjectOwnerOutputs],
     definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
@@ -5797,10 +6171,23 @@ fn collect_definition_execution_dependencies(
     dependencies.clear();
     let owner = expression.owner();
     let definition = definition_execution_owner(owners, owner, "node dependency")?;
-    let expression_row = definition
-        .expression_artifacts
+    let facts = definition_facts.get(owner.0 as usize).ok_or_else(|| {
+        KernelSolveError::new(format!(
+            "kernel packed execution references missing definition facts {}",
+            owner.0,
+        ))
+    })?;
+    let expression_row = program
+        .owners
+        .get(owner.0 as usize)
+        .ok_or_else(|| {
+            KernelSolveError::new(format!(
+                "kernel packed execution references missing owner {}",
+                owner.0,
+            ))
+        })?
+        .nodes
         .get(expression.expression().0 as usize)
-        .filter(|row| row.id == expression.expression())
         .ok_or_else(|| {
             KernelSolveError::new(format!(
                 "kernel packed execution references missing node {}:{}",
@@ -5808,14 +6195,7 @@ fn collect_definition_execution_dependencies(
                 expression.expression().0,
             ))
         })?;
-    let payload = definition_facts
-        .get(owner.0 as usize)
-        .ok_or_else(|| {
-            KernelSolveError::new(format!(
-                "kernel packed execution references missing definition facts {}",
-                owner.0,
-            ))
-        })?
+    let payload = facts
         .expression_payloads
         .get(expression.expression().0 as usize)
         .ok_or_else(|| {
@@ -5828,45 +6208,52 @@ fn collect_definition_execution_dependencies(
     if matches!(payload, KernelExpressionSemanticPayload::Delimiter) {
         return Ok(());
     }
+    let resolve_input = |input: &KernelOwnerInputEdge| {
+        kernel_value_reference(
+            &program.owners[owner.0 as usize],
+            input.expression,
+            expression.expression().0 as usize,
+        )
+        .map_err(|error| KernelSolveError::new(error.to_string()))
+    };
 
     let flat_expression = definition_execution_expression_index(expression_offsets, expression)?;
     let call_ordinal = *call_by_expression.get(flat_expression).ok_or_else(|| {
         KernelSolveError::new("kernel packed execution call index is out of range")
     })?;
     if call_ordinal != u32::MAX {
-        let call = definition
-            .calls
-            .get(call_ordinal as usize)
-            .filter(|call| call.expression == expression.expression())
+        let definition_ref = KernelDefinitionInputRef {
+            owner,
+            input: &program.owners[owner.0 as usize],
+            facts,
+            outputs: definition,
+        };
+        let call = definition_ref
+            .call(call_ordinal as usize)
+            .filter(|call| call.expression() == expression.expression())
             .ok_or_else(|| {
                 KernelSolveError::new(format!(
                     "kernel packed execution call {}:{} is missing",
                     owner.0, call_ordinal,
                 ))
             })?;
-        let abi_callable = match &call.target {
-            KernelCallTarget::User { .. } => None,
-            KernelCallTarget::RenderConstructor { .. }
-            | KernelCallTarget::PureBuiltin { .. }
-            | KernelCallTarget::FixedAbi
-            | KernelCallTarget::HostEffect { .. }
-            | KernelCallTarget::FieldProjection { .. } => {
-                let syntax = definition_execution_call_syntax(definition, expression.expression())?;
-                Some(abi.callable(&syntax.function).ok_or_else(|| {
-                    KernelSolveError::new(format!(
-                        "kernel packed execution call `{}` has no immutable ABI contract",
-                        syntax.function,
-                    ))
-                })?)
-            }
+        let user_call = call.target().is_user();
+        let abi_callable = if user_call {
+            None
+        } else {
+            let syntax = definition_execution_call_syntax(facts, expression.expression())?;
+            Some(abi.callable(&syntax.function).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel packed execution call `{}` has no immutable ABI contract",
+                    syntax.function,
+                ))
+            })?)
         };
         for input in &expression_row.inputs {
-            let consumed = match (&call.target, &input.role) {
-                (KernelCallTarget::User { .. }, KernelOwnerEdgeRole::CallArgument { .. }) => true,
-                (KernelCallTarget::User { .. }, KernelOwnerEdgeRole::CallOutArgument { .. }) => {
-                    false
-                }
-                (_, KernelOwnerEdgeRole::AbiArgument { name }) => {
+            let consumed = match (user_call, &input.role) {
+                (true, KernelOwnerEdgeRole::CallArgument { .. }) => true,
+                (true, KernelOwnerEdgeRole::CallOutArgument { .. }) => false,
+                (false, KernelOwnerEdgeRole::AbiArgument { name }) => {
                     let callable = abi_callable.expect("non-user call has an ABI contract");
                     let parameter = callable
                         .parameters
@@ -5897,10 +6284,12 @@ fn collect_definition_execution_dependencies(
                 }
             };
             if consumed {
+                let value = resolve_input(input)?;
                 dependencies.push(definition_execution_value(
-                    owners,
+                    program,
+                    definition_facts,
                     owner,
-                    input.value,
+                    value,
                     "call dependency",
                 )?);
             }
@@ -5939,10 +6328,12 @@ fn collect_definition_execution_dependencies(
                 continue;
             }
         }
+        let value = resolve_input(input)?;
         dependencies.push(definition_execution_value(
-            owners,
+            program,
+            definition_facts,
             owner,
-            input.value,
+            value,
             "expression dependency",
         )?);
     }
@@ -5957,7 +6348,8 @@ fn collect_definition_execution_dependencies(
             *statement_generation = 1;
         }
         append_definition_execution_statement_dependencies(
-            owners,
+            program,
+            definition_facts,
             expression_offsets,
             statement_offsets,
             expression,
@@ -5969,25 +6361,39 @@ fn collect_definition_execution_dependencies(
         )?;
     }
     if matches!(expression_row.kind, KernelOwnerNodeKind::Block) {
-        let KernelExecutionShapeArtifact::Block {
+        let KernelExecutionShapeInput::Block {
             bindings, result, ..
-        } = definition_execution_block_shape(definition, expression.expression())?
+        } = definition_execution_block_shape(facts, expression.expression())?
         else {
             unreachable!("BLOCK shape helper returned a non-BLOCK row")
         };
         for binding in bindings {
-            dependencies.push(definition_execution_value(
-                owners,
-                owner,
+            let value = kernel_value_reference(
+                &program.owners[owner.0 as usize],
                 binding.value,
+                expression.expression().0 as usize,
+            )
+            .map_err(|error| KernelSolveError::new(error.to_string()))?;
+            dependencies.push(definition_execution_value(
+                program,
+                definition_facts,
+                owner,
+                value,
                 "BLOCK binding dependency",
             )?);
         }
         if let Some(result) = result {
-            dependencies.push(definition_execution_value(
-                owners,
-                owner,
+            let value = kernel_value_reference(
+                &program.owners[owner.0 as usize],
                 *result,
+                expression.expression().0 as usize,
+            )
+            .map_err(|error| KernelSolveError::new(error.to_string()))?;
+            dependencies.push(definition_execution_value(
+                program,
+                definition_facts,
+                owner,
+                value,
                 "BLOCK result dependency",
             )?);
         }
@@ -5998,26 +6404,31 @@ fn collect_definition_execution_dependencies(
 }
 
 fn collect_definition_execution_selector(
+    program: &KernelProjectProgramInput,
+    definition_facts: &[KernelDefinitionFactsInput],
     owners: &[KernelProjectOwnerOutputs],
     expression: PackedExpressionRef,
     arms: &mut Vec<PackedExpressionRef>,
 ) -> Result<Option<PackedExpressionRef>, KernelSolveError> {
     arms.clear();
-    let definition = definition_execution_owner(owners, expression.owner(), "selector")?;
-    let Some(shape) = definition_execution_conditional_shape(definition, expression.expression())?
+    definition_execution_owner(owners, expression.owner(), "selector")?;
+    let facts = definition_facts
+        .get(expression.owner().0 as usize)
+        .ok_or_else(|| KernelSolveError::new("kernel packed selector facts are missing"))?;
+    let Some(shape) = definition_execution_conditional_shape(facts, expression.expression())?
     else {
         return Ok(None);
     };
-    let KernelExecutionShapeArtifact::Conditional { kind, .. } = shape else {
+    let KernelExecutionShapeInput::Conditional { kind, .. } = shape else {
         unreachable!("conditional-shape helper returned a non-conditional row")
     };
     if *kind == KernelConditionalKind::While {
         return Ok(None);
     }
-    let row = definition
-        .expression_artifacts
-        .get(expression.expression().0 as usize)
-        .filter(|row| row.id == expression.expression())
+    let row = program
+        .owners
+        .get(expression.owner().0 as usize)
+        .and_then(|definition| definition.nodes.get(expression.expression().0 as usize))
         .ok_or_else(|| KernelSolveError::new("kernel packed execution selector node is missing"))?;
     let mut selector_inputs = row
         .inputs
@@ -6042,44 +6453,65 @@ fn collect_definition_execution_selector(
         .iter()
         .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenArm))
     {
+        let value = kernel_value_reference(
+            &program.owners[expression.owner().0 as usize],
+            arm.expression,
+            expression.expression().0 as usize,
+        )
+        .map_err(|error| KernelSolveError::new(error.to_string()))?;
         arms.push(definition_execution_value(
-            owners,
+            program,
+            definition_facts,
             expression.owner(),
-            arm.value,
+            value,
             "WHEN arm",
         )?);
     }
-    definition_execution_value(owners, expression.owner(), selector.value, "WHEN selector")
-        .map(Some)
+    let selector = kernel_value_reference(
+        &program.owners[expression.owner().0 as usize],
+        selector.expression,
+        expression.expression().0 as usize,
+    )
+    .map_err(|error| KernelSolveError::new(error.to_string()))?;
+    definition_execution_value(
+        program,
+        definition_facts,
+        expression.owner(),
+        selector,
+        "WHEN selector",
+    )
+    .map(Some)
 }
 
 fn build_definition_execution_code(
+    program: &KernelProjectProgramInput,
     owners: &[KernelProjectOwnerOutputs],
     definition_facts: &[KernelDefinitionFactsInput],
     abi: &crate::KernelAbiInput,
     builder: &mut DefinitionCodeBuilder,
 ) -> Result<(), KernelSolveError> {
     let expression_offsets = definition_execution_offsets(
-        owners.iter().map(|owner| owner.expression_artifacts.len()),
+        program.owners.iter().map(|owner| owner.nodes.len()),
         "expression",
     )?;
     let statement_offsets = definition_execution_offsets(
-        owners.iter().map(|owner| owner.statements.len()),
+        definition_facts.iter().map(|facts| facts.statements.len()),
         "statement",
     )?;
     let expression_count = expression_offsets.last().copied().unwrap_or(0) as usize;
     let statement_count = statement_offsets.last().copied().unwrap_or(0) as usize;
-    let dependency_capacity = owners
+    let dependency_capacity = program
+        .owners
         .iter()
-        .flat_map(|owner| owner.expression_artifacts.iter())
+        .flat_map(|owner| owner.nodes.iter())
         .map(|expression| expression.inputs.len())
         .sum::<usize>()
         .saturating_add(
-            owners
+            definition_facts
                 .iter()
-                .flat_map(|owner| owner.execution_shapes.iter())
+                .flat_map(|facts| facts.execution_shapes.iter())
                 .map(|shape| match shape {
-                    KernelExecutionShapeArtifact::Block {
+                    KernelExecutionShapeInput::Block {
                         bindings, result, ..
                     } => bindings.len().saturating_add(usize::from(result.is_some())),
                     _ => 0,
@@ -6087,22 +6519,23 @@ fn build_definition_execution_code(
                 .sum(),
         )
         .saturating_add(statement_count);
-    let selector_capacity = owners
+    let selector_capacity = definition_facts
         .iter()
-        .flat_map(|owner| owner.execution_shapes.iter())
+        .flat_map(|facts| facts.execution_shapes.iter())
         .filter(|shape| {
             matches!(
                 shape,
-                KernelExecutionShapeArtifact::Conditional {
+                KernelExecutionShapeInput::Conditional {
                     kind: KernelConditionalKind::When,
                     ..
                 }
             )
         })
         .count();
-    let selector_arm_capacity = owners
+    let selector_arm_capacity = program
+        .owners
         .iter()
-        .flat_map(|owner| owner.expression_artifacts.iter())
+        .flat_map(|owner| owner.nodes.iter())
         .flat_map(|expression| expression.inputs.iter())
         .filter(|input| matches!(input.role, KernelOwnerEdgeRole::WhenArm))
         .count();
@@ -6121,12 +6554,13 @@ fn build_definition_execution_code(
     let mut read_provider_callable = vec![None; expression_count];
 
     for (owner_index, definition) in owners.iter().enumerate() {
+        let facts = &definition_facts[owner_index];
         let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
             KernelSolveError::new("kernel packed execution definition count exceeds u32")
         })?);
         for (ordinal, call) in definition.calls.iter().enumerate() {
             let expression = definition_execution_expression(
-                owners,
+                program,
                 owner,
                 call.expression,
                 "call reverse index",
@@ -6145,15 +6579,26 @@ fn build_definition_execution_code(
                 )));
             }
         }
-        for statement in &definition.statements {
+        for statement in &facts.statements {
             if statement.children.is_empty() {
                 continue;
             }
-            let Some(value) = statement.value else {
+            let Some(encoded) = statement.value else {
                 continue;
             };
-            let expression =
-                definition_execution_value(owners, owner, value, "statement reverse index")?;
+            let value = kernel_value_reference(
+                &program.owners[owner_index],
+                encoded,
+                statement.id.0 as usize,
+            )
+            .map_err(|error| KernelSolveError::new(error.to_string()))?;
+            let expression = definition_execution_value(
+                program,
+                definition_facts,
+                owner,
+                value,
+                "statement reverse index",
+            )?;
             let index = definition_execution_expression_index(&expression_offsets, expression)?;
             if statement_root_by_expression[index].is_none() {
                 statement_root_by_expression[index] = Some(PackedStatementRef {
@@ -6162,10 +6607,14 @@ fn build_definition_execution_code(
                 });
             }
         }
-        for binding in &definition.lexical_bindings {
-            let expression =
-                definition_execution_expression(owners, owner, binding.expression, "lexical read")?;
-            let expression_row = &definition.expression_artifacts[binding.expression.0 as usize];
+        for binding in &facts.lexical_bindings {
+            let expression = definition_execution_expression(
+                program,
+                owner,
+                binding.expression,
+                "lexical read",
+            )?;
+            let expression_row = &program.owners[owner_index].nodes[binding.expression.0 as usize];
             if !expression_row
                 .inputs
                 .iter()
@@ -6182,19 +6631,15 @@ fn build_definition_execution_code(
             }
             read_provider_present[index] = true;
             read_provider_callable[index] = match binding.target {
-                KernelLexicalBindingTarget::Declaration(reference) => {
+                KernelLexicalBindingTargetInput::Declaration(reference) => {
                     let declaration = definition_execution_declaration(
-                        owners,
+                        definition_facts,
                         owner,
                         reference,
                         "lexical read target",
                     )?;
-                    let target = &definition_execution_owner(
-                        owners,
-                        declaration.owner,
-                        "lexical read target",
-                    )?
-                    .declarations[declaration.declaration.0 as usize];
+                    let target = &definition_facts[declaration.owner.0 as usize].declarations
+                        [declaration.declaration.0 as usize];
                     if target.value.is_none() {
                         None
                     } else {
@@ -6217,7 +6662,6 @@ fn build_definition_execution_code(
                             ))
                         })?;
                         definition_execution_scope_callable(
-                            owners,
                             definition_facts,
                             declaration.owner,
                             presentation.scope,
@@ -6225,9 +6669,9 @@ fn build_definition_execution_code(
                         )?
                     }
                 }
-                KernelLexicalBindingTarget::ContextFormal { .. }
-                | KernelLexicalBindingTarget::Value { .. }
-                | KernelLexicalBindingTarget::RuntimeContext => None,
+                KernelLexicalBindingTargetInput::ContextFormal { .. }
+                | KernelLexicalBindingTargetInput::Value { .. }
+                | KernelLexicalBindingTargetInput::RuntimeContext => None,
             };
         }
     }
@@ -6248,33 +6692,38 @@ fn build_definition_execution_code(
     let mut statement_generation = 0_u32;
     let mut statement_stack = Vec::<PackedStatementRef>::new();
 
-    for (owner_index, definition) in owners.iter().enumerate() {
+    for owner_index in 0..owners.len() {
+        let facts = &definition_facts[owner_index];
         let owner = KernelOwnerId(u32::try_from(owner_index).map_err(|_| {
             KernelSolveError::new("kernel packed execution definition count exceeds u32")
         })?);
-        let Some(root_statement) = definition.linkage.root_statement else {
+        let Some(root_statement) = facts.linkage.root_statement else {
             continue;
         };
-        let root_statement =
-            definition_execution_statement(owners, owner, root_statement, "template root")?;
+        let root_statement = definition_execution_statement(
+            definition_facts,
+            owner,
+            root_statement,
+            "template root",
+        )?;
         if !matches!(root_statement.kind, KernelStatementKind::Function { .. }) {
             continue;
         }
-        let result = definition.linkage.result_expression.ok_or_else(|| {
+        let result = facts.linkage.result_expression.ok_or_else(|| {
             KernelSolveError::new(format!(
                 "kernel packed callable definition {} has no result expression",
                 owner.0,
             ))
         })?;
-        let result = definition_execution_expression(owners, owner, result, "template result")?;
-        let public_declaration = definition.linkage.public_declaration.ok_or_else(|| {
+        let result = definition_execution_expression(program, owner, result, "template result")?;
+        let public_declaration = facts.linkage.public_declaration.ok_or_else(|| {
             KernelSolveError::new(format!(
                 "kernel packed callable definition {} has no public declaration",
                 owner.0,
             ))
         })?;
         let template_callable = definition_execution_declaration(
-            owners,
+            definition_facts,
             owner,
             public_declaration,
             "template callable",
@@ -6317,6 +6766,7 @@ fn build_definition_execution_code(
 
             if dependency_starts[index] == u32::MAX {
                 collect_definition_execution_dependencies(
+                    program,
                     owners,
                     definition_facts,
                     abi,
@@ -6381,8 +6831,13 @@ fn build_definition_execution_code(
             if let Some(call) = call {
                 calls.push(call);
             }
-            let selector =
-                collect_definition_execution_selector(owners, expression, &mut selector_arms)?;
+            let selector = collect_definition_execution_selector(
+                program,
+                definition_facts,
+                owners,
+                expression,
+                &mut selector_arms,
+            )?;
             builder.push_execution_node(
                 token,
                 expression,
@@ -6635,90 +7090,194 @@ fn definition_code_types_stable_digest(
     Ok(digest.finalize().into())
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static TEST_COMPATIBILITY_DEFINITION_MATERIALIZATIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_compatibility_definition_materializations() {
+    TEST_COMPATIBILITY_DEFINITION_MATERIALIZATIONS.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn test_compatibility_definition_materializations() -> usize {
+    TEST_COMPATIBILITY_DEFINITION_MATERIALIZATIONS.get()
+}
+
 fn materialize_project_definition_structures(
-    owners: Box<[KernelProjectOwnerOutputs]>,
-    synthetic_state_ordinals: Box<[Box<[Option<u32>]>]>,
+    program: &KernelProjectProgramInput,
+    definition_facts: &[KernelDefinitionFactsInput],
+    owners: &[KernelProjectOwnerOutputs],
+    synthetic_state_ordinals: &[Box<[Option<u32>]>],
     owner_effects: &[KernelEffectSummary],
+    demanded: Option<&[KernelOwnerId]>,
 ) -> Result<Box<[DefinitionArtifact]>, KernelSolveError> {
+    if program.owners.len() != owners.len() || definition_facts.len() != owners.len() {
+        return Err(KernelSolveError::new(
+            "kernel structural publication received mismatched program authorities",
+        ));
+    }
     if owners.len() != synthetic_state_ordinals.len() {
         return Err(KernelSolveError::new(
             "kernel structural definition rows and synthetic state paths differ in length",
         ));
     }
     owners
-        .into_vec()
-        .into_iter()
-        .zip(synthetic_state_ordinals.into_vec())
-        .map(|(owner, synthetic_state_ordinals)| {
-            if owner.resources.states.len() != synthetic_state_ordinals.len() {
+        .iter()
+        .zip(synthetic_state_ordinals)
+        .enumerate()
+        .filter(|(owner_index, _)| {
+            demanded.is_none_or(|demanded| {
+                demanded
+                    .binary_search(&KernelOwnerId(
+                        u32::try_from(*owner_index)
+                            .expect("kernel definition count exceeds the dense u32 namespace"),
+                    ))
+                    .is_ok()
+            })
+        })
+        .map(|(owner_index, (owner, synthetic_state_ordinals))| {
+            #[cfg(test)]
+            TEST_COMPATIBILITY_DEFINITION_MATERIALIZATIONS
+                .set(TEST_COMPATIBILITY_DEFINITION_MATERIALIZATIONS.get() + 1);
+            let input = &program.owners[owner_index];
+            let facts = &definition_facts[owner_index];
+            if facts.states.len() != synthetic_state_ordinals.len() {
                 return Err(KernelSolveError::new(
                     "kernel structural state rows and synthetic paths differ in length",
                 ));
             }
-            let expressions = owner
-                .expression_artifacts
-                .into_vec()
-                .into_iter()
-                .map(|expression| {
-                    let effect = direct_expression_effect(&expression.kind, owner_effects);
-                    KernelExpressionArtifact {
-                        id: expression.id,
-                        kind: expression.kind.into(),
-                        inputs: expression.inputs,
-                        effect,
-                    }
+            let expressions = input
+                .nodes
+                .iter()
+                .enumerate()
+                .map(|(index, expression)| {
+                    let id = KernelExpressionId(
+                        u32::try_from(index).expect("kernel expression count exceeds u32"),
+                    );
+                    let inputs = expression
+                        .inputs
+                        .iter()
+                        .map(|edge| {
+                            Ok(KernelExpressionInputArtifact {
+                                role: edge.role.clone(),
+                                value: kernel_value_reference(input, edge.expression, index)
+                                    .map_err(|error| KernelSolveError::new(error.to_string()))?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, KernelSolveError>>()?
+                        .into_boxed_slice();
+                    Ok(KernelExpressionArtifact {
+                        id,
+                        kind: (&expression.kind).into(),
+                        inputs,
+                        effect: direct_expression_effect(&expression.kind, owner_effects),
+                    })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, KernelSolveError>>()?
                 .into_boxed_slice();
-            let declarations = owner
+            let statements = collect_statement_artifacts(input, facts)
+                .map_err(|error| KernelSolveError::new(error.to_string()))?;
+            let execution_shapes = collect_execution_shape_artifacts(input, facts)
+                .map_err(|error| KernelSolveError::new(error.to_string()))?;
+            let call_syntax = collect_call_syntax_artifacts(input, facts)
+                .map_err(|error| KernelSolveError::new(error.to_string()))?;
+            let declarations = facts
                 .declarations
-                .into_vec()
-                .into_iter()
-                .map(|declaration| KernelDeclarationArtifact {
-                    id: declaration.id,
-                    origin: declaration.origin,
-                    name: declaration.name,
-                    kind: declaration.kind,
-                    value: declaration.value,
+                .iter()
+                .map(|declaration| {
+                    Ok(KernelDeclarationArtifact {
+                        id: declaration.id,
+                        origin: declaration.origin.clone(),
+                        name: declaration.name.clone(),
+                        kind: declaration.kind,
+                        value: declaration
+                            .value
+                            .map(|value| {
+                                kernel_value_reference(input, value, declaration.id.0 as usize)
+                                    .map_err(|error| KernelSolveError::new(error.to_string()))
+                            })
+                            .transpose()?,
+                    })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, KernelSolveError>>()?
                 .into_boxed_slice();
-            let calls = owner
-                .calls
-                .into_vec()
-                .into_iter()
-                .map(|call| KernelCallArtifact {
-                    expression: call.expression,
-                    target: call.target,
-                    inputs: call.inputs,
+            let lexical_bindings = collect_lexical_binding_artifacts(input, facts)
+                .map_err(|error| KernelSolveError::new(error.to_string()))?;
+            let definition = KernelDefinitionInputRef {
+                owner: KernelOwnerId(
+                    u32::try_from(owner_index).expect("kernel definition count exceeds u32"),
+                ),
+                input,
+                facts,
+                outputs: owner,
+            };
+            let calls = definition
+                .calls()
+                .map(|call| {
+                    let inputs = call
+                        .inputs()
+                        .iter()
+                        .map(|edge| {
+                            let role = match call
+                                .input_role(edge)
+                                .map_err(|error| KernelSolveError::new(error.to_string()))?
+                            {
+                                KernelCallInputRoleRef::Formal { ordinal } => {
+                                    KernelCallInputRole::Formal { ordinal }
+                                }
+                                KernelCallInputRoleRef::Abi { name } => {
+                                    KernelCallInputRole::Abi { name: name.into() }
+                                }
+                            };
+                            Ok(KernelCallInputArtifact {
+                                role,
+                                value: call
+                                    .input_value(edge)
+                                    .map_err(|error| KernelSolveError::new(error.to_string()))?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, KernelSolveError>>()?
+                        .into_boxed_slice();
+                    Ok(KernelCallArtifact {
+                        expression: call.expression(),
+                        target: call.target().to_owned(),
+                        inputs,
+                    })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, KernelSolveError>>()?
                 .into_boxed_slice();
-            let sources = owner
-                .resources
+            let sources = facts
                 .sources
-                .into_vec()
-                .into_iter()
+                .iter()
                 .map(|source| KernelSourceArtifact {
                     id: source.id,
                     declaration: source.declaration,
                     statement: source.statement,
                     expression: source.expression,
-                    path: source.path,
+                    path: KernelSemanticPath {
+                        anchor: source.declaration,
+                        projection: source.projection.clone(),
+                    },
                     interval_ms: source.interval_ms,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            let states = owner
-                .resources
+            let states = facts
                 .states
-                .into_vec()
-                .into_iter()
-                .zip(synthetic_state_ordinals)
-                .filter(|(state, _)| state_candidate_survives(state, &owner.expression_modes))
+                .iter()
+                .zip(synthetic_state_ordinals.iter().copied())
+                .filter(|(state, _)| {
+                    state_input_candidate_survives(input, state, &owner.expression_modes)
+                })
                 .enumerate()
                 .map(|(index, (state, synthetic_ordinal))| {
-                    let mut path = state.path;
+                    let mut path = KernelSemanticPath {
+                        anchor: state.declaration,
+                        projection: state.projection.clone(),
+                    };
                     if state.synthetic_path {
                         let ordinal = synthetic_ordinal.expect(
                             "surviving synthetic state candidate has no allocated path ordinal",
@@ -6729,7 +7288,7 @@ fn materialize_project_definition_structures(
                     } else {
                         debug_assert!(synthetic_ordinal.is_none());
                     }
-                    KernelStateArtifact {
+                    Ok(KernelStateArtifact {
                         id: KernelStateId(
                             u32::try_from(index)
                                 .expect("kernel materialized state count exceeds u32"),
@@ -6738,39 +7297,46 @@ fn materialize_project_definition_structures(
                         declaration: state.declaration,
                         statement: state.statement,
                         expression: state.expression,
-                        initial: state.initial,
+                        initial: kernel_value_reference(
+                            input,
+                            state.initial,
+                            state.expression.0 as usize,
+                        )
+                        .map_err(|error| KernelSolveError::new(error.to_string()))?,
                         path,
                         kind: state.kind,
-                    }
+                    })
                 })
-                .collect::<Vec<_>>()
+                .collect::<Result<Vec<_>, KernelSolveError>>()?
                 .into_boxed_slice();
-            let lists = owner
-                .resources
+            let lists = facts
                 .lists
-                .into_vec()
-                .into_iter()
+                .iter()
                 .map(|list| KernelListArtifact {
                     id: list.id,
                     declaration: list.declaration,
                     statement: list.statement,
                     producer: list.producer,
-                    path: list.path,
+                    path: KernelSemanticPath {
+                        anchor: list.declaration,
+                        projection: list.projection.clone(),
+                    },
                     capacity: list.capacity,
                     key_policy: list.key_policy,
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
             Ok(DefinitionArtifact {
-                linkage: owner.linkage,
-                call_syntax: owner.call_syntax,
-                execution_shapes: owner.execution_shapes,
+                linkage: facts.linkage,
+                call_syntax,
+                execution_shapes,
                 expressions,
-                statements: owner.statements,
+                statements,
                 declarations,
-                lexical_bindings: owner.lexical_bindings,
+                lexical_bindings,
                 calls,
-                effects: owner.effects,
+                effects: collect_host_effect_artifacts(input)
+                    .map_err(|error| KernelSolveError::new(error.to_string()))?,
                 sources,
                 states,
                 lists,
@@ -6822,6 +7388,7 @@ impl ProjectExpressionFlushTerms {
 }
 
 fn project_expression_flush_terms(
+    program: &KernelProjectProgramInput,
     owners: &[KernelProjectOwnerOutputs],
     artifact: &mut UnsealedComponentArtifact,
 ) -> Result<ProjectExpressionFlushTerms, KernelSolveError> {
@@ -6899,8 +7466,8 @@ fn project_expression_flush_terms(
 
     let mut dependency_counts = vec![0_u32; total];
     let mut base_counts = vec![0_u32; total];
-    for (owner_index, owner) in owners.iter().enumerate() {
-        for (local, expression) in owner.expression_artifacts.iter().enumerate() {
+    for (owner_index, input) in program.owners.iter().enumerate() {
+        for (local, expression) in input.nodes.iter().enumerate() {
             let index = definition_offsets[owner_index] as usize + local;
             let carries_input_flush = |role: &KernelOwnerEdgeRole| match &expression.kind {
                 KernelOwnerNodeKind::Record { .. } | KernelOwnerNodeKind::Block => false,
@@ -6912,7 +7479,10 @@ fn project_expression_flush_terms(
                 .iter()
                 .filter(|input| carries_input_flush(&input.role))
             {
-                if value_index(owner_index, input.value).is_some() {
+                let value =
+                    kernel_value_reference(&program.owners[owner_index], input.expression, local)
+                        .map_err(|error| KernelSolveError::new(error.to_string()))?;
+                if value_index(owner_index, value).is_some() {
                     dependency_counts[index] =
                         dependency_counts[index].checked_add(1).ok_or_else(|| {
                             KernelSolveError::new("kernel FLUSH dependency count exceeds u32")
@@ -6933,7 +7503,13 @@ fn project_expression_flush_terms(
                     .iter()
                     .filter(|input| matches!(input.role, KernelOwnerEdgeRole::FlushPayload))
                 {
-                    if value_term(owner_index, payload.value, artifact).is_some() {
+                    let value = kernel_value_reference(
+                        &program.owners[owner_index],
+                        payload.expression,
+                        local,
+                    )
+                    .map_err(|error| KernelSolveError::new(error.to_string()))?;
+                    if value_term(owner_index, value, artifact).is_some() {
                         base_counts[index] =
                             base_counts[index].checked_add(1).ok_or_else(|| {
                                 KernelSolveError::new("kernel FLUSH base count exceeds u32")
@@ -6967,8 +7543,8 @@ fn project_expression_flush_terms(
     let mut bases = vec![artifact.terms().absent(); base_len];
     let mut dependency_cursors = dependency_offsets[..total].to_vec();
     let mut base_cursors = base_offsets[..total].to_vec();
-    for (owner_index, owner) in owners.iter().enumerate() {
-        for (local, expression) in owner.expression_artifacts.iter().enumerate() {
+    for (owner_index, input) in program.owners.iter().enumerate() {
+        for (local, expression) in input.nodes.iter().enumerate() {
             let index = definition_offsets[owner_index] as usize + local;
             let carries_input_flush = |role: &KernelOwnerEdgeRole| match &expression.kind {
                 KernelOwnerNodeKind::Record { .. } | KernelOwnerNodeKind::Block => false,
@@ -6980,7 +7556,10 @@ fn project_expression_flush_terms(
                 .iter()
                 .filter(|input| carries_input_flush(&input.role))
             {
-                if let Some(provider) = value_index(owner_index, input.value) {
+                let value =
+                    kernel_value_reference(&program.owners[owner_index], input.expression, local)
+                        .map_err(|error| KernelSolveError::new(error.to_string()))?;
+                if let Some(provider) = value_index(owner_index, value) {
                     let cursor = &mut dependency_cursors[index];
                     dependencies[*cursor as usize] = provider;
                     *cursor += 1;
@@ -6999,7 +7578,13 @@ fn project_expression_flush_terms(
                     .iter()
                     .filter(|input| matches!(input.role, KernelOwnerEdgeRole::FlushPayload))
                 {
-                    if let Some(term) = value_term(owner_index, payload.value, artifact) {
+                    let value = kernel_value_reference(
+                        &program.owners[owner_index],
+                        payload.expression,
+                        local,
+                    )
+                    .map_err(|error| KernelSolveError::new(error.to_string()))?;
+                    if let Some(term) = value_term(owner_index, value, artifact) {
                         let cursor = &mut base_cursors[index];
                         bases[*cursor as usize] = term;
                         *cursor += 1;
@@ -7184,18 +7769,23 @@ fn local_expression_effect(kind: &KernelOwnerNodeKind) -> KernelEffectSummary {
 /// graph. Effects form a four-bit monotone lattice, so reverse-call consumers
 /// converge by queue exhaustion even for recursive call components.
 fn project_owner_effect_summaries(
-    owners: &[KernelProjectOwnerOutputs],
+    program: &KernelProjectProgramInput,
+    definition_facts: &[KernelDefinitionFactsInput],
 ) -> Box<[KernelEffectSummary]> {
-    let mut summaries = owners
+    debug_assert_eq!(definition_facts.len(), program.owners.len());
+    let mut summaries = program
+        .owners
         .iter()
-        .map(|owner| {
-            let mut summary = owner.expression_artifacts.iter().fold(
-                KernelEffectSummary::default(),
-                |summary, expression| {
-                    merge_kernel_effects(summary, local_expression_effect(&expression.kind))
-                },
-            );
-            for declaration in &owner.declarations {
+        .zip(definition_facts)
+        .map(|(input, facts)| {
+            let mut summary =
+                input
+                    .nodes
+                    .iter()
+                    .fold(KernelEffectSummary::default(), |summary, expression| {
+                        merge_kernel_effects(summary, local_expression_effect(&expression.kind))
+                    });
+            for declaration in &facts.declarations {
                 match declaration.kind {
                     KernelDeclarationKind::Source => summary.emits_source = true,
                     KernelDeclarationKind::Hold => {
@@ -7215,9 +7805,9 @@ fn project_owner_effect_summaries(
             summary
         })
         .collect::<Vec<_>>();
-    let mut consumers = vec![Vec::<usize>::new(); owners.len()];
-    for (caller, owner) in owners.iter().enumerate() {
-        for target in owner.expression_artifacts.iter().filter_map(|expression| {
+    let mut consumers = vec![Vec::<usize>::new(); program.owners.len()];
+    for (caller, owner) in program.owners.iter().enumerate() {
+        for target in owner.nodes.iter().filter_map(|expression| {
             let KernelOwnerNodeKind::UserCall { target, .. } = &expression.kind else {
                 return None;
             };
@@ -7232,8 +7822,8 @@ fn project_owner_effect_summaries(
         target_consumers.sort_unstable();
         target_consumers.dedup();
     }
-    let mut queued = vec![true; owners.len()];
-    let mut pending = (0..owners.len()).collect::<VecDeque<_>>();
+    let mut queued = vec![true; program.owners.len()];
+    let mut pending = (0..program.owners.len()).collect::<VecDeque<_>>();
     while let Some(target) = pending.pop_front() {
         queued[target] = false;
         let target_summary = summaries[target];
@@ -7264,7 +7854,11 @@ fn direct_expression_effect(
     }
 }
 
-fn interface_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputId]> {
+fn interface_output_demand(
+    program: &KernelProjectProgramInput,
+    definition_facts: &[KernelDefinitionFactsInput],
+    owners: &[KernelProjectOwnerOutputs],
+) -> Box<[OutputId]> {
     fn insert_value(
         outputs: &mut Vec<OutputId>,
         owners: &[KernelProjectOwnerOutputs],
@@ -7291,25 +7885,48 @@ fn interface_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputI
         }
     }
 
+    debug_assert_eq!(program.owners.len(), owners.len());
+    debug_assert_eq!(definition_facts.len(), owners.len());
     let estimated = owners
         .iter()
-        .map(|owner| {
-            owner.formals.len() + owner.calls.len() * 2 + owner.diagnostic_values.len() + 1
+        .enumerate()
+        .map(|(index, owner)| {
+            owner.formals.len()
+                + owner.calls.len() * 2
+                + definition_facts[index].diagnostic_values.len()
+                + 1
         })
         .sum();
     let mut outputs = Vec::with_capacity(estimated);
-    for (owner_index, owner) in owners.iter().enumerate() {
-        outputs.push(owner.result);
-        outputs.extend_from_slice(&owner.formals);
-        for call in owner.calls.iter() {
-            for input in call.inputs.iter() {
-                insert_value(&mut outputs, owners, owner_index, input.value);
+    let definitions = KernelProjectDefinitionRefs::new(program, definition_facts, owners)
+        .expect("validated definition authorities remain aligned");
+    for definition in definitions.definitions() {
+        let owner_index = definition.owner.0 as usize;
+        outputs.push(definition.outputs.result);
+        outputs.extend_from_slice(&definition.outputs.formals);
+        for call in definition.calls() {
+            for input in call.inputs() {
+                insert_value(
+                    &mut outputs,
+                    owners,
+                    owner_index,
+                    call.input_value(input)
+                        .expect("validated call input remains in its definition namespace"),
+                );
             }
-            if let Some(output) = call.syntax_discriminated_root_output {
+            if let Some(output) = call.solve.syntax_discriminated_root_output {
                 outputs.push(output);
             }
         }
-        for value in owner.diagnostic_values.iter().copied() {
+        for value in definition_facts[owner_index]
+            .diagnostic_values
+            .iter()
+            .copied()
+            .map(|value| {
+                kernel_value_reference(&program.owners[owner_index], value, value.0 as usize)
+                    .expect("validated diagnostic value remains in its definition namespace")
+            })
+        {
             insert_value(&mut outputs, owners, owner_index, value);
         }
     }
@@ -7322,18 +7939,27 @@ fn interface_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputI
 /// can be wider than every individual input. Checked-call substitutions must
 /// publish that result type even when the source ignores the call value, while
 /// the diagnostics-only interface demand deliberately remains smaller.
-fn checked_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputId]> {
-    let mut outputs = interface_output_demand(owners).into_vec();
-    for owner in owners {
-        for call in &owner.calls {
+fn checked_output_demand(
+    program: &KernelProjectProgramInput,
+    definition_facts: &[KernelDefinitionFactsInput],
+    owners: &[KernelProjectOwnerOutputs],
+) -> Box<[OutputId]> {
+    let mut outputs = interface_output_demand(program, definition_facts, owners).into_vec();
+    let definitions = KernelProjectDefinitionRefs::new(program, definition_facts, owners)
+        .expect("validated definition authorities remain aligned");
+    for definition in definitions.definitions() {
+        for call in definition.calls() {
             if matches!(
-                call.target,
-                KernelCallTarget::PureBuiltin {
+                call.target(),
+                KernelCallTargetRef::PureBuiltin {
                     kind: KernelPureBuiltinKind::ListAppend
                         | KernelPureBuiltinKind::MapUpsert
                         | KernelPureBuiltinKind::SetAdd,
                 }
-            ) && let Some(output) = owner.expressions.get(call.expression.0 as usize)
+            ) && let Some(output) = definition
+                .outputs
+                .expressions
+                .get(call.expression().0 as usize)
             {
                 outputs.push(*output);
             }
@@ -7345,6 +7971,8 @@ fn checked_output_demand(owners: &[KernelProjectOwnerOutputs]) -> Box<[OutputId]
 }
 
 fn project_interface_snapshot(
+    program: &KernelProjectProgramInput,
+    definition_facts: &[KernelDefinitionFactsInput],
     owners: &[KernelProjectOwnerOutputs],
     artifact: &ComponentOutputSnapshot,
     solved_results: &[FlowType],
@@ -7356,8 +7984,16 @@ fn project_interface_snapshot(
     let mut diagnostics = Vec::new();
     let mut diagnostic_values = Vec::new();
     for (owner, (formals, result)) in solved_formals.iter().zip(solved_results).enumerate() {
-        let owner_value_types = owners[owner]
+        let owner_values = definition_facts[owner]
             .diagnostic_values
+            .iter()
+            .copied()
+            .map(|value| {
+                kernel_value_reference(&program.owners[owner], value, value.0 as usize)
+                    .expect("validated diagnostic value remains in its definition namespace")
+            })
+            .collect::<Vec<_>>();
+        let owner_value_types = owner_values
             .iter()
             .map(|value| {
                 project_call_value_type(owner, *value, owners, artifact, solved_results)
@@ -7376,8 +8012,7 @@ fn project_interface_snapshot(
         public_results.push(result);
         diagnostics.extend(owner_diagnostics);
         diagnostic_values.extend(
-            owners[owner]
-                .diagnostic_values
+            owner_values
                 .iter()
                 .copied()
                 .zip(owner_value_types)
@@ -7410,6 +8045,8 @@ fn project_interface_snapshot(
 /// exact call-result syntax receipts; diagnostics demand deliberately neither
 /// computes nor roots those checked-only facts.
 fn project_call_facts_and_diagnostics(
+    program: &KernelProjectProgramInput,
+    definition_facts: &[KernelDefinitionFactsInput],
     owners: &[KernelProjectOwnerOutputs],
     abi: &crate::KernelAbiInput,
     artifact: &ComponentOutputSnapshot,
@@ -7423,15 +8060,20 @@ fn project_call_facts_and_diagnostics(
 ) {
     let mut project_call_facts = Vec::with_capacity(owners.len());
     let mut project_diagnostics = Vec::with_capacity(owners.len());
-    for (owner_index, owner) in owners.iter().enumerate() {
-        let owner_id = KernelOwnerId(
-            u32::try_from(owner_index)
-                .expect("kernel diagnostic owner count exceeds the dense u32 namespace"),
-        );
+    let definitions = KernelProjectDefinitionRefs::new(program, definition_facts, owners)
+        .expect("validated definition authorities remain aligned");
+    for definition in definitions.definitions() {
+        let owner_index = definition.owner.0 as usize;
+        let owner_id = definition.owner;
+        let owner = definition.outputs;
         let mut owner_call_facts = Vec::with_capacity(owner.calls.len());
-        let mut diagnostics = owner.diagnostics.to_vec();
-        for call in owner.calls.iter() {
-            let substitutions = if let KernelCallTarget::User { target, .. } = call.target {
+        let mut diagnostics =
+            collect_definition_diagnostic_artifacts(owner_id, definition.input, definition.facts)
+                .expect("validated definition diagnostics remain structurally valid")
+                .into_vec();
+        for call in definition.calls() {
+            let call_target = call.target();
+            let substitutions = if let KernelCallTargetRef::User { target, .. } = call_target {
                 let target_formals = public_formals
                     .get(target.0 as usize)
                     .expect("validated kernel call target has public formals");
@@ -7440,15 +8082,17 @@ fn project_call_facts_and_diagnostics(
                     .expect("validated kernel call target has a public result");
 
                 let mut actuals = call
-                    .inputs
+                    .inputs()
                     .iter()
                     .filter_map(|input| {
-                        let KernelCallInputRole::Formal { ordinal } = input.role else {
+                        let Ok(KernelCallInputRoleRef::Formal { ordinal }) = call.input_role(input)
+                        else {
                             return None;
                         };
+                        let value = call.input_value(input).ok()?;
                         project_call_value_type(
                             owner_index,
-                            input.value,
+                            value,
                             owners,
                             artifact,
                             public_results,
@@ -7456,10 +8100,10 @@ fn project_call_facts_and_diagnostics(
                         .map(|actual| (ordinal, actual))
                     })
                     .collect::<Vec<_>>();
-                if let KernelCallTarget::User {
+                if let KernelCallTargetRef::User {
                     inherited_formal: Some(inherited),
                     ..
-                } = call.target
+                } = call_target
                     && let Some(actual) = public_formals
                         .get(owner_index)
                         .and_then(|formals| formals.get(inherited.caller_ordinal as usize))
@@ -7476,8 +8120,9 @@ fn project_call_facts_and_diagnostics(
                 // requirements are propagated through the separate formal
                 // requirement channel and are intentionally not diagnosed as
                 // an explicit argument error here.
-                for input in call.inputs.iter() {
-                    let KernelCallInputRole::Formal { ordinal } = input.role else {
+                for input in call.inputs() {
+                    let Ok(KernelCallInputRoleRef::Formal { ordinal }) = call.input_role(input)
+                    else {
                         continue;
                     };
                     if owners.get(target.0 as usize).is_some_and(|target| {
@@ -7492,9 +8137,12 @@ fn project_call_facts_and_diagnostics(
                         // contract for this occurrence.
                         continue;
                     }
+                    let Ok(value) = call.input_value(input) else {
+                        continue;
+                    };
                     let Some(actual) = project_call_value_type(
                         owner_index,
-                        input.value,
+                        value,
                         owners,
                         artifact,
                         public_results,
@@ -7518,7 +8166,7 @@ fn project_call_facts_and_diagnostics(
                         owner: owner_id,
                         severity: KernelDiagnosticSeverity::Error,
                         site: KernelDiagnosticSite::CallInput {
-                            call: call.expression,
+                            call: call.expression(),
                             target,
                             formal_ordinal: ordinal,
                         },
@@ -7533,7 +8181,6 @@ fn project_call_facts_and_diagnostics(
             } else if retain_call_facts {
                 project_abi_call_type_substitutions(
                     owner_index,
-                    owner,
                     call,
                     owners,
                     abi,
@@ -7546,7 +8193,7 @@ fn project_call_facts_and_diagnostics(
             if !retain_call_facts {
                 continue;
             }
-            let result_output = owner.expressions.get(call.expression.0 as usize).copied();
+            let result_output = owner.expressions.get(call.expression().0 as usize).copied();
             let result_is_concrete = result_output.is_some_and(|output| {
                 packed_artifact.map_or_else(
                     || {
@@ -7572,9 +8219,9 @@ fn project_call_facts_and_diagnostics(
                 )
             });
             let exact_structural_constructor = matches!(
-                &call.target,
-                KernelCallTarget::RenderConstructor { .. }
-                    | KernelCallTarget::PureBuiltin {
+                call_target,
+                KernelCallTargetRef::RenderConstructor { .. }
+                    | KernelCallTargetRef::PureBuiltin {
                         kind: KernelPureBuiltinKind::RecordConstructor,
                     }
             );
@@ -7587,23 +8234,25 @@ fn project_call_facts_and_diagnostics(
                 // immutable ABI signature intentionally retains only a
                 // kind-only base contract.
                 syntax_discriminated_result: (exact_structural_constructor
-                    || call.syntax_discriminated_candidate
-                    || (matches!(&call.target, KernelCallTarget::User { .. })
+                    || call.solve.syntax_discriminated_candidate
+                    || (matches!(call_target, KernelCallTargetRef::User { .. })
                         && (call_syntax_selected
-                            || call.syntax_discriminated_root_output.is_some_and(|output| {
-                                packed_artifact.map_or_else(
-                                    || {
-                                        artifact
-                                            .output_flags(output)
-                                            .is_some_and(|flags| flags.syntax_selected_here)
-                                    },
-                                    |packed| {
-                                        packed
-                                            .output(output)
-                                            .is_some_and(|output| output.syntax_selected_here)
-                                    },
-                                )
-                            }))))
+                            || call.solve.syntax_discriminated_root_output.is_some_and(
+                                |output| {
+                                    packed_artifact.map_or_else(
+                                        || {
+                                            artifact
+                                                .output_flags(output)
+                                                .is_some_and(|flags| flags.syntax_selected_here)
+                                        },
+                                        |packed| {
+                                            packed
+                                                .output(output)
+                                                .is_some_and(|output| output.syntax_selected_here)
+                                        },
+                                    )
+                                },
+                            ))))
                     && result_is_concrete,
             });
         }
@@ -7624,17 +8273,17 @@ fn project_call_facts_and_diagnostics(
 /// caller-frame ownership for cross-definition inputs.
 fn project_abi_call_type_substitutions(
     owner_index: usize,
-    owner: &KernelProjectOwnerOutputs,
-    call: &PendingKernelCallArtifact,
+    call: KernelProjectCallRef<'_>,
     owners: &[KernelProjectOwnerOutputs],
     abi: &crate::KernelAbiInput,
     artifact: &ComponentOutputSnapshot,
     public_results: &[FlowType],
 ) -> Box<[KernelCallTypeSubstitution]> {
-    let Ok(syntax) = owner
+    let facts = call.definition.facts;
+    let Ok(syntax) = facts
         .call_syntax
-        .binary_search_by_key(&call.expression, |syntax| syntax.expression)
-        .map(|index| &owner.call_syntax[index])
+        .binary_search_by_key(&call.expression(), |syntax| syntax.expression)
+        .map(|index| &facts.call_syntax[index])
     else {
         // Lower-level equation tests intentionally omit checked-image syntax.
         // Production linking validates and requires the authored row.
@@ -7646,27 +8295,28 @@ fn project_abi_call_type_substitutions(
         // checked linker with that incomplete contract.
         return Box::new([]);
     };
-    let actuals = call.inputs.iter().filter_map(|input| {
-        let KernelCallInputRole::Abi { name } = &input.role else {
+    let actuals = call.inputs().iter().filter_map(|input| {
+        let Ok(KernelCallInputRoleRef::Abi { name }) = call.input_role(input) else {
             return None;
         };
         let parameter = target
             .parameters
             .iter()
-            .find(|parameter| parameter.name.as_ref() == name.as_ref())
+            .find(|parameter| parameter.name.as_ref() == name)
             .or_else(|| {
-                (name.as_ref() == "$pipe").then(|| {
+                (name == "$pipe").then(|| {
                     target.parameters.iter().find(|parameter| {
                         parameter.kind == boon_checked::CheckedParameterKind::Value
                     })
                 })?
             })?;
-        project_call_value_type(owner_index, input.value, owners, artifact, public_results)
+        let value = call.input_value(input).ok()?;
+        project_call_value_type(owner_index, value, owners, artifact, public_results)
             .map(|actual| (parameter.ordinal, actual))
     });
     let actual_result = matches!(
-        &call.target,
-        KernelCallTarget::PureBuiltin {
+        call.target(),
+        KernelCallTargetRef::PureBuiltin {
             kind: KernelPureBuiltinKind::ListAppend
                 | KernelPureBuiltinKind::MapUpsert
                 | KernelPureBuiltinKind::SetAdd,
@@ -7675,7 +8325,7 @@ fn project_abi_call_type_substitutions(
     .then(|| {
         project_call_value_type(
             owner_index,
-            KernelValueReference::Local(call.expression),
+            KernelValueReference::Local(call.expression()),
             owners,
             artifact,
             public_results,
@@ -9061,11 +9711,7 @@ fn compile_owner_program_with_definition_facts_and_text(
         declarations,
         lexical_bindings,
         resources,
-        calls: collect_call_artifacts(
-            input,
-            &vec![false; input.nodes.len()],
-            &vec![None; input.nodes.len()],
-        )?,
+        calls: collect_call_artifacts(input, &vec![false; input.nodes.len()])?,
         effects: collect_host_effect_artifacts(input)?,
         diagnostics: collect_definition_diagnostic_artifacts(KernelOwnerId(0), input, facts)?,
         basis_fingerprint_v14,
@@ -9259,6 +9905,46 @@ fn collect_statement_artifacts(
         .map(Vec::into_boxed_slice)
 }
 
+fn validate_project_statement_inputs(
+    owner: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<(), KernelOwnerBuildError> {
+    let mut parent = vec![false; facts.statements.len()];
+    for (index, statement) in facts.statements.iter().enumerate() {
+        if statement.id.0 as usize != index {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel statement rows must use dense IDs: row {index} has ID {}",
+                statement.id.0
+            )));
+        }
+        if let Some(value) = statement.value {
+            kernel_value_reference(owner, value, index)?;
+        }
+        for child in &statement.children {
+            let KernelStatementChildReference::Local(child) = child else {
+                continue;
+            };
+            let child = child.0 as usize;
+            if child >= facts.statements.len() {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel statement {index} references missing child statement {child}"
+                )));
+            }
+            if child <= index {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel statement {index} has non-forward child statement {child}"
+                )));
+            }
+            if std::mem::replace(&mut parent[child], true) {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel statement {child} has more than one local parent"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn collect_declaration_artifacts(
     owner: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
@@ -9296,6 +9982,32 @@ fn collect_declaration_artifacts(
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Vec::into_boxed_slice)
+}
+
+fn validate_project_declaration_inputs(
+    owner: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<(), KernelOwnerBuildError> {
+    let mut origins = HashSet::with_capacity(facts.declarations.len());
+    for (index, declaration) in facts.declarations.iter().enumerate() {
+        if declaration.id.0 as usize != index {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel declaration rows must use dense IDs: row {index} has ID {}",
+                declaration.id.0
+            )));
+        }
+        if !origins.insert(&declaration.origin) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel declaration {index} repeats structural origin {:?}",
+                declaration.origin
+            )));
+        }
+        validate_declaration_origin(owner, facts, declaration)?;
+        if let Some(value) = declaration.value {
+            kernel_value_reference(owner, value, index)?;
+        }
+    }
+    Ok(())
 }
 
 fn validate_declaration_origin(
@@ -9547,6 +10259,49 @@ fn collect_lexical_binding_artifacts(
         .map(Vec::into_boxed_slice)
 }
 
+fn validate_project_lexical_inputs(
+    owner: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<(), KernelOwnerBuildError> {
+    let mut expressions = vec![false; owner.nodes.len()];
+    for binding in &facts.lexical_bindings {
+        let expression = checked_expression_index(
+            binding.expression,
+            owner.nodes.len(),
+            "kernel lexical binding expression",
+        )?;
+        if std::mem::replace(&mut expressions[expression], true) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel expression {expression} has more than one lexical binding row"
+            )));
+        }
+        match binding.target {
+            KernelLexicalBindingTargetInput::Declaration(KernelDeclarationReference::Local(
+                declaration,
+            )) if declaration.0 as usize >= facts.declarations.len() => {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel expression {expression} references missing declaration {}",
+                    declaration.0
+                )));
+            }
+            KernelLexicalBindingTargetInput::ContextFormal { ordinal }
+                if ordinal >= owner.formal_count =>
+            {
+                return Err(KernelOwnerBuildError::new(format!(
+                    "kernel expression {expression} references missing context formal {ordinal}"
+                )));
+            }
+            KernelLexicalBindingTargetInput::Value { provider } => {
+                kernel_value_reference(owner, provider, expression)?;
+            }
+            KernelLexicalBindingTargetInput::Declaration(_)
+            | KernelLexicalBindingTargetInput::ContextFormal { .. }
+            | KernelLexicalBindingTargetInput::RuntimeContext => {}
+        }
+    }
+    Ok(())
+}
+
 fn validate_resource_declaration(
     facts: &KernelDefinitionFactsInput,
     declaration: KernelDeclarationReference,
@@ -9753,6 +10508,114 @@ fn collect_resource_artifacts(
     })
 }
 
+fn validate_project_resource_inputs(
+    owner: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<(), KernelOwnerBuildError> {
+    let mut published = vec![false; owner.nodes.len()];
+    for (index, source) in facts.sources.iter().enumerate() {
+        if source.id.0 as usize != index {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel SOURCE rows must use dense IDs: row {index} has ID {}",
+                source.id.0
+            )));
+        }
+        validate_resource_declaration(facts, source.declaration, "kernel SOURCE row")?;
+        validate_resource_statement(facts, source.statement, "kernel SOURCE row")?;
+        let expression = checked_expression_index(
+            source.expression,
+            owner.nodes.len(),
+            "kernel SOURCE expression",
+        )?;
+        if !matches!(owner.nodes[expression].kind, KernelOwnerNodeKind::Source(_)) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel SOURCE row {index} expression {expression} is not a literal SOURCE"
+            )));
+        }
+        if std::mem::replace(&mut published[expression], true) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel SOURCE expression {expression} is published more than once"
+            )));
+        }
+    }
+    for (index, state) in facts.states.iter().enumerate() {
+        if state.id.0 as usize != index {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel state rows must use dense IDs: row {index} has ID {}",
+                state.id.0
+            )));
+        }
+        validate_resource_declaration(facts, state.binding_declaration, "kernel state binding")?;
+        validate_resource_declaration(facts, state.declaration, "kernel state row")?;
+        validate_resource_statement(facts, state.statement, "kernel state row")?;
+        if state.synthetic_path && !state.projection.is_empty() {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel synthetic state row {index} already has a structural projection"
+            )));
+        }
+        let expression = checked_expression_index(
+            state.expression,
+            owner.nodes.len(),
+            "kernel state expression",
+        )?;
+        if !matches!(
+            (&owner.nodes[expression].kind, state.kind),
+            (KernelOwnerNodeKind::Hold, CheckedStateKind::Hold)
+                | (KernelOwnerNodeKind::Latest, CheckedStateKind::InitialLatest)
+                | (
+                    KernelOwnerNodeKind::PureBuiltin {
+                        kind: KernelPureBuiltinKind::BoolToggle,
+                    },
+                    CheckedStateKind::StatefulCall,
+                )
+        ) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel state row {index} kind {:?} is incompatible with expression {expression} kind {:?}",
+                state.kind, owner.nodes[expression].kind
+            )));
+        }
+        if std::mem::replace(&mut published[expression], true) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel state expression {expression} is published more than once"
+            )));
+        }
+        kernel_value_reference(owner, state.initial, expression)?;
+    }
+    for (index, list) in facts.lists.iter().enumerate() {
+        if list.id.0 as usize != index {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel LIST rows must use dense IDs: row {index} has ID {}",
+                list.id.0
+            )));
+        }
+        validate_resource_declaration(facts, list.declaration, "kernel LIST row")?;
+        validate_resource_statement(facts, list.statement, "kernel LIST row")?;
+        let producer =
+            checked_expression_index(list.producer, owner.nodes.len(), "kernel LIST producer")?;
+        let KernelOwnerNodeKind::Collection {
+            kind: KernelCollectionKind::List,
+            capacity,
+        } = &owner.nodes[producer].kind
+        else {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel LIST row {index} producer {producer} is not a list literal"
+            )));
+        };
+        if capacity != &list.capacity {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel LIST row {index} capacity {:?} differs from producer capacity {:?}",
+                list.capacity, capacity
+            )));
+        }
+        if std::mem::replace(&mut published[producer], true) {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel LIST producer {producer} is published more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn state_candidate_survives(
     state: &PendingKernelStateArtifact,
     expression_modes: &[FlowMode],
@@ -9797,22 +10660,67 @@ fn allocate_synthetic_state_ordinals(
 }
 
 fn allocate_project_synthetic_state_ordinals(
+    program: &KernelProjectProgramInput,
     owners: &[KernelProjectOwnerOutputs],
+    definition_facts: &[KernelDefinitionFactsInput],
 ) -> Box<[Box<[Option<u32>]>]> {
-    let mut next_by_anchor = BTreeMap::new();
+    debug_assert_eq!(program.owners.len(), owners.len());
+    debug_assert_eq!(definition_facts.len(), owners.len());
+    let mut next_by_anchor = BTreeMap::<KernelOwnerId, u32>::new();
     owners
         .iter()
         .enumerate()
         .map(|(owner, definition)| {
-            allocate_synthetic_state_ordinals(
-                KernelOwnerId(u32::try_from(owner).expect("kernel definition count exceeds u32")),
-                &definition.resources.states,
-                &definition.expression_modes,
-                &mut next_by_anchor,
-            )
+            let owner_id =
+                KernelOwnerId(u32::try_from(owner).expect("kernel definition count exceeds u32"));
+            definition_facts[owner]
+                .states
+                .iter()
+                .map(|state| {
+                    if !state.synthetic_path
+                        || !state_input_candidate_survives(
+                            &program.owners[owner],
+                            state,
+                            &definition.expression_modes,
+                        )
+                    {
+                        return None;
+                    }
+                    let anchor = match state.declaration {
+                        KernelDeclarationReference::Local(_) => owner_id,
+                        KernelDeclarationReference::OwnerPublic(owner) => owner,
+                        KernelDeclarationReference::OwnerDeclaration { owner, .. } => owner,
+                    };
+                    let next = next_by_anchor.entry(anchor).or_default();
+                    let ordinal = *next;
+                    *next = next
+                        .checked_add(1)
+                        .expect("kernel synthetic state-path ordinal exceeds u32");
+                    Some(ordinal)
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
+}
+
+fn state_input_candidate_survives(
+    input: &KernelOwnerProgramInput,
+    state: &KernelStateInput,
+    expression_modes: &[FlowMode],
+) -> bool {
+    if state.kind != CheckedStateKind::InitialLatest {
+        return true;
+    }
+    let Ok(KernelValueReference::Local(initial)) =
+        kernel_value_reference(input, state.initial, state.expression.0 as usize)
+    else {
+        return false;
+    };
+    expression_modes
+        .get(initial.0 as usize)
+        .is_some_and(|mode| *mode == FlowMode::Continuous)
 }
 
 fn materialize_resource_artifacts(
@@ -10495,7 +11403,6 @@ fn link_structural_declaration(
 fn collect_call_artifacts(
     input: &KernelOwnerProgramInput,
     syntax_discriminated_candidates: &[bool],
-    syntax_discriminated_root_outputs: &[Option<OutputId>],
 ) -> Result<Box<[PendingKernelCallArtifact]>, KernelOwnerBuildError> {
     input
         .nodes
@@ -10568,10 +11475,6 @@ fn collect_call_artifacts(
                         .get(expression)
                         .copied()
                         .unwrap_or(false),
-                    syntax_discriminated_root_output: syntax_discriminated_root_outputs
-                        .get(expression)
-                        .copied()
-                        .flatten(),
                 })
             })())
         })
@@ -10579,37 +11482,84 @@ fn collect_call_artifacts(
         .map(Vec::into_boxed_slice)
 }
 
+fn validate_project_call_inputs(
+    input: &KernelOwnerProgramInput,
+) -> Result<(), KernelOwnerBuildError> {
+    for (expression, node) in input.nodes.iter().enumerate() {
+        let uses_abi_inputs = match node.kind {
+            KernelOwnerNodeKind::UserCall { .. } => false,
+            KernelOwnerNodeKind::RenderConstructor { .. }
+            | KernelOwnerNodeKind::PureBuiltin { .. }
+            | KernelOwnerNodeKind::FixedAbiCall { .. }
+            | KernelOwnerNodeKind::HostEffect { .. }
+            | KernelOwnerNodeKind::FieldProjection { .. } => true,
+            _ => continue,
+        };
+        for edge in &node.inputs {
+            match &edge.role {
+                KernelOwnerEdgeRole::CallArgument { .. }
+                | KernelOwnerEdgeRole::CallOutArgument { .. }
+                    if !uses_abi_inputs => {}
+                KernelOwnerEdgeRole::AbiArgument { .. } if uses_abi_inputs => {}
+                role => {
+                    return Err(KernelOwnerBuildError::new(format!(
+                        "kernel call node {expression} has non-call input role {role:?}"
+                    )));
+                }
+            }
+            kernel_value_reference(input, edge.expression, expression)?;
+        }
+    }
+    Ok(())
+}
+
+fn collect_project_call_solve_rows(
+    input: &KernelOwnerProgramInput,
+    syntax_discriminated_candidates: &[bool],
+    syntax_discriminated_root_outputs: &[Option<OutputId>],
+) -> Box<[KernelProjectCallSolve]> {
+    input
+        .nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            matches!(
+                node.kind,
+                KernelOwnerNodeKind::UserCall { .. }
+                    | KernelOwnerNodeKind::RenderConstructor { .. }
+                    | KernelOwnerNodeKind::PureBuiltin { .. }
+                    | KernelOwnerNodeKind::FixedAbiCall { .. }
+                    | KernelOwnerNodeKind::HostEffect { .. }
+                    | KernelOwnerNodeKind::FieldProjection { .. }
+            )
+        })
+        .map(|(expression, _)| KernelProjectCallSolve {
+            expression: KernelExpressionId(
+                u32::try_from(expression).expect("kernel owner expression count exceeds u32"),
+            ),
+            syntax_discriminated_candidate: syntax_discriminated_candidates
+                .get(expression)
+                .copied()
+                .unwrap_or(false),
+            syntax_discriminated_root_output: syntax_discriminated_root_outputs
+                .get(expression)
+                .copied()
+                .flatten(),
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 fn collect_definition_diagnostic_artifacts(
     owner: KernelOwnerId,
     input: &KernelOwnerProgramInput,
     facts: &KernelDefinitionFactsInput,
 ) -> Result<Box<[KernelDiagnosticArtifact]>, KernelOwnerBuildError> {
+    validate_definition_diagnostic_inputs(owner, input, facts)?;
     facts
         .diagnostics
         .iter()
         .map(|diagnostic| {
-            match diagnostic.site {
-                KernelDiagnosticSite::Expression { expression } => {
-                    checked_expression_index(
-                        expression,
-                        input.nodes.len(),
-                        "source diagnostic expression",
-                    )?;
-                }
-                KernelDiagnosticSite::CallArgument { call, .. }
-                | KernelDiagnosticSite::CallPass { call, .. } => {
-                    checked_expression_index(
-                        call,
-                        input.nodes.len(),
-                        "call diagnostic expression",
-                    )?;
-                }
-                KernelDiagnosticSite::CallInput { .. } => {
-                    return Err(KernelOwnerBuildError::new(
-                        "definition diagnostic inputs cannot precompute solved call-input failures",
-                    ));
-                }
-            }
             Ok(KernelDiagnosticArtifact {
                 owner,
                 severity: diagnostic.severity,
@@ -10619,6 +11569,37 @@ fn collect_definition_diagnostic_artifacts(
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Vec::into_boxed_slice)
+}
+
+fn validate_definition_diagnostic_inputs(
+    _owner: KernelOwnerId,
+    input: &KernelOwnerProgramInput,
+    facts: &KernelDefinitionFactsInput,
+) -> Result<(), KernelOwnerBuildError> {
+    for diagnostic in &facts.diagnostics {
+        match diagnostic.site {
+            KernelDiagnosticSite::Expression { expression } => {
+                checked_expression_index(
+                    expression,
+                    input.nodes.len(),
+                    "source diagnostic expression",
+                )?;
+            }
+            KernelDiagnosticSite::CallArgument { call, .. }
+            | KernelDiagnosticSite::CallPass { call, .. } => {
+                checked_expression_index(call, input.nodes.len(), "call diagnostic expression")?;
+            }
+            KernelDiagnosticSite::CallInput { .. } => {
+                return Err(KernelOwnerBuildError::new(
+                    "definition diagnostic inputs cannot precompute solved call-input failures",
+                ));
+            }
+        }
+    }
+    for expression in facts.diagnostic_values.iter().copied() {
+        kernel_value_reference(input, expression, expression.0 as usize)?;
+    }
+    Ok(())
 }
 
 fn collect_host_effect_artifacts(
@@ -10658,6 +11639,38 @@ fn collect_host_effect_artifacts(
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Vec::into_boxed_slice)
+}
+
+fn validate_host_effect_inputs(
+    input: &KernelOwnerProgramInput,
+) -> Result<(), KernelOwnerBuildError> {
+    for (expression, node) in input.nodes.iter().enumerate() {
+        let KernelOwnerNodeKind::HostEffect { operation } = &node.kind else {
+            continue;
+        };
+        let spec = host_effect_spec(operation).ok_or_else(|| {
+            KernelOwnerBuildError::new(format!(
+                "kernel host-effect node {expression} names unknown operation `{operation}`"
+            ))
+        })?;
+        if spec.result_policy != ResultPolicySpec::ReturnValue || spec.schema.is_none() {
+            return Err(KernelOwnerBuildError::new(format!(
+                "kernel host-effect node {expression} operation `{operation}` has no return-value schema"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_project_expression_inputs(
+    input: &KernelOwnerProgramInput,
+) -> Result<(), KernelOwnerBuildError> {
+    for (consumer, node) in input.nodes.iter().enumerate() {
+        for edge in &node.inputs {
+            kernel_value_reference(input, edge.expression, consumer)?;
+        }
+    }
+    Ok(())
 }
 
 fn expression_formal_dependencies(
@@ -10841,7 +11854,7 @@ pub fn compile_project_program_with_definition_facts(
         &crate::KernelAbiInput::default(),
     )?;
     compile_project_program_with_definition_facts_abi_and_text(
-        input,
+        Arc::new(input.clone()),
         Arc::from(facts.to_vec()),
         Arc::new(crate::KernelAbiInput::default()),
         text,
@@ -10849,11 +11862,13 @@ pub fn compile_project_program_with_definition_facts(
 }
 
 pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
-    input: &KernelProjectProgramInput,
+    input: Arc<KernelProjectProgramInput>,
     facts: Arc<[KernelDefinitionFactsInput]>,
     abi: Arc<crate::KernelAbiInput>,
     text: ProjectTextSnapshot,
 ) -> Result<KernelProjectProgram, KernelOwnerBuildError> {
+    let program = Arc::clone(&input);
+    let input = input.as_ref();
     if facts.len() != input.owners.len() {
         return Err(KernelOwnerBuildError::new(format!(
             "kernel project has {} owners but {} definition-fact tables",
@@ -10995,6 +12010,14 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
             u32::try_from(owner_index).expect("kernel project owner count exceeds u32"),
         );
         validate_owner_input(owner_id, owner, &principals)?;
+        validate_project_expression_inputs(owner)?;
+        validate_project_call_inputs(owner)?;
+        validate_host_effect_inputs(owner)?;
+        validate_definition_diagnostic_inputs(owner_id, owner, &facts[owner_index])?;
+        validate_project_statement_inputs(owner, &facts[owner_index])?;
+        validate_project_declaration_inputs(owner, &facts[owner_index])?;
+        validate_project_lexical_inputs(owner, &facts[owner_index])?;
+        validate_project_resource_inputs(owner, &facts[owner_index])?;
     }
     // A call authored inside a formal-derived WHEN arm owns an exact branch
     // occurrence even when the callee itself contains no SELECT. Seed that
@@ -11141,10 +12164,6 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
         .iter()
         .enumerate()
         .map(|(owner_index, owner)| {
-            let owner_id = KernelOwnerId(
-                u32::try_from(owner_index)
-                    .expect("kernel project owner count exceeds the dense u32 namespace"),
-            );
             let result = checked_expression_index(
                 owner.result,
                 owner.nodes.len(),
@@ -11157,8 +12176,6 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
                 .map(|(variable, node)| builder.add_output(*variable, node.mode))
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            let statements = collect_statement_artifacts(owner, &facts[owner_index])?;
-            let resources = collect_resource_artifacts(owner, &facts[owner_index])?;
             Ok(KernelProjectOwnerOutputs {
                 result: expressions[result],
                 formals: principals[owner_index]
@@ -11180,34 +12197,11 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
                     .map(|mode| modes[mode.0 as usize])
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
-                expression_artifacts: collect_expression_artifacts(owner)?,
-                linkage: facts[owner_index].linkage,
-                call_syntax: collect_call_syntax_artifacts(owner, &facts[owner_index])?,
-                execution_shapes: collect_execution_shape_artifacts(owner, &facts[owner_index])?,
-                statements,
-                declarations: collect_declaration_artifacts(owner, &facts[owner_index])?,
-                lexical_bindings: collect_lexical_binding_artifacts(owner, &facts[owner_index])?,
-                resources,
-                calls: collect_call_artifacts(
+                calls: collect_project_call_solve_rows(
                     owner,
                     &syntax_discriminated_call_candidates[owner_index],
                     &syntax_discriminated_call_root_outputs[owner_index],
-                )?,
-                effects: collect_host_effect_artifacts(owner)?,
-                diagnostics: collect_definition_diagnostic_artifacts(
-                    owner_id,
-                    owner,
-                    &facts[owner_index],
-                )?,
-                diagnostic_values: facts[owner_index]
-                    .diagnostic_values
-                    .iter()
-                    .copied()
-                    .map(|expression| {
-                        kernel_value_reference(owner, expression, expression.0 as usize)
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_boxed_slice(),
+                ),
                 syntax_discriminated_formals: syntax_discriminated_formals[owner_index].clone(),
                 basis_fingerprint_v14: definition_basis_fingerprint_with_buffer(
                     owner,
@@ -11273,6 +12267,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_and_text(
     compile_work.acyclic_initial_operations = component.acyclic_initial_operation_count();
     Ok(KernelProjectProgram {
         component,
+        program,
         owners: owners.into_boxed_slice(),
         definition_facts: facts,
         abi,
@@ -19256,6 +20251,15 @@ mod tests {
             .err()
             .expect("non-dense statement IDs must fail closed");
         assert!(error.to_string().contains("dense IDs"));
+
+        let mut invalid_value = facts.clone();
+        invalid_value.statements[1].value = Some(KernelExpressionId(2));
+        let project = KernelProjectProgramInput {
+            owners: Box::new([input.clone()]),
+        };
+        let error = compile_project_program_with_definition_facts(&project, &[invalid_value])
+            .expect_err("project validation must reject an unresolved leaf-statement value");
+        assert!(error.to_string().contains("local and external namespaces"));
     }
 
     #[test]
@@ -23675,7 +24679,7 @@ mod tests {
         .unwrap();
         let text = crate::text::build_project_text_snapshot(&input.owners, &facts, &abi).unwrap();
         let snapshot = compile_project_program_with_definition_facts_abi_and_text(
-            &input,
+            Arc::new(input),
             Arc::from(facts.to_vec()),
             Arc::new(abi),
             text,
@@ -23834,7 +24838,7 @@ mod tests {
         .unwrap();
         let text = crate::text::build_project_text_snapshot(&input.owners, &facts, &abi).unwrap();
         let snapshot = compile_project_program_with_definition_facts_abi_and_text(
-            &input,
+            Arc::new(input),
             Arc::from(facts.to_vec()),
             Arc::new(abi),
             text,

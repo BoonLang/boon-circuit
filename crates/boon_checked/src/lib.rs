@@ -2628,17 +2628,36 @@ impl CheckedProgramFields {
     }
 
     pub fn semantic_path(&self, path: &CheckedSemanticPath) -> Option<String> {
+        self.semantic_path_from_parts(path.anchor, path.projection.iter().map(String::as_str))
+    }
+
+    /// Format one semantic path from a dense declaration anchor and borrowed
+    /// projection segments. Packed compiler consumers use this without first
+    /// rebuilding `CheckedSemanticPath` or cloning its strings.
+    pub fn semantic_path_from_parts<'a>(
+        &self,
+        anchor: DeclId,
+        projection: impl IntoIterator<Item = &'a str>,
+    ) -> Option<String> {
         let declaration = self
             .declarations
             .iter()
-            .find(|candidate| candidate.id == path.anchor)?;
+            .find(|candidate| candidate.id == anchor)?;
+        let mut projection = projection.into_iter().peekable();
         if declaration.kind == CheckedDeclarationKind::Function {
-            return (!path.projection.is_empty()).then(|| path.projection.join("."));
+            let first = projection.next()?;
+            let mut result = String::from(first);
+            for segment in projection {
+                result.push('.');
+                result.push_str(segment);
+            }
+            return Some(result);
         }
-        let mut segments = vec![declaration.name.clone()];
+        let mut segments = vec![declaration.name.as_str()];
         let mut scope = declaration.scope_id;
-        let mut visited = BTreeSet::new();
-        while scope != self.root_scope && visited.insert(scope) {
+        let mut remaining = self.scopes.len().saturating_add(1);
+        while scope != self.root_scope {
+            remaining = remaining.checked_sub(1)?;
             let current = self.scopes.iter().find(|candidate| candidate.id == scope)?;
             if current.kind == CheckedScopeKind::Function {
                 break;
@@ -2656,15 +2675,20 @@ impl CheckedProgramFields {
                         | CheckedDeclarationKind::List
                 )
             {
-                segments.push(owner.name.clone());
+                segments.push(owner.name.as_str());
             }
             scope = current.parent?;
         }
-        segments.reverse();
-        let mut result = segments.join(".");
-        if !path.projection.is_empty() {
+        let mut result = String::new();
+        for segment in segments.into_iter().rev() {
+            if !result.is_empty() {
+                result.push('.');
+            }
+            result.push_str(segment);
+        }
+        for segment in projection {
             result.push('.');
-            result.push_str(&path.projection.join("."));
+            result.push_str(segment);
         }
         Some(result)
     }

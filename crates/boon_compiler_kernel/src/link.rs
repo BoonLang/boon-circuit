@@ -27,7 +27,7 @@ use boon_checked::{
     FlowMode, FlowType, LexicalScopeId, ObjectShape, ProgramRole, SemanticOccurrence,
     SemanticOccurrenceKind, SharedObjectShape, Type, TypeVar, Variant,
 };
-use boon_contract::SourceBundleDigestV1;
+use boon_contract::{SourceBundleDigestV1, SymbolId};
 use boon_syntax::StableOccurrenceKey;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -129,6 +129,9 @@ pub struct KernelCheckedRows {
     /// ordinal. Checked-image sealing consumes this relocation directly and
     /// never interprets compact checked expression IDs as parser slots.
     pub call_occurrences: Box<[StableOccurrenceKey]>,
+    /// Explicit editor/oracle projection. Runtime compilation publishes the
+    /// same row cardinality and ownership directly into
+    /// `checked_image_publication` and leaves this compatibility family empty.
     pub call_result_paths: Box<[CheckedCallResultPath]>,
     pub pattern_bindings: Box<[CheckedPatternBinding]>,
     /// Move-only packed authority bound by the linker that produced these
@@ -144,8 +147,20 @@ pub struct KernelCheckedRows {
     /// typechecker consumes it by value; neither stage replays rich checked
     /// expression/statement tables.
     pub checked_image_publication: CheckedImageKernelPublicationV1,
+    /// Explicit editor/oracle projection. Runtime compilation consumes the
+    /// dense occurrence routes in `checked_image_publication` and never owns
+    /// a second span/name-oriented occurrence table.
     pub occurrences: Box<[SemanticOccurrence]>,
     occurrence_ranges: Box<[KernelCheckedRowRange]>,
+}
+
+/// Rich checked rows are a presentation demand, not a prerequisite for the
+/// runtime image. Keeping this decision at the kernel linker prevents callers
+/// from materializing an expensive family and immediately dropping it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelCheckedRowProjectionDemand {
+    RuntimePacked,
+    EditorRich,
 }
 
 impl KernelCheckedRows {
@@ -275,27 +290,34 @@ impl KernelCheckedRows {
                 )?;
             }
         }
-        let occurrence_range = *self
-            .occurrence_ranges
-            .get(owner.0 as usize)
-            .ok_or_else(|| {
-                KernelCheckedLinkError::new(format!(
-                    "kernel checked occurrence ranges omit definition {}",
-                    owner.0,
-                ))
-            })?;
-        for row in checked_range(occurrence_range)? {
-            let occurrence = self.occurrences.get_mut(row).ok_or_else(|| {
-                KernelCheckedLinkError::new(format!(
-                    "kernel checked occurrence linker references missing row {row}"
-                ))
-            })?;
-            rebase_checked_span(
-                &mut occurrence.span,
-                start_line,
-                start_byte,
-                &format!("kernel checked occurrence row {row}"),
-            )?;
+        if !self.occurrence_ranges.is_empty() {
+            let occurrence_range =
+                *self
+                    .occurrence_ranges
+                    .get(owner.0 as usize)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel checked occurrence ranges omit definition {}",
+                            owner.0,
+                        ))
+                    })?;
+            for row in checked_range(occurrence_range)? {
+                let occurrence = self.occurrences.get_mut(row).ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel checked occurrence linker references missing row {row}"
+                    ))
+                })?;
+                rebase_checked_span(
+                    &mut occurrence.span,
+                    start_line,
+                    start_byte,
+                    &format!("kernel checked occurrence row {row}"),
+                )?;
+            }
+        } else if !self.occurrences.is_empty() {
+            return Err(KernelCheckedLinkError::new(
+                "kernel checked occurrence rows have no definition ranges",
+            ));
         }
         if let Some(callable) = self
             .callables
@@ -344,6 +366,19 @@ struct KernelSemanticResourceProjectionLocatorV1 {
     target: DeclId,
 }
 
+/// One compact call-result path in the linked checked namespace.
+///
+/// Projection spelling stays in the project text authority. The row owns only
+/// the final declaration anchor and a range into one flat `SymbolId` column,
+/// so ordinary compilation does not allocate `Vec<String>` per call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KernelSemanticCallResultPathLocatorV1 {
+    call: CheckedCallId,
+    anchor: DeclId,
+    projection_start: u32,
+    projection_len: u32,
+}
+
 /// Immutable relocation from one definition-local code module into the
 /// checked image bound to this semantic input.
 ///
@@ -381,6 +416,8 @@ pub struct KernelSemanticInputConstructionV1 {
     definition_relocations: Box<[KernelSemanticDefinitionRelocationV1]>,
     /// Owners with execution templates, ordered by final callable ID.
     definition_execution_owners: Box<[KernelOwnerId]>,
+    call_result_paths: Box<[KernelSemanticCallResultPathLocatorV1]>,
+    call_result_path_symbols: Box<[SymbolId]>,
     resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
     resource_projection_by_expression: Box<[u32]>,
     rich_editor_projection_expected: bool,
@@ -461,6 +498,12 @@ pub struct KernelSemanticDefinitionListIter<'a> {
 pub struct KernelSemanticResourceProjectionRef<'a> {
     input: &'a KernelSemanticInputV1,
     locator: KernelSemanticResourceProjectionLocatorV1,
+}
+
+#[derive(Clone, Copy)]
+pub struct KernelSemanticCallResultPathRef<'a> {
+    input: &'a KernelSemanticInputV1,
+    locator: KernelSemanticCallResultPathLocatorV1,
 }
 
 pub struct KernelSemanticResourceOriginIter<'a> {
@@ -823,6 +866,15 @@ impl KernelSemanticInputConstructionV1 {
         ))
     }
 
+    fn call_result_path_symbols(
+        &self,
+        path: KernelSemanticCallResultPathLocatorV1,
+    ) -> Option<&[SymbolId]> {
+        let start = path.projection_start as usize;
+        let end = start.checked_add(path.projection_len as usize)?;
+        self.call_result_path_symbols.get(start..end)
+    }
+
     fn materialize_rich_definition_execution(&self) -> Box<[CheckedDefinitionExecutionTemplateV1]> {
         self.definition_execution_owners
             .iter()
@@ -1032,11 +1084,6 @@ impl KernelSemanticInputConstructionV1 {
     }
 
     #[doc(hidden)]
-    pub fn expect_rich_editor_projection(&mut self) {
-        self.rich_editor_projection_expected = true;
-    }
-
-    #[doc(hidden)]
     pub fn materialize_rich_definition_execution_templates(
         &self,
     ) -> Box<[CheckedDefinitionExecutionTemplateV1]> {
@@ -1050,8 +1097,11 @@ impl KernelSemanticInputConstructionV1 {
     fn from_linked_rows(
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
+        projection_demand: KernelCheckedRowProjectionDemand,
         snapshot: &KernelCheckedSnapshot,
         layout: &KernelCheckedLinkLayout,
+        call_result_paths: Box<[KernelSemanticCallResultPathLocatorV1]>,
+        call_result_path_symbols: Box<[SymbolId]>,
         resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
         checked_image_pairing: Arc<boon_checked::CheckedImageKernelPairingV1>,
     ) -> Result<Self, KernelCheckedLinkError> {
@@ -1123,6 +1173,43 @@ impl KernelSemanticInputConstructionV1 {
                 "kernel semantic execution templates repeat a callable relocation",
             ));
         }
+        let mut previous_call = None;
+        let mut next_symbol = 0u32;
+        for path in &call_result_paths {
+            if path.call.0 >= layout.totals.calls {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel semantic call-result path references missing call {}",
+                    path.call.0,
+                )));
+            }
+            if previous_call.is_some_and(|previous| previous >= path.call) {
+                return Err(KernelCheckedLinkError::new(
+                    "kernel semantic call-result paths are not strictly ordered",
+                ));
+            }
+            previous_call = Some(path.call);
+            if path.projection_start != next_symbol {
+                return Err(KernelCheckedLinkError::new(
+                    "kernel semantic call-result path symbols are not contiguous",
+                ));
+            }
+            next_symbol = next_symbol
+                .checked_add(path.projection_len)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(
+                        "kernel semantic call-result path symbol range overflows u32",
+                    )
+                })?;
+        }
+        if next_symbol as usize != call_result_path_symbols.len()
+            || call_result_path_symbols
+                .iter()
+                .any(|symbol| snapshot.definition_code.symbol(*symbol).is_none())
+        {
+            return Err(KernelCheckedLinkError::new(
+                "kernel semantic call-result path symbols differ from their text authority",
+            ));
+        }
         let mut resource_projection_by_expression =
             vec![u32::MAX; layout.totals.expressions as usize];
         for (index, requirement) in resource_projections.iter().enumerate() {
@@ -1156,9 +1243,14 @@ impl KernelSemanticInputConstructionV1 {
             source_count: layout.totals.sources,
             definition_relocations: definition_relocations.into_boxed_slice(),
             definition_execution_owners: definition_execution_owners.into_boxed_slice(),
+            call_result_paths,
+            call_result_path_symbols,
             resource_projections,
             resource_projection_by_expression: resource_projection_by_expression.into_boxed_slice(),
-            rich_editor_projection_expected: false,
+            rich_editor_projection_expected: matches!(
+                projection_demand,
+                KernelCheckedRowProjectionDemand::EditorRich
+            ),
             checked_image_pairing,
         })
     }
@@ -1242,6 +1334,7 @@ impl KernelSemanticInputConstructionV1 {
             checked_image_digest: handoff.local_image_digest,
         };
         if input.construction.rich_editor_projection_expected {
+            input.validate_rich_call_result_paths(&checked.call_result_paths)?;
             input.validate_rich_definition_execution_templates(
                 &checked.definition_execution_templates,
             )?;
@@ -1345,6 +1438,62 @@ impl KernelSemanticInputV1 {
 
     pub fn definition_count(&self) -> usize {
         self.construction.definition_count
+    }
+
+    /// Borrow one call-result path from the packed kernel authority.
+    ///
+    /// Absence is distinct from a present path with an empty projection: an
+    /// empty function path intentionally contributes no textual prefix.
+    pub fn call_result_path(
+        &self,
+        call: CheckedCallId,
+    ) -> Option<KernelSemanticCallResultPathRef<'_>> {
+        let index = self
+            .construction
+            .call_result_paths
+            .binary_search_by_key(&call, |path| path.call)
+            .ok()?;
+        Some(KernelSemanticCallResultPathRef {
+            input: self,
+            locator: self.construction.call_result_paths[index],
+        })
+    }
+
+    pub fn validate_rich_call_result_paths(
+        &self,
+        rich: &[CheckedCallResultPath],
+    ) -> Result<(), KernelCheckedLinkError> {
+        if rich.is_empty() && !self.construction.rich_editor_projection_expected {
+            return Ok(());
+        }
+        if rich.len() != self.construction.call_result_paths.len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "checked editor image has {} rich call-result paths but packed authority has {}",
+                rich.len(),
+                self.construction.call_result_paths.len(),
+            )));
+        }
+        for (ordinal, (rich, packed)) in rich
+            .iter()
+            .zip(self.construction.call_result_paths.iter().copied())
+            .enumerate()
+        {
+            let packed = KernelSemanticCallResultPathRef {
+                input: self,
+                locator: packed,
+            };
+            if rich.call != packed.call()
+                || rich.path.anchor != packed.anchor()
+                || !packed
+                    .projection()
+                    .eq(rich.path.projection.iter().map(String::as_str))
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "checked editor call-result path {ordinal} differs from packed authority",
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn definition_execution_templates(
@@ -1531,6 +1680,36 @@ impl KernelSemanticInputV1 {
             }
         }
         Ok(())
+    }
+}
+
+impl<'a> KernelSemanticCallResultPathRef<'a> {
+    pub const fn call(self) -> CheckedCallId {
+        self.locator.call
+    }
+
+    pub const fn anchor(self) -> DeclId {
+        self.locator.anchor
+    }
+
+    pub const fn projection_len(self) -> usize {
+        self.locator.projection_len as usize
+    }
+
+    pub fn projection(self) -> impl ExactSizeIterator<Item = &'a str> {
+        let input = self.input;
+        input
+            .construction
+            .call_result_path_symbols(self.locator)
+            .expect("sealed kernel call-result path symbol range is valid")
+            .iter()
+            .map(move |symbol| {
+                input
+                    .construction
+                    .definition_code
+                    .symbol(*symbol)
+                    .expect("sealed kernel call-result path symbol belongs to its text authority")
+            })
     }
 }
 
@@ -1807,13 +1986,13 @@ fn checked_image_publication_v1(
     context_formals: &[CheckedContextFormal],
     calls: &[CheckedCall],
     call_occurrences: &[StableOccurrenceKey],
-    call_result_paths: &[CheckedCallResultPath],
+    call_result_paths: &[KernelSemanticCallResultPathLocatorV1],
     pattern_bindings: &[CheckedPatternBinding],
     resource_projection_requirements: &[KernelSemanticResourceProjectionLocatorV1],
     sources: &[CheckedSource],
     states: &[CheckedState],
     lists: &[CheckedList],
-    occurrences: &[SemanticOccurrence],
+    occurrence_targets: &[DeclId],
 ) -> Result<CheckedImageKernelPublicationV1, KernelCheckedLinkError> {
     let error = |message: String| KernelCheckedLinkError::new(message);
     let root_owner = CheckedShardOwnerKeyV2::ProgramTopLevel { role };
@@ -2209,9 +2388,9 @@ fn checked_image_publication_v1(
             )
             .map_err(&error)?;
     }
-    for (index, occurrence) in occurrences.iter().enumerate() {
+    for (index, target) in occurrence_targets.iter().copied().enumerate() {
         let projection = declaration_projections
-            .get(occurrence.target.0 as usize)
+            .get(target.0 as usize)
             .and_then(|projection| *projection)
             .unwrap_or(root_definition_id);
         publication
@@ -2481,6 +2660,7 @@ impl KernelCheckedLinkLayout {
         snapshot: &KernelCheckedSnapshot,
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
+        projection_demand: KernelCheckedRowProjectionDemand,
     ) -> Result<KernelCheckedRows, KernelCheckedLinkError> {
         let materialize_expression_rows = || {
             Ok::<_, KernelCheckedLinkError>((
@@ -2528,8 +2708,16 @@ impl KernelCheckedLinkLayout {
         } = base;
         let (calls, call_occurrences) =
             self.materialize_calls(project, snapshot, &callables, &declarations)?;
-        let call_result_paths =
-            self.materialize_call_result_paths(&declarations, &callables, &expressions, &calls)?;
+        let (packed_call_result_paths, packed_call_result_path_symbols) =
+            self.pack_call_result_paths(snapshot, &declarations, &callables, &expressions, &calls)?;
+        let call_result_paths = match projection_demand {
+            KernelCheckedRowProjectionDemand::RuntimePacked => Box::new([]),
+            KernelCheckedRowProjectionDemand::EditorRich => self.materialize_call_result_paths(
+                snapshot,
+                &packed_call_result_paths,
+                &packed_call_result_path_symbols,
+            )?,
+        };
         let pattern_bindings = self.materialize_pattern_bindings(snapshot)?;
         let semantic_resource_projections = self.semantic_resource_projection_locators(snapshot)?;
         #[cfg(test)]
@@ -2543,8 +2731,27 @@ impl KernelCheckedLinkLayout {
                 ));
             }
         }
-        let (occurrences, occurrence_ranges) =
-            self.materialize_occurrences(snapshot, &declarations, &expressions, &calls)?;
+        let occurrence_targets = self.occurrence_targets(snapshot, &expressions, &calls)?;
+        let (occurrences, occurrence_ranges): (
+            Box<[SemanticOccurrence]>,
+            Box<[KernelCheckedRowRange]>,
+        ) = match projection_demand {
+            KernelCheckedRowProjectionDemand::RuntimePacked => (Box::new([]), Box::new([])),
+            KernelCheckedRowProjectionDemand::EditorRich => {
+                let (occurrences, ranges) =
+                    self.materialize_occurrences(snapshot, &declarations, &expressions, &calls)?;
+                if !occurrences
+                    .iter()
+                    .map(|occurrence| occurrence.target)
+                    .eq(occurrence_targets.iter().copied())
+                {
+                    return Err(KernelCheckedLinkError::new(
+                        "kernel packed occurrence topology differs from rich editor rows",
+                    ));
+                }
+                (occurrences, ranges)
+            }
+        };
         #[cfg(test)]
         let rich_definition_execution_oracle = self
             .build_semantic_definition_execution_store_rich_oracle(
@@ -2565,19 +2772,22 @@ impl KernelCheckedLinkLayout {
             &context_formals,
             &calls,
             &call_occurrences,
-            &call_result_paths,
+            &packed_call_result_paths,
             &pattern_bindings,
             &semantic_resource_projections,
             &sources,
             &states,
             &lists,
-            &occurrences,
+            &occurrence_targets,
         )?;
         let semantic_input = KernelSemanticInputConstructionV1::from_linked_rows(
             source_bundle_digest_v1,
             role,
+            projection_demand,
             snapshot,
             self,
+            packed_call_result_paths,
+            packed_call_result_path_symbols,
             semantic_resource_projections,
             checked_image_publication.__kernel_pairing(),
         )?;
@@ -3254,38 +3464,70 @@ impl KernelCheckedLinkLayout {
         Ok(bindings.into_boxed_slice())
     }
 
-    /// Derive each call's stable storage path from the already-linked checked
-    /// expression graph. This is a single linear-table postpass; it performs no
-    /// type inference and does not reopen source-shaped owner products.
-    pub fn materialize_call_result_paths(
+    /// Derive each call's stable storage path into one flat interned-symbol
+    /// column. The traversal reuses one projection buffer and one visiting
+    /// bitmap for every call; no path owns a `String` or nested vector.
+    fn pack_call_result_paths(
         &self,
+        snapshot: &KernelCheckedSnapshot,
         declarations: &[CheckedDeclaration],
         callables: &[CheckedCallableSignature],
         expressions: &[CheckedExpression],
         calls: &[CheckedCall],
-    ) -> Result<Box<[CheckedCallResultPath]>, KernelCheckedLinkError> {
-        let declaration_values = declarations
+    ) -> Result<
+        (
+            Box<[KernelSemanticCallResultPathLocatorV1]>,
+            Box<[SymbolId]>,
+        ),
+        KernelCheckedLinkError,
+    > {
+        let declaration_slots = declarations
             .iter()
-            .filter_map(|declaration| declaration.value.map(|value| (declaration.id, value)))
-            .collect::<BTreeMap<_, _>>();
-        let callable_results = callables
-            .iter()
-            .filter_map(|callable| {
-                callable
-                    .result_expression
-                    .map(|expression| (callable.decl_id, expression))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let calls_by_id = calls
-            .iter()
-            .map(|call| (call.id, call))
-            .collect::<BTreeMap<_, _>>();
-        if calls_by_id.len() != calls.len() {
-            return Err(KernelCheckedLinkError::new(
-                "kernel checked call-result path materializer received duplicate call IDs",
-            ));
+            .map(|declaration| declaration.id.0 as usize)
+            .chain(callables.iter().map(|callable| callable.decl_id.0 as usize))
+            .max()
+            .map_or(1, |last| last.saturating_add(1));
+        let mut roots = vec![None; declaration_slots];
+        for declaration in declarations {
+            let slot = roots.get_mut(declaration.id.0 as usize).ok_or_else(|| {
+                KernelCheckedLinkError::new("declaration result-path root exceeds dense table")
+            })?;
+            if let Some(value) = declaration.value
+                && slot.replace(value).is_some()
+            {
+                return Err(KernelCheckedLinkError::new(
+                    "declaration result-path root is published twice",
+                ));
+            }
         }
-        let mut paths = Vec::new();
+        for callable in callables {
+            let Some(result) = callable.result_expression else {
+                continue;
+            };
+            let slot = roots.get_mut(callable.decl_id.0 as usize).ok_or_else(|| {
+                KernelCheckedLinkError::new("callable result-path root exceeds dense table")
+            })?;
+            if slot.is_none() {
+                *slot = Some(result);
+            }
+        }
+        for (ordinal, call) in calls.iter().enumerate() {
+            if call.id.0 as usize != ordinal {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel checked call-result topology expected dense call {ordinal} but found {}",
+                    call.id.0,
+                )));
+            }
+        }
+        let text = snapshot
+            .definition_code
+            .type_store()
+            .as_arena()
+            .text_snapshot();
+        let mut visiting = vec![false; expressions.len()];
+        let mut projection = Vec::new();
+        let mut symbols = Vec::new();
+        let mut result = Vec::new();
         for call in calls {
             let expression = expressions
                 .get(call.expression.0 as usize)
@@ -3299,25 +3541,164 @@ impl KernelCheckedLinkLayout {
             let Some(anchor) = expression.declaration else {
                 continue;
             };
-            let Some(root) = declaration_values
-                .get(&anchor)
-                .copied()
-                .or_else(|| callable_results.get(&anchor).copied())
-            else {
+            let Some(root) = roots.get(anchor.0 as usize).copied().flatten() else {
                 continue;
             };
-            let Some(projection) =
-                checked_projection_to_expression(expressions, &calls_by_id, root, call.expression)
-            else {
-                continue;
-            };
-            paths.push(CheckedCallResultPath {
-                call: call.id,
-                path: CheckedSemanticPath { anchor, projection },
-            });
+            projection.clear();
+            if checked_projection_symbols_to_expression_with_scratch(
+                text,
+                expressions,
+                calls,
+                root,
+                call.expression,
+                &mut visiting,
+                &mut projection,
+            )? {
+                let projection_start = u32::try_from(symbols.len()).map_err(|_| {
+                    KernelCheckedLinkError::new(
+                        "kernel semantic call-result path symbol start exceeds u32",
+                    )
+                })?;
+                let projection_len = u32::try_from(projection.len()).map_err(|_| {
+                    KernelCheckedLinkError::new(
+                        "kernel semantic call-result path length exceeds u32",
+                    )
+                })?;
+                symbols.extend_from_slice(&projection);
+                result.push(KernelSemanticCallResultPathLocatorV1 {
+                    call: call.id,
+                    anchor,
+                    projection_start,
+                    projection_len,
+                });
+            }
         }
-        paths.sort_unstable_by_key(|path| path.call);
-        Ok(paths.into_boxed_slice())
+        Ok((result.into_boxed_slice(), symbols.into_boxed_slice()))
+    }
+
+    /// Project compact call-result paths only for editor/export and the rich
+    /// differential oracle.
+    fn materialize_call_result_paths(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        paths: &[KernelSemanticCallResultPathLocatorV1],
+        symbols: &[SymbolId],
+    ) -> Result<Box<[CheckedCallResultPath]>, KernelCheckedLinkError> {
+        let text = snapshot
+            .definition_code
+            .type_store()
+            .as_arena()
+            .text_snapshot();
+        paths
+            .iter()
+            .map(|path| {
+                let start = path.projection_start as usize;
+                let end = start
+                    .checked_add(path.projection_len as usize)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(
+                            "kernel editor call-result path range overflows",
+                        )
+                    })?;
+                let projection = symbols
+                    .get(start..end)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(
+                            "kernel editor call-result path range is invalid",
+                        )
+                    })?
+                    .iter()
+                    .map(|symbol| {
+                        text.symbol(*symbol).map(str::to_owned).ok_or_else(|| {
+                            KernelCheckedLinkError::new(
+                                "kernel editor call-result path has a foreign symbol",
+                            )
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(CheckedCallResultPath {
+                    call: path.call,
+                    path: CheckedSemanticPath {
+                        anchor: path.anchor,
+                        projection,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(Vec::into_boxed_slice)
+    }
+
+    /// Emit only the dense declaration target of every semantic occurrence.
+    /// Checked-image routing depends on this identity and never consumes the
+    /// rich occurrence kind or source span.
+    fn occurrence_targets(
+        &self,
+        snapshot: &KernelCheckedSnapshot,
+        expressions: &[CheckedExpression],
+        calls: &[CheckedCall],
+    ) -> Result<Box<[DeclId]>, KernelCheckedLinkError> {
+        self.validate_snapshot_definition_count(snapshot, "occurrence topology")?;
+        let mut targets = Vec::new();
+        for definition in snapshot.definition_refs() {
+            let owner = definition.owner();
+            let linked = self.definition(owner)?;
+
+            for declaration in &definition.facts().declarations {
+                if matches!(
+                    declaration.origin,
+                    crate::KernelDeclarationOrigin::RecordField { .. }
+                        | crate::KernelDeclarationOrigin::CallbackBinding { .. }
+                        | crate::KernelDeclarationOrigin::CallContext { .. }
+                ) {
+                    continue;
+                }
+                targets.push(
+                    self.declaration(owner, KernelDeclarationReference::Local(declaration.id))?,
+                );
+            }
+
+            for row in checked_range(linked.calls)? {
+                let call = calls
+                    .get(row)
+                    .filter(|call| call.id.0 as usize == row)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} occurrence topology references missing call row {row}",
+                            owner.0,
+                        ))
+                    })?;
+                for entry in &call.entries {
+                    match entry {
+                        CheckedCallEntry::FreshOut { output, .. } => targets.push(*output),
+                        CheckedCallEntry::ForwardOut { target, .. } => targets.push(*target),
+                        CheckedCallEntry::Input { .. } => {}
+                    }
+                }
+                targets.extend(call.contexts.iter().map(|context| context.declaration));
+                targets.push(call.callable);
+                if matches!(call.context_binding, CheckedContextBinding::Explicit { .. }) {
+                    targets.push(call.callable);
+                }
+            }
+
+            for row in checked_range(linked.expressions)? {
+                let expression = expressions
+                    .get(row)
+                    .filter(|expression| expression.id.0 as usize == row)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {} occurrence topology references missing expression row {row}",
+                            owner.0,
+                        ))
+                    })?;
+                match expression.kind {
+                    CheckedExpressionKind::Read { target, .. }
+                    | CheckedExpressionKind::Drain { target, .. } => targets.push(target),
+                    _ => {}
+                }
+            }
+        }
+        Ok(targets.into_boxed_slice())
     }
 
     /// Emit the complete semantic occurrence inventory while source-local
@@ -7295,80 +7676,169 @@ fn checked_match_pattern(
     })
 }
 
-fn checked_projection_to_expression(
+fn checked_projection_symbols_to_expression_with_scratch(
+    text: &boon_contract::ProjectTextSnapshot,
     expressions: &[CheckedExpression],
-    calls: &BTreeMap<CheckedCallId, &CheckedCall>,
-    root: CheckedExprId,
+    calls: &[CheckedCall],
+    current: CheckedExprId,
     target: CheckedExprId,
-) -> Option<Vec<String>> {
-    fn visit(
-        expressions: &[CheckedExpression],
-        calls: &BTreeMap<CheckedCallId, &CheckedCall>,
-        current: CheckedExprId,
-        target: CheckedExprId,
-        visiting: &mut BTreeSet<CheckedExprId>,
-    ) -> Option<Vec<String>> {
-        if current == target {
-            return Some(Vec::new());
-        }
-        if !visiting.insert(current) {
-            return None;
-        }
-        let expression = expressions
+    visiting: &mut [bool],
+    projection: &mut Vec<SymbolId>,
+) -> Result<bool, KernelCheckedLinkError> {
+    if current == target {
+        return Ok(true);
+    }
+    let Some(active) = visiting.get_mut(current.0 as usize) else {
+        return Ok(false);
+    };
+    if *active {
+        return Ok(false);
+    }
+    *active = true;
+    let result = (|| {
+        let Some(expression) = expressions
             .get(current.0 as usize)
-            .filter(|expression| expression.id == current)?;
-        let direct =
-            |child, visiting: &mut BTreeSet<_>| visit(expressions, calls, child, target, visiting);
-        let result = match &expression.kind {
+            .filter(|expression| expression.id == current)
+        else {
+            return Ok(false);
+        };
+        macro_rules! reaches {
+            ($child:expr) => {
+                checked_projection_symbols_to_expression_with_scratch(
+                    text,
+                    expressions,
+                    calls,
+                    $child,
+                    target,
+                    visiting,
+                    projection,
+                )?
+            };
+        }
+        Ok(match &expression.kind {
             CheckedExpressionKind::TaggedObject { fields, .. }
-            | CheckedExpressionKind::Object { fields } => fields.iter().find_map(|field| {
-                let mut projection = direct(field.value, visiting)?;
-                projection.insert(0, field.name.clone());
-                Some(projection)
-            }),
-            CheckedExpressionKind::Call { call } => calls
-                .get(call)
-                .into_iter()
-                .flat_map(|call| &call.entries)
-                .find_map(|entry| match entry {
-                    CheckedCallEntry::Input { value, .. } => direct(*value, visiting),
-                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
-                }),
+            | CheckedExpressionKind::Object { fields } => {
+                let mut found = false;
+                for field in fields {
+                    let symbol = text.lookup_symbol(&field.name).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "checked object field `{}` is absent from the project text authority",
+                            field.name,
+                        ))
+                    })?;
+                    projection.push(symbol);
+                    if reaches!(field.value) {
+                        found = true;
+                        break;
+                    }
+                    projection.pop();
+                }
+                found
+            }
+            CheckedExpressionKind::Call { call } => {
+                let Some(call) = calls
+                    .get(call.0 as usize)
+                    .filter(|candidate| candidate.id == *call)
+                else {
+                    return Ok(false);
+                };
+                let mut found = false;
+                for entry in &call.entries {
+                    if let CheckedCallEntry::Input { value, .. } = entry
+                        && reaches!(*value)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                found
+            }
             CheckedExpressionKind::Draining { input }
-            | CheckedExpressionKind::Hold { initial: input, .. } => direct(*input, visiting),
-            CheckedExpressionKind::Flush { payload } => direct(*payload, visiting),
+            | CheckedExpressionKind::Hold { initial: input, .. } => reaches!(*input),
+            CheckedExpressionKind::Flush { payload } => reaches!(*payload),
             CheckedExpressionKind::When { input, arms }
-            | CheckedExpressionKind::While { input, arms } => direct(*input, visiting)
-                .or_else(|| arms.iter().find_map(|arm| direct(*arm, visiting))),
-            CheckedExpressionKind::Then { input, output } => direct(*input, visiting)
-                .or_else(|| output.and_then(|output| direct(output, visiting))),
-            CheckedExpressionKind::Infix { left, right, .. } => {
-                direct(*left, visiting).or_else(|| direct(*right, visiting))
+            | CheckedExpressionKind::While { input, arms } => {
+                if reaches!(*input) {
+                    true
+                } else {
+                    let mut found = false;
+                    for arm in arms {
+                        if reaches!(*arm) {
+                            found = true;
+                            break;
+                        }
+                    }
+                    found
+                }
             }
+            CheckedExpressionKind::Then { input, output } => {
+                if reaches!(*input) {
+                    true
+                } else if let Some(output) = output {
+                    reaches!(*output)
+                } else {
+                    false
+                }
+            }
+            CheckedExpressionKind::Infix { left, right, .. } => reaches!(*left) || reaches!(*right),
             CheckedExpressionKind::MatchArm { output, .. } => {
-                output.and_then(|output| direct(output, visiting))
+                if let Some(output) = output {
+                    reaches!(*output)
+                } else {
+                    false
+                }
             }
-            CheckedExpressionKind::Block { bindings, result } => bindings
-                .iter()
-                .find_map(|binding| direct(binding.value, visiting))
-                .or_else(|| result.and_then(|result| direct(result, visiting))),
+            CheckedExpressionKind::Block { bindings, result } => {
+                let mut found = false;
+                for binding in bindings {
+                    if reaches!(binding.value) {
+                        found = true;
+                        break;
+                    }
+                }
+                if found {
+                    true
+                } else if let Some(result) = result {
+                    reaches!(*result)
+                } else {
+                    false
+                }
+            }
             CheckedExpressionKind::List { items, .. }
             | CheckedExpressionKind::Bytes { items, .. }
             | CheckedExpressionKind::Set { items }
             | CheckedExpressionKind::Latest { branches: items } => {
-                items.iter().find_map(|item| direct(*item, visiting))
+                let mut found = false;
+                for item in items {
+                    if reaches!(*item) {
+                        found = true;
+                        break;
+                    }
+                }
+                found
             }
             CheckedExpressionKind::Map { entries } => {
-                entries.iter().find_map(|entry| direct(*entry, visiting))
+                let mut found = false;
+                for entry in entries {
+                    if reaches!(*entry) {
+                        found = true;
+                        break;
+                    }
+                }
+                found
             }
-            CheckedExpressionKind::MapEntry { key, value } => {
-                direct(*key, visiting).or_else(|| direct(*value, visiting))
-            }
+            CheckedExpressionKind::MapEntry { key, value } => reaches!(*key) || reaches!(*value),
             CheckedExpressionKind::TextTemplate { segments } => {
-                segments.iter().find_map(|segment| match segment {
-                    CheckedTextSegment::Static { .. } => None,
-                    CheckedTextSegment::Dynamic { value } => direct(*value, visiting),
-                })
+                let mut found = false;
+                for segment in segments {
+                    if let CheckedTextSegment::Dynamic { value } = segment
+                        && reaches!(*value)
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                found
             }
             CheckedExpressionKind::Read { .. }
             | CheckedExpressionKind::Passed { .. }
@@ -7382,13 +7852,11 @@ fn checked_projection_to_expression(
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Delimiter
-            | CheckedExpressionKind::Invalid { .. } => None,
-        };
-        visiting.remove(&current);
-        result
-    }
-
-    visit(expressions, calls, root, target, &mut BTreeSet::new())
+            | CheckedExpressionKind::Invalid { .. } => false,
+        })
+    })();
+    visiting[current.0 as usize] = false;
+    result
 }
 
 fn lexical_payload_path(payload: &crate::KernelExpressionSemanticPayload) -> Option<String> {
@@ -8327,6 +8795,7 @@ mod tests {
         KernelStatementKind, KernelStatementValueUse,
     };
     use boon_checked::FlowMode;
+    use boon_contract::PackedTextCatalogBuilder;
     use boon_syntax::{
         SourceUnitId, StableCheckOwnerKey, StableExpressionKey, StableItemRoute,
         StableItemRouteSegment, StableOwnerKey, StableStatementKey, StableStatementRoute,
@@ -8342,6 +8811,124 @@ mod tests {
                 matching_sibling_ordinal: 0,
             }]),
         })
+    }
+
+    #[test]
+    fn packed_call_result_projection_traversal_has_independent_known_answers() {
+        fn expression(id: u32, kind: CheckedExpressionKind) -> CheckedExpression {
+            CheckedExpression {
+                id: CheckedExprId(id),
+                scope_id: LexicalScopeId(0),
+                declaration: None,
+                flow_type: FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: Type::Unknown,
+                },
+                flush_type: None,
+                effect: CheckedEffectSummary::default(),
+                kind,
+                span: CheckedSpan::default(),
+            }
+        }
+
+        fn field(name: &str, value: u32) -> CheckedRecordField {
+            CheckedRecordField {
+                declaration: None,
+                name: name.to_owned(),
+                value: CheckedExprId(value),
+                spread: false,
+                span: CheckedSpan::default(),
+            }
+        }
+
+        fn projection(
+            text: &boon_contract::ProjectTextSnapshot,
+            expressions: &[CheckedExpression],
+            root: u32,
+            target: u32,
+        ) -> Option<Vec<String>> {
+            let mut visiting = vec![false; expressions.len()];
+            let mut symbols = Vec::new();
+            checked_projection_symbols_to_expression_with_scratch(
+                text,
+                expressions,
+                &[],
+                CheckedExprId(root),
+                CheckedExprId(target),
+                &mut visiting,
+                &mut symbols,
+            )
+            .unwrap()
+            .then(|| {
+                symbols
+                    .iter()
+                    .map(|symbol| text.symbol(*symbol).unwrap().to_owned())
+                    .collect()
+            })
+        }
+
+        let mut text = PackedTextCatalogBuilder::new();
+        for name in ["outer", "inner", "cycle", "alternate", "leaf"] {
+            text.intern_symbol(name).unwrap();
+        }
+        let text = text.freeze();
+
+        let nested = vec![
+            expression(
+                0,
+                CheckedExpressionKind::Object {
+                    fields: vec![field("outer", 1)],
+                },
+            ),
+            expression(
+                1,
+                CheckedExpressionKind::Object {
+                    fields: vec![field("inner", 2)],
+                },
+            ),
+            expression(
+                2,
+                CheckedExpressionKind::Number {
+                    value: boon_data::ExactNumber::from_u64(1),
+                },
+            ),
+        ];
+        assert_eq!(
+            projection(&text, &nested, 0, 2),
+            Some(vec!["outer".to_owned(), "inner".to_owned()]),
+        );
+        assert_eq!(
+            projection(&text, &nested, 2, 2),
+            Some(Vec::new()),
+            "a function result rooted at its call expression has a present empty path",
+        );
+        assert_eq!(projection(&text, &nested, 0, 3), None);
+
+        let cyclic = vec![
+            expression(
+                0,
+                CheckedExpressionKind::Object {
+                    fields: vec![field("cycle", 0), field("alternate", 1)],
+                },
+            ),
+            expression(
+                1,
+                CheckedExpressionKind::Object {
+                    fields: vec![field("leaf", 2)],
+                },
+            ),
+            expression(
+                2,
+                CheckedExpressionKind::Number {
+                    value: boon_data::ExactNumber::from_u64(2),
+                },
+            ),
+        ];
+        assert_eq!(
+            projection(&text, &cyclic, 0, 2),
+            Some(vec!["alternate".to_owned(), "leaf".to_owned()]),
+            "a failed cyclic branch must backtrack before the reachable sibling",
+        );
     }
 
     #[test]
@@ -8585,6 +9172,7 @@ mod tests {
                 )
                 .unwrap(),
                 ProgramRole::Client,
+                KernelCheckedRowProjectionDemand::EditorRich,
             )
             .expect("one linker call must materialize the complete checked-row surface");
         assert_eq!(rows.scopes.len(), 1);

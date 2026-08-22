@@ -1520,6 +1520,7 @@ pub(crate) fn derive_contextual_materializations(
         }
         let mut builder = SemanticExpressionBuilder::new(
             program,
+            kernel_input,
             &lookup,
             out_net,
             &builder_indexes,
@@ -2647,6 +2648,7 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
 
 pub(crate) fn derive_semantic_execution_graph(
     program: &CheckedProgramFields,
+    kernel_input: Option<&boon_compiler_kernel::KernelSemanticInputV1>,
     checked_handoff: CheckedImageHandoffV4,
     runtime_flow_terms: boon_checked::CheckedRuntimeFlowTermHandoffV1,
     out_net: &OutNet,
@@ -2764,6 +2766,7 @@ pub(crate) fn derive_semantic_execution_graph(
     let inherited_local_types = BTreeMap::new();
     let mut builder = SemanticExpressionBuilder::new(
         program,
+        kernel_input,
         &lookup,
         out_net,
         builder_indexes,
@@ -6460,6 +6463,7 @@ fn definition_resource_expression_indexes(
 
 pub(crate) struct SemanticExpressionBuilder<'a> {
     program: &'a CheckedProgramFields,
+    kernel_input: Option<&'a boon_compiler_kernel::KernelSemanticInputV1>,
     lookup: &'a CheckedProgramLookup,
     out_net: &'a OutNet,
     indexes: &'a SemanticExpressionBuilderIndexes,
@@ -6492,6 +6496,7 @@ pub(crate) struct SemanticExpressionBuilder<'a> {
 impl<'a> SemanticExpressionBuilder<'a> {
     fn new(
         program: &'a CheckedProgramFields,
+        kernel_input: Option<&'a boon_compiler_kernel::KernelSemanticInputV1>,
         lookup: &'a CheckedProgramLookup,
         out_net: &'a OutNet,
         indexes: &'a SemanticExpressionBuilderIndexes,
@@ -6502,6 +6507,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
     ) -> Self {
         Self {
             program,
+            kernel_input,
             lookup,
             out_net,
             indexes,
@@ -9061,16 +9067,32 @@ impl<'a> SemanticExpressionBuilder<'a> {
         for instance_id in ancestry {
             let instance = self.out_net.call_instances.get(instance_id.as_usize())?;
             let local = if let Some(call) = instance.provenance.call_id {
-                let checked_path = self.program.result_path_for_call(call)?;
-                self.program.semantic_path(checked_path).or_else(|| {
-                    self.lookup
-                        .declaration(self.program, checked_path.anchor)
-                        .is_some_and(|declaration| {
-                            declaration.kind == CheckedDeclarationKind::Function
-                                && checked_path.projection.is_empty()
-                        })
-                        .then(String::new)
-                })?
+                if let Some(kernel_input) = self.kernel_input {
+                    let path = kernel_input.call_result_path(call)?;
+                    let anchor = path.anchor();
+                    let empty = path.projection_len() == 0;
+                    self.program
+                        .semantic_path_from_parts(anchor, path.projection())
+                        .or_else(|| {
+                            self.lookup
+                                .declaration(self.program, anchor)
+                                .is_some_and(|declaration| {
+                                    declaration.kind == CheckedDeclarationKind::Function && empty
+                                })
+                                .then(String::new)
+                        })?
+                } else {
+                    let checked_path = self.program.result_path_for_call(call)?;
+                    self.program.semantic_path(checked_path).or_else(|| {
+                        self.lookup
+                            .declaration(self.program, checked_path.anchor)
+                            .is_some_and(|declaration| {
+                                declaration.kind == CheckedDeclarationKind::Function
+                                    && checked_path.projection.is_empty()
+                            })
+                            .then(String::new)
+                    })?
+                }
             } else {
                 self.out_net
                     .producer_root_result_path(instance_id)?
@@ -9081,7 +9103,12 @@ impl<'a> SemanticExpressionBuilder<'a> {
             }
             result = Some(match result {
                 None => local,
-                Some(prefix) if local == prefix || local.starts_with(&(prefix.clone() + ".")) => {
+                Some(prefix)
+                    if local == prefix
+                        || local
+                            .strip_prefix(prefix.as_str())
+                            .is_some_and(|suffix| suffix.starts_with('.')) =>
+                {
                     local
                 }
                 Some(mut prefix) => {
@@ -9112,7 +9139,10 @@ impl<'a> SemanticExpressionBuilder<'a> {
         let prefix = frame.and_then(|frame| self.concrete_call_result_path(frame));
         match (prefix, local) {
             (Some(prefix), Some(local))
-                if local == prefix || local.starts_with(&(prefix.clone() + ".")) =>
+                if local == prefix
+                    || local
+                        .strip_prefix(prefix.as_str())
+                        .is_some_and(|suffix| suffix.starts_with('.')) =>
             {
                 Some(local)
             }
@@ -9375,6 +9405,7 @@ mod tests {
                 .expect("valid fixture derives contextual materializations");
         let builder = derive_semantic_execution_graph(
             &program,
+            None,
             checked_handoff,
             runtime_flow_terms,
             &out,

@@ -2945,6 +2945,7 @@ fn elaborate_with_representation(
         "derive_semantic_execution_graph",
         contextual_expansion::derive_semantic_execution_graph(
             &checked_program,
+            kernel_input.as_ref(),
             checked_handoff,
             runtime_flow_terms,
             &resolved_out_graph,

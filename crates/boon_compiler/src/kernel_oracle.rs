@@ -24,26 +24,26 @@ use boon_compiler_kernel::{
     KernelCallShapeInput, KernelCallShapeParameter, KernelCallShapeResolution,
     KernelCallSyntaxArgument, KernelCallSyntaxInput, KernelCallTypeSubstitution,
     KernelCallableAbiInput, KernelCallableKind, KernelCheckProduct, KernelCheckedLinkLayout,
-    KernelCollectionKind, KernelCompileWork, KernelConditionalKind, KernelDeclarationId,
-    KernelDeclarationInput, KernelDeclarationKind, KernelDeclarationOrigin,
-    KernelDeclarationPresentation, KernelDeclarationReference, KernelDefinitionFactsInput,
-    KernelDefinitionPresentation, KernelDefinitionRelocations, KernelDiagnosticKind,
-    KernelDiagnosticSeverity, KernelDiagnosticSite, KernelExecutionBlockBindingInput,
-    KernelExecutionRecordFieldInput, KernelExecutionShapeInput, KernelExpressionId,
-    KernelExpressionPresentation, KernelExpressionRelocation, KernelExpressionSemanticPayload,
-    KernelExternalExpression, KernelExternalTarget, KernelHostEffectArtifact,
-    KernelInheritedFormal, KernelInterfaceSnapshot, KernelLexicalAccess, KernelLexicalBindingInput,
-    KernelLexicalBindingTargetInput, KernelListId, KernelListInput, KernelMatchPatternPayload,
-    KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge, KernelOwnerNode, KernelOwnerNodeKind,
-    KernelOwnerProgramInput, KernelParameterEvaluationScope, KernelParameterKind, KernelPattern,
-    KernelProjectInput, KernelProjectProgramInput, KernelPureBuiltinKind,
-    KernelRenderConstructorKind, KernelScopeId, KernelScopeKind, KernelScopeOrigin,
-    KernelScopePresentation, KernelScopeReference, KernelSession, KernelSolveWork, KernelSourceId,
-    KernelSourceInput, KernelSourceSpan, KernelStateId, KernelStateInput,
-    KernelStatementChildReference, KernelStatementId, KernelStatementInput, KernelStatementKind,
-    KernelStatementParameter, KernelStatementPresentation, KernelStatementReference,
-    KernelStatementValueUse, KernelStructuralDeclarationInput, KernelTextTemplateSegment,
-    KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
+    KernelCheckedRowProjectionDemand, KernelCollectionKind, KernelCompileWork,
+    KernelConditionalKind, KernelDeclarationId, KernelDeclarationInput, KernelDeclarationKind,
+    KernelDeclarationOrigin, KernelDeclarationPresentation, KernelDeclarationReference,
+    KernelDefinitionFactsInput, KernelDefinitionPresentation, KernelDefinitionRelocations,
+    KernelDiagnosticKind, KernelDiagnosticSeverity, KernelDiagnosticSite,
+    KernelExecutionBlockBindingInput, KernelExecutionRecordFieldInput, KernelExecutionShapeInput,
+    KernelExpressionId, KernelExpressionPresentation, KernelExpressionRelocation,
+    KernelExpressionSemanticPayload, KernelExternalExpression, KernelExternalTarget,
+    KernelHostEffectArtifact, KernelInheritedFormal, KernelInterfaceSnapshot, KernelLexicalAccess,
+    KernelLexicalBindingInput, KernelLexicalBindingTargetInput, KernelListId, KernelListInput,
+    KernelMatchPatternPayload, KernelOwnerEdgeRole, KernelOwnerId, KernelOwnerInputEdge,
+    KernelOwnerNode, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelParameterEvaluationScope,
+    KernelParameterKind, KernelPattern, KernelProjectInput, KernelProjectProgramInput,
+    KernelPureBuiltinKind, KernelRenderConstructorKind, KernelScopeId, KernelScopeKind,
+    KernelScopeOrigin, KernelScopePresentation, KernelScopeReference, KernelSession,
+    KernelSolveWork, KernelSourceId, KernelSourceInput, KernelSourceSpan, KernelStateId,
+    KernelStateInput, KernelStatementChildReference, KernelStatementId, KernelStatementInput,
+    KernelStatementKind, KernelStatementParameter, KernelStatementPresentation,
+    KernelStatementReference, KernelStatementValueUse, KernelStructuralDeclarationInput,
+    KernelTextTemplateSegment, KernelTypeMismatch, KernelValueReference, is_kernel_host_effect,
     is_registered_kernel_host_effect, project_kernel_call_shape,
     project_kernel_source_expression_diagnostics,
 };
@@ -1311,6 +1311,7 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                             &checked,
                             project.source_bundle_digest_v1(),
                             role,
+                            KernelCheckedRowProjectionDemand::EditorRich,
                         )
                         .map_err(|error| error.to_string())?;
                     let rows_us = elapsed_us(rows_started.elapsed());
@@ -2767,6 +2768,14 @@ fn checked_construction_from_kernel(
             &snapshot,
             project.source_bundle_digest_v1(),
             role,
+            match projection_demand {
+                KernelCheckedProjectionDemand::RuntimePacked => {
+                    KernelCheckedRowProjectionDemand::RuntimePacked
+                }
+                KernelCheckedProjectionDemand::EditorRich => {
+                    KernelCheckedRowProjectionDemand::EditorRich
+                }
+            },
         )
         .map_err(|error| format!("cannot link dense kernel checked rows: {error}"))?;
     let rows_us = elapsed_us(phase_started.elapsed());
@@ -2863,9 +2872,6 @@ fn checked_construction_from_kernel(
             .semantic_input
             .materialize_rich_definition_execution_templates(),
     };
-    if projection_demand == KernelCheckedProjectionDemand::EditorRich {
-        rows.semantic_input.expect_rich_editor_projection();
-    }
     let call_occurrences = rows.call_occurrences;
     let semantic_input = rows.semantic_input;
     let mut checked_image_publication = rows.checked_image_publication;
@@ -20757,11 +20763,52 @@ FUNCTION stateful_row(row) {
             packed_program.image_handoff().local_image_digest,
             rich_program.image_handoff().local_image_digest,
         );
+        assert_eq!(
+            packed_program.image_handoff(),
+            rich_program.image_handoff(),
+            "runtime packed and editor-rich checked-image handoffs must be identical",
+        );
 
         let packed_semantic = boon_semantic::elaborate_kernel(packed_program, packed_input, &[])
             .expect("RuntimePacked definition templates elaborate");
         let rich_semantic = boon_semantic::elaborate(rich_program, &[])
             .expect("EditorRich definition templates elaborate");
+        macro_rules! assert_execution_column {
+            ($column:ident) => {{
+                let packed = &packed_semantic.execution_graph().$column;
+                let rich = &rich_semantic.execution_graph().$column;
+                if packed != rich {
+                    let first = packed
+                        .iter()
+                        .zip(rich)
+                        .position(|(packed, rich)| packed != rich);
+                    panic!(
+                        "semantic execution column `{}` differs at {first:?}: packed={:#?} rich={:#?}",
+                        stringify!($column),
+                        first.and_then(|index| packed.get(index)),
+                        first.and_then(|index| rich.get(index)),
+                    );
+                }
+            }};
+        }
+        assert_execution_column!(expressions);
+        assert_execution_column!(statements);
+        assert_execution_column!(scopes);
+        assert_execution_column!(callables);
+        assert_execution_column!(calls);
+        assert_execution_column!(call_occurrences);
+        assert_execution_column!(sources);
+        assert_execution_column!(states);
+        assert_execution_column!(roots);
+        assert_execution_column!(functions);
+        assert_execution_column!(materializations);
+        assert_execution_column!(static_owners);
+        assert_execution_column!(checked_expression_origins);
+        assert_eq!(
+            packed_semantic.dependency_manifest(),
+            rich_semantic.dependency_manifest(),
+            "runtime packed and editor-rich dependency manifests must be identical",
+        );
         assert_eq!(packed_semantic.digest(), rich_semantic.digest());
 
         let packed_verified = boon_verify::verify_explicit_contracts(packed_semantic)

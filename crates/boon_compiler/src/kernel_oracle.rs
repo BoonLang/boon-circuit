@@ -2626,10 +2626,12 @@ fn append_kernel_checked_metadata_publication(
     projection_demand: KernelCheckedProjectionDemand,
 ) -> Result<(), String> {
     let root_owner = boon_checked::CheckedShardOwnerKeyV2::ProgramTopLevel { role: fields.role };
-    let root_definition = publication.__kernel_intern_projection(CheckedShardProjectionKeyV2 {
-        owner: root_owner.clone(),
-        region: CheckedShardRegionV2::Definition,
-    })?;
+    let root_definition = publication
+        .__kernel_projection_id(&CheckedShardProjectionKeyV2 {
+            owner: root_owner.clone(),
+            region: CheckedShardRegionV2::Definition,
+        })
+        .ok_or_else(|| "kernel metadata has no linked root Definition projection".to_owned())?;
     for chain in &fields.order_chains {
         let projection = publication
             .__kernel_projection_for_route(CheckedImageRowDomainV2::Call, chain.call.0 as usize)
@@ -2661,10 +2663,14 @@ fn append_kernel_checked_metadata_publication(
             .into_iter()
             .next()
             .unwrap_or_else(|| root_owner.clone());
-        let projection = publication.__kernel_intern_projection(CheckedShardProjectionKeyV2 {
-            owner,
-            region: CheckedShardRegionV2::Definition,
-        })?;
+        let projection = publication
+            .__kernel_projection_id(&CheckedShardProjectionKeyV2 {
+                owner,
+                region: CheckedShardRegionV2::Definition,
+            })
+            .ok_or_else(|| {
+                "kernel source-payload metadata has no linked Definition projection".to_owned()
+            })?;
         publication.__kernel_publish_rows(projection, 1)?;
     }
     publication.__kernel_publish_rows(root_definition, 1)?;
@@ -2999,7 +3005,7 @@ fn checked_construction_from_kernel(
             .materialize_rich_definition_execution_templates(),
     };
     let call_occurrences = rows.call_occurrences;
-    let semantic_input = rows.semantic_input;
+    let mut semantic_input = rows.semantic_input;
     let mut checked_image_publication = rows.checked_image_publication;
     let mut fields = CheckedProgramFields {
         source_bundle_digest_v1: project.source_bundle_digest_v1(),
@@ -3073,6 +3079,9 @@ fn checked_construction_from_kernel(
         &mut checked_image_publication,
         projection_demand,
     )?;
+    semantic_input
+        .__compiler_freeze_checked_image_ownership(&checked_image_publication)
+        .map_err(|error| format!("cannot freeze dense checked-image ownership: {error}"))?;
     let program_metadata_fingerprint = boon_contract::canonical_serde_hash_v1(
         KERNEL_CHECKED_PROGRAM_METADATA_SEAL_DOMAIN_V1,
         &(
@@ -12191,7 +12200,7 @@ mod tests {
     fn seal_runtime_packed_test_program(
         project: &ProjectSyntaxSnapshot,
         fields: boon_checked::CheckedProgramFields,
-        semantic_input: &boon_compiler_kernel::KernelSemanticInputConstructionV1,
+        semantic_input: &mut boon_compiler_kernel::KernelSemanticInputConstructionV1,
         authority: boon_checked::CheckedImageKernelAuthorityV1,
         publication: boon_checked::CheckedImageKernelPublicationV1,
     ) -> Result<boon_checked::RuntimePackedCheckedProgramV1, String> {
@@ -12222,7 +12231,9 @@ mod tests {
                 list_count: counts.lists,
                 occurrence_count: counts.occurrences,
             },
-            entity_route_digest_v1: semantic_input.checked_image_entity_route_digest_v1(),
+            ownership_expectation: semantic_input
+                .take_checked_image_ownership_expectation()
+                .map_err(|error| error.to_string())?,
             resource_routes: &resource_routes,
         };
         let construction = unsafe {
@@ -21711,7 +21722,7 @@ ordered_mutual:
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse dense checked-construction fixture");
-        let checked = checked_construction_from_kernel(
+        let mut checked = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Server,
             KernelCheckedProjectionDemand::EditorRich,
@@ -21760,6 +21771,10 @@ ordered_mutual:
                 &checked.call_occurrences,
                 &checked.checked_image_authority,
                 checked.checked_image_publication,
+                checked
+                    .semantic_input
+                    .take_checked_image_ownership_expectation()
+                    .expect("take checked-image ownership expectation"),
             )
             .expect("dense checked construction seals through its direct image publication");
         // SAFETY: `expected` is the same completed construction used above;
@@ -21798,7 +21813,7 @@ ordered_mutual:
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse packed definition-execution fixture");
-        let checked = checked_construction_from_kernel(
+        let mut checked = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Server,
             KernelCheckedProjectionDemand::RuntimePacked,
@@ -21827,7 +21842,7 @@ ordered_mutual:
         let program = seal_runtime_packed_test_program(
             &project,
             checked.fields,
-            &checked.semantic_input,
+            &mut checked.semantic_input,
             checked.checked_image_authority,
             checked.checked_image_publication,
         )
@@ -21966,6 +21981,10 @@ ordered_mutual:
                 &checked.call_occurrences,
                 &checked.checked_image_authority,
                 checked.checked_image_publication,
+                checked
+                    .semantic_input
+                    .take_checked_image_ownership_expectation()
+                    .expect("take checked-image ownership expectation"),
             )
             .expect("seal editor checked image without compatibility-only template rows");
         assert!(
@@ -21991,7 +22010,7 @@ ordered_mutual:
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse checked-image resource fixture");
-        let checked = checked_construction_from_kernel(
+        let mut checked = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Server,
             KernelCheckedProjectionDemand::EditorRich,
@@ -22018,6 +22037,10 @@ ordered_mutual:
                 &checked.call_occurrences,
                 &checked.checked_image_authority,
                 checked.checked_image_publication,
+                checked
+                    .semantic_input
+                    .take_checked_image_ownership_expectation()
+                    .expect("take checked-image ownership expectation"),
             )
             .expect("seal direct resource publication");
         let replay =
@@ -22184,7 +22207,7 @@ ordered_mutual:
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse packed semantic resource fixture");
-        let checked = checked_construction_from_kernel(
+        let mut checked = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Server,
             KernelCheckedProjectionDemand::EditorRich,
@@ -22215,6 +22238,10 @@ ordered_mutual:
                 &checked.call_occurrences,
                 &checked.checked_image_authority,
                 checked.checked_image_publication,
+                checked
+                    .semantic_input
+                    .take_checked_image_ownership_expectation()
+                    .expect("take checked-image ownership expectation"),
             )
             .expect("seal packed semantic checked image");
         let replay =
@@ -22249,7 +22276,7 @@ ordered_mutual:
         .expect("rich semantics lower to IR");
         assert_eq!(packed_ir, rich_ir);
 
-        let compact = checked_construction_from_kernel(
+        let mut compact = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Server,
             KernelCheckedProjectionDemand::RuntimePacked,
@@ -22259,13 +22286,13 @@ ordered_mutual:
         let compact_program = seal_runtime_packed_test_program(
             &project,
             compact.fields,
-            &compact.semantic_input,
+            &mut compact.semantic_input,
             compact.checked_image_authority,
             compact.checked_image_publication,
         )
         .expect("seal runtime-packed checked image");
 
-        let independent = checked_construction_from_kernel(
+        let mut independent = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Server,
             KernelCheckedProjectionDemand::RuntimePacked,
@@ -22274,7 +22301,7 @@ ordered_mutual:
         let independent_program = seal_runtime_packed_test_program(
             &project,
             independent.fields,
-            &independent.semantic_input,
+            &mut independent.semantic_input,
             independent.checked_image_authority,
             independent.checked_image_publication,
         )
@@ -22356,7 +22383,7 @@ FUNCTION stateful_row(row) {
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse packed definition-template semantic fixture");
 
-        let packed = checked_construction_from_kernel(
+        let mut packed = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Server,
             KernelCheckedProjectionDemand::RuntimePacked,
@@ -22367,7 +22394,7 @@ FUNCTION stateful_row(row) {
         let packed_program = seal_runtime_packed_test_program(
             &project,
             packed.fields,
-            &packed.semantic_input,
+            &mut packed.semantic_input,
             packed.checked_image_authority,
             packed.checked_image_publication,
         )
@@ -22380,7 +22407,7 @@ FUNCTION stateful_row(row) {
             packed_input.definition_execution_templates().len() >= 2,
             "fixture must exercise nested user definitions",
         );
-        let rich = checked_construction_from_kernel(
+        let mut rich = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Server,
             KernelCheckedProjectionDemand::EditorRich,
@@ -22701,6 +22728,9 @@ FUNCTION stateful_row(row) {
                 &rich.call_occurrences,
                 &rich.checked_image_authority,
                 rich.checked_image_publication,
+                rich.semantic_input
+                    .take_checked_image_ownership_expectation()
+                    .expect("take checked-image ownership expectation"),
             )
             .expect("seal EditorRich definition-template replay");
         let rich_input = rich
@@ -22805,7 +22835,7 @@ FUNCTION stateful_row(row) {
             units.into_iter().map(|unit| (unit.path, unit.source)),
         )
         .expect("parse TodoMVC unit-native project");
-        let checked = checked_construction_from_kernel(
+        let mut checked = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Client,
             KernelCheckedProjectionDemand::EditorRich,
@@ -22839,6 +22869,10 @@ FUNCTION stateful_row(row) {
                 &checked.call_occurrences,
                 &checked.checked_image_authority,
                 checked.checked_image_publication,
+                checked
+                    .semantic_input
+                    .take_checked_image_ownership_expectation()
+                    .expect("take checked-image ownership expectation"),
             )
             .expect("seal direct TodoMVC publication");
         let replay =
@@ -23258,7 +23292,7 @@ FUNCTION stateful_row(row) {
         if std::env::var_os("BOON_KERNEL_PRODUCTION_CHECKED").is_some() {
             let replay_parity = std::env::var_os("BOON_KERNEL_CHECKED_REPLAY_PARITY").is_some();
             let checked_started = Instant::now();
-            let checked = checked_construction_from_kernel(
+            let mut checked = checked_construction_from_kernel(
                 &project,
                 boon_checked::ProgramRole::Client,
                 if replay_parity {
@@ -23295,6 +23329,10 @@ FUNCTION stateful_row(row) {
                     &checked.call_occurrences,
                     &checked.checked_image_authority,
                     checked.checked_image_publication,
+                    checked
+                        .semantic_input
+                        .take_checked_image_ownership_expectation()
+                        .expect("take checked-image ownership expectation"),
                 )
                 .expect("seal NovyWave EditorRich checked image");
                 seal_us = elapsed_us(seal_started.elapsed());
@@ -23326,7 +23364,7 @@ FUNCTION stateful_row(row) {
                 let _sealed = seal_runtime_packed_test_program(
                     &project,
                     checked.fields,
-                    &checked.semantic_input,
+                    &mut checked.semantic_input,
                     checked.checked_image_authority,
                     checked.checked_image_publication,
                 )

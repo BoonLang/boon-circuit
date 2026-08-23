@@ -8997,6 +8997,7 @@ fields = [
   { name = "role", disposition = "r-ra-priv-sp-id-n", reviewed = true },
   { name = "semantic_image", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "checked_program", disposition = "r-c-priv-sp-id-n", reviewed = true },
+  { name = "kernel_input", disposition = "r-c-priv-sp-id-n", reviewed = true },
   { name = "execution_graph", disposition = "r-c-priv-sp-id-n", reviewed = true },
   { name = "producer_materializations", disposition = "r-r-priv-sp-id-n", reviewed = true },
   { name = "resolved_out_graph", disposition = "r-r-priv-sp-id-n", reviewed = true },
@@ -12164,6 +12165,7 @@ name = "CheckOutput"
 fields = [
   { name = "program", disposition = "r-r-priv-sp-id-n", reviewed = true },
   { name = "construction", disposition = "r-r-priv-sp-id-n", reviewed = true },
+  { name = "runtime_packed_construction", disposition = "r-r-priv-sp-id-n", reviewed = true },
   { name = "report", disposition = "r-r-priv-sp-id-n", reviewed = true },
 ]
 
@@ -13612,6 +13614,33 @@ fields = [
 kind = "struct"
 source = "crates/boon_checked/src/lib.rs"
 name = "CheckedProgramConstruction"
+fields = [
+  { name = "fields", disposition = "r-f-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "RuntimePackedCheckedProgramV1"
+fields = [
+  { name = "fields", disposition = "r-f-priv-sp-id-n", reviewed = true },
+  { name = "checked", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "RuntimePackedCheckedSealV1"
+fields = [
+  { name = "image_handoff", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "pairing_receipt", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "runtime_flow_terms", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "RuntimePackedCheckedProgramConstructionV1"
 fields = [
   { name = "fields", disposition = "r-f-priv-sp-id-n", reviewed = true },
 ]

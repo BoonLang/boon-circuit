@@ -1263,7 +1263,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         checked_call_seal_authority,
         checked_image_kernel_authority,
         checked_image_kernel_publication,
-        kernel_semantic_input,
+        mut kernel_semantic_input,
     } = checked_source;
     let deferred_runtime_handoff =
         output.construction.is_some() || output.runtime_packed_construction.is_some();
@@ -1278,7 +1278,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         checked_call_seal_authority,
         checked_image_kernel_authority,
         checked_image_kernel_publication,
-        &kernel_semantic_input,
+        &mut kernel_semantic_input,
     )?;
     // Checked sealing is the final consumer of parser arenas on the ordinary
     // verified path. Release the project snapshot before semantic expansion
@@ -1494,7 +1494,7 @@ fn checked_program_from_output(
     checked_call_seal_authority: Option<CheckedCallSealAuthority>,
     checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
     checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
-    kernel_semantic_input: &boon_compiler_kernel::KernelSemanticInputConstructionV1,
+    kernel_semantic_input: &mut boon_compiler_kernel::KernelSemanticInputConstructionV1,
 ) -> CompilerResult<(
     CheckedProgramForSemantic,
     Option<boon_checked::CheckedImageKernelPairingReceiptV1>,
@@ -1581,6 +1581,9 @@ fn checked_program_from_output(
                             &call_occurrences,
                             &authority,
                             *publication,
+                            kernel_semantic_input
+                                .take_checked_image_ownership_expectation()
+                                .map_err(|error| PlanError::new(error.to_string()))?,
                         )
                         .map(|(program, receipt)| (CheckedProgramForSemantic::Rich(program), Some(receipt)))
                         .map_err(|error| PlanError::new(error).into())
@@ -1665,8 +1668,9 @@ fn checked_program_from_output(
                             list_count: counts.lists,
                             occurrence_count: counts.occurrences,
                         },
-                        entity_route_digest_v1: kernel_semantic_input
-                            .checked_image_entity_route_digest_v1(),
+                        ownership_expectation: kernel_semantic_input
+                            .take_checked_image_ownership_expectation()
+                            .map_err(|error| PlanError::new(error.to_string()))?,
                         resource_routes: &resource_routes,
                     };
                     boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication(

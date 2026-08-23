@@ -20,18 +20,19 @@ use boon_checked::{
     CheckedDeclaration, CheckedDeclarationKind, CheckedDefinitionExecutionNodeV1,
     CheckedDefinitionExecutionTemplateV1, CheckedDefinitionSelectorV1, CheckedEffectSummary,
     CheckedEvaluationScope, CheckedExprId, CheckedExpression, CheckedExpressionKind,
-    CheckedExternalDeclarationIdentityV1, CheckedImageKernelPublicationV1, CheckedImageRowDomainV2,
-    CheckedList, CheckedListId, CheckedMatchPattern, CheckedParameter, CheckedParameterDefault,
-    CheckedParameterKind, CheckedParameterRequirement, CheckedPassedAccess, CheckedPatternBinding,
-    CheckedProgram, CheckedProgramFields, CheckedRecordField, CheckedResourceBinding,
-    CheckedResourceProjectionRequirement, CheckedRuntimeFlowTermProjectionV1, CheckedScope,
-    CheckedScopeKind, CheckedSemanticPath, CheckedShardCallableKindV2, CheckedShardOwnerKeyV2,
-    CheckedShardProjectionKeyV2, CheckedShardRegionV2, CheckedSource, CheckedSourceId,
-    CheckedSourceRead, CheckedSpan, CheckedState, CheckedStateId, CheckedStatement,
-    CheckedStatementId, CheckedStatementKind, CheckedTextSegment, CheckedTypeSubstitution,
-    CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape,
-    ProgramRole, SemanticOccurrence, SemanticOccurrenceKind, SharedObjectShape, Type, TypeVar,
-    Variant,
+    CheckedExternalDeclarationIdentityV1, CheckedImageKernelExpectedRouteV1,
+    CheckedImageKernelOwnershipExpectationV1, CheckedImageKernelPublicationV1,
+    CheckedImageRowDomainV2, CheckedList, CheckedListId, CheckedMatchPattern, CheckedParameter,
+    CheckedParameterDefault, CheckedParameterKind, CheckedParameterRequirement,
+    CheckedPassedAccess, CheckedPatternBinding, CheckedProgram, CheckedProgramFields,
+    CheckedRecordField, CheckedResourceBinding, CheckedResourceProjectionRequirement,
+    CheckedRuntimeFlowTermProjectionV1, CheckedScope, CheckedScopeKind, CheckedSemanticPath,
+    CheckedShardCallableKindV2, CheckedShardOwnerKeyV2, CheckedShardProjectionKeyV2,
+    CheckedShardRegionV2, CheckedSource, CheckedSourceId, CheckedSourceRead, CheckedSpan,
+    CheckedState, CheckedStateId, CheckedStatement, CheckedStatementId, CheckedStatementKind,
+    CheckedTextSegment, CheckedTypeSubstitution, CheckedValueUse, ContextFormalId, DeclId,
+    FlowMode, FlowType, LexicalScopeId, ObjectShape, ProgramRole, SemanticOccurrence,
+    SemanticOccurrenceKind, SharedObjectShape, Type, TypeVar, Variant,
 };
 use boon_contract::{PathId, SourceBundleDigestV1, SymbolId};
 use boon_syntax::StableOccurrenceKey;
@@ -278,6 +279,7 @@ struct KernelPackedLinkTopologyV1 {
     resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
     occurrence_targets: Box<[DeclId]>,
     checked_image_publication: CheckedImageKernelPublicationV1,
+    checked_image_ownership_expectation: CheckedImageKernelOwnershipExpectationV1,
 }
 
 /// Rich checked rows are a presentation demand, not a prerequisite for the
@@ -755,7 +757,7 @@ pub struct KernelSemanticInputConstructionV1 {
     resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
     resource_projection_by_expression: Box<[u32]>,
     rich_editor_projection_expected: bool,
-    checked_image_entity_route_digest_v1: boon_checked::CheckedImageEntityRouteDigestV1,
+    checked_image_ownership_expectation: Option<CheckedImageKernelOwnershipExpectationV1>,
     checked_image_pairing: Arc<boon_checked::CheckedImageKernelPairingV1>,
 }
 
@@ -3907,12 +3909,38 @@ impl KernelSemanticInputConstructionV1 {
         })
     }
 
-    /// Frozen exact entity-to-projection topology copied into the sibling
-    /// semantic construction before the publication crosses the typechecker.
-    pub const fn checked_image_entity_route_digest_v1(
-        &self,
-    ) -> boon_checked::CheckedImageEntityRouteDigestV1 {
-        self.checked_image_entity_route_digest_v1
+    /// Take the independently derived ownership plan for one consuming
+    /// typechecker validation. No full projection/route slab survives into
+    /// the sealed semantic input.
+    #[doc(hidden)]
+    pub fn take_checked_image_ownership_expectation(
+        &mut self,
+    ) -> Result<CheckedImageKernelOwnershipExpectationV1, KernelCheckedLinkError> {
+        self.checked_image_ownership_expectation
+            .take()
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(
+                    "kernel checked-image ownership expectation was already consumed",
+                )
+            })
+    }
+
+    /// Freeze the sibling ownership stores after the compiler has appended
+    /// all metadata row counts. Subsequent publication mutation fails closed.
+    #[doc(hidden)]
+    pub fn __compiler_freeze_checked_image_ownership(
+        &mut self,
+        publication: &CheckedImageKernelPublicationV1,
+    ) -> Result<(), KernelCheckedLinkError> {
+        self.checked_image_ownership_expectation
+            .as_mut()
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(
+                    "kernel checked-image ownership expectation was already consumed",
+                )
+            })?
+            .__kernel_freeze_against(publication)
+            .map_err(KernelCheckedLinkError::new)
     }
 
     pub const fn source_bundle_digest_v1(&self) -> SourceBundleDigestV1 {
@@ -3944,7 +3972,7 @@ impl KernelSemanticInputConstructionV1 {
         pattern_bindings: Box<[KernelSemanticPatternBindingLocatorV1]>,
         resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
         occurrence_count: usize,
-        checked_image_entity_route_digest_v1: boon_checked::CheckedImageEntityRouteDigestV1,
+        checked_image_ownership_expectation: CheckedImageKernelOwnershipExpectationV1,
         checked_image_pairing: Arc<boon_checked::CheckedImageKernelPairingV1>,
     ) -> Result<Self, KernelCheckedLinkError> {
         if snapshot.definition_count() != layout.definitions.len()
@@ -4508,7 +4536,7 @@ impl KernelSemanticInputConstructionV1 {
                 projection_demand,
                 KernelCheckedRowProjectionDemand::EditorRich
             ),
-            checked_image_entity_route_digest_v1,
+            checked_image_ownership_expectation: Some(checked_image_ownership_expectation),
             checked_image_pairing,
         })
     }
@@ -4789,6 +4817,11 @@ impl KernelSemanticInputConstructionV1 {
         checked: &CheckedProgram,
         pairing_receipt: &boon_checked::CheckedImageKernelPairingReceiptV1,
     ) -> Result<KernelSemanticInputV1, KernelCheckedLinkError> {
+        if self.checked_image_ownership_expectation.is_some() {
+            return Err(KernelCheckedLinkError::new(
+                "typechecker did not consume the checked-image ownership topology",
+            ));
+        }
         self.validate_checked_shape(
             checked.source_bundle_digest_v1,
             checked.role,
@@ -4824,6 +4857,11 @@ impl KernelSemanticInputConstructionV1 {
         self,
         checked: &boon_checked::RuntimePackedCheckedSealV1,
     ) -> Result<KernelSemanticInputV1, KernelCheckedLinkError> {
+        if self.checked_image_ownership_expectation.is_some() {
+            return Err(KernelCheckedLinkError::new(
+                "typechecker did not consume the checked-image ownership topology",
+            ));
+        }
         let handoff = checked.image_handoff();
         if self.source_bundle_digest_v1 != handoff.source_bundle_digest_v1 {
             return Err(KernelCheckedLinkError::new(
@@ -5092,14 +5130,6 @@ impl KernelSemanticInputV1 {
 
     pub fn entity_counts(&self) -> KernelSemanticEntityCountsV1 {
         self.construction.entity_counts()
-    }
-
-    /// Frozen exact entity-to-projection topology copied into the sibling
-    /// semantic construction before the publication crosses the typechecker.
-    pub const fn checked_image_entity_route_digest_v1(
-        &self,
-    ) -> boon_checked::CheckedImageEntityRouteDigestV1 {
-        self.construction.checked_image_entity_route_digest_v1
     }
 
     /// Iterate callable schemes in the exact dense order used by semantic
@@ -7408,14 +7438,12 @@ fn packed_publication_declaration<'a>(
     Ok((definition, row, presentation))
 }
 
-fn packed_publication_scope_owner(
+fn packed_publication_scope_owner_declaration(
     layout: &KernelCheckedLinkLayout,
     snapshot: &KernelCheckedSnapshot,
     scope_locations: &[Option<(KernelOwnerId, crate::KernelScopeId)>],
-    callable_owners: &[Option<CheckedShardOwnerKeyV2>],
-    role: ProgramRole,
     mut scope: LexicalScopeId,
-) -> Result<CheckedShardOwnerKeyV2, KernelCheckedLinkError> {
+) -> Result<Option<DeclId>, KernelCheckedLinkError> {
     let mut remaining = scope_locations.len().saturating_add(1);
     loop {
         if remaining == 0 {
@@ -7426,7 +7454,7 @@ fn packed_publication_scope_owner(
         }
         remaining -= 1;
         if scope == LexicalScopeId(0) {
-            return Ok(CheckedShardOwnerKeyV2::ProgramTopLevel { role });
+            return Ok(None);
         }
         let (owner, local) = scope_locations
             .get(scope.0 as usize)
@@ -7459,18 +7487,34 @@ fn packed_publication_scope_owner(
             && let Some(declaration) = row.owner
         {
             let declaration = layout.declaration(owner, declaration)?;
-            return callable_owners
-                .get(declaration.0 as usize)
-                .and_then(|owner| owner.clone())
-                .ok_or_else(|| {
-                    KernelCheckedLinkError::new(format!(
-                        "packed function scope {} has no callable owner {}",
-                        scope.0, declaration.0,
-                    ))
-                });
+            return Ok(Some(declaration));
         }
         scope = layout.scope(owner, row.parent)?;
     }
+}
+
+fn packed_publication_scope_owner(
+    layout: &KernelCheckedLinkLayout,
+    snapshot: &KernelCheckedSnapshot,
+    scope_locations: &[Option<(KernelOwnerId, crate::KernelScopeId)>],
+    callable_owners: &[Option<CheckedShardOwnerKeyV2>],
+    role: ProgramRole,
+    scope: LexicalScopeId,
+) -> Result<CheckedShardOwnerKeyV2, KernelCheckedLinkError> {
+    let Some(declaration) =
+        packed_publication_scope_owner_declaration(layout, snapshot, scope_locations, scope)?
+    else {
+        return Ok(CheckedShardOwnerKeyV2::ProgramTopLevel { role });
+    };
+    callable_owners
+        .get(declaration.0 as usize)
+        .and_then(|owner| owner.clone())
+        .ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "packed function scope {} has no callable owner {}",
+                scope.0, declaration.0,
+            ))
+        })
 }
 
 fn push_canonical_path_segment(path: &mut String, segment: &str) {
@@ -7626,6 +7670,867 @@ fn checked_link_packed_authority_projection(
     })
 }
 
+struct KernelCheckedImagePrehashEntryV1 {
+    key: CheckedShardProjectionKeyV2,
+    projection_digest_id: u32,
+}
+
+struct BuildingKernelCheckedImagePrehashEntryV1 {
+    key: CheckedShardProjectionKeyV2,
+    digest: [u8; 32],
+}
+
+#[derive(Clone, Copy)]
+struct BuildingKernelCheckedImageExpectedRouteV1 {
+    domain: CheckedImageRowDomainV2,
+    dense_index: u32,
+    projection_digest: [u8; 32],
+}
+
+/// Complete packed-layout ownership authority built before publication starts.
+///
+/// Exact keys exist only as a construction-time prehash registry. Expected
+/// routes use fixed-width digests and never refer to publication-issued IDs.
+/// The registry is dropped with this plan immediately after publication.
+struct KernelCheckedImageOwnershipPlanV1 {
+    prehash_by_key: Box<[KernelCheckedImagePrehashEntryV1]>,
+    projection_digests: Box<[[u8; 32]]>,
+    routes: Box<[CheckedImageKernelExpectedRouteV1]>,
+}
+
+struct BuildingKernelCheckedImageOwnershipPlanV1 {
+    prehash_by_key: Vec<BuildingKernelCheckedImagePrehashEntryV1>,
+    routes: Vec<BuildingKernelCheckedImageExpectedRouteV1>,
+}
+
+impl BuildingKernelCheckedImageOwnershipPlanV1 {
+    fn new() -> Self {
+        Self {
+            prehash_by_key: Vec::new(),
+            routes: Vec::new(),
+        }
+    }
+
+    fn intern_projection(
+        &mut self,
+        key: CheckedShardProjectionKeyV2,
+    ) -> Result<[u8; 32], KernelCheckedLinkError> {
+        match self
+            .prehash_by_key
+            .binary_search_by(|entry| entry.key.cmp(&key))
+        {
+            Ok(index) => return Ok(self.prehash_by_key[index].digest),
+            Err(index) => {
+                let digest = boon_checked::checked_image_projection_key_digest_v4(&key)
+                    .map_err(KernelCheckedLinkError::new)?;
+                self.prehash_by_key.insert(
+                    index,
+                    BuildingKernelCheckedImagePrehashEntryV1 { key, digest },
+                );
+                return Ok(digest);
+            }
+        }
+    }
+
+    fn route(
+        &mut self,
+        domain: CheckedImageRowDomainV2,
+        dense_index: usize,
+        projection_digest: [u8; 32],
+    ) -> Result<(), KernelCheckedLinkError> {
+        self.routes.push(BuildingKernelCheckedImageExpectedRouteV1 {
+            domain,
+            dense_index: u32::try_from(dense_index).map_err(|_| {
+                KernelCheckedLinkError::new("kernel checked-image expected route exceeds u32")
+            })?,
+            projection_digest,
+        });
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<KernelCheckedImageOwnershipPlanV1, KernelCheckedLinkError> {
+        let mut projection_digests = self
+            .prehash_by_key
+            .iter()
+            .map(|entry| entry.digest)
+            .collect::<Vec<_>>();
+        projection_digests.sort_unstable();
+        if projection_digests.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(KernelCheckedLinkError::new(
+                "kernel checked-image ownership keys contain a stable-digest collision",
+            ));
+        }
+        self.routes
+            .sort_unstable_by_key(|route| (route.domain, route.dense_index));
+        if self.routes.windows(2).any(|pair| {
+            (pair[0].domain, pair[0].dense_index) == (pair[1].domain, pair[1].dense_index)
+        }) {
+            return Err(KernelCheckedLinkError::new(
+                "kernel checked-image ownership plan contains a duplicate entity route",
+            ));
+        }
+        let routes = self
+            .routes
+            .into_iter()
+            .map(|route| {
+                let projection_digest_id = projection_digests
+                    .binary_search(&route.projection_digest)
+                    .map_err(|_| {
+                        KernelCheckedLinkError::new(
+                            "kernel checked-image ownership route references a foreign projection",
+                        )
+                    })?;
+                Ok(CheckedImageKernelExpectedRouteV1::__kernel_new(
+                    route.domain,
+                    route.dense_index,
+                    u32::try_from(projection_digest_id).map_err(|_| {
+                        KernelCheckedLinkError::new(
+                            "kernel checked-image projection catalog exceeds u32",
+                        )
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
+        let prehash_by_key = self
+            .prehash_by_key
+            .into_iter()
+            .map(|entry| {
+                let projection_digest_id = projection_digests
+                    .binary_search(&entry.digest)
+                    .expect("validated ownership digest remains in the sorted catalog");
+                Ok(KernelCheckedImagePrehashEntryV1 {
+                    key: entry.key,
+                    projection_digest_id: u32::try_from(projection_digest_id).map_err(|_| {
+                        KernelCheckedLinkError::new(
+                            "kernel checked-image projection catalog exceeds u32",
+                        )
+                    })?,
+                })
+            })
+            .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
+        Ok(KernelCheckedImageOwnershipPlanV1 {
+            prehash_by_key: prehash_by_key.into_boxed_slice(),
+            projection_digests: projection_digests.into_boxed_slice(),
+            routes: routes.into_boxed_slice(),
+        })
+    }
+}
+
+impl KernelCheckedImageOwnershipPlanV1 {
+    fn projection_digest(&self, key: &CheckedShardProjectionKeyV2) -> Result<[u8; 32], String> {
+        let entry = self
+            .prehash_by_key
+            .binary_search_by(|entry| entry.key.cmp(key))
+            .ok()
+            .and_then(|index| self.prehash_by_key.get(index))
+            .ok_or_else(|| {
+                "kernel checked-image publication produced a projection absent from the completed ownership plan"
+                    .to_owned()
+            })?;
+        self.projection_digests
+            .get(entry.projection_digest_id as usize)
+            .copied()
+            .ok_or_else(|| {
+                "kernel checked-image prehash references a missing digest slot".to_owned()
+            })
+    }
+
+    fn install(
+        self,
+        expectation: &mut CheckedImageKernelOwnershipExpectationV1,
+    ) -> Result<(), String> {
+        let Self {
+            prehash_by_key: _,
+            projection_digests,
+            routes,
+        } = self;
+        expectation.__kernel_install_compact_topology(projection_digests, routes)
+    }
+}
+
+/// Publication-only writer. The expected route plan is already complete when
+/// this value is created and can be consulted solely for exact-key prehashes.
+/// No expectation route can be read or mutated from this writer.
+struct KernelCheckedImagePublicationBuilderV1<'a> {
+    publication: CheckedImageKernelPublicationV1,
+    ownership_plan: &'a KernelCheckedImageOwnershipPlanV1,
+}
+
+impl<'a> KernelCheckedImagePublicationBuilderV1<'a> {
+    fn new(
+        publication: CheckedImageKernelPublicationV1,
+        ownership_plan: &'a KernelCheckedImageOwnershipPlanV1,
+    ) -> Self {
+        Self {
+            publication,
+            ownership_plan,
+        }
+    }
+
+    fn __kernel_intern_projection(
+        &mut self,
+        key: CheckedShardProjectionKeyV2,
+    ) -> Result<boon_checked::CheckedImageKernelProjectionIdV1, String> {
+        let digest = self.ownership_plan.projection_digest(&key)?;
+        self.publication
+            .__kernel_intern_prehashed_projection(key, digest)
+    }
+
+    fn __kernel_publish_rows(
+        &mut self,
+        projection: boon_checked::CheckedImageKernelProjectionIdV1,
+        row_count: u32,
+    ) -> Result<(), String> {
+        self.publication
+            .__kernel_publish_rows(projection, row_count)
+    }
+
+    fn __kernel_publish_dependency_row(
+        &mut self,
+        projection: boon_checked::CheckedImageKernelProjectionIdV1,
+        relocations: impl IntoIterator<Item = boon_checked::CheckedImageKernelProjectionIdV1>,
+    ) -> Result<(), String> {
+        self.publication
+            .__kernel_publish_dependency_row(projection, relocations)
+    }
+
+    fn __kernel_route(
+        &mut self,
+        domain: CheckedImageRowDomainV2,
+        dense_index: usize,
+        projection: boon_checked::CheckedImageKernelProjectionIdV1,
+    ) -> Result<(), String> {
+        self.publication
+            .__kernel_route(domain, dense_index, projection)
+    }
+
+    fn into_publication(self) -> CheckedImageKernelPublicationV1 {
+        self.publication
+    }
+}
+
+/// Derive checked ownership independently from publication IDs and writers.
+///
+/// This pass is deliberately complete before `checked_image_publication_v1`
+/// starts its separate publication traversal. Only exact-key prehash lookup is
+/// shared afterward; entity routes can never be copied out of this plan.
+#[allow(clippy::too_many_arguments)]
+fn checked_image_ownership_plan_v1(
+    role: ProgramRole,
+    layout: &KernelCheckedLinkLayout,
+    snapshot: &KernelCheckedSnapshot,
+    expression_declaration_targets: &[u32],
+    pattern_bindings: &[KernelSemanticPatternBindingLocatorV1],
+    resource_projection_requirements: &[KernelSemanticResourceProjectionLocatorV1],
+    occurrence_targets: &[DeclId],
+) -> Result<KernelCheckedImageOwnershipPlanV1, KernelCheckedLinkError> {
+    if expression_declaration_targets.len() != layout.totals.expressions as usize {
+        return Err(KernelCheckedLinkError::new(
+            "packed checked ownership lexical target count differs from expressions",
+        ));
+    }
+    let root_owner = CheckedShardOwnerKeyV2::ProgramTopLevel { role };
+    let root_definition = checked_link_definition_projection(root_owner.clone());
+    let root_interface = checked_link_interface_projection(root_owner.clone());
+
+    let mut scope_locations = vec![None; layout.totals.scopes as usize];
+    let mut declaration_locations = vec![None; layout.totals.declarations as usize];
+    for definition in layout.definitions() {
+        for local in 0..definition.scopes.len {
+            let linked = definition.scopes.resolve(local, "ownership scope")? as usize;
+            let slot = scope_locations.get_mut(linked).ok_or_else(|| {
+                KernelCheckedLinkError::new("ownership scope exceeds its dense table")
+            })?;
+            if slot
+                .replace((definition.owner, crate::KernelScopeId(local)))
+                .is_some()
+            {
+                return Err(KernelCheckedLinkError::new(
+                    "ownership scope is owned twice",
+                ));
+            }
+        }
+        for local in 0..definition.declarations.len {
+            let linked = definition
+                .declarations
+                .resolve(local, "ownership declaration")? as usize;
+            let slot = declaration_locations.get_mut(linked).ok_or_else(|| {
+                KernelCheckedLinkError::new("ownership declaration exceeds its dense table")
+            })?;
+            if slot
+                .replace((definition.owner, crate::KernelDeclarationId(local)))
+                .is_some()
+            {
+                return Err(KernelCheckedLinkError::new(
+                    "ownership declaration is owned twice",
+                ));
+            }
+        }
+    }
+
+    let mut callable_owners = vec![None; layout.totals.declarations as usize];
+    let mut callable_count = 0usize;
+    for definition in snapshot.definition_refs() {
+        let root = definition.linkage().root_statement.ok_or_else(|| {
+            KernelCheckedLinkError::new(format!(
+                "kernel definition {} has no ownership root statement",
+                definition.owner().0,
+            ))
+        })?;
+        let statement = definition
+            .runtime_facts()
+            .statements()
+            .get(root.0 as usize)
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel definition {} ownership root statement {} is missing",
+                    definition.owner().0,
+                    root.0,
+                ))
+            })?;
+        let crate::PackedStatementKind::Function { name, .. } = statement.kind else {
+            continue;
+        };
+        let declaration = layout.definition(definition.owner())?.public_declaration;
+        let name = definition.input().symbol(name).ok_or_else(|| {
+            KernelCheckedLinkError::new("packed ownership callable has a foreign name symbol")
+        })?;
+        let slot = callable_owners
+            .get_mut(declaration.0 as usize)
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new("ownership callable exceeds declaration namespace")
+            })?;
+        if slot
+            .replace(CheckedShardOwnerKeyV2::Callable {
+                role,
+                callable_kind: CheckedShardCallableKindV2::User,
+                name: name.to_owned(),
+                external_identity: None,
+            })
+            .is_some()
+        {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel ownership repeats callable declaration {}",
+                declaration.0,
+            )));
+        }
+        callable_count += 1;
+    }
+    for callable_layout in layout.abi_callables() {
+        let callable = snapshot
+            .definition_code
+            .abi_callable_scheme(callable_layout.callable)
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel ownership has no ABI callable {}",
+                    callable_layout.callable.0,
+                ))
+            })?;
+        if callable.kind() == crate::KernelCallableKind::User {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel ownership ABI unexpectedly contains user callable `{}`",
+                callable.name(),
+            )));
+        }
+        let slot = callable_owners
+            .get_mut(callable_layout.declaration.0 as usize)
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new("ownership ABI callable exceeds declaration namespace")
+            })?;
+        if slot
+            .replace(CheckedShardOwnerKeyV2::Callable {
+                role: callable.role(),
+                callable_kind: checked_link_kernel_callable_kind(callable.kind()),
+                name: callable.name().to_owned(),
+                external_identity: callable.external_identity(),
+            })
+            .is_some()
+        {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel ownership repeats ABI callable declaration {}",
+                callable_layout.declaration.0,
+            )));
+        }
+        callable_count += 1;
+    }
+    if callable_count != layout.totals.callables as usize {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel ownership found {callable_count} callable owners for {} callables",
+            layout.totals.callables,
+        )));
+    }
+
+    let mut plan = BuildingKernelCheckedImageOwnershipPlanV1::new();
+    let root_definition_digest = plan.intern_projection(root_definition.clone())?;
+    plan.intern_projection(root_interface)?;
+
+    // Materialize each callable's exact rich owner key once per unique region.
+    // Every entity below carries only its compact declaration/digest authority;
+    // repeated scopes and rows never clone the callable name String.
+    let mut callable_definition_digests = vec![None; callable_owners.len()];
+    let mut callable_interface_digests = vec![None; callable_owners.len()];
+    for definition in snapshot.definition_refs() {
+        let declaration = layout.definition(definition.owner())?.public_declaration;
+        let Some(owner) = callable_owners
+            .get(declaration.0 as usize)
+            .and_then(Option::as_ref)
+        else {
+            continue;
+        };
+        callable_definition_digests[declaration.0 as usize] =
+            Some(plan.intern_projection(checked_link_definition_projection(owner.clone()))?);
+    }
+    for (declaration, owner) in callable_owners.iter().enumerate() {
+        let Some(owner) = owner else { continue };
+        callable_interface_digests[declaration] =
+            Some(plan.intern_projection(checked_link_interface_projection(owner.clone()))?);
+    }
+
+    let mut scope_owner_declarations = Vec::with_capacity(layout.totals.scopes as usize);
+    let mut scope_digests = Vec::with_capacity(layout.totals.scopes as usize);
+    for scope in 0..layout.totals.scopes {
+        let owner = packed_publication_scope_owner_declaration(
+            layout,
+            snapshot,
+            &scope_locations,
+            LexicalScopeId(scope),
+        )?;
+        let digest = owner.map_or(Ok(root_definition_digest), |declaration| {
+            callable_definition_digests
+                .get(declaration.0 as usize)
+                .and_then(|digest| *digest)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "packed function scope {scope} has no callable owner {}",
+                        declaration.0,
+                    ))
+                })
+        })?;
+        scope_owner_declarations.push(owner);
+        scope_digests.push(digest);
+        plan.route(CheckedImageRowDomainV2::Scope, scope as usize, digest)?;
+    }
+
+    let mut declaration_digests = vec![None; layout.totals.declarations as usize];
+    for definition in snapshot.definition_refs() {
+        let owner = definition.owner();
+        let facts = definition.runtime_facts();
+        if facts.declarations().len() != facts.declaration_presentations().len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel definition {} ownership declaration rows disagree",
+                owner.0,
+            )));
+        }
+        for (declaration, presentation) in facts
+            .declarations()
+            .iter()
+            .zip(facts.declaration_presentations())
+        {
+            if declaration.id != presentation.declaration {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} ownership declaration {} has presentation {}",
+                    owner.0, declaration.id.0, presentation.declaration.0,
+                )));
+            }
+            let id =
+                layout.declaration(owner, KernelDeclarationReference::Local(declaration.id))?;
+            let digest = if declaration.kind == crate::KernelDeclarationKind::Function {
+                callable_definition_digests
+                    .get(id.0 as usize)
+                    .and_then(|digest| *digest)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel ownership function declaration {} has no callable owner",
+                            id.0,
+                        ))
+                    })?
+            } else {
+                let scope = layout.scope(owner, presentation.scope)?;
+                scope_digests
+                    .get(scope.0 as usize)
+                    .copied()
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel ownership declaration {} references missing scope {}",
+                            id.0, scope.0,
+                        ))
+                    })?
+            };
+            plan.route(CheckedImageRowDomainV2::Declaration, id.0 as usize, digest)?;
+            let slot = declaration_digests.get_mut(id.0 as usize).ok_or_else(|| {
+                KernelCheckedLinkError::new("ownership declaration route exceeds dense table")
+            })?;
+            if slot.replace(digest).is_some() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel ownership declaration {} is routed twice",
+                    id.0,
+                )));
+            }
+        }
+    }
+    for callable in layout.abi_callables() {
+        for declaration in std::iter::once(callable.declaration).chain(
+            (0..callable.parameters.len).map(|ordinal| DeclId(callable.parameters.start + ordinal)),
+        ) {
+            plan.route(
+                CheckedImageRowDomainV2::Declaration,
+                declaration.0 as usize,
+                root_definition_digest,
+            )?;
+            let slot = declaration_digests
+                .get_mut(declaration.0 as usize)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(
+                        "ownership ABI declaration route exceeds dense table",
+                    )
+                })?;
+            if slot.replace(root_definition_digest).is_some() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel ownership ABI declaration {} is routed twice",
+                    declaration.0,
+                )));
+            }
+        }
+    }
+
+    let mut expression_digests = Vec::with_capacity(layout.totals.expressions as usize);
+    for definition in snapshot.definition_refs() {
+        let owner = definition.owner();
+        let facts = definition.runtime_facts();
+        if facts.expression_presentations().len() != definition.input().node_count() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel definition {} ownership expression rows disagree",
+                owner.0,
+            )));
+        }
+        for (local, presentation) in facts.expression_presentations().iter().enumerate() {
+            if presentation.expression.0 as usize != local {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} ownership expression {} is non-dense at {local}",
+                    owner.0, presentation.expression.0,
+                )));
+            }
+            let id =
+                layout.expression(owner, KernelValueReference::Local(presentation.expression))?;
+            if id.0 as usize != expression_digests.len() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel ownership expression {} is non-dense",
+                    id.0,
+                )));
+            }
+            let scope = layout.scope(owner, presentation.scope)?;
+            expression_digests.push(scope_digests.get(scope.0 as usize).copied().ok_or_else(
+                || {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel ownership expression {} references missing scope {}",
+                        id.0, scope.0,
+                    ))
+                },
+            )?);
+        }
+    }
+
+    let mut statement_digests = Vec::with_capacity(layout.totals.statements as usize);
+    for definition in snapshot.definition_refs() {
+        let owner = definition.owner();
+        let facts = definition.runtime_facts();
+        if facts.statements().len() != facts.statement_presentations().len() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel definition {} ownership statement rows disagree",
+                owner.0,
+            )));
+        }
+        for (statement, presentation) in facts
+            .statements()
+            .iter()
+            .zip(facts.statement_presentations())
+        {
+            if statement.id != presentation.statement {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel definition {} ownership statement {} has presentation {}",
+                    owner.0, statement.id.0, presentation.statement.0,
+                )));
+            }
+            let id = layout.statement(owner, KernelStatementReference::Local(statement.id))?;
+            if id.0 as usize != statement_digests.len() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel ownership statement {} is non-dense",
+                    id.0,
+                )));
+            }
+            let scope = layout.scope(owner, presentation.scope)?;
+            statement_digests.push(scope_digests.get(scope.0 as usize).copied().ok_or_else(
+                || {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel ownership statement {} references missing scope {}",
+                        id.0, scope.0,
+                    ))
+                },
+            )?);
+        }
+    }
+    for (statement, digest) in statement_digests.iter().copied().enumerate() {
+        plan.route(CheckedImageRowDomainV2::Statement, statement, digest)?;
+    }
+    for (expression, digest) in expression_digests.iter().copied().enumerate() {
+        plan.route(CheckedImageRowDomainV2::Expression, expression, digest)?;
+    }
+
+    let mut callable_digests = vec![None; layout.totals.declarations as usize];
+    let mut route_callable = |declaration: DeclId| -> Result<(), KernelCheckedLinkError> {
+        let digest = callable_interface_digests
+            .get(declaration.0 as usize)
+            .and_then(|digest| *digest)
+            .ok_or_else(|| KernelCheckedLinkError::new("ownership callable index is incomplete"))?;
+        plan.route(
+            CheckedImageRowDomainV2::Callable,
+            declaration.0 as usize,
+            digest,
+        )?;
+        let slot = callable_digests
+            .get_mut(declaration.0 as usize)
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new("ownership callable route exceeds dense table")
+            })?;
+        if slot.replace(digest).is_some() {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel ownership callable {} is routed twice",
+                declaration.0,
+            )));
+        }
+        Ok(())
+    };
+    for definition in snapshot.definition_refs() {
+        let declaration = layout.definition(definition.owner())?.public_declaration;
+        if callable_owners
+            .get(declaration.0 as usize)
+            .is_some_and(Option::is_some)
+        {
+            route_callable(declaration)?;
+        }
+    }
+    for callable in layout.abi_callables() {
+        route_callable(callable.declaration)?;
+    }
+    drop(route_callable);
+
+    for definition in layout.definitions() {
+        let Some(formal) = definition.context_formal else {
+            continue;
+        };
+        let digest = callable_digests
+            .get(definition.public_declaration.0 as usize)
+            .and_then(|digest| *digest)
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "ownership context formal {} references missing callable {}",
+                    formal.0, definition.public_declaration.0,
+                ))
+            })?;
+        plan.route(
+            CheckedImageRowDomainV2::ContextFormal,
+            formal.0 as usize,
+            digest,
+        )?;
+    }
+
+    let mut structural_sites = Vec::with_capacity(layout.totals.calls as usize);
+    layout.for_each_packed_call(snapshot, |call| {
+        let id = call.id()?;
+        let digest = call.authored_site_digest_v4()?;
+        structural_sites.push(digest);
+        let owner = call
+            .owner_callable()?
+            .and_then(|owner| {
+                callable_owners
+                    .get(owner.0 as usize)
+                    .and_then(|owner| owner.clone())
+            })
+            .unwrap_or_else(|| root_owner.clone());
+        let projection_digest = plan.intern_projection(CheckedShardProjectionKeyV2 {
+            owner,
+            region: CheckedShardRegionV2::Invocation {
+                authored_call_site_digest: digest,
+                identical_site_reverse_ordinal: 0,
+            },
+        })?;
+        plan.route(
+            CheckedImageRowDomainV2::Call,
+            id.0 as usize,
+            projection_digest,
+        )
+    })?;
+    structural_sites.sort_unstable();
+    if let Some(repeated) = structural_sites.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(KernelCheckedLinkError::new(format!(
+            "kernel ownership calls share authored-site digest {:?}",
+            repeated[0],
+        )));
+    }
+
+    for (index, binding) in pattern_bindings.iter().enumerate() {
+        let digest = declaration_digests
+            .get(binding.declaration.0 as usize)
+            .and_then(|digest| *digest)
+            .unwrap_or(root_definition_digest);
+        plan.route(CheckedImageRowDomainV2::PatternBinding, index, digest)?;
+    }
+    for (index, requirement) in resource_projection_requirements.iter().enumerate() {
+        let digest = expression_digests
+            .get(requirement.expression.0 as usize)
+            .copied()
+            .unwrap_or(root_definition_digest);
+        plan.route(CheckedImageRowDomainV2::ResourceProjection, index, digest)?;
+    }
+
+    let mut ancestor_symbols = Vec::new();
+    for definition in snapshot.definition_refs() {
+        let owner = definition.owner();
+        let facts = definition.runtime_facts();
+        for source in facts.sources() {
+            let id = layout.source(owner, source.id.0)?;
+            let presentation = expression_presentation(facts, source.expression)?;
+            let owner_scope = layout.scope(owner, presentation.scope)?;
+            let owner_declaration = scope_owner_declarations
+                .get(owner_scope.0 as usize)
+                .copied()
+                .ok_or_else(|| KernelCheckedLinkError::new("ownership SOURCE scope is missing"))?;
+            let anchor = layout.declaration(owner, source.declaration)?;
+            let digest = match owner_declaration {
+                Some(declaration) => callable_definition_digests
+                    .get(declaration.0 as usize)
+                    .and_then(|digest| *digest)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(
+                            "ownership SOURCE callable scope has no definition digest",
+                        )
+                    })?,
+                None => plan.intern_projection(checked_link_packed_authority_projection(
+                    layout,
+                    snapshot,
+                    &scope_locations,
+                    &declaration_locations,
+                    root_owner.clone(),
+                    anchor,
+                    KernelPublicationPathV1::Packed(source.projection),
+                    &mut ancestor_symbols,
+                )?)?,
+            };
+            plan.route(CheckedImageRowDomainV2::Source, id.0 as usize, digest)?;
+        }
+    }
+    for definition in snapshot.definition_refs() {
+        let owner = definition.owner();
+        let facts = definition.runtime_facts();
+        for (ordinal, state) in definition.code().states().iter().copied().enumerate() {
+            let input = facts
+                .states()
+                .get(state.input_ordinal as usize)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "kernel definition {} ownership state {} references missing input {}",
+                        owner.0, ordinal, state.input_ordinal,
+                    ))
+                })?;
+            let id = layout.state(
+                owner,
+                u32::try_from(ordinal)
+                    .map_err(|_| KernelCheckedLinkError::new("kernel state ordinal exceeds u32"))?,
+            )?;
+            let owner_scope = if input.kind == boon_checked::CheckedStateKind::StatementHold {
+                let (statement_owner, statement) =
+                    layout.local_statement_reference(snapshot, owner, input.statement)?;
+                let statement_definition =
+                    snapshot.definition(statement_owner).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel ownership state references missing definition {}",
+                            statement_owner.0,
+                        ))
+                    })?;
+                let presentation =
+                    statement_presentation(statement_definition.runtime_facts(), statement)?;
+                layout.scope(statement_owner, presentation.scope)?
+            } else {
+                let presentation = expression_presentation(facts, input.expression)?;
+                layout.scope(owner, presentation.scope)?
+            };
+            let owner_declaration = scope_owner_declarations
+                .get(owner_scope.0 as usize)
+                .copied()
+                .ok_or_else(|| KernelCheckedLinkError::new("ownership state scope is missing"))?;
+            let anchor = layout.declaration(owner, input.declaration)?;
+            let path = state.synthetic_ordinal().map_or(
+                KernelPublicationPathV1::Packed(input.projection),
+                KernelPublicationPathV1::SyntheticState,
+            );
+            let digest = match owner_declaration {
+                Some(declaration) => callable_definition_digests
+                    .get(declaration.0 as usize)
+                    .and_then(|digest| *digest)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(
+                            "ownership state callable scope has no definition digest",
+                        )
+                    })?,
+                None => plan.intern_projection(checked_link_packed_authority_projection(
+                    layout,
+                    snapshot,
+                    &scope_locations,
+                    &declaration_locations,
+                    root_owner.clone(),
+                    anchor,
+                    path,
+                    &mut ancestor_symbols,
+                )?)?,
+            };
+            plan.route(CheckedImageRowDomainV2::State, id.0 as usize, digest)?;
+        }
+    }
+    for definition in snapshot.definition_refs() {
+        let owner = definition.owner();
+        let facts = definition.runtime_facts();
+        for list in facts.lists() {
+            let id = layout.list(owner, list.id.0)?;
+            let presentation = expression_presentation(facts, list.producer)?;
+            let owner_scope = layout.scope(owner, presentation.scope)?;
+            let owner_declaration = scope_owner_declarations
+                .get(owner_scope.0 as usize)
+                .copied()
+                .ok_or_else(|| KernelCheckedLinkError::new("ownership LIST scope is missing"))?;
+            let anchor = layout.declaration(owner, list.declaration)?;
+            let digest = match owner_declaration {
+                Some(declaration) => callable_definition_digests
+                    .get(declaration.0 as usize)
+                    .and_then(|digest| *digest)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(
+                            "ownership LIST callable scope has no definition digest",
+                        )
+                    })?,
+                None => plan.intern_projection(checked_link_packed_authority_projection(
+                    layout,
+                    snapshot,
+                    &scope_locations,
+                    &declaration_locations,
+                    root_owner.clone(),
+                    anchor,
+                    KernelPublicationPathV1::Packed(list.projection),
+                    &mut ancestor_symbols,
+                )?)?,
+            };
+            plan.route(CheckedImageRowDomainV2::List, id.0 as usize, digest)?;
+        }
+    }
+    for (index, target) in occurrence_targets.iter().copied().enumerate() {
+        let digest = declaration_digests
+            .get(target.0 as usize)
+            .and_then(|digest| *digest)
+            .unwrap_or(root_definition_digest);
+        plan.route(CheckedImageRowDomainV2::Occurrence, index, digest)?;
+    }
+    plan.finish()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn checked_image_publication_v1(
     source_bundle_digest_v1: SourceBundleDigestV1,
@@ -7637,7 +8542,13 @@ fn checked_image_publication_v1(
     pattern_bindings: &[KernelSemanticPatternBindingLocatorV1],
     resource_projection_requirements: &[KernelSemanticResourceProjectionLocatorV1],
     occurrence_targets: &[DeclId],
-) -> Result<CheckedImageKernelPublicationV1, KernelCheckedLinkError> {
+) -> Result<
+    (
+        CheckedImageKernelPublicationV1,
+        CheckedImageKernelOwnershipExpectationV1,
+    ),
+    KernelCheckedLinkError,
+> {
     if expression_declaration_targets.len() != layout.totals.expressions as usize {
         return Err(KernelCheckedLinkError::new(
             "packed checked publication lexical target count differs from expressions",
@@ -7647,6 +8558,17 @@ fn checked_image_publication_v1(
     let root_owner = CheckedShardOwnerKeyV2::ProgramTopLevel { role };
     let root_definition = checked_link_definition_projection(root_owner.clone());
     let root_interface = checked_link_interface_projection(root_owner.clone());
+    let ownership_plan = checked_image_ownership_plan_v1(
+        role,
+        layout,
+        snapshot,
+        expression_declaration_targets,
+        pattern_bindings,
+        resource_projection_requirements,
+        occurrence_targets,
+    )?;
+    let (checked_image_publication, mut checked_image_ownership_expectation) =
+        CheckedImageKernelPublicationV1::__kernel_new_pair(source_bundle_digest_v1, role);
 
     // Final dense coordinates point back into one immutable packed row. These
     // two temporary columns replace rich scope/declaration DTOs and are
@@ -7790,7 +8712,7 @@ fn checked_image_publication_v1(
     }
 
     let mut publication =
-        CheckedImageKernelPublicationV1::__kernel_new(source_bundle_digest_v1, role);
+        KernelCheckedImagePublicationBuilderV1::new(checked_image_publication, &ownership_plan);
     let root_definition_id = publication
         .__kernel_intern_projection(root_definition.clone())
         .map_err(&error)?;
@@ -8052,7 +8974,7 @@ fn checked_image_publication_v1(
 
     let mut callable_projections = vec![None; layout.totals.declarations as usize];
     let mut publish_callable = |declaration: DeclId,
-                                publication: &mut CheckedImageKernelPublicationV1|
+                                publication: &mut KernelCheckedImagePublicationBuilderV1|
      -> Result<(), KernelCheckedLinkError> {
         let owner = callable_owners
             .get(declaration.0 as usize)
@@ -8380,7 +9302,128 @@ fn checked_image_publication_v1(
             .__kernel_route(CheckedImageRowDomainV2::Occurrence, index, projection)
             .map_err(&error)?;
     }
-    Ok(publication)
+    let publication = publication.into_publication();
+    ownership_plan
+        .install(&mut checked_image_ownership_expectation)
+        .map_err(&error)?;
+    Ok((publication, checked_image_ownership_expectation))
+}
+
+#[cfg(test)]
+struct KernelCheckedImageRichOraclePublicationBuilderV1 {
+    publication: CheckedImageKernelPublicationV1,
+    expectation: CheckedImageKernelOwnershipExpectationV1,
+    projection_digests: Vec<[u8; 32]>,
+    routes: Vec<BuildingKernelCheckedImageExpectedRouteV1>,
+}
+
+#[cfg(test)]
+impl KernelCheckedImageRichOraclePublicationBuilderV1 {
+    fn new(source_bundle_digest_v1: SourceBundleDigestV1, role: ProgramRole) -> Self {
+        let (publication, expectation) =
+            CheckedImageKernelPublicationV1::__kernel_new_pair(source_bundle_digest_v1, role);
+        Self {
+            publication,
+            expectation,
+            projection_digests: Vec::new(),
+            routes: Vec::new(),
+        }
+    }
+
+    fn __kernel_intern_projection(
+        &mut self,
+        key: CheckedShardProjectionKeyV2,
+    ) -> Result<boon_checked::CheckedImageKernelProjectionIdV1, String> {
+        let digest = boon_checked::checked_image_projection_key_digest_v4(&key)?;
+        let projection = self
+            .publication
+            .__kernel_intern_prehashed_projection(key, digest)?;
+        match self.projection_digests.get(projection.as_usize()) {
+            Some(previous) if *previous != digest => {
+                return Err("rich oracle projection key digest changed".to_owned());
+            }
+            Some(_) => {}
+            None if projection.as_usize() == self.projection_digests.len() => {
+                self.projection_digests.push(digest);
+            }
+            None => return Err("rich oracle projection ID is non-dense".to_owned()),
+        }
+        Ok(projection)
+    }
+
+    fn __kernel_publish_rows(
+        &mut self,
+        projection: boon_checked::CheckedImageKernelProjectionIdV1,
+        row_count: u32,
+    ) -> Result<(), String> {
+        self.publication
+            .__kernel_publish_rows(projection, row_count)
+    }
+
+    fn __kernel_publish_dependency_row(
+        &mut self,
+        projection: boon_checked::CheckedImageKernelProjectionIdV1,
+        relocations: impl IntoIterator<Item = boon_checked::CheckedImageKernelProjectionIdV1>,
+    ) -> Result<(), String> {
+        self.publication
+            .__kernel_publish_dependency_row(projection, relocations)
+    }
+
+    fn __kernel_route(
+        &mut self,
+        domain: CheckedImageRowDomainV2,
+        dense_index: usize,
+        projection: boon_checked::CheckedImageKernelProjectionIdV1,
+    ) -> Result<(), String> {
+        let digest = self
+            .projection_digests
+            .get(projection.as_usize())
+            .copied()
+            .ok_or_else(|| "rich oracle route references a missing projection".to_owned())?;
+        self.routes.push(BuildingKernelCheckedImageExpectedRouteV1 {
+            domain,
+            dense_index: u32::try_from(dense_index)
+                .map_err(|_| "rich oracle route exceeds u32".to_owned())?,
+            projection_digest: digest,
+        });
+        self.publication
+            .__kernel_route(domain, dense_index, projection)
+    }
+
+    fn into_parts(
+        mut self,
+    ) -> Result<
+        (
+            CheckedImageKernelPublicationV1,
+            CheckedImageKernelOwnershipExpectationV1,
+        ),
+        String,
+    > {
+        let mut catalog = self.projection_digests;
+        catalog.sort_unstable();
+        self.routes
+            .sort_unstable_by_key(|route| (route.domain, route.dense_index));
+        let routes = self
+            .routes
+            .into_iter()
+            .map(|route| {
+                let projection_digest_id = catalog
+                    .binary_search(&route.projection_digest)
+                    .map_err(|_| "rich oracle route references a foreign projection".to_owned())?;
+                Ok(CheckedImageKernelExpectedRouteV1::__kernel_new(
+                    route.domain,
+                    route.dense_index,
+                    u32::try_from(projection_digest_id)
+                        .map_err(|_| "rich oracle projection catalog exceeds u32".to_owned())?,
+                ))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        self.expectation.__kernel_install_compact_topology(
+            catalog.into_boxed_slice(),
+            routes.into_boxed_slice(),
+        )?;
+        Ok((self.publication, self.expectation))
+    }
 }
 
 #[cfg(test)]
@@ -8403,7 +9446,13 @@ fn checked_image_publication_rich_oracle_v1(
     states: &[CheckedState],
     lists: &[CheckedList],
     occurrence_targets: &[DeclId],
-) -> Result<CheckedImageKernelPublicationV1, KernelCheckedLinkError> {
+) -> Result<
+    (
+        CheckedImageKernelPublicationV1,
+        CheckedImageKernelOwnershipExpectationV1,
+    ),
+    KernelCheckedLinkError,
+> {
     let error = |message: String| KernelCheckedLinkError::new(message);
     let root_owner = CheckedShardOwnerKeyV2::ProgramTopLevel { role };
     let root_definition = checked_link_definition_projection(root_owner.clone());
@@ -8422,7 +9471,7 @@ fn checked_image_publication_rich_oracle_v1(
         .map(|scope| checked_link_owner_for_scope(scopes, &callable_owners, role, scope.id))
         .collect::<Result<Vec<_>, _>>()?;
     let mut publication =
-        CheckedImageKernelPublicationV1::__kernel_new(source_bundle_digest_v1, role);
+        KernelCheckedImageRichOraclePublicationBuilderV1::new(source_bundle_digest_v1, role);
     let root_definition_id = publication
         .__kernel_intern_projection(root_definition.clone())
         .map_err(error)?;
@@ -8803,7 +9852,7 @@ fn checked_image_publication_rich_oracle_v1(
             .__kernel_route(CheckedImageRowDomainV2::Occurrence, index, projection)
             .map_err(&error)?;
     }
-    Ok(publication)
+    publication.into_parts().map_err(&error)
 }
 
 impl KernelCheckedLinkLayout {
@@ -9045,17 +10094,18 @@ impl KernelCheckedLinkLayout {
         let expression_declaration_targets = self.expression_declaration_targets(snapshot)?;
         let occurrence_targets =
             self.occurrence_targets(snapshot, &expression_declaration_targets)?;
-        let checked_image_publication = checked_image_publication_v1(
-            source_bundle_digest_v1,
-            role,
-            self,
-            snapshot,
-            &expression_declaration_targets,
-            &call_result_paths,
-            &pattern_bindings,
-            &resource_projections,
-            &occurrence_targets,
-        )?;
+        let (checked_image_publication, checked_image_ownership_expectation) =
+            checked_image_publication_v1(
+                source_bundle_digest_v1,
+                role,
+                self,
+                snapshot,
+                &expression_declaration_targets,
+                &call_result_paths,
+                &pattern_bindings,
+                &resource_projections,
+                &occurrence_targets,
+            )?;
         Ok(KernelPackedLinkTopologyV1 {
             call_result_paths,
             call_result_path_symbols,
@@ -9063,6 +10113,7 @@ impl KernelCheckedLinkLayout {
             resource_projections,
             occurrence_targets,
             checked_image_publication,
+            checked_image_ownership_expectation,
         })
     }
 
@@ -9086,12 +10137,10 @@ impl KernelCheckedLinkLayout {
             resource_projections,
             occurrence_targets,
             checked_image_publication,
+            checked_image_ownership_expectation,
         } = self.packed_link_topology(snapshot, source_bundle_digest_v1, role)?;
         let occurrence_count = occurrence_targets.len();
-        let (checked_image_pairing, checked_image_entity_route_digest_v1) =
-            checked_image_publication
-                .__kernel_pairing_with_entity_route_digest()
-                .map_err(KernelCheckedLinkError::new)?;
+        let checked_image_pairing = checked_image_publication.__kernel_unfrozen_pairing();
         let semantic_input = KernelSemanticInputConstructionV1::from_linked_rows(
             source_bundle_digest_v1,
             role,
@@ -9103,7 +10152,7 @@ impl KernelCheckedLinkLayout {
             pattern_bindings,
             resource_projections,
             occurrence_count,
-            checked_image_entity_route_digest_v1,
+            checked_image_ownership_expectation,
             checked_image_pairing,
         )?;
         Ok(KernelRuntimePackedLinkV1 {
@@ -9196,6 +10245,7 @@ impl KernelCheckedLinkLayout {
             resource_projections: semantic_resource_projections,
             occurrence_targets,
             checked_image_publication,
+            checked_image_ownership_expectation,
         } = self.packed_link_topology(snapshot, source_bundle_digest_v1, role)?;
         let call_result_paths = match projection_demand {
             KernelCheckedRowProjectionDemand::RuntimePacked => Box::new([]),
@@ -9262,35 +10312,42 @@ impl KernelCheckedLinkLayout {
             projection_demand,
             KernelCheckedRowProjectionDemand::EditorRich
         ) {
-            let rich_oracle = checked_image_publication_rich_oracle_v1(
-                source_bundle_digest_v1,
-                role,
-                self,
-                snapshot,
-                &scopes,
-                &declarations,
-                &statements,
-                &expressions,
-                &callables,
-                &context_formals,
-                &packed_call_result_paths,
-                &packed_pattern_bindings,
-                &semantic_resource_projections,
-                &sources,
-                &states,
-                &lists,
-                &occurrence_targets,
-            )?;
-            if checked_image_publication != rich_oracle {
+            let (rich_publication_oracle, rich_expectation_oracle) =
+                checked_image_publication_rich_oracle_v1(
+                    source_bundle_digest_v1,
+                    role,
+                    self,
+                    snapshot,
+                    &scopes,
+                    &declarations,
+                    &statements,
+                    &expressions,
+                    &callables,
+                    &context_formals,
+                    &packed_call_result_paths,
+                    &packed_pattern_bindings,
+                    &semantic_resource_projections,
+                    &sources,
+                    &states,
+                    &lists,
+                    &occurrence_targets,
+                )?;
+            if checked_image_publication != rich_publication_oracle {
                 return Err(KernelCheckedLinkError::new(
                     "packed checked-image publication differs from rich editor oracle",
                 ));
             }
-        }
-        let (checked_image_pairing, checked_image_entity_route_digest_v1) =
-            checked_image_publication
-                .__kernel_pairing_with_entity_route_digest()
+            // The ownership expectations intentionally use different writers
+            // and insertion orders. Freeze the rich oracle against its own
+            // publication so this test still proves its complete route plan;
+            // the production expectation is frozen later, after compiler
+            // metadata rows are appended.
+            let mut rich_expectation_oracle = rich_expectation_oracle;
+            rich_expectation_oracle
+                .__kernel_freeze_against(&rich_publication_oracle)
                 .map_err(KernelCheckedLinkError::new)?;
+        }
+        let checked_image_pairing = checked_image_publication.__kernel_unfrozen_pairing();
         let semantic_input = KernelSemanticInputConstructionV1::from_linked_rows(
             source_bundle_digest_v1,
             role,
@@ -9302,7 +10359,7 @@ impl KernelCheckedLinkLayout {
             packed_pattern_bindings,
             semantic_resource_projections,
             occurrence_targets.len(),
-            checked_image_entity_route_digest_v1,
+            checked_image_ownership_expectation,
             checked_image_pairing,
         )?;
         #[cfg(debug_assertions)]
@@ -16387,6 +17444,58 @@ mod tests {
         StableItemRouteSegment, StableOwnerKey, StableStatementKey, StableStatementRoute,
         UnitItemKind,
     };
+
+    #[test]
+    fn independent_ownership_plan_rejects_an_actual_publication_route_swap() {
+        let role = ProgramRole::Client;
+        let source_bundle_digest_v1 = SourceBundleDigestV1::new(
+            "ownership-swap.bn",
+            [boon_contract::SourceBundleUnit::new(
+                "ownership-swap.bn",
+                "value: 1",
+            )],
+        )
+        .expect("build ownership-swap source digest");
+        let owner = CheckedShardOwnerKeyV2::ProgramTopLevel { role };
+        let definition = checked_link_definition_projection(owner.clone());
+        let interface = checked_link_interface_projection(owner);
+
+        let mut preparation = BuildingKernelCheckedImageOwnershipPlanV1::new();
+        let definition_digest = preparation
+            .intern_projection(definition.clone())
+            .expect("prepare Definition projection");
+        preparation
+            .intern_projection(interface.clone())
+            .expect("prepare Interface projection");
+        preparation
+            .route(CheckedImageRowDomainV2::Expression, 0, definition_digest)
+            .expect("prepare expected Expression route");
+        let plan = preparation.finish().expect("finish independent plan");
+
+        let (publication, mut expectation) =
+            CheckedImageKernelPublicationV1::__kernel_new_pair(source_bundle_digest_v1, role);
+        let mut actual = KernelCheckedImagePublicationBuilderV1::new(publication, &plan);
+        actual
+            .__kernel_intern_projection(definition)
+            .expect("publish independently selected Definition key");
+        let wrong = actual
+            .__kernel_intern_projection(interface)
+            .expect("publish independently selected Interface key");
+
+        // Fault injection is deliberately after actual-key selection and
+        // immediately before the production publication writer. The expected
+        // route is already complete and cannot observe this replacement.
+        actual
+            .__kernel_route(CheckedImageRowDomainV2::Expression, 0, wrong)
+            .expect("inject actual owner swap");
+        let publication = actual.into_publication();
+        plan.install(&mut expectation)
+            .expect("install completed expectation");
+        let error = expectation
+            .__kernel_freeze_against(&publication)
+            .expect_err("independent ownership must reject the actual route swap");
+        assert!(error.contains("independent ownership plan"), "{error}");
+    }
 
     fn owner_key(unit: &SourceUnitId, name: &str) -> StableCheckOwnerKey {
         StableCheckOwnerKey::Item(StableOwnerKey {

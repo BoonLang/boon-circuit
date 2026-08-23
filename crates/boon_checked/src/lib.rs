@@ -10,7 +10,8 @@ mod owner_shard;
 mod type_terms;
 #[doc(hidden)]
 pub use checked_image_publication::{
-    CheckedImageEntityRouteDigestV1, CheckedImageKernelPairingReceiptV1,
+    CheckedImageEntityRouteDigestV1, CheckedImageKernelExpectedRouteV1,
+    CheckedImageKernelOwnershipExpectationV1, CheckedImageKernelPairingReceiptV1,
     CheckedImageKernelPairingV1, CheckedImageKernelProjectionIdV1, CheckedImageKernelPublicationV1,
     checked_image_entity_route_digest_v1, checked_image_projection_key_digest_v4,
 };
@@ -2536,9 +2537,9 @@ impl RuntimePackedCheckedSealV1 {
     /// # Safety
     ///
     /// The caller must be the RuntimePacked typechecker seal. It must have
-    /// compared the entity-route digest of `image_handoff` with the frozen
-    /// sibling copy in the packed semantic construction, then created
-    /// `pairing_receipt` and
+    /// compared the complete `image_handoff` topology with the independently
+    /// derived packed ownership plan, consumed and dropped that plan, then
+    /// created `pairing_receipt` and
     /// `runtime_flow_terms` from that exact, since-unmodified handoff and the
     /// same checked construction. None of the three arguments may have been
     /// separated, mutated, and recombined after that validation.

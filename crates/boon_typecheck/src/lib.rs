@@ -16980,6 +16980,7 @@ pub fn seal_project_checked_program_construction_with_kernel_publication(
     call_occurrences: &[StableOccurrenceKey],
     authority: &CheckedImageKernelAuthorityV1,
     publication: boon_checked::CheckedImageKernelPublicationV1,
+    ownership_expectation: boon_checked::CheckedImageKernelOwnershipExpectationV1,
 ) -> Result<CheckedProgram, String> {
     seal_project_checked_program_construction_with_kernel_publication_inner(
         parsed,
@@ -16987,6 +16988,7 @@ pub fn seal_project_checked_program_construction_with_kernel_publication(
         call_occurrences,
         authority,
         publication,
+        ownership_expectation,
     )
     .map(|(program, _)| program)
 }
@@ -17002,6 +17004,7 @@ pub fn seal_project_checked_program_construction_with_kernel_publication_and_pai
     call_occurrences: &[StableOccurrenceKey],
     authority: &CheckedImageKernelAuthorityV1,
     publication: boon_checked::CheckedImageKernelPublicationV1,
+    ownership_expectation: boon_checked::CheckedImageKernelOwnershipExpectationV1,
 ) -> Result<
     (
         CheckedProgram,
@@ -17015,6 +17018,7 @@ pub fn seal_project_checked_program_construction_with_kernel_publication_and_pai
         call_occurrences,
         authority,
         publication,
+        ownership_expectation,
     )
 }
 
@@ -17061,12 +17065,12 @@ pub struct RuntimePackedCheckedResourceRouteV1 {
 /// the sibling packed semantic construction and are consumed only for
 /// cross-route validation.
 #[doc(hidden)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct RuntimePackedCheckedSealContextV1<'a> {
     pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub role: ProgramRole,
     pub entity_counts: RuntimePackedCheckedEntityCountsV1,
-    pub entity_route_digest_v1: boon_checked::CheckedImageEntityRouteDigestV1,
+    pub ownership_expectation: boon_checked::CheckedImageKernelOwnershipExpectationV1,
     pub resource_routes: &'a [RuntimePackedCheckedResourceRouteV1],
 }
 
@@ -17109,13 +17113,9 @@ pub fn seal_project_runtime_packed_checked_authority_with_kernel_publication(
         authority_context,
         publication,
     )?;
-    let actual_route_digest = boon_checked::checked_image_entity_route_digest_v1(&image_handoff)?;
-    if actual_route_digest != context.entity_route_digest_v1 {
-        return Err(
-            "compact checked-image entity routes differ from their packed semantic authority"
-                .to_owned(),
-        );
-    }
+    context
+        .ownership_expectation
+        .__kernel_validate_pairing(&pairing)?;
     validate_runtime_packed_entity_routes(
         &image_handoff,
         context.role,
@@ -17127,8 +17127,8 @@ pub fn seal_project_runtime_packed_checked_authority_with_kernel_publication(
     let pairing_receipt = boon_checked::CheckedImageKernelPairingReceiptV1::__typechecker_new(
         pairing,
         &image_handoff,
-        actual_route_digest,
-    );
+        context.ownership_expectation,
+    )?;
     let runtime_flow_terms = checked_runtime_flow_term_handoff_from_projection(
         authority.runtime_flow_terms,
         context.entity_counts.expression_count,
@@ -17136,9 +17136,9 @@ pub fn seal_project_runtime_packed_checked_authority_with_kernel_publication(
         context.role,
         &image_handoff,
     )?;
-    // SAFETY: `actual_route_digest` was compared with the frozen sibling
-    // packed-semantic digest above. The receipt and flow terms were then made
-    // from this exact, unmodified handoff and the same consumed construction.
+    // SAFETY: the exact handoff catalog and routes were compared with the
+    // consumed independent ownership plan above. The receipt and flow terms
+    // were then made from this unmodified handoff and the same construction.
     Ok(unsafe {
         boon_checked::RuntimePackedCheckedSealV1::__typechecker_new(
             image_handoff,
@@ -17725,6 +17725,7 @@ fn seal_project_checked_program_construction_with_kernel_publication_inner(
     call_occurrences: &[StableOccurrenceKey],
     authority: &CheckedImageKernelAuthorityV1,
     publication: boon_checked::CheckedImageKernelPublicationV1,
+    ownership_expectation: boon_checked::CheckedImageKernelOwnershipExpectationV1,
 ) -> Result<
     (
         CheckedProgram,
@@ -17853,12 +17854,11 @@ fn seal_project_checked_program_construction_with_kernel_publication_inner(
             }
         }
     }
-    let actual_route_digest = boon_checked::checked_image_entity_route_digest_v1(&image_handoff)?;
     let pairing_receipt = boon_checked::CheckedImageKernelPairingReceiptV1::__typechecker_new(
         pairing,
         &image_handoff,
-        actual_route_digest,
-    );
+        ownership_expectation,
+    )?;
     let program = seal_kernel_checked_program_fields(fields, image_handoff, Some(authority))?;
     Ok((program, pairing_receipt))
 }

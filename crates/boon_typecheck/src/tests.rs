@@ -282,7 +282,6 @@ struct RuntimePackedPublicationFixture {
     packed_construction: boon_checked::RuntimePackedCheckedProgramConstructionV1,
     authority: CheckedImageKernelAuthorityV1,
     authority_handoff: CheckedImageHandoffV4,
-    entity_route_digest_v1: boon_checked::CheckedImageEntityRouteDigestV1,
     entity_counts: RuntimePackedCheckedEntityCountsV1,
     resource_routes: Box<[RuntimePackedCheckedResourceRouteV1]>,
 }
@@ -354,9 +353,6 @@ fn runtime_packed_publication_fixture() -> RuntimePackedPublicationFixture {
     let authority_handoff =
         checked_image_handoff_with_call_occurrences(&rich_fields, &occurrences, Some(&authority))
             .expect("fixture derives its authority-backed checked image");
-    let entity_route_digest_v1 =
-        boon_checked::checked_image_entity_route_digest_v1(&authority_handoff)
-            .expect("fixture derives its independent exact route identity");
     let entity_counts = RuntimePackedCheckedEntityCountsV1 {
         scope_count: rich_fields.scopes.len(),
         declaration_count: rich_fields.declarations.len(),
@@ -400,10 +396,15 @@ fn runtime_packed_publication_fixture() -> RuntimePackedPublicationFixture {
         packed_construction,
         authority,
         authority_handoff,
-        entity_route_digest_v1,
         entity_counts,
         resource_routes,
     }
+}
+
+#[derive(Debug)]
+struct RuntimePackedTestPublication {
+    publication: boon_checked::CheckedImageKernelPublicationV1,
+    expectation: boon_checked::CheckedImageKernelOwnershipExpectationV1,
 }
 
 fn runtime_packed_publication_with_call_routes(
@@ -411,7 +412,7 @@ fn runtime_packed_publication_with_call_routes(
     source_bundle_digest_v1: SourceBundleDigestV1,
     role: ProgramRole,
     call_routes: &[usize],
-) -> Result<boon_checked::CheckedImageKernelPublicationV1, String> {
+) -> Result<RuntimePackedTestPublication, String> {
     runtime_packed_publication_with_call_routes_and_expression_swap(
         handoff,
         source_bundle_digest_v1,
@@ -427,9 +428,19 @@ fn runtime_packed_publication_with_call_routes_and_expression_swap(
     role: ProgramRole,
     call_routes: &[usize],
     expression_swap: Option<(u32, u32)>,
-) -> Result<boon_checked::CheckedImageKernelPublicationV1, String> {
-    let mut publication =
-        boon_checked::CheckedImageKernelPublicationV1::__kernel_new(source_bundle_digest_v1, role);
+) -> Result<RuntimePackedTestPublication, String> {
+    let (mut publication, mut expectation) =
+        boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
+            source_bundle_digest_v1,
+            role,
+        );
+    let mut expected_projection_digests = handoff
+        .projections
+        .iter()
+        .map(|projection| projection.stable_key_digest)
+        .collect::<Vec<_>>();
+    expected_projection_digests.sort_unstable();
+    let mut expected_routes = Vec::with_capacity(handoff.entity_routes.len());
     let projection_ids = handoff
         .projections
         .iter()
@@ -512,25 +523,69 @@ fn runtime_packed_publication_with_call_routes_and_expression_swap(
                 )
             })?;
         publication.__kernel_route(route.domain, route.dense_index as usize, projection)?;
+        let expected_projection_digest = handoff
+            .projection(route.projection)
+            .map(|projection| projection.stable_key_digest)
+            .ok_or_else(|| {
+                format!(
+                    "fixture expected route {:?}/{} references missing projection {}",
+                    route.domain, route.dense_index, route.projection.0,
+                )
+            })?;
+        let projection_digest_id = expected_projection_digests
+            .binary_search(&expected_projection_digest)
+            .map_err(|_| "fixture route references a foreign projection digest".to_owned())?;
+        expected_routes.push(
+            boon_checked::CheckedImageKernelExpectedRouteV1::__kernel_new(
+                route.domain,
+                route.dense_index,
+                u32::try_from(projection_digest_id)
+                    .map_err(|_| "fixture projection catalog exceeds u32".to_owned())?,
+            ),
+        );
     }
     for dense_index in call_routes {
         publication.__kernel_route(CheckedImageRowDomainV2::Call, *dense_index, call_projection)?;
+        let call_projection_digest = publication
+            .__kernel_projection_digest(call_projection)
+            .ok_or_else(|| "fixture Call projection is missing".to_owned())?;
+        let projection_digest_id = expected_projection_digests
+            .binary_search(&call_projection_digest)
+            .map_err(|_| "fixture Call route references a foreign projection digest".to_owned())?;
+        expected_routes.push(
+            boon_checked::CheckedImageKernelExpectedRouteV1::__kernel_new(
+                CheckedImageRowDomainV2::Call,
+                u32::try_from(*dense_index)
+                    .map_err(|_| "fixture Call route exceeds u32".to_owned())?,
+                u32::try_from(projection_digest_id)
+                    .map_err(|_| "fixture projection catalog exceeds u32".to_owned())?,
+            ),
+        );
     }
-    publication.__kernel_pairing()?;
-    Ok(publication)
+    expected_routes.sort_unstable_by_key(|route| route.__kernel_coordinates());
+    expectation.__kernel_install_compact_topology(
+        expected_projection_digests.into_boxed_slice(),
+        expected_routes.into_boxed_slice(),
+    )?;
+    expectation.__kernel_freeze_against(&publication)?;
+    Ok(RuntimePackedTestPublication {
+        publication,
+        expectation,
+    })
 }
 
 #[test]
 fn runtime_packed_kernel_publication_seals_without_rich_call_rows() {
     let fixture = runtime_packed_publication_fixture();
-    let publication = runtime_packed_publication_with_call_routes(
+    let sealed_publication = runtime_packed_publication_with_call_routes(
         &fixture.authority_handoff,
         fixture.authority.source_bundle_digest_v1,
         fixture.authority.role,
         &[0],
     )
     .expect("fixture rebuilds the packed publication");
-    let pairing = publication
+    let pairing = sealed_publication
+        .publication
         .__kernel_pairing()
         .expect("fixture finalizes its entity-route pairing");
     let program = seal_project_runtime_packed_checked_program_construction_with_kernel_publication(
@@ -540,11 +595,11 @@ fn runtime_packed_kernel_publication_seals_without_rich_call_rows() {
             source_bundle_digest_v1: fixture.authority.source_bundle_digest_v1,
             role: fixture.authority.role,
             entity_counts: fixture.entity_counts,
-            entity_route_digest_v1: fixture.entity_route_digest_v1,
+            ownership_expectation: sealed_publication.expectation,
             resource_routes: &fixture.resource_routes,
         },
         fixture.authority,
-        publication,
+        sealed_publication.publication,
     )
     .expect("RuntimePacked publication seals without rich call rows");
     let checked = program.__kernel_checked_seal();
@@ -563,14 +618,15 @@ fn runtime_packed_kernel_publication_seals_without_rich_call_rows() {
 #[test]
 fn runtime_packed_direct_seal_consumes_only_compact_authorities() {
     let fixture = runtime_packed_publication_fixture();
-    let publication = runtime_packed_publication_with_call_routes(
+    let sealed_publication = runtime_packed_publication_with_call_routes(
         &fixture.authority_handoff,
         fixture.authority.source_bundle_digest_v1,
         fixture.authority.role,
         &[0],
     )
     .expect("fixture rebuilds the packed publication");
-    let pairing = publication
+    let pairing = sealed_publication
+        .publication
         .__kernel_pairing()
         .expect("fixture finalizes its entity-route pairing");
     let source_bundle_digest_v1 = fixture.authority.source_bundle_digest_v1;
@@ -581,11 +637,11 @@ fn runtime_packed_direct_seal_consumes_only_compact_authorities() {
             source_bundle_digest_v1,
             role,
             entity_counts: fixture.entity_counts,
-            entity_route_digest_v1: fixture.entity_route_digest_v1,
+            ownership_expectation: sealed_publication.expectation,
             resource_routes: &fixture.resource_routes,
         },
         fixture.authority,
-        publication,
+        sealed_publication.publication,
     )
     .expect("compact authorities seal without CheckedProgramFields");
 
@@ -601,14 +657,15 @@ fn runtime_packed_direct_seal_consumes_only_compact_authorities() {
 #[test]
 fn runtime_packed_pairing_rejects_swapped_definition_routes() {
     let fixture = runtime_packed_publication_fixture();
-    let publication = runtime_packed_publication_with_call_routes(
+    let sealed_publication = runtime_packed_publication_with_call_routes(
         &fixture.authority_handoff,
         fixture.authority.source_bundle_digest_v1,
         fixture.authority.role,
         &[0],
     )
     .expect("fixture rebuilds the packed publication");
-    let pairing = publication
+    let pairing = sealed_publication
+        .publication
         .__kernel_pairing()
         .expect("fixture finalizes its entity-route pairing");
     let seal = seal_project_runtime_packed_checked_authority_with_kernel_publication(
@@ -617,11 +674,11 @@ fn runtime_packed_pairing_rejects_swapped_definition_routes() {
             source_bundle_digest_v1: fixture.authority.source_bundle_digest_v1,
             role: fixture.authority.role,
             entity_counts: fixture.entity_counts,
-            entity_route_digest_v1: fixture.entity_route_digest_v1,
+            ownership_expectation: sealed_publication.expectation,
             resource_routes: &fixture.resource_routes,
         },
         fixture.authority,
-        publication,
+        sealed_publication.publication,
     )
     .expect("unmodified packed publication seals");
 
@@ -672,28 +729,15 @@ fn runtime_packed_seal_rejects_a_prepaired_owner_swapped_publication() {
                 .map(|right| (left.dense_index, right.dense_index))
         })
         .expect("fixture has expressions owned by different definitions");
-    let publication = runtime_packed_publication_with_call_routes_and_expression_swap(
+    let error = runtime_packed_publication_with_call_routes_and_expression_swap(
         &fixture.authority_handoff,
         fixture.authority.source_bundle_digest_v1,
         fixture.authority.role,
         &[0],
         Some((left, right)),
     )
-    .expect("fixture builds a self-consistent but owner-swapped publication");
-    let error = seal_project_runtime_packed_checked_authority_with_kernel_publication(
-        &fixture.project,
-        RuntimePackedCheckedSealContextV1 {
-            source_bundle_digest_v1: fixture.authority.source_bundle_digest_v1,
-            role: fixture.authority.role,
-            entity_counts: fixture.entity_counts,
-            entity_route_digest_v1: fixture.entity_route_digest_v1,
-            resource_routes: &fixture.resource_routes,
-        },
-        fixture.authority,
-        publication,
-    )
-    .expect_err("the packed semantic route authority must reject a self-certified route swap");
-    assert!(error.contains("packed semantic authority"), "{error}");
+    .expect_err("the independent ownership plan must reject a self-certified route swap");
+    assert!(error.contains("independent ownership plan"), "{error}");
 }
 
 #[test]
@@ -818,7 +862,7 @@ fn runtime_packed_direct_seal_rejects_unrouted_domains_and_wrong_callable_projec
 #[test]
 fn runtime_packed_kernel_publication_requires_empty_rich_calls() {
     let fixture = runtime_packed_publication_fixture();
-    let publication = runtime_packed_publication_with_call_routes(
+    let sealed_publication = runtime_packed_publication_with_call_routes(
         &fixture.authority_handoff,
         fixture.authority.source_bundle_digest_v1,
         fixture.authority.role,
@@ -832,11 +876,11 @@ fn runtime_packed_kernel_publication_requires_empty_rich_calls() {
             source_bundle_digest_v1: fixture.authority.source_bundle_digest_v1,
             role: fixture.authority.role,
             entity_counts: fixture.entity_counts,
-            entity_route_digest_v1: fixture.entity_route_digest_v1,
+            ownership_expectation: sealed_publication.expectation,
             resource_routes: &fixture.resource_routes,
         },
         fixture.authority,
-        publication,
+        sealed_publication.publication,
     )
     .expect_err("RuntimePacked boundary must reject retained rich calls");
     assert!(error.contains("retains 1 rich call rows"), "{error}");
@@ -845,7 +889,7 @@ fn runtime_packed_kernel_publication_requires_empty_rich_calls() {
 #[test]
 fn runtime_packed_kernel_publication_requires_empty_rich_callables() {
     let fixture = runtime_packed_publication_fixture();
-    let publication = runtime_packed_publication_with_call_routes(
+    let sealed_publication = runtime_packed_publication_with_call_routes(
         &fixture.authority_handoff,
         fixture.authority.source_bundle_digest_v1,
         fixture.authority.role,
@@ -868,11 +912,11 @@ fn runtime_packed_kernel_publication_requires_empty_rich_callables() {
             source_bundle_digest_v1: fixture.authority.source_bundle_digest_v1,
             role: fixture.authority.role,
             entity_counts: fixture.entity_counts,
-            entity_route_digest_v1: fixture.entity_route_digest_v1,
+            ownership_expectation: sealed_publication.expectation,
             resource_routes: &fixture.resource_routes,
         },
         fixture.authority,
-        publication,
+        sealed_publication.publication,
     )
     .expect_err("RuntimePacked boundary must reject retained rich callables");
     assert!(
@@ -884,20 +928,13 @@ fn runtime_packed_kernel_publication_requires_empty_rich_callables() {
 #[test]
 fn runtime_packed_kernel_publication_rejects_missing_call_route() {
     let fixture = runtime_packed_publication_fixture();
-    let publication = runtime_packed_publication_with_call_routes(
+    let sealed_publication = runtime_packed_publication_with_call_routes(
         &fixture.authority_handoff,
         fixture.authority.source_bundle_digest_v1,
         fixture.authority.role,
         &[0, 2],
     )
     .expect("fixture rebuilds a publication with a gap in its Call routes");
-    // Align the independent test authority with this deliberately malformed
-    // route set so the test reaches the dense-count validator rather than the
-    // earlier cross-authority identity check.
-    let entity_route_digest_v1 = publication
-        .__kernel_pairing_with_entity_route_digest()
-        .expect("fixture finalizes its malformed route identity")
-        .1;
     let mut counts = fixture.entity_counts;
     counts.call_count = 3;
     let error = seal_project_runtime_packed_checked_program_construction_with_kernel_publication(
@@ -907,11 +944,11 @@ fn runtime_packed_kernel_publication_rejects_missing_call_route() {
             source_bundle_digest_v1: fixture.authority.source_bundle_digest_v1,
             role: fixture.authority.role,
             entity_counts: counts,
-            entity_route_digest_v1,
+            ownership_expectation: sealed_publication.expectation,
             resource_routes: &fixture.resource_routes,
         },
         fixture.authority,
-        publication,
+        sealed_publication.publication,
     )
     .expect_err("missing RuntimePacked Call route must fail closed");
     assert!(
@@ -923,19 +960,13 @@ fn runtime_packed_kernel_publication_rejects_missing_call_route() {
 #[test]
 fn runtime_packed_kernel_publication_rejects_out_of_range_call_route() {
     let fixture = runtime_packed_publication_fixture();
-    let publication = runtime_packed_publication_with_call_routes(
+    let sealed_publication = runtime_packed_publication_with_call_routes(
         &fixture.authority_handoff,
         fixture.authority.source_bundle_digest_v1,
         fixture.authority.role,
         &[0, 1],
     )
     .expect("fixture rebuilds a publication with an extra Call route");
-    // Keep the identity authority consistent so this negative test isolates
-    // the authoritative packed call-count boundary.
-    let entity_route_digest_v1 = publication
-        .__kernel_pairing_with_entity_route_digest()
-        .expect("fixture finalizes its malformed route identity")
-        .1;
     let error = seal_project_runtime_packed_checked_program_construction_with_kernel_publication(
         &fixture.project,
         fixture.packed_construction,
@@ -943,11 +974,11 @@ fn runtime_packed_kernel_publication_rejects_out_of_range_call_route() {
             source_bundle_digest_v1: fixture.authority.source_bundle_digest_v1,
             role: fixture.authority.role,
             entity_counts: fixture.entity_counts,
-            entity_route_digest_v1,
+            ownership_expectation: sealed_publication.expectation,
             resource_routes: &fixture.resource_routes,
         },
         fixture.authority,
-        publication,
+        sealed_publication.publication,
     )
     .expect_err("out-of-range RuntimePacked Call route must fail closed");
     assert!(
@@ -967,6 +998,138 @@ fn kernel_publication_rejects_duplicate_call_route_at_construction() {
     )
     .expect_err("duplicate Call routes are not constructible");
     assert!(error.contains("Call route 0 is published twice"), "{error}");
+}
+
+#[test]
+fn runtime_packed_ownership_freeze_rejects_every_late_mutator() {
+    let fixture = runtime_packed_publication_fixture();
+    let mut sealed = runtime_packed_publication_with_call_routes(
+        &fixture.authority_handoff,
+        fixture.authority.source_bundle_digest_v1,
+        fixture.authority.role,
+        &[0],
+    )
+    .expect("fixture freezes a complete publication and ownership plan");
+    let projection = sealed
+        .publication
+        .__kernel_projection_for_route(CheckedImageRowDomainV2::Expression, 0)
+        .expect("fixture has an Expression route");
+    let key = fixture.authority_handoff.projections[projection.as_usize()]
+        .stable_key
+        .clone();
+
+    for error in [
+        sealed
+            .publication
+            .__kernel_intern_projection(key)
+            .expect_err("projection interning after ownership freeze must fail"),
+        sealed
+            .publication
+            .__kernel_publish_rows(projection, 1)
+            .expect_err("row publication after ownership freeze must fail"),
+        sealed
+            .publication
+            .__kernel_publish_dependency_row(projection, [projection])
+            .expect_err("dependency publication after ownership freeze must fail"),
+        sealed
+            .publication
+            .__kernel_route(CheckedImageRowDomainV2::Expression, 0, projection)
+            .expect_err("route publication after ownership freeze must fail"),
+        sealed
+            .expectation
+            .__kernel_install_compact_topology(Box::new([[0xA5; 32]]), Box::new([]))
+            .expect_err("ownership topology replacement after freeze must fail"),
+    ] {
+        assert!(error.contains("frozen"), "{error}");
+    }
+}
+
+#[test]
+fn runtime_packed_ownership_freeze_rejects_a_foreign_pair() {
+    let fixture = runtime_packed_publication_fixture();
+    let (left_publication, mut left_expectation) =
+        boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
+            fixture.authority.source_bundle_digest_v1,
+            fixture.authority.role,
+        );
+    let (right_publication, _right_expectation) =
+        boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
+            fixture.authority.source_bundle_digest_v1,
+            fixture.authority.role,
+        );
+    drop(left_publication);
+    let error = left_expectation
+        .__kernel_freeze_against(&right_publication)
+        .expect_err("ownership expectation must reject a foreign publication pair");
+    assert!(
+        error.contains("different construction identities"),
+        "{error}"
+    );
+}
+
+#[test]
+fn runtime_packed_prehashed_projection_rejects_digest_collision() {
+    let fixture = runtime_packed_publication_fixture();
+    let (mut publication, _expectation) =
+        boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
+            fixture.authority.source_bundle_digest_v1,
+            fixture.authority.role,
+        );
+    let left = fixture.authority_handoff.projections[0].stable_key.clone();
+    let right = fixture
+        .authority_handoff
+        .projections
+        .iter()
+        .map(|projection| projection.stable_key.clone())
+        .find(|key| *key != left)
+        .expect("fixture has two distinct projection keys");
+    publication
+        .__kernel_intern_prehashed_projection(left, [0x5A; 32])
+        .expect("first prehashed key interns");
+    let error = publication
+        .__kernel_intern_prehashed_projection(right, [0x5A; 32])
+        .expect_err("distinct keys may not share a supplied stable digest");
+    assert!(error.contains("distinct projection keys"), "{error}");
+}
+
+#[test]
+fn runtime_packed_ownership_freeze_rejects_duplicate_catalog_digest() {
+    let fixture = runtime_packed_publication_fixture();
+    let (mut publication, mut expectation) =
+        boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
+            fixture.authority.source_bundle_digest_v1,
+            fixture.authority.role,
+        );
+    let key = fixture.authority_handoff.projections[0].stable_key.clone();
+    let digest = boon_checked::checked_image_projection_key_digest_v4(&key)
+        .expect("fixture key has a stable digest");
+    publication
+        .__kernel_intern_prehashed_projection(key, digest)
+        .expect("fixture key interns");
+    let error = expectation
+        .__kernel_install_compact_topology(Box::new([digest, digest]), Box::new([]))
+        .expect_err("duplicate expected digest must fail closed");
+    assert!(error.contains("strict-sorted"), "{error}");
+}
+
+#[test]
+fn runtime_packed_ownership_freeze_rejects_a_foreign_projection_catalog() {
+    let fixture = runtime_packed_publication_fixture();
+    let (mut publication, mut expectation) =
+        boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
+            fixture.authority.source_bundle_digest_v1,
+            fixture.authority.role,
+        );
+    publication
+        .__kernel_intern_projection(fixture.authority_handoff.projections[0].stable_key.clone())
+        .expect("fixture projection interns");
+    expectation
+        .__kernel_install_compact_topology(Box::new([[0xA5; 32]]), Box::new([]))
+        .expect("foreign expectation remains constructible before freeze");
+    let error = expectation
+        .__kernel_freeze_against(&publication)
+        .expect_err("foreign projection catalog must not certify the publication");
+    assert!(error.contains("independent ownership plan"), "{error}");
 }
 
 #[test]

@@ -284,76 +284,358 @@ fn construction_owned_checked_image_publication(workspace: &Path) -> Result<Stri
         read_text(&workspace.join("crates/boon_checked/src/checked_image_publication.rs"))?;
     let linker = read_text(&workspace.join("crates/boon_compiler_kernel/src/link.rs"))?;
     let typecheck = read_text(&workspace.join("crates/boon_typecheck/src/lib.rs"))?;
+    let linker_syntax =
+        syn::parse_file(&linker).map_err(|error| format!("cannot parse kernel linker: {error}"))?;
+    let typecheck_syntax = syn::parse_file(&typecheck)
+        .map_err(|error| format!("cannot parse typechecker: {error}"))?;
+    let kernel_oracle_path = workspace.join("crates/boon_compiler/src/kernel_oracle.rs");
+    let kernel_oracle = read_text(&kernel_oracle_path)?;
+    let kernel_oracle_syntax = syn::parse_file(&kernel_oracle)
+        .map_err(|error| format!("cannot parse `{}`: {error}", kernel_oracle_path.display()))?;
     let compiler_path = workspace.join("crates/boon_compiler/src/lib.rs");
     let compiler = read_text(&compiler_path)?;
     let compiler_syntax = syn::parse_file(&compiler)
         .map_err(|error| format!("cannot parse `{}`: {error}", compiler_path.display()))?;
 
-    for (label, source, required) in [
+    for (source, required) in [
         (
-            "checked model",
             &checked_publication,
             "pub struct CheckedImageKernelPublicationV1",
         ),
         (
-            "checked model",
             &checked_publication,
             "pub struct CheckedImageKernelPairingReceiptV1",
         ),
         (
-            "checked model",
-            &checked,
-            "pub use checked_image_publication::{",
+            &checked_publication,
+            "pub struct CheckedImageKernelOwnershipExpectationV1",
         ),
-        ("kernel linker", &linker, "checked_image_publication_v1("),
-        (
-            "typechecker seal",
-            &typecheck,
-            "checked_image_handoff_from_kernel_publication(",
-        ),
-        (
-            "typechecker seal",
-            &typecheck,
-            "construction-published checked image differs from the rich-row V4 replay oracle",
-        ),
-        (
-            "compiler handoff",
-            &compiler,
-            "checked_image_kernel_publication",
-        ),
+        (&checked, "pub use checked_image_publication::{"),
+        (&typecheck, "checked_image_handoff_from_kernel_publication("),
     ] {
         if !source.contains(required) {
-            return Err(format!(
-                "{label} omits construction-owned checked-image proof `{required}`"
-            ));
+            return Err(format!("checked-image architecture omits `{required}`"));
         }
     }
 
-    let mut direct = ProductionIdentifierReferenceCollector::new(
-        "seal_project_checked_program_construction_with_kernel_publication_and_pairing",
-    );
-    direct.visit_file(&compiler_syntax);
-    if direct.references.len() != 1 {
-        return Err(format!(
-            "production compiler must consume one move-only checked-image publication; found {:?}",
-            direct.references,
-        ));
+    for (name, expected) in [
+        (
+            "seal_project_checked_program_construction_with_kernel_publication_and_pairing",
+            1,
+        ),
+        (
+            "seal_project_checked_program_construction_with_kernel_authority",
+            0,
+        ),
+    ] {
+        let mut uses = ProductionIdentifierReferenceCollector::new(name);
+        uses.visit_file(&compiler_syntax);
+        if uses.references.len() != expected {
+            return Err(format!(
+                "production compiler has {} `{name}` references",
+                uses.references.len()
+            ));
+        }
     }
-    let mut replay = ProductionIdentifierReferenceCollector::new(
-        "seal_project_checked_program_construction_with_kernel_authority",
-    );
-    replay.visit_file(&compiler_syntax);
-    if !replay.references.is_empty() {
-        return Err(format!(
-            "production compiler replays rich checked rows at {:?}",
-            replay.references,
-        ));
+    for forbidden in [
+        "checked_image_entity_route_digest_v1",
+        "__kernel_pairing_with_entity_route_digest",
+        "__kernel_projection_digest",
+    ] {
+        for syntax in [
+            &linker_syntax,
+            &kernel_oracle_syntax,
+            &compiler_syntax,
+            &typecheck_syntax,
+        ] {
+            let mut references = ProductionIdentifierReferenceCollector::new(forbidden);
+            references.visit_file(syntax);
+            if !references.references.is_empty() {
+                return Err(format!(
+                    "production reads forbidden publication API `{forbidden}`"
+                ));
+            }
+        }
     }
+    verify_checked_publication_writer_split(&linker_syntax)?;
+    verify_checked_construction_freeze_order(&kernel_oracle_syntax)?;
+    verify_runtime_packed_seal_consumption(&compiler_syntax, &typecheck, &typecheck_syntax)?;
 
     Ok(
-        "dense checked rows publish one compact V4 topology; production verified sealing consumes it by value with an exact construction-pairing receipt and rich checked replay is test-only"
+        "dense checked rows publish one compact V4 topology beside an independently populated ownership expectation; compiler metadata closes before the shared freeze, verified sealing consumes the publication by value, and rich checked replay is test-only"
             .to_owned(),
     )
+}
+
+#[derive(Default)]
+struct CheckedImageWrites(usize, usize);
+
+#[rustfmt::skip]
+impl Visit<'_> for CheckedImageWrites {
+    fn visit_expr_method_call(&mut self, call: &syn::ExprMethodCall) {
+        match call.method.to_string().as_str() {
+            "__kernel_install_compact_topology" => self.0 += 1,
+            "__kernel_intern_projection" | "__kernel_intern_prehashed_projection" | "__kernel_route"
+            | "__kernel_publish_rows" | "__kernel_publish_dependency_row" => self.1 += 1,
+            _ => {}
+        }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+}
+
+struct TypeHas<'a>(&'a str, bool);
+#[rustfmt::skip]
+impl<'ast> Visit<'ast> for TypeHas<'_> {
+    fn visit_type_path(&mut self, path: &'ast syn::TypePath) {
+        self.1 |= path.path.segments.iter().any(|part| part.ident == self.0);
+        syn::visit::visit_type_path(self, path);
+    }
+}
+fn type_has(ty: &syn::Type, name: &str) -> bool {
+    let mut found = TypeHas(name, false);
+    found.visit_type(ty);
+    found.1
+}
+#[rustfmt::skip]
+fn direct_type(ty: &syn::Type) -> Option<&syn::Ident> {
+    match ty { syn::Type::Path(path) if path.qself.is_none() => path.path.segments.last().map(|part| &part.ident), _ => None }
+}
+#[rustfmt::skip]
+fn production_fn<'a>(syntax: &'a syn::File, name: &str) -> Result<&'a syn::ItemFn, String> {
+    let found = syntax.items.iter().filter_map(|item| match item {
+        syn::Item::Fn(function) if function.sig.ident == name && !cfg_is_test_only(&function.attrs) => Some(function), _ => None,
+    }).collect::<Vec<_>>();
+    match found.as_slice() {
+        [function] => Ok(function),
+        _ => Err(format!("expected one production `{name}`; found {}", found.len())),
+    }
+}
+fn identifier_uses(block: &syn::Block, name: &str) -> usize {
+    let mut uses = ProductionIdentifierReferenceCollector::new(name);
+    uses.visit_block(block);
+    uses.references.len()
+}
+fn expression_identifier_uses(expression: &syn::Expr, name: &str) -> usize {
+    let mut uses = ProductionIdentifierReferenceCollector::new(name);
+    uses.visit_expr(expression);
+    uses.references.len()
+}
+
+fn signature_has_type(signature: &syn::Signature, name: &str) -> bool {
+    signature
+        .inputs
+        .iter()
+        .any(|arg| matches!(arg, syn::FnArg::Typed(arg) if type_has(&arg.ty, name)))
+        || matches!(&signature.output, syn::ReturnType::Type(_, ty) if type_has(ty, name))
+}
+
+#[rustfmt::skip]
+fn verify_checked_publication_writer_split(syntax: &syn::File) -> Result<(), String> {
+    let owner = production_fn(syntax, "checked_image_ownership_plan_v1")?;
+    let publisher = production_fn(syntax, "checked_image_publication_v1")?;
+    let mut owner_writes = CheckedImageWrites::default();
+    let mut publisher_writes = CheckedImageWrites::default();
+    owner_writes.visit_block(&owner.block); publisher_writes.visit_block(&publisher.block);
+    if owner_writes.1 != 0 || publisher_writes.0 != 0 || identifier_uses(&publisher.block, "checked_image_ownership_plan_v1") != 1 {
+        return Err("checked ownership/publication producers are not separated".to_owned());
+    }
+    let read_apis = ["checked_image_entity_route_digest_v1", "__kernel_pairing", "__kernel_unfrozen_pairing",
+        "__kernel_projection_digest", "__kernel_projection_for_route", "__kernel_projection_id", "__kernel_projection_key"];
+    for api in read_apis {
+        if identifier_uses(&owner.block, api) != 0 || identifier_uses(&publisher.block, api) != 0 {
+            return Err(format!("checked-image producer reads publication API `{api}`"));
+        }
+    }
+    if owner.sig.inputs.iter().any(|arg| matches!(arg, syn::FnArg::Typed(arg) if type_has(&arg.ty, "CheckedImageKernelPublicationV1"))) {
+        return Err("ownership producer accepts publication state".to_owned());
+    }
+    if !matches!(&owner.sig.output, syn::ReturnType::Type(_, ty) if type_has(ty, "KernelCheckedImageOwnershipPlanV1")) {
+        return Err("ownership producer omits its concrete plan result".to_owned());
+    }
+    let structure = |name: &str| syntax.items.iter().find_map(|item| match item {
+        syn::Item::Struct(value) if value.ident == name && !cfg_is_test_only(&value.attrs) => Some(value), _ => None,
+    }).ok_or_else(|| format!("missing `{name}` structure"));
+    let plan = structure("KernelCheckedImageOwnershipPlanV1")?;
+    if plan.fields.iter().any(|field| type_has(&field.ty, "CheckedImageKernelPublicationV1") || type_has(&field.ty, "CheckedImageKernelOwnershipExpectationV1")) {
+        return Err("ownership plan stores a sibling writer".to_owned());
+    }
+    let builder = structure("KernelCheckedImagePublicationBuilderV1")?;
+    let field = |name: &str| builder.fields.iter().find(|field| field.ident.as_ref().is_some_and(|id| id == name));
+    if !field("publication").and_then(|field| direct_type(&field.ty)).is_some_and(|ty| ty == "CheckedImageKernelPublicationV1")
+        || !field("ownership_plan").is_some_and(|field| matches!(&field.ty,
+            syn::Type::Reference(reference) if reference.mutability.is_none()
+                && direct_type(&reference.elem).is_some_and(|ty| ty == "KernelCheckedImageOwnershipPlanV1")))
+        || builder.fields.iter().any(|field| type_has(&field.ty, "CheckedImageKernelOwnershipExpectationV1")) {
+        return Err("publication builder does not own publication and borrow only its plan".to_owned());
+    }
+    let mut writes = std::collections::BTreeMap::<String, CheckedImageWrites>::new();
+    for implementation in syntax.items.iter().filter_map(|item| match item {
+        syn::Item::Impl(value) if !cfg_is_test_only(&value.attrs) => Some(value), _ => None,
+    }) {
+        let Some(name) = direct_type(&implementation.self_ty).map(ToString::to_string) else { continue };
+        let total = writes.entry(name.clone()).or_default();
+        for method in implementation.items.iter().filter_map(|item| match item {
+            syn::ImplItem::Fn(value) if !cfg_is_test_only(&value.attrs) => Some(value), _ => None,
+        }) {
+            if matches!(name.as_str(), "BuildingKernelCheckedImageOwnershipPlanV1" | "KernelCheckedImageOwnershipPlanV1") {
+                if signature_has_type(&method.sig, "CheckedImageKernelPublicationV1") { return Err(format!("`{name}::{}` accepts or returns publication state", method.sig.ident)); }
+                for api in read_apis { if identifier_uses(&method.block, api) != 0 { return Err(format!("`{name}::{}` reads publication API `{api}`", method.sig.ident)); } }
+            }
+            let mut current = CheckedImageWrites::default();
+            current.visit_block(&method.block);
+            total.0 += current.0; total.1 += current.1;
+        }
+        if total.0 != 0 && total.1 != 0 { return Err(format!("`{name}` shadow-writes both siblings")); }
+    }
+    if !matches!(writes.get("KernelCheckedImageOwnershipPlanV1"), Some(value) if value.0 == 1 && value.1 == 0)
+        || !matches!(writes.get("KernelCheckedImagePublicationBuilderV1"), Some(value) if value.0 == 0 && value.1 != 0)
+    {
+        return Err("concrete ownership/publication writers are not exclusive".to_owned());
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct CheckedConstructionEvents(Vec<&'static str>);
+impl CheckedConstructionEvents {
+    fn add(&mut self, event: &'static str) {
+        self.0.push(event);
+    }
+}
+#[rustfmt::skip]
+impl<'ast> Visit<'ast> for CheckedConstructionEvents {
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if matches!(call.func.as_ref(), syn::Expr::Path(path) if path.path.segments.last().is_some_and(|part| part.ident == "append_kernel_checked_metadata_publication")) { self.add("append"); }
+        syn::visit::visit_expr_call(self, call);
+    }
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        if call.method == "__compiler_freeze_checked_image_ownership" { self.add("freeze"); }
+        syn::visit::visit_expr_method_call(self, call);
+    }
+    fn visit_expr_struct(&mut self, value: &'ast syn::ExprStruct) {
+        match value.path.segments.last().map(|part| part.ident.to_string()).as_deref() {
+            Some("CheckedImageKernelAuthorityV1") => self.add("authority"),
+            Some("KernelCheckedConstruction") => self.add("construction"), _ => {}
+        }
+        syn::visit::visit_expr_struct(self, value);
+    }
+}
+#[derive(Default)]
+struct HasCfg(bool);
+impl Visit<'_> for HasCfg {
+    fn visit_attribute(&mut self, value: &syn::Attribute) {
+        self.0 |= value.path().is_ident("cfg") || value.path().is_ident("cfg_attr");
+    }
+}
+#[rustfmt::skip]
+fn exact_checked_construction_event(statement: &syn::Stmt) -> Option<&'static str> {
+    match statement {
+        syn::Stmt::Expr(syn::Expr::Try(value), Some(_)) => match value.expr.as_ref() {
+            syn::Expr::Call(call) if matches!(call.func.as_ref(), syn::Expr::Path(path) if path.path.segments.last().is_some_and(|part| part.ident == "append_kernel_checked_metadata_publication")) => Some("append"),
+            syn::Expr::MethodCall(map) if map.method == "map_err" && matches!(map.receiver.as_ref(), syn::Expr::MethodCall(freeze) if freeze.method == "__compiler_freeze_checked_image_ownership") => Some("freeze"),
+            _ => None,
+        },
+        syn::Stmt::Local(local) if matches!(&local.pat, syn::Pat::Ident(pattern) if pattern.ident == "checked_image_authority")
+            && matches!(&local.init, Some(init) if matches!(init.expr.as_ref(), syn::Expr::Struct(value) if value.path.segments.last().is_some_and(|part| part.ident == "CheckedImageKernelAuthorityV1"))) => Some("authority"),
+        syn::Stmt::Expr(syn::Expr::Call(call), None) if matches!(call.func.as_ref(), syn::Expr::Path(path) if path.path.segments.last().is_some_and(|part| part.ident == "Ok"))
+            && matches!(call.args.first(), Some(syn::Expr::Struct(value)) if call.args.len() == 1 && value.path.segments.last().is_some_and(|part| part.ident == "KernelCheckedConstruction")) => Some("construction"),
+        _ => None,
+    }
+}
+#[rustfmt::skip]
+fn verify_checked_construction_freeze_order(syntax: &syn::File) -> Result<(), String> {
+    let function = production_fn(syntax, "checked_construction_from_kernel")?;
+    let mut positions = std::collections::BTreeMap::new();
+    for (index, statement) in function.block.stmts.iter().enumerate() {
+        let mut events = CheckedConstructionEvents::default(); events.visit_stmt(statement);
+        let mut cfg = HasCfg::default(); cfg.visit_stmt(statement);
+        if !events.0.is_empty() && (events.0.len() != 1 || exact_checked_construction_event(statement) != events.0.first().copied() || cfg.0) {
+            return Err(
+                "checked construction events must retain their exact top-level fail-closed statement shapes".to_owned(),
+            );
+        }
+        for event in events.0 {
+            if positions.insert(event, index).is_some() { return Err(format!("duplicate `{event}` event")); }
+        }
+    }
+    let at = |name| {
+        positions
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("missing `{name}` event"))
+    };
+    let order = [at("append")?, at("freeze")?, at("authority")?, at("construction")?];
+    if !order.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(format!(
+            "invalid append/freeze/authority/construction order: {order:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn is_ident(expression: &syn::Expr, name: &str) -> bool {
+    matches!(expression, syn::Expr::Path(path) if path.qself.is_none()
+        && path.path.segments.len() == 1 && path.path.segments[0].ident == name)
+}
+fn is_deref(expression: &syn::Expr, name: &str) -> bool {
+    matches!(expression, syn::Expr::Unary(value) if matches!(value.op, syn::UnOp::Deref(_)) && is_ident(&value.expr, name))
+}
+#[derive(Default)]
+struct RuntimePackedSealAudit(usize, usize, usize);
+#[rustfmt::skip]
+impl<'ast> Visit<'ast> for RuntimePackedSealAudit {
+    fn visit_local(&mut self, local: &'ast syn::Local) {
+        if matches!(&local.pat, syn::Pat::Ident(pattern) if pattern.ident == "context")
+            && let Some(syn::LocalInit { expr, .. }) = &local.init
+            && let syn::Expr::Struct(context) = expr.as_ref()
+            && context.path.segments.last().is_some_and(|part| part.ident == "RuntimePackedCheckedSealContextV1")
+        {
+            self.0 += 1;
+            self.1 += context.fields.iter().filter(|field| { matches!(&field.member,
+                syn::Member::Named(name) if name == "ownership_expectation")
+                    && expression_identifier_uses(&field.expr, "take_checked_image_ownership_expectation") == 1 }).count();
+        }
+        syn::visit::visit_local(self, local);
+    }
+    fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+        if matches!(call.func.as_ref(), syn::Expr::Path(path) if path.path.segments.last().is_some_and(|part| part.ident == "seal_project_runtime_packed_checked_program_construction_with_kernel_publication"))
+            && call.args.len() == 5
+            && call.args.get(2).is_some_and(|arg| is_ident(arg, "context"))
+            && call.args.get(3).is_some_and(|arg| is_deref(arg, "authority"))
+            && call.args.get(4).is_some_and(|arg| is_deref(arg, "publication"))
+        {
+            self.2 += 1;
+        }
+        syn::visit::visit_expr_call(self, call);
+    }
+}
+fn owned_parameter(function: &syn::ItemFn, name: &str, ty: &str) -> bool {
+    function.sig.inputs.iter().any(|arg| {
+        matches!(arg, syn::FnArg::Typed(arg)
+        if matches!(arg.pat.as_ref(), syn::Pat::Ident(pattern) if pattern.ident == name)
+            && direct_type(&arg.ty).is_some_and(|actual| actual == ty))
+    })
+}
+#[rustfmt::skip]
+fn verify_runtime_packed_seal_consumption(compiler: &syn::File, source: &str, typecheck: &syn::File) -> Result<(), String> {
+    verify_required_direct_field(source, "RuntimePackedCheckedSealContextV1", "ownership_expectation", "CheckedImageKernelOwnershipExpectationV1")?;
+    let seal = production_fn(typecheck, "seal_project_runtime_packed_checked_program_construction_with_kernel_publication")?;
+    for (name, ty) in [
+        ("context", "RuntimePackedCheckedSealContextV1"),
+        ("authority", "CheckedImageKernelAuthorityV1"),
+        ("publication", "CheckedImageKernelPublicationV1"),
+    ] {
+        if !owned_parameter(seal, name, ty) { return Err(format!("RuntimePacked seal does not own `{name}: {ty}`")); }
+    }
+    let mut audit = RuntimePackedSealAudit::default();
+    audit.visit_block(&production_fn(compiler, "checked_program_from_output")?.block);
+    if audit.0 != 1 || audit.1 != 1 || audit.2 != 1 {
+        return Err(format!(
+            "RuntimePacked context/take/linked-seal counts are {}/{}/{}",
+            audit.0, audit.1, audit.2
+        ));
+    }
+    Ok(())
 }
 
 fn pinned_production_rust_toolchain(workspace: &Path) -> Result<String, String> {
@@ -1159,7 +1441,8 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         "pub struct SemanticProgram",
         "pub fn elaborate(",
         "CallableDependencyManifestV7",
-        "#[cfg(test)]\n    checked_program: CheckedProgramFields",
+        "#[cfg(any(test, feature = \"test-packed-call-oracle\"))]\n    checked_program: CheckedProgramFields",
+        "#[cfg(any(test, feature = \"test-packed-call-oracle\"))]\n    kernel_input: Option<Arc<boon_compiler_kernel::KernelSemanticInputV1>>",
         "#[cfg(test)]\n    execution_graph: SemanticExecutionImageColumnsV1",
     ] {
         if !semantic.contains(required) {
@@ -1540,6 +1823,13 @@ impl<'ast> Visit<'ast> for ProductionIdentifierReferenceCollector<'_> {
             self.references.push("expression");
         }
         syn::visit::visit_expr_path(self, expression);
+    }
+
+    fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
+        if expression.method == self.identifier {
+            self.references.push("method call");
+        }
+        syn::visit::visit_expr_method_call(self, expression);
     }
 
     fn visit_macro(&mut self, item: &'ast syn::Macro) {

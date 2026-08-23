@@ -3943,6 +3943,59 @@ impl KernelSemanticInputConstructionV1 {
             .map_err(KernelCheckedLinkError::new)
     }
 
+    /// Resolve compiler-owned metadata through the sole compact ownership
+    /// topology. The payload publication intentionally exposes no key or route
+    /// lookup API.
+    #[doc(hidden)]
+    pub fn __compiler_checked_image_projection_for_route(
+        &self,
+        domain: CheckedImageRowDomainV2,
+        dense_index: usize,
+    ) -> Result<Option<boon_checked::CheckedImageKernelProjectionIdV1>, KernelCheckedLinkError>
+    {
+        self.checked_image_ownership_expectation
+            .as_ref()
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(
+                    "kernel checked-image ownership expectation was already consumed",
+                )
+            })?
+            .__compiler_projection_for_route(domain, dense_index)
+            .map_err(KernelCheckedLinkError::new)
+    }
+
+    #[doc(hidden)]
+    pub fn __compiler_checked_image_definition_projection(
+        &self,
+        projection: boon_checked::CheckedImageKernelProjectionIdV1,
+    ) -> Result<Option<boon_checked::CheckedImageKernelProjectionIdV1>, KernelCheckedLinkError>
+    {
+        self.checked_image_ownership_expectation
+            .as_ref()
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(
+                    "kernel checked-image ownership expectation was already consumed",
+                )
+            })?
+            .__compiler_definition_projection(projection)
+            .map_err(KernelCheckedLinkError::new)
+    }
+
+    #[doc(hidden)]
+    pub fn __compiler_checked_image_root_definition_projection(
+        &self,
+    ) -> Result<boon_checked::CheckedImageKernelProjectionIdV1, KernelCheckedLinkError> {
+        self.checked_image_ownership_expectation
+            .as_ref()
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(
+                    "kernel checked-image ownership expectation was already consumed",
+                )
+            })?
+            .__compiler_root_definition_projection()
+            .map_err(KernelCheckedLinkError::new)
+    }
+
     pub const fn source_bundle_digest_v1(&self) -> SourceBundleDigestV1 {
         self.source_bundle_digest_v1
     }
@@ -7670,31 +7723,29 @@ fn checked_link_packed_authority_projection(
     })
 }
 
-struct KernelCheckedImagePrehashEntryV1 {
-    key: CheckedShardProjectionKeyV2,
-    projection_digest_id: u32,
-}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TempCheckedImageProjectionIdV1(u32);
 
 struct BuildingKernelCheckedImagePrehashEntryV1 {
     key: CheckedShardProjectionKeyV2,
     digest: [u8; 32],
+    projection: TempCheckedImageProjectionIdV1,
 }
 
 #[derive(Clone, Copy)]
 struct BuildingKernelCheckedImageExpectedRouteV1 {
     domain: CheckedImageRowDomainV2,
     dense_index: u32,
-    projection_digest: [u8; 32],
+    projection: TempCheckedImageProjectionIdV1,
 }
 
 /// Complete packed-layout ownership authority built before publication starts.
 ///
-/// Exact keys exist only as a construction-time prehash registry. Expected
-/// routes use fixed-width digests and never refer to publication-issued IDs.
-/// The registry is dropped with this plan immediately after publication.
+/// Projection keys are canonicalized once and move directly into the final V4
+/// handoff. The sibling publication owns payload only; it never stores keys or
+/// routes.
 struct KernelCheckedImageOwnershipPlanV1 {
-    prehash_by_key: Box<[KernelCheckedImagePrehashEntryV1]>,
-    projection_digests: Box<[[u8; 32]]>,
+    projections: Box<[boon_checked::CheckedImageKernelPlannedProjectionV1]>,
     routes: Box<[CheckedImageKernelExpectedRouteV1]>,
 }
 
@@ -7714,20 +7765,31 @@ impl BuildingKernelCheckedImageOwnershipPlanV1 {
     fn intern_projection(
         &mut self,
         key: CheckedShardProjectionKeyV2,
-    ) -> Result<[u8; 32], KernelCheckedLinkError> {
+    ) -> Result<TempCheckedImageProjectionIdV1, KernelCheckedLinkError> {
         match self
             .prehash_by_key
             .binary_search_by(|entry| entry.key.cmp(&key))
         {
-            Ok(index) => return Ok(self.prehash_by_key[index].digest),
+            Ok(index) => return Ok(self.prehash_by_key[index].projection),
             Err(index) => {
                 let digest = boon_checked::checked_image_projection_key_digest_v4(&key)
                     .map_err(KernelCheckedLinkError::new)?;
+                let projection = TempCheckedImageProjectionIdV1(
+                    u32::try_from(self.prehash_by_key.len()).map_err(|_| {
+                        KernelCheckedLinkError::new(
+                            "kernel checked-image projection catalog exceeds u32",
+                        )
+                    })?,
+                );
                 self.prehash_by_key.insert(
                     index,
-                    BuildingKernelCheckedImagePrehashEntryV1 { key, digest },
+                    BuildingKernelCheckedImagePrehashEntryV1 {
+                        key,
+                        digest,
+                        projection,
+                    },
                 );
-                return Ok(digest);
+                return Ok(projection);
             }
         }
     }
@@ -7736,14 +7798,14 @@ impl BuildingKernelCheckedImageOwnershipPlanV1 {
         &mut self,
         domain: CheckedImageRowDomainV2,
         dense_index: usize,
-        projection_digest: [u8; 32],
+        projection: TempCheckedImageProjectionIdV1,
     ) -> Result<(), KernelCheckedLinkError> {
         self.routes.push(BuildingKernelCheckedImageExpectedRouteV1 {
             domain,
             dense_index: u32::try_from(dense_index).map_err(|_| {
                 KernelCheckedLinkError::new("kernel checked-image expected route exceeds u32")
             })?,
-            projection_digest,
+            projection,
         });
         Ok(())
     }
@@ -7769,13 +7831,24 @@ impl BuildingKernelCheckedImageOwnershipPlanV1 {
                 "kernel checked-image ownership plan contains a duplicate entity route",
             ));
         }
+        let mut canonical_by_temp = vec![u32::MAX; self.prehash_by_key.len()];
+        for (canonical, entry) in self.prehash_by_key.iter().enumerate() {
+            canonical_by_temp[entry.projection.0 as usize] =
+                u32::try_from(canonical).map_err(|_| {
+                    KernelCheckedLinkError::new(
+                        "kernel checked-image projection catalog exceeds u32",
+                    )
+                })?;
+        }
         let routes = self
             .routes
             .into_iter()
             .map(|route| {
-                let projection_digest_id = projection_digests
-                    .binary_search(&route.projection_digest)
-                    .map_err(|_| {
+                let projection = canonical_by_temp
+                    .get(route.projection.0 as usize)
+                    .copied()
+                    .filter(|projection| *projection != u32::MAX)
+                    .ok_or_else(|| {
                         KernelCheckedLinkError::new(
                             "kernel checked-image ownership route references a foreign projection",
                         )
@@ -7783,56 +7856,98 @@ impl BuildingKernelCheckedImageOwnershipPlanV1 {
                 Ok(CheckedImageKernelExpectedRouteV1::__kernel_new(
                     route.domain,
                     route.dense_index,
-                    u32::try_from(projection_digest_id).map_err(|_| {
-                        KernelCheckedLinkError::new(
-                            "kernel checked-image projection catalog exceeds u32",
-                        )
-                    })?,
+                    projection,
                 ))
             })
             .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
-        let prehash_by_key = self
+        let mut definition_by_temp = vec![None; self.prehash_by_key.len()];
+        let mut group_start = 0usize;
+        while group_start < self.prehash_by_key.len() {
+            let owner = &self.prehash_by_key[group_start].key.owner;
+            let mut group_end = group_start + 1;
+            while group_end < self.prehash_by_key.len()
+                && self.prehash_by_key[group_end].key.owner == *owner
+            {
+                group_end += 1;
+            }
+            let definition = self.prehash_by_key[group_start..group_end]
+                .iter()
+                .position(|entry| entry.key.region == CheckedShardRegionV2::Definition)
+                .map(|offset| group_start + offset)
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| {
+                    KernelCheckedLinkError::new(
+                        "kernel checked-image projection catalog exceeds u32",
+                    )
+                })?;
+            for entry in &self.prehash_by_key[group_start..group_end] {
+                definition_by_temp[entry.projection.0 as usize] = definition;
+            }
+            group_start = group_end;
+        }
+        let projections = self
             .prehash_by_key
             .into_iter()
             .map(|entry| {
-                let projection_digest_id = projection_digests
-                    .binary_search(&entry.digest)
-                    .expect("validated ownership digest remains in the sorted catalog");
-                Ok(KernelCheckedImagePrehashEntryV1 {
-                    key: entry.key,
-                    projection_digest_id: u32::try_from(projection_digest_id).map_err(|_| {
-                        KernelCheckedLinkError::new(
-                            "kernel checked-image projection catalog exceeds u32",
-                        )
-                    })?,
-                })
+                boon_checked::CheckedImageKernelPlannedProjectionV1::__kernel_new(
+                    entry.key,
+                    entry.digest,
+                    definition_by_temp[entry.projection.0 as usize],
+                )
             })
-            .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
+            .collect::<Vec<_>>();
         Ok(KernelCheckedImageOwnershipPlanV1 {
-            prehash_by_key: prehash_by_key.into_boxed_slice(),
-            projection_digests: projection_digests.into_boxed_slice(),
+            projections: projections.into_boxed_slice(),
             routes: routes.into_boxed_slice(),
         })
     }
 }
 
 impl KernelCheckedImageOwnershipPlanV1 {
-    fn projection_digest(&self, key: &CheckedShardProjectionKeyV2) -> Result<[u8; 32], String> {
-        let entry = self
-            .prehash_by_key
-            .binary_search_by(|entry| entry.key.cmp(key))
+    fn projection(
+        &self,
+        key: &CheckedShardProjectionKeyV2,
+    ) -> Result<boon_checked::CheckedImageKernelProjectionIdV1, String> {
+        let index = self
+            .projections
+            .binary_search_by(|entry| entry.__kernel_key().cmp(key))
             .ok()
-            .and_then(|index| self.prehash_by_key.get(index))
             .ok_or_else(|| {
                 "kernel checked-image publication produced a projection absent from the completed ownership plan"
                     .to_owned()
             })?;
-        self.projection_digests
-            .get(entry.projection_digest_id as usize)
-            .copied()
-            .ok_or_else(|| {
-                "kernel checked-image prehash references a missing digest slot".to_owned()
-            })
+        Ok(
+            boon_checked::CheckedImageKernelProjectionIdV1::__kernel_new(
+                u32::try_from(index).map_err(|_| {
+                    "kernel checked-image projection catalog exceeds u32".to_owned()
+                })?,
+            ),
+        )
+    }
+
+    fn route(
+        &self,
+        domain: CheckedImageRowDomainV2,
+        dense_index: usize,
+    ) -> Result<(usize, boon_checked::CheckedImageKernelProjectionIdV1), String> {
+        let dense_index = u32::try_from(dense_index)
+            .map_err(|_| "kernel checked-image route exceeds u32".to_owned())?;
+        let index = self
+            .routes
+            .binary_search_by_key(&(domain, dense_index), |route| route.__kernel_coordinates())
+            .map_err(|_| {
+                format!("kernel checked-image plan has no {domain:?} route {dense_index}")
+            })?;
+        Ok((index, self.routes[index].__kernel_projection()))
+    }
+
+    fn projection_count(&self) -> usize {
+        self.projections.len()
+    }
+
+    fn route_count(&self) -> usize {
+        self.routes.len()
     }
 
     fn install(
@@ -7840,11 +7955,10 @@ impl KernelCheckedImageOwnershipPlanV1 {
         expectation: &mut CheckedImageKernelOwnershipExpectationV1,
     ) -> Result<(), String> {
         let Self {
-            prehash_by_key: _,
-            projection_digests,
+            projections,
             routes,
         } = self;
-        expectation.__kernel_install_compact_topology(projection_digests, routes)
+        expectation.__kernel_install_compact_topology(projections, routes)
     }
 }
 
@@ -7871,9 +7985,7 @@ impl<'a> KernelCheckedImagePublicationBuilderV1<'a> {
         &mut self,
         key: CheckedShardProjectionKeyV2,
     ) -> Result<boon_checked::CheckedImageKernelProjectionIdV1, String> {
-        let digest = self.ownership_plan.projection_digest(&key)?;
-        self.publication
-            .__kernel_intern_prehashed_projection(key, digest)
+        self.ownership_plan.projection(&key)
     }
 
     fn __kernel_publish_rows(
@@ -7885,23 +7997,49 @@ impl<'a> KernelCheckedImagePublicationBuilderV1<'a> {
             .__kernel_publish_rows(projection, row_count)
     }
 
-    fn __kernel_publish_dependency_row(
-        &mut self,
+    fn validated_route(
+        &self,
+        domain: CheckedImageRowDomainV2,
+        dense_index: usize,
         projection: boon_checked::CheckedImageKernelProjectionIdV1,
-        relocations: impl IntoIterator<Item = boon_checked::CheckedImageKernelProjectionIdV1>,
-    ) -> Result<(), String> {
-        self.publication
-            .__kernel_publish_dependency_row(projection, relocations)
+    ) -> Result<usize, String> {
+        let (route, expected) = self.ownership_plan.route(domain, dense_index)?;
+        if expected != projection {
+            return Err(format!(
+                "kernel checked-image {domain:?} route {dense_index} differs from its independent ownership plan"
+            ));
+        }
+        Ok(route)
     }
 
-    fn __kernel_route(
+    fn publish_routed_rows(
         &mut self,
         domain: CheckedImageRowDomainV2,
         dense_index: usize,
         projection: boon_checked::CheckedImageKernelProjectionIdV1,
+        row_count: u32,
     ) -> Result<(), String> {
+        let route = self.validated_route(domain, dense_index, projection)?;
         self.publication
-            .__kernel_route(domain, dense_index, projection)
+            .__kernel_publish_routed_rows(route, projection, row_count)
+            .map_err(|error| {
+                format!("kernel checked-image {domain:?} route {dense_index}: {error}")
+            })
+    }
+
+    fn publish_routed_dependency_row(
+        &mut self,
+        domain: CheckedImageRowDomainV2,
+        dense_index: usize,
+        projection: boon_checked::CheckedImageKernelProjectionIdV1,
+        relocations: &[boon_checked::CheckedImageKernelProjectionIdV1],
+    ) -> Result<(), String> {
+        let route = self.validated_route(domain, dense_index, projection)?;
+        self.publication
+            .__kernel_publish_routed_dependency_row(route, projection, relocations)
+            .map_err(|error| {
+                format!("kernel checked-image {domain:?} route {dense_index}: {error}")
+            })
     }
 
     fn into_publication(self) -> CheckedImageKernelPublicationV1 {
@@ -8568,7 +8706,12 @@ fn checked_image_publication_v1(
         occurrence_targets,
     )?;
     let (checked_image_publication, mut checked_image_ownership_expectation) =
-        CheckedImageKernelPublicationV1::__kernel_new_pair(source_bundle_digest_v1, role);
+        CheckedImageKernelPublicationV1::__kernel_new_pair(
+            source_bundle_digest_v1,
+            role,
+            ownership_plan.projection_count(),
+            ownership_plan.route_count(),
+        );
 
     // Final dense coordinates point back into one immutable packed row. These
     // two temporary columns replace rich scope/declaration DTOs and are
@@ -8729,10 +8872,7 @@ fn checked_image_publication_v1(
             .__kernel_intern_projection(checked_link_definition_projection(owner))
             .map_err(&error)?;
         publication
-            .__kernel_publish_rows(projection, 1)
-            .map_err(&error)?;
-        publication
-            .__kernel_route(CheckedImageRowDomainV2::Scope, scope, projection)
+            .publish_routed_rows(CheckedImageRowDomainV2::Scope, scope, projection, 1)
             .map_err(&error)?;
         scope_projections.push(projection);
     }
@@ -8783,13 +8923,11 @@ fn checked_image_publication_v1(
                 .__kernel_intern_projection(checked_link_definition_projection(owner))
                 .map_err(&error)?;
             publication
-                .__kernel_publish_rows(projection, 1)
-                .map_err(&error)?;
-            publication
-                .__kernel_route(
+                .publish_routed_rows(
                     CheckedImageRowDomainV2::Declaration,
                     id.0 as usize,
                     projection,
+                    1,
                 )
                 .map_err(&error)?;
             let slot = declaration_projections
@@ -8813,13 +8951,11 @@ fn checked_image_publication_v1(
                 .__kernel_intern_projection(root_definition.clone())
                 .map_err(&error)?;
             publication
-                .__kernel_publish_rows(projection, 1)
-                .map_err(&error)?;
-            publication
-                .__kernel_route(
+                .publish_routed_rows(
                     CheckedImageRowDomainV2::Declaration,
                     declaration.0 as usize,
                     projection,
+                    1,
                 )
                 .map_err(&error)?;
             let slot = declaration_projections
@@ -8944,13 +9080,11 @@ fn checked_image_publication_v1(
                 })
                 .transpose()?;
             publication
-                .__kernel_publish_dependency_row(projection, dependency)
-                .map_err(&error)?;
-            publication
-                .__kernel_route(
+                .publish_routed_dependency_row(
                     CheckedImageRowDomainV2::Statement,
                     id.0 as usize,
                     projection,
+                    dependency.as_slice(),
                 )
                 .map_err(&error)?;
         }
@@ -8965,10 +9099,12 @@ fn checked_image_publication_v1(
             })
             .flatten();
         publication
-            .__kernel_publish_dependency_row(projection, dependency)
-            .map_err(&error)?;
-        publication
-            .__kernel_route(CheckedImageRowDomainV2::Expression, expression, projection)
+            .publish_routed_dependency_row(
+                CheckedImageRowDomainV2::Expression,
+                expression,
+                projection,
+                dependency.as_slice(),
+            )
             .map_err(&error)?;
     }
 
@@ -8984,13 +9120,11 @@ fn checked_image_publication_v1(
             .__kernel_intern_projection(checked_link_interface_projection(owner))
             .map_err(&error)?;
         publication
-            .__kernel_publish_rows(projection, 1)
-            .map_err(&error)?;
-        publication
-            .__kernel_route(
+            .publish_routed_rows(
                 CheckedImageRowDomainV2::Callable,
                 declaration.0 as usize,
                 projection,
+                1,
             )
             .map_err(&error)?;
         let slot = callable_projections
@@ -9032,13 +9166,11 @@ fn checked_image_publication_v1(
                 ))
             })?;
         publication
-            .__kernel_publish_rows(projection, 1)
-            .map_err(&error)?;
-        publication
-            .__kernel_route(
+            .publish_routed_rows(
                 CheckedImageRowDomainV2::ContextFormal,
                 formal.0 as usize,
                 projection,
+                1,
             )
             .map_err(&error)?;
     }
@@ -9081,10 +9213,12 @@ fn checked_image_publication_v1(
                 ))
             })?;
         publication
-            .__kernel_publish_dependency_row(projection, [callee])
-            .map_err(&error)?;
-        publication
-            .__kernel_route(CheckedImageRowDomainV2::Call, id.0 as usize, projection)
+            .publish_routed_dependency_row(
+                CheckedImageRowDomainV2::Call,
+                id.0 as usize,
+                projection,
+                &[callee],
+            )
             .map_err(&error)?;
         call_projections.push(projection);
         Ok(())
@@ -9104,10 +9238,12 @@ fn checked_image_publication_v1(
             .and_then(|projection| *projection)
             .unwrap_or(root_definition_id);
         publication
-            .__kernel_publish_rows(projection, 1)
-            .map_err(&error)?;
-        publication
-            .__kernel_route(CheckedImageRowDomainV2::PatternBinding, index, projection)
+            .publish_routed_rows(
+                CheckedImageRowDomainV2::PatternBinding,
+                index,
+                projection,
+                1,
+            )
             .map_err(&error)?;
     }
     for (index, requirement) in resource_projection_requirements.iter().enumerate() {
@@ -9119,13 +9255,11 @@ fn checked_image_publication_v1(
             .get(requirement.target.0 as usize)
             .and_then(|projection| *projection);
         publication
-            .__kernel_publish_dependency_row(projection, target)
-            .map_err(&error)?;
-        publication
-            .__kernel_route(
+            .publish_routed_dependency_row(
                 CheckedImageRowDomainV2::ResourceProjection,
                 index,
                 projection,
+                target.as_slice(),
             )
             .map_err(&error)?;
     }
@@ -9162,10 +9296,12 @@ fn checked_image_publication_v1(
                 .copied()
                 .ok_or_else(|| KernelCheckedLinkError::new("SOURCE expression is missing"))?;
             publication
-                .__kernel_publish_dependency_row(projection, [dependency])
-                .map_err(&error)?;
-            publication
-                .__kernel_route(CheckedImageRowDomainV2::Source, id.0 as usize, projection)
+                .publish_routed_dependency_row(
+                    CheckedImageRowDomainV2::Source,
+                    id.0 as usize,
+                    projection,
+                    &[dependency],
+                )
                 .map_err(&error)?;
         }
     }
@@ -9234,22 +9370,28 @@ fn checked_image_publication_v1(
                     .map_err(|error| KernelCheckedLinkError::new(error.to_string()))?,
             )?;
             let binding = layout.declaration(owner, input.binding_declaration)?;
+            let mut dependencies = [root_definition_id; 3];
+            let mut dependency_count = 0;
+            for dependency in [
+                expression_projections.get(expression.0 as usize).copied(),
+                expression_projections.get(initial.0 as usize).copied(),
+                declaration_projections
+                    .get(binding.0 as usize)
+                    .and_then(|projection| *projection),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                dependencies[dependency_count] = dependency;
+                dependency_count += 1;
+            }
             publication
-                .__kernel_publish_dependency_row(
+                .publish_routed_dependency_row(
+                    CheckedImageRowDomainV2::State,
+                    id.0 as usize,
                     projection,
-                    [
-                        expression_projections.get(expression.0 as usize).copied(),
-                        expression_projections.get(initial.0 as usize).copied(),
-                        declaration_projections
-                            .get(binding.0 as usize)
-                            .and_then(|projection| *projection),
-                    ]
-                    .into_iter()
-                    .flatten(),
+                    &dependencies[..dependency_count],
                 )
-                .map_err(&error)?;
-            publication
-                .__kernel_route(CheckedImageRowDomainV2::State, id.0 as usize, projection)
                 .map_err(&error)?;
         }
     }
@@ -9283,10 +9425,12 @@ fn checked_image_publication_v1(
                 .copied()
                 .ok_or_else(|| KernelCheckedLinkError::new("LIST producer is missing"))?;
             publication
-                .__kernel_publish_dependency_row(projection, [dependency])
-                .map_err(&error)?;
-            publication
-                .__kernel_route(CheckedImageRowDomainV2::List, id.0 as usize, projection)
+                .publish_routed_dependency_row(
+                    CheckedImageRowDomainV2::List,
+                    id.0 as usize,
+                    projection,
+                    &[dependency],
+                )
                 .map_err(&error)?;
         }
     }
@@ -9296,10 +9440,7 @@ fn checked_image_publication_v1(
             .and_then(|projection| *projection)
             .unwrap_or(root_definition_id);
         publication
-            .__kernel_publish_rows(projection, 1)
-            .map_err(&error)?;
-        publication
-            .__kernel_route(CheckedImageRowDomainV2::Occurrence, index, projection)
+            .publish_routed_rows(CheckedImageRowDomainV2::Occurrence, index, projection, 1)
             .map_err(&error)?;
     }
     let publication = publication.into_publication();
@@ -9311,87 +9452,108 @@ fn checked_image_publication_v1(
 
 #[cfg(test)]
 struct KernelCheckedImageRichOraclePublicationBuilderV1 {
-    publication: CheckedImageKernelPublicationV1,
-    expectation: CheckedImageKernelOwnershipExpectationV1,
-    projection_digests: Vec<[u8; 32]>,
-    routes: Vec<BuildingKernelCheckedImageExpectedRouteV1>,
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    role: ProgramRole,
+    plan: BuildingKernelCheckedImageOwnershipPlanV1,
+    payloads: Vec<KernelCheckedImageRichOraclePayloadV1>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct KernelCheckedImageRichOraclePayloadV1 {
+    row_count: u32,
+    dependency_row_count: u32,
+    relocations: Vec<TempCheckedImageProjectionIdV1>,
 }
 
 #[cfg(test)]
 impl KernelCheckedImageRichOraclePublicationBuilderV1 {
     fn new(source_bundle_digest_v1: SourceBundleDigestV1, role: ProgramRole) -> Self {
-        let (publication, expectation) =
-            CheckedImageKernelPublicationV1::__kernel_new_pair(source_bundle_digest_v1, role);
         Self {
-            publication,
-            expectation,
-            projection_digests: Vec::new(),
-            routes: Vec::new(),
+            source_bundle_digest_v1,
+            role,
+            plan: BuildingKernelCheckedImageOwnershipPlanV1::new(),
+            payloads: Vec::new(),
         }
     }
 
     fn __kernel_intern_projection(
         &mut self,
         key: CheckedShardProjectionKeyV2,
-    ) -> Result<boon_checked::CheckedImageKernelProjectionIdV1, String> {
-        let digest = boon_checked::checked_image_projection_key_digest_v4(&key)?;
+    ) -> Result<TempCheckedImageProjectionIdV1, String> {
         let projection = self
-            .publication
-            .__kernel_intern_prehashed_projection(key, digest)?;
-        match self.projection_digests.get(projection.as_usize()) {
-            Some(previous) if *previous != digest => {
-                return Err("rich oracle projection key digest changed".to_owned());
-            }
-            Some(_) => {}
-            None if projection.as_usize() == self.projection_digests.len() => {
-                self.projection_digests.push(digest);
-            }
-            None => return Err("rich oracle projection ID is non-dense".to_owned()),
+            .plan
+            .intern_projection(key)
+            .map_err(|error| error.to_string())?;
+        if projection.0 as usize == self.payloads.len() {
+            self.payloads
+                .push(KernelCheckedImageRichOraclePayloadV1::default());
         }
         Ok(projection)
     }
 
     fn __kernel_publish_rows(
         &mut self,
-        projection: boon_checked::CheckedImageKernelProjectionIdV1,
+        projection: TempCheckedImageProjectionIdV1,
         row_count: u32,
     ) -> Result<(), String> {
-        self.publication
-            .__kernel_publish_rows(projection, row_count)
+        let payload = self
+            .payloads
+            .get_mut(projection.0 as usize)
+            .ok_or_else(|| "rich oracle row references a missing projection".to_owned())?;
+        payload.row_count = payload
+            .row_count
+            .checked_add(row_count)
+            .ok_or_else(|| "rich oracle row count exceeds u32".to_owned())?;
+        Ok(())
     }
 
     fn __kernel_publish_dependency_row(
         &mut self,
-        projection: boon_checked::CheckedImageKernelProjectionIdV1,
-        relocations: impl IntoIterator<Item = boon_checked::CheckedImageKernelProjectionIdV1>,
+        projection: TempCheckedImageProjectionIdV1,
+        relocations: impl IntoIterator<Item = TempCheckedImageProjectionIdV1>,
     ) -> Result<(), String> {
-        self.publication
-            .__kernel_publish_dependency_row(projection, relocations)
+        let projection_count = self.payloads.len();
+        let payload = self
+            .payloads
+            .get_mut(projection.0 as usize)
+            .ok_or_else(|| "rich oracle dependency source is missing".to_owned())?;
+        payload.row_count = payload
+            .row_count
+            .checked_add(1)
+            .ok_or_else(|| "rich oracle row count exceeds u32".to_owned())?;
+        let mut has_relocation = false;
+        for target in relocations {
+            if target.0 as usize >= projection_count {
+                return Err("rich oracle dependency target is missing".to_owned());
+            }
+            if target != projection {
+                payload.relocations.push(target);
+                has_relocation = true;
+            }
+        }
+        if has_relocation {
+            payload.dependency_row_count = payload
+                .dependency_row_count
+                .checked_add(1)
+                .ok_or_else(|| "rich oracle dependency count exceeds u32".to_owned())?;
+        }
+        Ok(())
     }
 
     fn __kernel_route(
         &mut self,
         domain: CheckedImageRowDomainV2,
         dense_index: usize,
-        projection: boon_checked::CheckedImageKernelProjectionIdV1,
+        projection: TempCheckedImageProjectionIdV1,
     ) -> Result<(), String> {
-        let digest = self
-            .projection_digests
-            .get(projection.as_usize())
-            .copied()
-            .ok_or_else(|| "rich oracle route references a missing projection".to_owned())?;
-        self.routes.push(BuildingKernelCheckedImageExpectedRouteV1 {
-            domain,
-            dense_index: u32::try_from(dense_index)
-                .map_err(|_| "rich oracle route exceeds u32".to_owned())?,
-            projection_digest: digest,
-        });
-        self.publication
-            .__kernel_route(domain, dense_index, projection)
+        self.plan
+            .route(domain, dense_index, projection)
+            .map_err(|error| error.to_string())
     }
 
     fn into_parts(
-        mut self,
+        self,
     ) -> Result<
         (
             CheckedImageKernelPublicationV1,
@@ -9399,30 +9561,87 @@ impl KernelCheckedImageRichOraclePublicationBuilderV1 {
         ),
         String,
     > {
-        let mut catalog = self.projection_digests;
-        catalog.sort_unstable();
-        self.routes
-            .sort_unstable_by_key(|route| (route.domain, route.dense_index));
-        let routes = self
-            .routes
-            .into_iter()
-            .map(|route| {
-                let projection_digest_id = catalog
-                    .binary_search(&route.projection_digest)
-                    .map_err(|_| "rich oracle route references a foreign projection".to_owned())?;
-                Ok(CheckedImageKernelExpectedRouteV1::__kernel_new(
-                    route.domain,
-                    route.dense_index,
-                    u32::try_from(projection_digest_id)
-                        .map_err(|_| "rich oracle projection catalog exceeds u32".to_owned())?,
-                ))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        self.expectation.__kernel_install_compact_topology(
-            catalog.into_boxed_slice(),
-            routes.into_boxed_slice(),
-        )?;
-        Ok((self.publication, self.expectation))
+        let Self {
+            source_bundle_digest_v1,
+            role,
+            plan,
+            payloads,
+        } = self;
+        let mut canonical_by_temp = vec![u32::MAX; plan.prehash_by_key.len()];
+        for (canonical, entry) in plan.prehash_by_key.iter().enumerate() {
+            canonical_by_temp[entry.projection.0 as usize] = u32::try_from(canonical)
+                .map_err(|_| "rich oracle projection catalog exceeds u32".to_owned())?;
+        }
+        let plan = plan.finish().map_err(|error| error.to_string())?;
+        let (mut publication, mut expectation) = CheckedImageKernelPublicationV1::__kernel_new_pair(
+            source_bundle_digest_v1,
+            role,
+            plan.projection_count(),
+            plan.route_count(),
+        );
+        let mut route_ordinals_by_projection = vec![Vec::new(); plan.projection_count()];
+        for (route_ordinal, route) in plan.routes.iter().enumerate() {
+            route_ordinals_by_projection
+                .get_mut(route.__kernel_projection().as_usize())
+                .ok_or_else(|| "rich oracle route references a missing projection".to_owned())?
+                .push(route_ordinal);
+        }
+        for (temporary, payload) in payloads.into_iter().enumerate() {
+            let projection = boon_checked::CheckedImageKernelProjectionIdV1::__kernel_new(
+                canonical_by_temp[temporary],
+            );
+            let independent_rows = payload
+                .row_count
+                .checked_sub(payload.dependency_row_count)
+                .ok_or_else(|| "rich oracle dependency count exceeds its row count".to_owned())?;
+            let relocations = payload
+                .relocations
+                .iter()
+                .map(|target| {
+                    boon_checked::CheckedImageKernelProjectionIdV1::__kernel_new(
+                        canonical_by_temp[target.0 as usize],
+                    )
+                })
+                .collect::<Vec<_>>();
+            let routes = &route_ordinals_by_projection[projection.as_usize()];
+            let route_count = u32::try_from(routes.len())
+                .map_err(|_| "rich oracle projection route count exceeds u32".to_owned())?;
+            if route_count > payload.row_count {
+                return Err(format!(
+                    "rich oracle projection {} has {route_count} routes for {} rows",
+                    projection.as_usize(),
+                    payload.row_count,
+                ));
+            }
+            let routed_dependencies = payload.dependency_row_count.min(route_count);
+            let routed_independent = route_count - routed_dependencies;
+            let remaining_independent = independent_rows
+                .checked_sub(routed_independent)
+                .ok_or_else(|| {
+                    format!(
+                        "rich oracle projection {} has too many independent routes",
+                        projection.as_usize(),
+                    )
+                })?;
+            for route_ordinal in routes.iter().copied().take(routed_dependencies as usize) {
+                publication.__kernel_publish_routed_dependency_row(
+                    route_ordinal,
+                    projection,
+                    &relocations,
+                )?;
+            }
+            for route_ordinal in routes.iter().copied().skip(routed_dependencies as usize) {
+                publication.__kernel_publish_routed_rows(route_ordinal, projection, 1)?;
+            }
+            if remaining_independent != 0 {
+                publication.__kernel_publish_rows(projection, remaining_independent)?;
+            }
+            for _ in routed_dependencies..payload.dependency_row_count {
+                publication.__kernel_publish_dependency_row(projection, &relocations)?;
+            }
+        }
+        plan.install(&mut expectation)?;
+        Ok((publication, expectation))
     }
 }
 
@@ -17456,45 +17675,60 @@ mod tests {
             )],
         )
         .expect("build ownership-swap source digest");
-        let owner = CheckedShardOwnerKeyV2::ProgramTopLevel { role };
-        let definition = checked_link_definition_projection(owner.clone());
-        let interface = checked_link_interface_projection(owner);
+        let owner = |name: &str| CheckedShardOwnerKeyV2::Callable {
+            role,
+            callable_kind: CheckedShardCallableKindV2::User,
+            name: name.to_owned(),
+            external_identity: None,
+        };
+        let expected_definition = checked_link_definition_projection(owner("expected"));
+        let swapped_definition = checked_link_definition_projection(owner("swapped"));
 
         let mut preparation = BuildingKernelCheckedImageOwnershipPlanV1::new();
-        let definition_digest = preparation
-            .intern_projection(definition.clone())
-            .expect("prepare Definition projection");
+        let expected = preparation
+            .intern_projection(expected_definition.clone())
+            .expect("prepare expected Definition projection");
         preparation
-            .intern_projection(interface.clone())
-            .expect("prepare Interface projection");
+            .intern_projection(swapped_definition.clone())
+            .expect("prepare swapped Definition projection");
         preparation
-            .route(CheckedImageRowDomainV2::Expression, 0, definition_digest)
+            .route(CheckedImageRowDomainV2::Expression, 0, expected)
             .expect("prepare expected Expression route");
         let plan = preparation.finish().expect("finish independent plan");
 
-        let (publication, mut expectation) =
-            CheckedImageKernelPublicationV1::__kernel_new_pair(source_bundle_digest_v1, role);
+        let (publication, mut expectation) = CheckedImageKernelPublicationV1::__kernel_new_pair(
+            source_bundle_digest_v1,
+            role,
+            plan.projection_count(),
+            plan.route_count(),
+        );
         let mut actual = KernelCheckedImagePublicationBuilderV1::new(publication, &plan);
-        actual
-            .__kernel_intern_projection(definition)
-            .expect("publish independently selected Definition key");
+        let expected = actual
+            .__kernel_intern_projection(expected_definition)
+            .expect("publish independently selected expected Definition key");
         let wrong = actual
-            .__kernel_intern_projection(interface)
-            .expect("publish independently selected Interface key");
+            .__kernel_intern_projection(swapped_definition)
+            .expect("publish independently selected wrong-owner Definition key");
 
         // Fault injection is deliberately after actual-key selection and
         // immediately before the production publication writer. The expected
         // route is already complete and cannot observe this replacement.
-        actual
-            .__kernel_route(CheckedImageRowDomainV2::Expression, 0, wrong)
-            .expect("inject actual owner swap");
-        let publication = actual.into_publication();
-        plan.install(&mut expectation)
-            .expect("install completed expectation");
-        let error = expectation
-            .__kernel_freeze_against(&publication)
+        let error = actual
+            .publish_routed_rows(CheckedImageRowDomainV2::Expression, 0, wrong, 1)
             .expect_err("independent ownership must reject the actual route swap");
         assert!(error.contains("independent ownership plan"), "{error}");
+        actual
+            .publish_routed_rows(CheckedImageRowDomainV2::Expression, 0, expected, 1)
+            .expect("the correct route remains publishable after the rejected owner swap");
+        actual
+            .__kernel_publish_rows(wrong, 1)
+            .expect("the unrelated planned projection receives its own row");
+        let publication = actual.into_publication();
+        plan.install(&mut expectation)
+            .expect("install the independent plan after publication");
+        expectation
+            .__kernel_freeze_against(&publication)
+            .expect("rejected owner swap leaves no route-coverage residue");
     }
 
     fn owner_key(unit: &SourceUnitId, name: &str) -> StableCheckOwnerKey {

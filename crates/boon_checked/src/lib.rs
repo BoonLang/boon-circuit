@@ -12,8 +12,10 @@ mod type_terms;
 pub use checked_image_publication::{
     CheckedImageEntityRouteDigestV1, CheckedImageKernelExpectedRouteV1,
     CheckedImageKernelOwnershipExpectationV1, CheckedImageKernelPairingReceiptV1,
-    CheckedImageKernelPairingV1, CheckedImageKernelProjectionIdV1, CheckedImageKernelPublicationV1,
-    checked_image_entity_route_digest_v1, checked_image_projection_key_digest_v4,
+    CheckedImageKernelPairingV1, CheckedImageKernelPlannedProjectionV1,
+    CheckedImageKernelProjectionIdV1, CheckedImageKernelPublicationV1,
+    FrozenCheckedImageKernelOwnershipTopologyV1, checked_image_entity_route_digest_v1,
+    checked_image_projection_key_digest_v4,
 };
 pub use owner_shard::*;
 pub use type_terms::*;

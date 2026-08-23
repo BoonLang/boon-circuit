@@ -15727,6 +15727,45 @@ struct CheckedImageHandoffBuilderV4 {
     kernel_authority: Option<CheckedImageKernelAuthorityContextV1>,
 }
 
+fn checked_image_kernel_projection_authority_seal(
+    authority: &CheckedImageKernelAuthorityContextV1,
+    projection: &CheckedShardProjectionKeyV2,
+) -> Result<[u8; 32], String> {
+    let definition_seal = authority.definition_seals.get(&projection.owner).copied();
+    if matches!(
+        projection.owner,
+        CheckedShardOwnerKeyV2::Callable {
+            callable_kind: CheckedShardCallableKindV2::User,
+            ..
+        }
+    ) && definition_seal.is_none()
+    {
+        return Err(format!(
+            "kernel checked-image authority has no definition seal for user owner {:?}",
+            projection.owner
+        ));
+    }
+    let ambient_fingerprint = match &projection.owner {
+        CheckedShardOwnerKeyV2::ProgramTopLevel { .. } => {
+            Some(authority.program_metadata_fingerprint)
+        }
+        CheckedShardOwnerKeyV2::Callable {
+            callable_kind:
+                CheckedShardCallableKindV2::Builtin | CheckedShardCallableKindV2::External,
+            ..
+        } => Some(authority.referenced_abi_fingerprint),
+        CheckedShardOwnerKeyV2::Callable {
+            callable_kind: CheckedShardCallableKindV2::User,
+            ..
+        } => None,
+    };
+    boon_contract::canonical_serde_hash_v1(
+        CHECKED_IMAGE_KERNEL_PROJECTION_AUTHORITY_DOMAIN_V1,
+        &(ambient_fingerprint, projection, definition_seal),
+    )
+    .map_err(|error| format!("failed to hash checked kernel projection authority: {error}"))
+}
+
 impl CheckedImageHandoffBuilderV4 {
     fn new(kernel_authority: Option<CheckedImageKernelAuthorityContextV1>) -> Self {
         Self {
@@ -15771,43 +15810,7 @@ impl CheckedImageHandoffBuilderV4 {
         let kernel_authority_seal = self
             .kernel_authority
             .as_ref()
-            .map(|authority| {
-                let definition_seal = authority.definition_seals.get(&projection.owner).copied();
-                if matches!(
-                    projection.owner,
-                    CheckedShardOwnerKeyV2::Callable {
-                        callable_kind: CheckedShardCallableKindV2::User,
-                        ..
-                    }
-                ) && definition_seal.is_none()
-                {
-                    return Err(format!(
-                        "kernel checked-image authority has no definition seal for user owner {:?}",
-                        projection.owner
-                    ));
-                }
-                let ambient_fingerprint = match &projection.owner {
-                    CheckedShardOwnerKeyV2::ProgramTopLevel { .. } => {
-                        Some(authority.program_metadata_fingerprint)
-                    }
-                    CheckedShardOwnerKeyV2::Callable {
-                        callable_kind: CheckedShardCallableKindV2::Builtin
-                            | CheckedShardCallableKindV2::External,
-                        ..
-                    } => Some(authority.referenced_abi_fingerprint),
-                    CheckedShardOwnerKeyV2::Callable {
-                        callable_kind: CheckedShardCallableKindV2::User,
-                        ..
-                    } => None,
-                };
-                boon_contract::canonical_serde_hash_v1(
-                    CHECKED_IMAGE_KERNEL_PROJECTION_AUTHORITY_DOMAIN_V1,
-                    &(ambient_fingerprint, &projection, definition_seal),
-                )
-                .map_err(|error| {
-                    format!("failed to hash checked kernel projection authority: {error}")
-                })
-            })
+            .map(|authority| checked_image_kernel_projection_authority_seal(authority, &projection))
             .transpose()?;
         self.ids.insert(projection, id);
         self.projections.push(PendingCheckedProjectionV2 {
@@ -16152,11 +16155,12 @@ fn checked_image_kernel_authority_context_from_scope_owners(
     checked_image_kernel_authority_context_from_rows(definition_seal_rows, authority)
 }
 
-fn checked_image_kernel_authority_context_from_publication(
+fn checked_image_kernel_authority_context_from_topology(
     source_bundle_digest_v1: SourceBundleDigestV1,
     role: ProgramRole,
     authority: &CheckedImageKernelAuthorityV1,
-    publication: &boon_checked::CheckedImageKernelPublicationV1,
+    projections: &[boon_checked::CheckedImageKernelPlannedProjectionV1],
+    routes: &[boon_checked::CheckedImageKernelExpectedRouteV1],
 ) -> Result<CheckedImageKernelAuthorityContextV1, String> {
     if authority.schema != CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1 {
         return Err(format!(
@@ -16172,19 +16176,22 @@ fn checked_image_kernel_authority_context_from_publication(
     let mut definition_seal_rows =
         BTreeMap::<CheckedShardOwnerKeyV2, Vec<CheckedImageDefinitionAuthorityIdentityV1>>::new();
     for (ordinal, definition) in authority.definitions.iter().enumerate() {
-        let projection = publication
-            .__kernel_projection_for_route(
-                CheckedImageRowDomainV2::Scope,
-                definition.root_scope.0 as usize,
+        let route = routes
+            .binary_search_by_key(
+                &(CheckedImageRowDomainV2::Scope, definition.root_scope.0),
+                |route| route.__kernel_coordinates(),
             )
+            .ok()
+            .and_then(|index| routes.get(index))
             .ok_or_else(|| {
                 format!(
                     "compact checked definition {ordinal} root scope {} has no published Scope route",
                     definition.root_scope.0,
                 )
             })?;
-        let key = publication
-            .__kernel_projection_key(projection)
+        let key = projections
+            .get(route.__kernel_projection().as_usize())
+            .map(|projection| projection.__kernel_key())
             .ok_or_else(|| {
                 format!(
                     "compact checked definition {ordinal} root scope {} references a missing projection",
@@ -16812,6 +16819,7 @@ fn checked_image_handoff_from_kernel_publication(
     program: &CheckedProgramFields,
     authority: &CheckedImageKernelAuthorityV1,
     publication: boon_checked::CheckedImageKernelPublicationV1,
+    ownership_expectation: &mut boon_checked::CheckedImageKernelOwnershipExpectationV1,
 ) -> Result<
     (
         CheckedImageHandoffV4,
@@ -16819,30 +16827,21 @@ fn checked_image_handoff_from_kernel_publication(
     ),
     String,
 > {
-    let callable_owners = program
-        .callables
-        .iter()
-        .map(|callable| (callable.decl_id, checked_stable_owner(callable)))
-        .collect::<BTreeMap<_, _>>();
-    let scope_owners = program
-        .scopes
-        .iter()
-        .map(|scope| checked_owner_for_scope(program, &callable_owners, scope.id))
-        .collect::<Result<Vec<_>, _>>()?;
-    let authority = checked_image_kernel_authority_context(program, &scope_owners, authority)?;
     checked_image_handoff_from_kernel_publication_parts(
         program.source_bundle_digest_v1,
         program.role,
         authority,
         publication,
+        ownership_expectation,
     )
 }
 
 fn checked_image_handoff_from_kernel_publication_parts(
     expected_source_bundle_digest_v1: SourceBundleDigestV1,
     expected_role: ProgramRole,
-    authority: CheckedImageKernelAuthorityContextV1,
+    authority: &CheckedImageKernelAuthorityV1,
     publication: boon_checked::CheckedImageKernelPublicationV1,
+    ownership_expectation: &mut boon_checked::CheckedImageKernelOwnershipExpectationV1,
 ) -> Result<
     (
         CheckedImageHandoffV4,
@@ -16850,7 +16849,7 @@ fn checked_image_handoff_from_kernel_publication_parts(
     ),
     String,
 > {
-    let (source_bundle_digest_v1, role, projections, routes, pairing) =
+    let (source_bundle_digest_v1, role, payloads, mut relocation_edges, pairing) =
         publication.__typechecker_into_parts()?;
     if source_bundle_digest_v1 != expected_source_bundle_digest_v1 || role != expected_role {
         return Err(
@@ -16859,48 +16858,163 @@ fn checked_image_handoff_from_kernel_publication_parts(
         );
     }
 
-    let mut builder = CheckedImageHandoffBuilderV4::new(Some(authority));
-    let mut pending_ids = Vec::with_capacity(projections.len());
-    for (key, stable_key_digest, _, _, _) in &projections {
-        pending_ids.push(builder.intern_prehashed(key.clone(), *stable_key_digest)?);
+    let topology = ownership_expectation.__typechecker_take_frozen_topology()?;
+    let (planned_projections, routes) = topology.__typechecker_into_parts();
+    let authority = checked_image_kernel_authority_context_from_topology(
+        source_bundle_digest_v1,
+        role,
+        authority,
+        &planned_projections,
+        &routes,
+    )?;
+    if planned_projections.len() != payloads.len() {
+        return Err(format!(
+            "kernel checked-image has {} topology projections but {} payload projections",
+            planned_projections.len(),
+            payloads.len(),
+        ));
     }
-    for (ordinal, (_, _, row_count, dependency_row_count, relocations)) in
-        projections.into_iter().enumerate()
+    let projection_count = payloads.len();
+    let projection_digests = planned_projections
+        .iter()
+        .map(|projection| projection.__kernel_digest())
+        .collect::<Vec<_>>();
+    for (source, target) in &relocation_edges {
+        if source.as_usize() >= projection_count || target.as_usize() >= projection_count {
+            return Err(format!(
+                "kernel checked-image relocation {}/{} references a missing projection",
+                source.as_usize(),
+                target.as_usize(),
+            ));
+        }
+    }
+    relocation_edges.sort_unstable_by(|left, right| {
+        let left_digest = planned_projections[left.1.as_usize()].__kernel_digest();
+        let right_digest = planned_projections[right.1.as_usize()].__kernel_digest();
+        (left.0.as_usize(), left_digest).cmp(&(right.0.as_usize(), right_digest))
+    });
+    relocation_edges.dedup();
+    let mut edge_cursor = 0usize;
+    let mut relocation_arena = Vec::with_capacity(relocation_edges.len());
+    let mut sealed_projections = Vec::with_capacity(planned_projections.len());
+    let mut relocation_digest_scratch = Vec::new();
+    for (ordinal, (planned, (row_count, dependency_row_count))) in planned_projections
+        .into_vec()
+        .into_iter()
+        .zip(payloads)
+        .enumerate()
     {
-        let projection = pending_ids[ordinal];
-        let relocations = relocations
-            .into_iter()
-            .map(|target| {
-                pending_ids.get(target.as_usize()).copied().ok_or_else(|| {
-                    format!(
-                        "kernel checked-image projection {ordinal} references missing relocation {}",
-                        target.as_usize()
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let pending = &mut builder.projections[projection.as_usize()];
-        pending.row_count = row_count;
-        pending.dependency_row_count = dependency_row_count;
-        pending.relocations = relocations;
+        if row_count == 0 || dependency_row_count > row_count {
+            return Err(format!(
+                "kernel checked-image projection {ordinal} has invalid row/dependency counts {row_count}/{dependency_row_count}"
+            ));
+        }
+        let (stable_key, stable_key_digest, _) = planned.__typechecker_into_parts();
+        let relocation_start = u32::try_from(relocation_arena.len())
+            .map_err(|_| "checked image relocation arena exceeds u32")?;
+        while let Some((source, target)) = relocation_edges.get(edge_cursor).copied() {
+            if source.as_usize() != ordinal {
+                break;
+            }
+            if target.as_usize() >= projection_count {
+                return Err(format!(
+                    "kernel checked-image projection {ordinal} references missing relocation {}",
+                    target.as_usize(),
+                ));
+            }
+            relocation_arena.push(CheckedImageProjectionIdV2(
+                u32::try_from(target.as_usize())
+                    .map_err(|_| "checked image relocation target exceeds u32")?,
+            ));
+            edge_cursor += 1;
+        }
+        let relocation_len = u32::try_from(relocation_arena.len())
+            .map_err(|_| "checked image relocation arena exceeds u32")?
+            .checked_sub(relocation_start)
+            .ok_or_else(|| "checked image relocation span underflow".to_owned())?;
+        let relocation_end = relocation_start
+            .checked_add(relocation_len)
+            .ok_or_else(|| "checked image relocation span exceeds u32".to_owned())?;
+        relocation_digest_scratch.clear();
+        relocation_digest_scratch.extend(
+            relocation_arena[relocation_start as usize..relocation_end as usize]
+                .iter()
+                .map(|target| projection_digests[target.as_usize()]),
+        );
+        let authority_seal =
+            checked_image_kernel_projection_authority_seal(&authority, &stable_key)?;
+        let local_content_digest = boon_contract::canonical_serde_hash_v1(
+            CHECKED_IMAGE_KERNEL_SHARD_DIGEST_DOMAIN_V1,
+            &(
+                stable_key_digest,
+                authority_seal,
+                row_count,
+                dependency_row_count,
+                &relocation_digest_scratch,
+            ),
+        )
+        .map_err(|error| format!("failed to hash checked kernel image shard: {error}"))?;
+        sealed_projections.push(CheckedImageProjectionV2 {
+            stable_key,
+            stable_key_digest,
+            local_content_digest,
+            row_count,
+            dependency_row_count,
+            relocation_span: CheckedImageRelocationSpanV2 {
+                start: relocation_start,
+                len: relocation_len,
+            },
+        });
     }
-    for ((domain, dense_index), projection) in routes {
-        let projection = pending_ids
-            .get(projection.as_usize())
-            .copied()
-            .ok_or_else(|| {
-                format!(
+    if edge_cursor != relocation_edges.len() {
+        return Err("kernel checked-image relocation source is out of range".to_owned());
+    }
+    let entity_routes = routes
+        .into_vec()
+        .into_iter()
+        .map(|route| {
+            let (domain, dense_index) = route.__kernel_coordinates();
+            let projection = route.__kernel_projection();
+            if projection.as_usize() >= sealed_projections.len() {
+                return Err(format!(
                     "kernel checked-image {domain:?} route {dense_index} references missing projection {}",
-                    projection.as_usize()
-                )
-            })?;
-        builder
-            .entity_routes
-            .push((domain, dense_index, projection));
-    }
-    builder
-        .finish(source_bundle_digest_v1, role)
-        .map(|handoff| (handoff, pairing))
+                    projection.as_usize(),
+                ));
+            }
+            Ok(CheckedImageEntityRouteV2 {
+                domain,
+                dense_index,
+                projection: CheckedImageProjectionIdV2(
+                    u32::try_from(projection.as_usize())
+                        .map_err(|_| "checked image projection exceeds u32")?,
+                ),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let local_image_digest = boon_contract::canonical_serde_hash_v1(
+        CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V4,
+        &(
+            CHECKED_IMAGE_HANDOFF_SCHEMA_V4,
+            source_bundle_digest_v1,
+            role,
+            &sealed_projections,
+            &relocation_arena,
+            &entity_routes,
+        ),
+    )
+    .map_err(|error| format!("failed to hash checked image handoff: {error}"))?;
+    Ok((
+        CheckedImageHandoffV4 {
+            schema: CHECKED_IMAGE_HANDOFF_SCHEMA_V4.to_owned(),
+            source_bundle_digest_v1,
+            role,
+            projections: sealed_projections,
+            relocations: relocation_arena,
+            entity_routes,
+            local_image_digest,
+        },
+        pairing,
+    ))
 }
 
 /// Consume a completed diagnostics construction and grant the runtime checked
@@ -17095,45 +17209,39 @@ pub fn seal_project_runtime_packed_checked_authority_with_kernel_publication(
             parsed.source_bundle_digest_v1(),
         ));
     }
-    validate_runtime_packed_definition_roots(
-        context.role,
-        context.entity_counts.scope_count,
-        &authority.definitions,
-        &publication,
-    )?;
-    let authority_context = checked_image_kernel_authority_context_from_publication(
-        context.source_bundle_digest_v1,
-        context.role,
-        &authority,
-        &publication,
-    )?;
+    let RuntimePackedCheckedSealContextV1 {
+        source_bundle_digest_v1,
+        role,
+        entity_counts,
+        mut ownership_expectation,
+        resource_routes,
+    } = context;
     let (image_handoff, pairing) = checked_image_handoff_from_kernel_publication_parts(
-        context.source_bundle_digest_v1,
-        context.role,
-        authority_context,
+        source_bundle_digest_v1,
+        role,
+        &authority,
         publication,
+        &mut ownership_expectation,
     )?;
-    context
-        .ownership_expectation
-        .__kernel_validate_pairing(&pairing)?;
+    ownership_expectation.__kernel_validate_pairing(&pairing)?;
     validate_runtime_packed_entity_routes(
         &image_handoff,
-        context.role,
+        role,
         &authority.definitions,
-        context.entity_counts,
-        context.resource_routes.len(),
+        entity_counts,
+        resource_routes.len(),
     )?;
-    validate_runtime_packed_resource_routes(&image_handoff, context.resource_routes)?;
+    validate_runtime_packed_resource_routes(&image_handoff, resource_routes)?;
     let pairing_receipt = boon_checked::CheckedImageKernelPairingReceiptV1::__typechecker_new(
         pairing,
         &image_handoff,
-        context.ownership_expectation,
+        ownership_expectation,
     )?;
     let runtime_flow_terms = checked_runtime_flow_term_handoff_from_projection(
         authority.runtime_flow_terms,
-        context.entity_counts.expression_count,
-        context.source_bundle_digest_v1,
-        context.role,
+        entity_counts.expression_count,
+        source_bundle_digest_v1,
+        role,
         &image_handoff,
     )?;
     // SAFETY: the exact handoff catalog and routes were compared with the
@@ -17295,52 +17403,6 @@ fn validate_runtime_packed_call_routes(
         return Err(format!(
             "RuntimePacked checked image has {expected_dense_index} dense Call routes for {packed_call_count} authoritative packed calls",
         ));
-    }
-    Ok(())
-}
-
-fn validate_runtime_packed_definition_roots(
-    role: ProgramRole,
-    scope_count: usize,
-    definitions: &[CheckedImageDefinitionAuthoritySealV1],
-    publication: &boon_checked::CheckedImageKernelPublicationV1,
-) -> Result<(), String> {
-    let scope_count = u32::try_from(scope_count)
-        .map_err(|_| "compact checked scope count exceeds u32".to_owned())?;
-    if scope_count == 0 {
-        return Err("compact checked authority has no project-root scope".to_owned());
-    }
-    for (ordinal, definition) in definitions.iter().enumerate() {
-        if definition.root_scope.0 >= scope_count {
-            return Err(format!(
-                "compact checked definition {ordinal} root scope {} is outside authoritative scope count {scope_count}",
-                definition.root_scope.0,
-            ));
-        }
-        let projection = publication
-            .__kernel_projection_for_route(
-                CheckedImageRowDomainV2::Scope,
-                definition.root_scope.0 as usize,
-            )
-            .ok_or_else(|| {
-                format!(
-                    "compact checked definition {ordinal} root scope {} has no published Scope route",
-                    definition.root_scope.0,
-                )
-            })?;
-        let key = publication.__kernel_projection_key(projection).ok_or_else(|| {
-            format!(
-                "compact checked definition {ordinal} root scope {} references a missing projection",
-                definition.root_scope.0,
-            )
-        })?;
-        if key.region != CheckedShardRegionV2::Definition {
-            return Err(format!(
-                "compact checked definition {ordinal} root scope {} does not target a definition projection",
-                definition.root_scope.0,
-            ));
-        }
-        validate_runtime_packed_definition_owner(role, ordinal, &key.owner)?;
     }
     Ok(())
 }
@@ -17725,7 +17787,7 @@ fn seal_project_checked_program_construction_with_kernel_publication_inner(
     call_occurrences: &[StableOccurrenceKey],
     authority: &CheckedImageKernelAuthorityV1,
     publication: boon_checked::CheckedImageKernelPublicationV1,
-    ownership_expectation: boon_checked::CheckedImageKernelOwnershipExpectationV1,
+    mut ownership_expectation: boon_checked::CheckedImageKernelOwnershipExpectationV1,
 ) -> Result<
     (
         CheckedProgram,
@@ -17748,8 +17810,12 @@ fn seal_project_checked_program_construction_with_kernel_publication_inner(
             fields.calls.len(),
         ));
     }
-    let (image_handoff, pairing) =
-        checked_image_handoff_from_kernel_publication(&fields, authority, publication)?;
+    let (image_handoff, pairing) = checked_image_handoff_from_kernel_publication(
+        &fields,
+        authority,
+        publication,
+        &mut ownership_expectation,
+    )?;
     #[cfg(test)]
     {
         let packed_resource_routes = image_handoff

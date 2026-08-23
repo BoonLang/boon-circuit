@@ -278,6 +278,7 @@ fn normative_single_thread_compiler(workspace: &Path) -> Result<String, String> 
     )
 }
 
+#[rustfmt::skip]
 fn construction_owned_checked_image_publication(workspace: &Path) -> Result<String, String> {
     let checked = read_text(&workspace.join("crates/boon_checked/src/lib.rs"))?;
     let checked_publication =
@@ -357,6 +358,8 @@ fn construction_owned_checked_image_publication(workspace: &Path) -> Result<Stri
             }
         }
     }
+    if checked_publication.contains("__kernel_mark_route") { return Err("checked-image publication exposes a raw route-coverage mutator".to_owned()); }
+    for raw_writer in ["__kernel_publish_routed_rows", "__kernel_publish_routed_dependency_row"] { if [&kernel_oracle_syntax, &compiler_syntax, &typecheck_syntax].into_iter().any(|syntax| production_file_identifier_uses(syntax, raw_writer) != 0) { return Err(format!("production bypasses the validated writer with `{raw_writer}`")); } }
     verify_checked_publication_writer_split(&linker_syntax)?;
     verify_checked_construction_freeze_order(&kernel_oracle_syntax)?;
     verify_runtime_packed_seal_consumption(&compiler_syntax, &typecheck, &typecheck_syntax)?;
@@ -368,7 +371,7 @@ fn construction_owned_checked_image_publication(workspace: &Path) -> Result<Stri
 }
 
 #[derive(Default)]
-struct CheckedImageWrites(usize, usize);
+struct CheckedImageWrites(usize, usize, usize);
 
 #[rustfmt::skip]
 impl Visit<'_> for CheckedImageWrites {
@@ -377,6 +380,7 @@ impl Visit<'_> for CheckedImageWrites {
             "__kernel_install_compact_topology" => self.0 += 1,
             "__kernel_intern_projection" | "__kernel_intern_prehashed_projection" | "__kernel_route"
             | "__kernel_publish_rows" | "__kernel_publish_dependency_row" => self.1 += 1,
+            "__kernel_publish_routed_rows" | "__kernel_publish_routed_dependency_row" => { self.1 += 1; self.2 += 1; }
             _ => {}
         }
         syn::visit::visit_expr_method_call(self, call);
@@ -420,6 +424,9 @@ fn expression_identifier_uses(expression: &syn::Expr, name: &str) -> usize {
     uses.visit_expr(expression);
     uses.references.len()
 }
+
+#[rustfmt::skip]
+fn production_file_identifier_uses(syntax: &syn::File, name: &str) -> usize { let mut uses = ProductionIdentifierReferenceCollector::new(name); uses.visit_file(syntax); uses.references.len() }
 
 fn signature_has_type(signature: &syn::Signature, name: &str) -> bool {
     signature
@@ -468,6 +475,7 @@ fn verify_checked_publication_writer_split(syntax: &syn::File) -> Result<(), Str
         || builder.fields.iter().any(|field| type_has(&field.ty, "CheckedImageKernelOwnershipExpectationV1")) {
         return Err("publication builder does not own publication and borrow only its plan".to_owned());
     }
+    for raw_writer in ["__kernel_publish_routed_rows", "__kernel_publish_routed_dependency_row"] { if production_file_identifier_uses(syntax, raw_writer) != 1 { return Err(format!("raw checked-image writer `{raw_writer}` must have one validated forwarding call")); } }
     let mut writes = std::collections::BTreeMap::<String, CheckedImageWrites>::new();
     for implementation in syntax.items.iter().filter_map(|item| match item {
         syn::Item::Impl(value) if !cfg_is_test_only(&value.attrs) => Some(value), _ => None,
@@ -483,12 +491,12 @@ fn verify_checked_publication_writer_split(syntax: &syn::File) -> Result<(), Str
             }
             let mut current = CheckedImageWrites::default();
             current.visit_block(&method.block);
-            total.0 += current.0; total.1 += current.1;
+            total.0 += current.0; total.1 += current.1; total.2 += current.2;
         }
         if total.0 != 0 && total.1 != 0 { return Err(format!("`{name}` shadow-writes both siblings")); }
     }
     if !matches!(writes.get("KernelCheckedImageOwnershipPlanV1"), Some(value) if value.0 == 1 && value.1 == 0)
-        || !matches!(writes.get("KernelCheckedImagePublicationBuilderV1"), Some(value) if value.0 == 0 && value.1 != 0)
+        || !matches!(writes.get("KernelCheckedImagePublicationBuilderV1"), Some(value) if value.0 == 0 && value.1 != 0 && value.2 == 2)
     {
         return Err("concrete ownership/publication writers are not exclusive".to_owned());
     }
@@ -634,6 +642,11 @@ fn verify_runtime_packed_seal_consumption(compiler: &syn::File, source: &str, ty
             "RuntimePacked context/take/linked-seal counts are {}/{}/{}",
             audit.0, audit.1, audit.2
         ));
+    }
+    let authority_seal = production_fn(typecheck, "seal_project_runtime_packed_checked_authority_with_kernel_publication")?; let direct_handoff = production_fn(typecheck, "checked_image_handoff_from_kernel_publication_parts")?;
+    if identifier_uses(&authority_seal.block, "checked_image_handoff_from_kernel_publication_parts") != 1
+        || identifier_uses(&authority_seal.block, "CheckedImageHandoffBuilderV4") != 0 || identifier_uses(&direct_handoff.block, "CheckedImageHandoffBuilderV4") != 0 {
+        return Err("RuntimePacked seal is not pinned to direct topology/payload-to-V4 handoff".to_owned());
     }
     Ok(())
 }

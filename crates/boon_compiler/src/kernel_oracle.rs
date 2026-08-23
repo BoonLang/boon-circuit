@@ -12,10 +12,9 @@ use boon_checked::{
     CheckedCall, CheckedCallableSignature, CheckedContextFormal, CheckedDeclaration,
     CheckedExpression, CheckedImageDefinitionAuthoritySealV1, CheckedImageKernelAuthorityV1,
     CheckedImageKernelPublicationV1, CheckedImageRowDomainV2, CheckedList, CheckedListKeyPolicy,
-    CheckedProgramFields, CheckedScope, CheckedShardProjectionKeyV2, CheckedShardRegionV2,
-    CheckedSource, CheckedState, CheckedStateKind, CheckedStatement, DiagnosticSeverity,
-    ExternalTypeEnvironment, FlowMode, FlowType, LexicalScopeId, ObjectShape, Type, TypeDiagnostic,
-    Variant, type_is_recursively_closed,
+    CheckedProgramFields, CheckedScope, CheckedSource, CheckedState, CheckedStateKind,
+    CheckedStatement, DiagnosticSeverity, ExternalTypeEnvironment, FlowMode, FlowType,
+    LexicalScopeId, ObjectShape, Type, TypeDiagnostic, Variant, type_is_recursively_closed,
 };
 use boon_compiler_kernel::{
     CheckDemand, KernelAbiCallContextInput, KernelAbiContextualOperation, KernelAbiInput,
@@ -2625,16 +2624,16 @@ fn append_kernel_checked_metadata_publication(
     publication: &mut CheckedImageKernelPublicationV1,
     projection_demand: KernelCheckedProjectionDemand,
 ) -> Result<(), String> {
-    let root_owner = boon_checked::CheckedShardOwnerKeyV2::ProgramTopLevel { role: fields.role };
-    let root_definition = publication
-        .__kernel_projection_id(&CheckedShardProjectionKeyV2 {
-            owner: root_owner.clone(),
-            region: CheckedShardRegionV2::Definition,
-        })
-        .ok_or_else(|| "kernel metadata has no linked root Definition projection".to_owned())?;
+    let root_definition = semantic_input
+        .__compiler_checked_image_root_definition_projection()
+        .map_err(|error| error.to_string())?;
     for chain in &fields.order_chains {
-        let projection = publication
-            .__kernel_projection_for_route(CheckedImageRowDomainV2::Call, chain.call.0 as usize)
+        let projection = semantic_input
+            .__compiler_checked_image_projection_for_route(
+                CheckedImageRowDomainV2::Call,
+                chain.call.0 as usize,
+            )
+            .map_err(|error| error.to_string())?
             .ok_or_else(|| {
                 format!(
                     "kernel order chain references missing checked call {}",
@@ -2647,50 +2646,50 @@ fn append_kernel_checked_metadata_publication(
         publication.__kernel_publish_rows(root_definition, 1)?;
     }
     for shape in &fields.lowering_metadata.source_payload_shape_table {
-        let owner = shape
-            .checked_sources
-            .iter()
-            .filter_map(|source| {
-                let projection = publication.__kernel_projection_for_route(
+        let mut projection = None;
+        for source in &shape.checked_sources {
+            let Some(source_projection) = semantic_input
+                .__compiler_checked_image_projection_for_route(
                     CheckedImageRowDomainV2::Source,
                     source.0 as usize,
-                )?;
-                publication
-                    .__kernel_projection_key(projection)
-                    .map(|projection| projection.owner.clone())
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| root_owner.clone());
-        let projection = publication
-            .__kernel_projection_id(&CheckedShardProjectionKeyV2 {
-                owner,
-                region: CheckedShardRegionV2::Definition,
-            })
-            .ok_or_else(|| {
-                "kernel source-payload metadata has no linked Definition projection".to_owned()
-            })?;
+                )
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            let definition_projection = semantic_input
+                .__compiler_checked_image_definition_projection(source_projection)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| {
+                    "kernel source-payload metadata has no linked Definition projection".to_owned()
+                })?;
+            projection = Some(projection.map_or(definition_projection, |current| {
+                std::cmp::min(current, definition_projection)
+            }));
+        }
+        let projection = projection.unwrap_or(root_definition);
         publication.__kernel_publish_rows(projection, 1)?;
     }
     publication.__kernel_publish_rows(root_definition, 1)?;
     for output in &fields.lowering_metadata.output_root_types {
-        let projection = publication
-            .__kernel_projection_for_route(
+        let projection = semantic_input
+            .__compiler_checked_image_projection_for_route(
                 CheckedImageRowDomainV2::Declaration,
                 output.declaration.0 as usize,
             )
+            .map_err(|error| error.to_string())?
             .unwrap_or(root_definition);
         publication.__kernel_publish_rows(projection, 1)?;
     }
     match projection_demand {
         KernelCheckedProjectionDemand::RuntimePacked => {
             for expression in &fields.expressions {
-                let projection = publication
-                    .__kernel_projection_for_route(
+                let projection = semantic_input
+                    .__compiler_checked_image_projection_for_route(
                         CheckedImageRowDomainV2::Expression,
                         expression.id.0 as usize,
                     )
+                    .map_err(|error| error.to_string())?
                     .ok_or_else(|| {
                         format!(
                             "RuntimePacked metadata references missing Expression route {}",
@@ -2700,11 +2699,12 @@ fn append_kernel_checked_metadata_publication(
                 publication.__kernel_publish_rows(projection, 1)?;
             }
             for callable in semantic_input.user_callable_declarations() {
-                let projection = publication
-                    .__kernel_projection_for_route(
+                let projection = semantic_input
+                    .__compiler_checked_image_projection_for_route(
                         CheckedImageRowDomainV2::Callable,
                         callable.0 as usize,
                     )
+                    .map_err(|error| error.to_string())?
                     .ok_or_else(|| {
                         format!(
                             "RuntimePacked metadata references missing Callable route {}",
@@ -2716,24 +2716,26 @@ fn append_kernel_checked_metadata_publication(
         }
         KernelCheckedProjectionDemand::EditorRich => {
             for entry in &fields.lowering_metadata.expr_type_table.entries {
-                let projection = fields
-                    .expressions
-                    .get(entry.expr_id)
-                    .and_then(|expression| {
-                        publication.__kernel_projection_for_route(
+                let projection = if let Some(expression) = fields.expressions.get(entry.expr_id) {
+                    semantic_input
+                        .__compiler_checked_image_projection_for_route(
                             CheckedImageRowDomainV2::Expression,
                             expression.id.0 as usize,
                         )
-                    })
-                    .unwrap_or(root_definition);
+                        .map_err(|error| error.to_string())?
+                        .unwrap_or(root_definition)
+                } else {
+                    root_definition
+                };
                 publication.__kernel_publish_rows(projection, 1)?;
             }
             for entry in &fields.lowering_metadata.function_type_table.entries {
-                let projection = publication
-                    .__kernel_projection_for_route(
+                let projection = semantic_input
+                    .__compiler_checked_image_projection_for_route(
                         CheckedImageRowDomainV2::Callable,
                         entry.callable.0 as usize,
                     )
+                    .map_err(|error| error.to_string())?
                     .unwrap_or(root_definition);
                 publication.__kernel_publish_rows(projection, 1)?;
             }
@@ -2744,22 +2746,27 @@ fn append_kernel_checked_metadata_publication(
         return Err("named-value image rows do not have exact statement-site coverage".to_owned());
     }
     for statement in &named_values.checked_statement_sites {
-        let projection = publication
-            .__kernel_projection_for_route(CheckedImageRowDomainV2::Statement, statement.0 as usize)
+        let projection = semantic_input
+            .__compiler_checked_image_projection_for_route(
+                CheckedImageRowDomainV2::Statement,
+                statement.0 as usize,
+            )
+            .map_err(|error| error.to_string())?
             .unwrap_or(root_definition);
         publication.__kernel_publish_rows(projection, 1)?;
     }
     for slot in &fields.lowering_metadata.render_slot_table.slots {
-        let projection = fields
-            .statements
-            .get(slot.slot_statement_id)
-            .and_then(|statement| {
-                publication.__kernel_projection_for_route(
+        let projection = if let Some(statement) = fields.statements.get(slot.slot_statement_id) {
+            semantic_input
+                .__compiler_checked_image_projection_for_route(
                     CheckedImageRowDomainV2::Statement,
                     statement.id.0 as usize,
                 )
-            })
-            .unwrap_or(root_definition);
+                .map_err(|error| error.to_string())?
+                .unwrap_or(root_definition)
+        } else {
+            root_definition
+        };
         publication.__kernel_publish_rows(projection, 1)?;
     }
     publication.__kernel_publish_rows(

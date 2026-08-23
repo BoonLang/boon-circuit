@@ -429,72 +429,43 @@ fn runtime_packed_publication_with_call_routes_and_expression_swap(
     call_routes: &[usize],
     expression_swap: Option<(u32, u32)>,
 ) -> Result<RuntimePackedTestPublication, String> {
-    let (mut publication, mut expectation) =
-        boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
-            source_bundle_digest_v1,
-            role,
-        );
-    let mut expected_projection_digests = handoff
+    let planned_projections = handoff
         .projections
         .iter()
-        .map(|projection| projection.stable_key_digest)
-        .collect::<Vec<_>>();
-    expected_projection_digests.sort_unstable();
-    let mut expected_routes = Vec::with_capacity(handoff.entity_routes.len());
-    let projection_ids = handoff
-        .projections
-        .iter()
-        .map(|projection| publication.__kernel_intern_projection(projection.stable_key.clone()))
-        .collect::<Result<Vec<_>, _>>()?;
-    for (ordinal, projection) in handoff.projections.iter().enumerate() {
-        let projection_id = projection_ids[ordinal];
-        let independent_rows = projection
-            .row_count
-            .checked_sub(projection.dependency_row_count)
-            .ok_or_else(|| "fixture dependency rows exceed total rows".to_owned())?;
-        publication.__kernel_publish_rows(projection_id, independent_rows)?;
-        let handoff_id = CheckedImageProjectionIdV2(
-            u32::try_from(ordinal)
-                .map_err(|_| "fixture projection ordinal exceeds u32".to_owned())?,
-        );
-        let relocations = handoff
-            .projection_relocations(handoff_id)
-            .ok_or_else(|| format!("fixture projection {ordinal} has invalid relocations"))?
-            .iter()
-            .map(|target| {
-                projection_ids
-                    .get(target.as_usize())
-                    .copied()
-                    .ok_or_else(|| {
-                        format!(
-                            "fixture projection {ordinal} references missing relocation {}",
-                            target.0,
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if projection.dependency_row_count != 0 && relocations.is_empty() {
-            return Err(format!(
-                "fixture projection {ordinal} has dependency rows without relocations"
-            ));
-        }
-        for _ in 0..projection.dependency_row_count {
-            publication
-                .__kernel_publish_dependency_row(projection_id, relocations.iter().copied())?;
-        }
-    }
+        .map(|projection| {
+            let definition_projection = handoff
+                .projections
+                .iter()
+                .position(|candidate| {
+                    candidate.stable_key.owner == projection.stable_key.owner
+                        && candidate.stable_key.region == CheckedShardRegionV2::Definition
+                })
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|_| "fixture projection catalog exceeds u32".to_owned())?;
+            Ok(
+                boon_checked::CheckedImageKernelPlannedProjectionV1::__kernel_new(
+                    projection.stable_key.clone(),
+                    projection.stable_key_digest,
+                    definition_projection,
+                ),
+            )
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let call_projection = handoff
         .entity_routes
         .iter()
         .find(|route| route.domain == CheckedImageRowDomainV2::Call)
-        .and_then(|route| projection_ids.get(route.projection.as_usize()))
-        .copied()
+        .map(|route| {
+            boon_checked::CheckedImageKernelProjectionIdV1::__kernel_new(route.projection.0)
+        })
         .ok_or_else(|| "fixture has no checked Call projection".to_owned())?;
+    let mut planned_routes = Vec::with_capacity(handoff.entity_routes.len() + call_routes.len());
     for route in &handoff.entity_routes {
         if route.domain == CheckedImageRowDomainV2::Call {
             continue;
         }
-        let expected_projection = match expression_swap {
+        let claimed_projection = match expression_swap {
             Some((left, right))
                 if route.domain == CheckedImageRowDomainV2::Expression
                     && route.dense_index == left =>
@@ -513,59 +484,121 @@ fn runtime_packed_publication_with_call_routes_and_expression_swap(
             }
             _ => route.projection,
         };
-        let projection = projection_ids
-            .get(expected_projection.as_usize())
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "fixture route {:?}/{} references missing projection {}",
-                    route.domain, route.dense_index, route.projection.0,
-                )
-            })?;
-        publication.__kernel_route(route.domain, route.dense_index as usize, projection)?;
-        let expected_projection_digest = handoff
-            .projection(route.projection)
-            .map(|projection| projection.stable_key_digest)
-            .ok_or_else(|| {
-                format!(
-                    "fixture expected route {:?}/{} references missing projection {}",
-                    route.domain, route.dense_index, route.projection.0,
-                )
-            })?;
-        let projection_digest_id = expected_projection_digests
-            .binary_search(&expected_projection_digest)
-            .map_err(|_| "fixture route references a foreign projection digest".to_owned())?;
-        expected_routes.push(
+        if claimed_projection != route.projection {
+            return Err(format!(
+                "kernel checked-image {:?} route {} differs from its independent ownership plan",
+                route.domain, route.dense_index,
+            ));
+        }
+        planned_routes.push(
             boon_checked::CheckedImageKernelExpectedRouteV1::__kernel_new(
                 route.domain,
                 route.dense_index,
-                u32::try_from(projection_digest_id)
-                    .map_err(|_| "fixture projection catalog exceeds u32".to_owned())?,
+                route.projection.0,
             ),
         );
     }
     for dense_index in call_routes {
-        publication.__kernel_route(CheckedImageRowDomainV2::Call, *dense_index, call_projection)?;
-        let call_projection_digest = publication
-            .__kernel_projection_digest(call_projection)
-            .ok_or_else(|| "fixture Call projection is missing".to_owned())?;
-        let projection_digest_id = expected_projection_digests
-            .binary_search(&call_projection_digest)
-            .map_err(|_| "fixture Call route references a foreign projection digest".to_owned())?;
-        expected_routes.push(
+        planned_routes.push(
             boon_checked::CheckedImageKernelExpectedRouteV1::__kernel_new(
                 CheckedImageRowDomainV2::Call,
                 u32::try_from(*dense_index)
                     .map_err(|_| "fixture Call route exceeds u32".to_owned())?,
-                u32::try_from(projection_digest_id)
+                u32::try_from(call_projection.as_usize())
                     .map_err(|_| "fixture projection catalog exceeds u32".to_owned())?,
             ),
         );
     }
-    expected_routes.sort_unstable_by_key(|route| route.__kernel_coordinates());
+    planned_routes.sort_unstable_by_key(|route| route.__kernel_coordinates());
+    if let Some(pair) = planned_routes
+        .windows(2)
+        .find(|pair| pair[0].__kernel_coordinates() == pair[1].__kernel_coordinates())
+    {
+        let (domain, dense_index) = pair[0].__kernel_coordinates();
+        return Err(format!("{domain:?} route {dense_index} is published twice"));
+    }
+    let (mut publication, mut expectation) =
+        boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
+            source_bundle_digest_v1,
+            role,
+            planned_projections.len(),
+            planned_routes.len(),
+        );
+    let mut route_ordinals_by_projection = vec![Vec::new(); handoff.projections.len()];
+    for (route_ordinal, route) in planned_routes.iter().enumerate() {
+        route_ordinals_by_projection
+            .get_mut(route.__kernel_projection().as_usize())
+            .ok_or_else(|| "fixture route references a missing projection".to_owned())?
+            .push(route_ordinal);
+    }
+    for (ordinal, projection) in handoff.projections.iter().enumerate() {
+        let projection_id = boon_checked::CheckedImageKernelProjectionIdV1::__kernel_new(
+            u32::try_from(ordinal)
+                .map_err(|_| "fixture projection ordinal exceeds u32".to_owned())?,
+        );
+        let independent_rows = projection
+            .row_count
+            .checked_sub(projection.dependency_row_count)
+            .ok_or_else(|| "fixture dependency rows exceed total rows".to_owned())?;
+        let handoff_id = CheckedImageProjectionIdV2(
+            u32::try_from(ordinal)
+                .map_err(|_| "fixture projection ordinal exceeds u32".to_owned())?,
+        );
+        let relocations = handoff
+            .projection_relocations(handoff_id)
+            .ok_or_else(|| format!("fixture projection {ordinal} has invalid relocations"))?
+            .iter()
+            .map(|target| {
+                handoff.projections.get(target.as_usize()).ok_or_else(|| {
+                    format!(
+                        "fixture projection {ordinal} references missing relocation {}",
+                        target.0,
+                    )
+                })?;
+                Ok(boon_checked::CheckedImageKernelProjectionIdV1::__kernel_new(target.0))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        if projection.dependency_row_count != 0 && relocations.is_empty() {
+            return Err(format!(
+                "fixture projection {ordinal} has dependency rows without relocations"
+            ));
+        }
+        let routes = &route_ordinals_by_projection[ordinal];
+        let route_count = u32::try_from(routes.len())
+            .map_err(|_| "fixture projection route count exceeds u32".to_owned())?;
+        if route_count > projection.row_count {
+            return Err(format!(
+                "fixture projection {ordinal} has {route_count} routes for {} rows",
+                projection.row_count,
+            ));
+        }
+        let routed_dependencies = projection.dependency_row_count.min(route_count);
+        let routed_independent = route_count - routed_dependencies;
+        let remaining_independent = independent_rows
+            .checked_sub(routed_independent)
+            .ok_or_else(|| {
+                format!("fixture projection {ordinal} has too many independent routes")
+            })?;
+        for route_ordinal in routes.iter().copied().take(routed_dependencies as usize) {
+            publication.__kernel_publish_routed_dependency_row(
+                route_ordinal,
+                projection_id,
+                &relocations,
+            )?;
+        }
+        for route_ordinal in routes.iter().copied().skip(routed_dependencies as usize) {
+            publication.__kernel_publish_routed_rows(route_ordinal, projection_id, 1)?;
+        }
+        if remaining_independent != 0 {
+            publication.__kernel_publish_rows(projection_id, remaining_independent)?;
+        }
+        for _ in routed_dependencies..projection.dependency_row_count {
+            publication.__kernel_publish_dependency_row(projection_id, &relocations)?;
+        }
+    }
     expectation.__kernel_install_compact_topology(
-        expected_projection_digests.into_boxed_slice(),
-        expected_routes.into_boxed_slice(),
+        planned_projections.into_boxed_slice(),
+        planned_routes.into_boxed_slice(),
     )?;
     expectation.__kernel_freeze_against(&publication)?;
     Ok(RuntimePackedTestPublication {
@@ -1011,33 +1044,34 @@ fn runtime_packed_ownership_freeze_rejects_every_late_mutator() {
     )
     .expect("fixture freezes a complete publication and ownership plan");
     let projection = sealed
-        .publication
-        .__kernel_projection_for_route(CheckedImageRowDomainV2::Expression, 0)
+        .expectation
+        .__compiler_projection_for_route(CheckedImageRowDomainV2::Expression, 0)
+        .expect("fixture topology remains available before typechecker consumption")
         .expect("fixture has an Expression route");
     let key = fixture.authority_handoff.projections[projection.as_usize()]
         .stable_key
         .clone();
+    let digest = boon_checked::checked_image_projection_key_digest_v4(&key)
+        .expect("fixture key has a stable digest");
+    let replacement =
+        boon_checked::CheckedImageKernelPlannedProjectionV1::__kernel_new(key, digest, Some(0));
 
     for error in [
-        sealed
-            .publication
-            .__kernel_intern_projection(key)
-            .expect_err("projection interning after ownership freeze must fail"),
         sealed
             .publication
             .__kernel_publish_rows(projection, 1)
             .expect_err("row publication after ownership freeze must fail"),
         sealed
             .publication
-            .__kernel_publish_dependency_row(projection, [projection])
+            .__kernel_publish_dependency_row(projection, &[projection])
             .expect_err("dependency publication after ownership freeze must fail"),
         sealed
             .publication
-            .__kernel_route(CheckedImageRowDomainV2::Expression, 0, projection)
+            .__kernel_publish_routed_rows(0, projection, 1)
             .expect_err("route publication after ownership freeze must fail"),
         sealed
             .expectation
-            .__kernel_install_compact_topology(Box::new([[0xA5; 32]]), Box::new([]))
+            .__kernel_install_compact_topology(Box::new([replacement]), Box::new([]))
             .expect_err("ownership topology replacement after freeze must fail"),
     ] {
         assert!(error.contains("frozen"), "{error}");
@@ -1051,11 +1085,15 @@ fn runtime_packed_ownership_freeze_rejects_a_foreign_pair() {
         boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
             fixture.authority.source_bundle_digest_v1,
             fixture.authority.role,
+            0,
+            0,
         );
     let (right_publication, _right_expectation) =
         boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
             fixture.authority.source_bundle_digest_v1,
             fixture.authority.role,
+            0,
+            0,
         );
     drop(left_publication);
     let error = left_expectation
@@ -1068,68 +1106,88 @@ fn runtime_packed_ownership_freeze_rejects_a_foreign_pair() {
 }
 
 #[test]
-fn runtime_packed_prehashed_projection_rejects_digest_collision() {
+fn runtime_packed_ownership_plan_rejects_digest_collision() {
     let fixture = runtime_packed_publication_fixture();
-    let (mut publication, _expectation) =
+    let (_publication, mut expectation) =
         boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
             fixture.authority.source_bundle_digest_v1,
             fixture.authority.role,
+            2,
+            0,
         );
-    let left = fixture.authority_handoff.projections[0].stable_key.clone();
-    let right = fixture
+    let mut keys = fixture
         .authority_handoff
         .projections
         .iter()
         .map(|projection| projection.stable_key.clone())
-        .find(|key| *key != left)
-        .expect("fixture has two distinct projection keys");
-    publication
-        .__kernel_intern_prehashed_projection(left, [0x5A; 32])
-        .expect("first prehashed key interns");
-    let error = publication
-        .__kernel_intern_prehashed_projection(right, [0x5A; 32])
+        .take(2)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    let projections = keys
+        .into_iter()
+        .map(|key| {
+            boon_checked::CheckedImageKernelPlannedProjectionV1::__kernel_new(key, [0x5A; 32], None)
+        })
+        .collect::<Vec<_>>();
+    let error = expectation
+        .__kernel_install_compact_topology(projections.into_boxed_slice(), Box::new([]))
         .expect_err("distinct keys may not share a supplied stable digest");
-    assert!(error.contains("distinct projection keys"), "{error}");
+    assert!(error.contains("digests are not unique"), "{error}");
 }
 
 #[test]
 fn runtime_packed_ownership_freeze_rejects_duplicate_catalog_digest() {
     let fixture = runtime_packed_publication_fixture();
-    let (mut publication, mut expectation) =
+    let (_publication, mut expectation) =
         boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
             fixture.authority.source_bundle_digest_v1,
             fixture.authority.role,
+            2,
+            0,
         );
-    let key = fixture.authority_handoff.projections[0].stable_key.clone();
-    let digest = boon_checked::checked_image_projection_key_digest_v4(&key)
-        .expect("fixture key has a stable digest");
-    publication
-        .__kernel_intern_prehashed_projection(key, digest)
-        .expect("fixture key interns");
+    let mut projections = fixture
+        .authority_handoff
+        .projections
+        .iter()
+        .take(2)
+        .map(|projection| {
+            boon_checked::CheckedImageKernelPlannedProjectionV1::__kernel_new(
+                projection.stable_key.clone(),
+                projection.stable_key_digest,
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    projections.sort_unstable_by(|left, right| left.__kernel_key().cmp(right.__kernel_key()));
+    let digest = projections[0].__kernel_digest();
+    let second_key = projections[1].__kernel_key().clone();
+    projections[1] =
+        boon_checked::CheckedImageKernelPlannedProjectionV1::__kernel_new(second_key, digest, None);
     let error = expectation
-        .__kernel_install_compact_topology(Box::new([digest, digest]), Box::new([]))
+        .__kernel_install_compact_topology(projections.into_boxed_slice(), Box::new([]))
         .expect_err("duplicate expected digest must fail closed");
-    assert!(error.contains("strict-sorted"), "{error}");
+    assert!(error.contains("digests are not unique"), "{error}");
 }
 
 #[test]
-fn runtime_packed_ownership_freeze_rejects_a_foreign_projection_catalog() {
+fn runtime_packed_ownership_install_rejects_a_foreign_projection_digest() {
     let fixture = runtime_packed_publication_fixture();
-    let (mut publication, mut expectation) =
+    let (_publication, mut expectation) =
         boon_checked::CheckedImageKernelPublicationV1::__kernel_new_pair(
             fixture.authority.source_bundle_digest_v1,
             fixture.authority.role,
+            1,
+            0,
         );
-    publication
-        .__kernel_intern_projection(fixture.authority_handoff.projections[0].stable_key.clone())
-        .expect("fixture projection interns");
-    expectation
-        .__kernel_install_compact_topology(Box::new([[0xA5; 32]]), Box::new([]))
-        .expect("foreign expectation remains constructible before freeze");
+    let projection = boon_checked::CheckedImageKernelPlannedProjectionV1::__kernel_new(
+        fixture.authority_handoff.projections[0].stable_key.clone(),
+        [0xA5; 32],
+        None,
+    );
     let error = expectation
-        .__kernel_freeze_against(&publication)
-        .expect_err("foreign projection catalog must not certify the publication");
-    assert!(error.contains("independent ownership plan"), "{error}");
+        .__kernel_install_compact_topology(Box::new([projection]), Box::new([]))
+        .expect_err("foreign projection digest must not enter the ownership plan");
+    assert!(error.contains("foreign digest"), "{error}");
 }
 
 #[test]

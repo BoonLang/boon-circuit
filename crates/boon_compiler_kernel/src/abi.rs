@@ -9,6 +9,12 @@ use boon_checked::{
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Exact checked-image digest domain for the normalized immutable ABI.
+/// Keeping it at the lower authority boundary lets RuntimePacked hash the rich
+/// compatibility input once, then carry only the digest after packing.
+pub const KERNEL_CHECKED_REFERENCED_ABI_SEAL_DOMAIN_V1: &[u8] =
+    b"boon.kernel-checked-referenced-abi-seal.v1\0";
+
 /// Revision-local dense identity of one immutable ABI callable.
 ///
 /// `KernelAbiInput` sorts callables by canonical name before assigning these
@@ -214,9 +220,9 @@ pub enum KernelAbiContextualOperation {
 }
 
 impl KernelAbiContextualOperation {
-    fn parameter_ordinals(self) -> Box<[u32]> {
-        match self {
-            Self::Map { list, row, body } => Box::new([list, row, body]),
+    pub(crate) fn parameter_ordinals(self) -> impl ExactSizeIterator<Item = u32> {
+        let (ordinals, len) = match self {
+            Self::Map { list, row, body } => ([list, row, body, 0], 3),
             Self::Filter {
                 list,
                 row,
@@ -246,7 +252,7 @@ impl KernelAbiContextualOperation {
                 list,
                 row,
                 predicate,
-            } => Box::new([list, row, predicate]),
+            } => ([list, row, predicate, 0], 3),
             Self::SortBy {
                 list,
                 row,
@@ -258,8 +264,9 @@ impl KernelAbiContextualOperation {
                 row,
                 key,
                 direction,
-            } => Box::new([list, row, key, direction]),
-        }
+            } => ([list, row, key, direction], 4),
+        };
+        ordinals.into_iter().take(len)
     }
 }
 

@@ -4,12 +4,16 @@ use crate::packed_call_types::{
     PackedCallableParameterTraversalScratch, packed_callable_type_parameter_sources_match,
 };
 use crate::{
-    FrozenTypeStore, KernelAbiCallableId, KernelArtifactFlowTermV1, KernelDeclarationId,
-    KernelDeclarationReference, KernelExternalTarget, KernelOwnerId, KernelScopeId,
-    KernelScopeReference, KernelSolveError, KernelSourceSpan, KernelValueReference, TypeTermId,
+    FrozenTypeStore, KernelAbiCallableId, KernelAbiContextualOperation, KernelArtifactFlowTermV1,
+    KernelCallableKind, KernelDeclarationId, KernelDeclarationReference, KernelExternalTarget,
+    KernelOwnerId, KernelParameterEvaluationScope, KernelScopeId, KernelScopeReference,
+    KernelSolveError, KernelSourceSpan, KernelValueReference, TypeTermHead, TypeTermId,
     TypeVariableId, alpha_normalize_flow_type,
 };
-use boon_checked::{FlowMode, FlowType, Type, TypeVar};
+use boon_checked::{
+    CheckedCallContextKind, CheckedEffectSummary, CheckedExternalDeclarationIdentityV1,
+    CheckedIntrinsicV1, CheckedParameterKind, FlowMode, FlowType, ProgramRole, Type, TypeVar,
+};
 use boon_contract::SymbolId;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -234,6 +238,11 @@ pub struct DefinitionCodeStore {
     callable_type_parameters: Box<[PackedCallableTypeParameter]>,
     abi_callable_schemes: Box<[PackedAbiCallableScheme]>,
     abi_callable_formals: Box<[PackedFlow]>,
+    abi_parameters: Box<[PackedAbiParameter]>,
+    abi_contexts: Box<[PackedAbiContext]>,
+    abi_default_text: Box<[u8]>,
+    abi_role: ProgramRole,
+    referenced_abi_fingerprint_v1: [u8; 32],
     execution_nodes: Box<[PackedExecutionNode]>,
     execution_dependencies: Box<[PackedExpressionRef]>,
     execution_selectors: Box<[PackedExecutionSelector]>,
@@ -288,6 +297,10 @@ impl DefinitionCodeStore {
 
     pub(crate) fn abi_callable_count(&self) -> usize {
         self.abi_callable_schemes.len()
+    }
+
+    pub fn referenced_abi_fingerprint_v1(&self) -> [u8; 32] {
+        self.referenced_abi_fingerprint_v1
     }
 
     pub(crate) fn abi_callable_scheme(
@@ -590,6 +603,9 @@ impl DefinitionCodeStore {
     fn validate_callable_schemes(&self) -> Result<(), KernelSolveError> {
         let arena = self.types.as_arena();
         let mut scratch = PackedCallableParameterTraversalScratch::default();
+        let mut abi_traversal = Vec::new();
+        let mut abi_children = Vec::new();
+        let mut abi_variables = Vec::new();
 
         for (owner, definition) in self.definitions.iter().enumerate() {
             let formals = definition.formals.get(&self.flows).ok_or_else(|| {
@@ -731,7 +747,21 @@ impl DefinitionCodeStore {
             }
         }
 
+        let mut previous_abi_name = None;
+        let mut next_default_text = 0usize;
         for (callable, scheme) in self.abi_callable_schemes.iter().enumerate() {
+            let name = self.symbol(scheme.name).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition-code ABI scheme {callable} has a foreign name symbol {}",
+                    scheme.name.as_u32(),
+                ))
+            })?;
+            if name.is_empty() || previous_abi_name.is_some_and(|previous| previous >= name) {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code ABI callable `{name}` is empty, repeated, or outside strict lexical order"
+                )));
+            }
+            previous_abi_name = Some(name);
             let formals = scheme
                 .formals
                 .get(&self.abi_callable_formals)
@@ -740,7 +770,126 @@ impl DefinitionCodeStore {
                         "kernel definition-code ABI scheme {callable} has an invalid formal span"
                     ))
                 })?;
-            let parameters = scheme
+            let callable_parameters = scheme.parameters.get(&self.abi_parameters).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition-code ABI scheme {callable} has an invalid parameter metadata span"
+                ))
+            })?;
+            if callable_parameters.len() != formals.len() {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code ABI scheme `{name}` has {} parameter rows and {} formal flows",
+                    callable_parameters.len(),
+                    formals.len(),
+                )));
+            }
+            for (ordinal, parameter) in callable_parameters.iter().enumerate() {
+                if parameter.ordinal as usize != ordinal {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme `{name}` parameter {} is non-dense at {ordinal}",
+                        parameter.ordinal,
+                    )));
+                }
+                let parameter_name = self.symbol(parameter.name).filter(|name| !name.is_empty());
+                if parameter_name.is_none()
+                    || callable_parameters[..ordinal]
+                        .iter()
+                        .any(|seen| seen.name == parameter.name)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme `{name}` parameter {ordinal} has an empty, repeated, or foreign name symbol {}",
+                        parameter.name.as_u32(),
+                    )));
+                }
+                match parameter.requirement {
+                    PackedAbiParameterRequirement::Required
+                    | PackedAbiParameterRequirement::ExactInteger(_) => {}
+                    PackedAbiParameterRequirement::CallableProfile(symbol)
+                    | PackedAbiParameterRequirement::Tag(symbol) => {
+                        if self.symbol(symbol).is_none() {
+                            return Err(KernelSolveError::new(format!(
+                                "kernel definition-code ABI scheme `{name}` parameter {ordinal} has a foreign default symbol {}",
+                                symbol.as_u32(),
+                            )));
+                        }
+                    }
+                    PackedAbiParameterRequirement::Text(span) => {
+                        if span.start as usize != next_default_text {
+                            return Err(KernelSolveError::new(format!(
+                                "kernel definition-code ABI scheme `{name}` parameter {ordinal} default text is not canonical in the shared byte slab"
+                            )));
+                        }
+                        let bytes = span.get(&self.abi_default_text).ok_or_else(|| {
+                            KernelSolveError::new(format!(
+                                "kernel definition-code ABI scheme `{name}` parameter {ordinal} has an invalid default-text span"
+                            ))
+                        })?;
+                        std::str::from_utf8(bytes).map_err(|_| {
+                            KernelSolveError::new(format!(
+                                "kernel definition-code ABI scheme `{name}` parameter {ordinal} has non-UTF-8 default text"
+                            ))
+                        })?;
+                        next_default_text = next_default_text
+                            .checked_add(bytes.len())
+                            .ok_or_else(|| {
+                                KernelSolveError::new(
+                                    "kernel definition-code ABI default-text cursor overflows usize",
+                                )
+                            })?;
+                    }
+                }
+                if let KernelParameterEvaluationScope::Output { parameter_ordinal } =
+                    parameter.evaluation_scope
+                {
+                    let output = callable_parameters.get(parameter_ordinal as usize);
+                    if output.is_none_or(|output| output.kind != CheckedParameterKind::Out) {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel definition-code ABI scheme `{name}` parameter {ordinal} targets missing or non-OUT parameter {parameter_ordinal}"
+                        )));
+                    }
+                }
+            }
+            let contexts = scheme.contexts.get(&self.abi_contexts).ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "kernel definition-code ABI scheme {callable} has an invalid context span"
+                ))
+            })?;
+            for (ordinal, context) in contexts.iter().enumerate() {
+                if self.symbol(context.name).is_none_or(str::is_empty)
+                    || contexts[..ordinal]
+                        .iter()
+                        .any(|seen| seen.name == context.name)
+                {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme `{name}` context {ordinal} has an empty, repeated, or foreign name symbol {}",
+                        context.name.as_u32(),
+                    )));
+                }
+                if context.provider_parameter_ordinal as usize >= callable_parameters.len() {
+                    return Err(KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme `{name}` context {ordinal} targets missing parameter {}",
+                        context.provider_parameter_ordinal,
+                    )));
+                }
+            }
+            scheme
+                .variable_base
+                .0
+                .checked_add(scheme.variable_count)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme `{name}` variable range overflows u32"
+                    ))
+                })?;
+            if let Some(operation) = scheme.contextual_operation {
+                for ordinal in operation.parameter_ordinals() {
+                    if ordinal as usize >= callable_parameters.len() {
+                        return Err(KernelSolveError::new(format!(
+                            "kernel definition-code ABI scheme `{name}` contextual operation targets missing parameter {ordinal}"
+                        )));
+                    }
+                }
+            }
+            let type_parameters = scheme
                 .type_parameters
                 .get(&self.callable_type_parameters)
                 .ok_or_else(|| {
@@ -752,16 +901,17 @@ impl DefinitionCodeStore {
                 arena,
                 formals.iter().map(|flow| flow.term),
                 scheme.result.term,
-                parameters,
+                type_parameters,
                 &mut scratch,
             ) {
                 return Err(KernelSolveError::new(format!(
                     "kernel definition-code ABI scheme {callable} parameter order does not match its packed formals and result"
                 )));
             }
-            for parameter in parameters {
+            for parameter in type_parameters {
                 if parameter.source.0.checked_sub(scheme.variable_base.0)
                     != Some(parameter.linked_local)
+                    || parameter.linked_local >= scheme.variable_count
                 {
                     return Err(KernelSolveError::new(format!(
                         "kernel definition-code ABI scheme {callable} parameter {} has invalid local alpha {} from base {}",
@@ -769,6 +919,42 @@ impl DefinitionCodeStore {
                     )));
                 }
             }
+
+            abi_traversal.clear();
+            abi_children.clear();
+            abi_variables.clear();
+            abi_traversal.push(scheme.result.term);
+            abi_traversal.extend(formals.iter().map(|flow| flow.term));
+            abi_traversal.extend(contexts.iter().map(|context| context.flow.term));
+            while let Some(term) = abi_traversal.pop() {
+                if let TypeTermHead::Variable(variable) = arena.term_head(term) {
+                    if !abi_variables.contains(&variable) {
+                        abi_variables.push(variable);
+                    }
+                    continue;
+                }
+                abi_children.clear();
+                arena.append_term_children(term, &mut abi_children);
+                abi_traversal.extend(abi_children.iter().copied());
+            }
+            if abi_variables.len() != scheme.variable_count as usize
+                || (0..scheme.variable_count).any(|local| {
+                    scheme
+                        .variable_base
+                        .0
+                        .checked_add(local)
+                        .is_none_or(|source| !abi_variables.contains(&TypeVariableId(source)))
+                })
+            {
+                return Err(KernelSolveError::new(format!(
+                    "kernel definition-code ABI scheme `{name}` does not own one dense complete alpha range"
+                )));
+            }
+        }
+        if next_default_text != self.abi_default_text.len() {
+            return Err(KernelSolveError::new(
+                "kernel definition-code ABI default-text slab has unreferenced trailing bytes",
+            ));
         }
         Ok(())
     }
@@ -1310,30 +1496,53 @@ impl DefinitionCodeStore {
                         "kernel definition-code ABI scheme {callable} has an invalid parameter span",
                     ))
                 })?;
-            for parameter in parameters {
-                let index = parameter.source.0 as usize;
+            let variable_end = scheme
+                .variable_base
+                .0
+                .checked_add(scheme.variable_count)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "kernel definition-code ABI scheme {callable} variable range overflows u32"
+                    ))
+                })?;
+            for source in scheme.variable_base.0..variable_end {
+                let index = source as usize;
                 if variable_generations.len() <= index {
                     variable_generations.resize(index + 1, 0);
                 }
                 if variable_generations[index] == generation {
                     return Err(KernelSolveError::new(format!(
-                        "kernel definition-code ABI scheme {callable} repeats parameter {}",
-                        parameter.source.0,
+                        "kernel definition-code ABI scheme {callable} repeats variable {source}",
                     )));
                 }
+                variable_generations[index] = generation;
+            }
+            for parameter in parameters {
                 if parameter.source.0.checked_sub(scheme.variable_base.0)
                     != Some(parameter.linked_local)
+                    || parameter.linked_local >= scheme.variable_count
                 {
                     return Err(KernelSolveError::new(format!(
                         "kernel definition-code ABI scheme {callable} parameter {} has invalid local alpha {} from base {}",
                         parameter.source.0, parameter.linked_local, scheme.variable_base.0,
                     )));
                 }
-                variable_generations[index] = generation;
             }
             stack.clear();
             stack.push(scheme.result.term);
             stack.extend(formals.iter().map(|flow| flow.term));
+            stack.extend(
+                scheme
+                    .contexts
+                    .get(&self.abi_contexts)
+                    .ok_or_else(|| {
+                        KernelSolveError::new(format!(
+                            "kernel definition-code ABI scheme {callable} has an invalid context span",
+                        ))
+                    })?
+                    .iter()
+                    .map(|context| context.flow.term),
+            );
             validate_type_roots(
                 &self.types,
                 &mut stack,
@@ -2093,6 +2302,38 @@ impl<'a> PackedAbiCallableSchemeRef<'a> {
         self.callable
     }
 
+    pub(crate) fn name(self) -> &'a str {
+        self.store
+            .symbol(self.scheme.name)
+            .expect("sealed ABI callable name belongs to the project text authority")
+    }
+
+    pub(crate) const fn kind(self) -> KernelCallableKind {
+        self.scheme.kind
+    }
+
+    pub(crate) const fn intrinsic(self) -> Option<CheckedIntrinsicV1> {
+        self.scheme.intrinsic
+    }
+
+    pub(crate) const fn external_identity(self) -> Option<CheckedExternalDeclarationIdentityV1> {
+        self.scheme.external_identity
+    }
+
+    pub(crate) fn parameters(self) -> &'a [PackedAbiParameter] {
+        self.scheme
+            .parameters
+            .get(&self.store.abi_parameters)
+            .expect("sealed ABI parameter span is valid")
+    }
+
+    pub(crate) fn contexts(self) -> &'a [PackedAbiContext] {
+        self.scheme
+            .contexts
+            .get(&self.store.abi_contexts)
+            .expect("sealed ABI context span is valid")
+    }
+
     pub(crate) fn formals(self) -> &'a [PackedFlow] {
         self.scheme
             .formals
@@ -2113,6 +2354,30 @@ impl<'a> PackedAbiCallableSchemeRef<'a> {
 
     pub(crate) const fn variable_base(self) -> TypeVariableId {
         self.scheme.variable_base
+    }
+
+    pub(crate) const fn variable_count(self) -> u32 {
+        self.scheme.variable_count
+    }
+
+    pub(crate) const fn role(self) -> ProgramRole {
+        self.store.abi_role
+    }
+
+    pub(crate) const fn effect(self) -> CheckedEffectSummary {
+        self.scheme.effect
+    }
+
+    pub(crate) const fn contextual_operation(self) -> Option<KernelAbiContextualOperation> {
+        self.scheme.contextual_operation
+    }
+
+    pub(crate) fn symbol(self, symbol: SymbolId) -> Option<&'a str> {
+        self.store.symbol(symbol)
+    }
+
+    pub(crate) fn default_text(self, span: Span32) -> Option<&'a str> {
+        std::str::from_utf8(span.get(&self.store.abi_default_text)?).ok()
     }
 }
 
@@ -2577,15 +2842,35 @@ pub(crate) struct PackedCallFactsInput {
     pub(crate) authored_site_digest_v4: [u8; 32],
 }
 
-/// Packed ABI scheme before its local columns are appended to the permanent
-/// definition-code store. The variable base preserves the ABI-local alpha
-/// namespace, including gaps introduced only by contextual contracts.
+/// One-shot flat ABI catalog produced while the rich compatibility input and
+/// mutable type arena are still available. Every variable-sized field already
+/// points into a sibling flat column, so installation moves these allocations
+/// into the permanent code store without rebuilding per-callable vectors.
 #[derive(Debug)]
-pub(crate) struct PackedAbiCallableSchemeInput {
+pub(crate) struct PackedAbiCatalogInput {
+    pub(crate) role: ProgramRole,
+    pub(crate) referenced_abi_fingerprint_v1: [u8; 32],
+    pub(crate) callables: Box<[PackedAbiCallableScheme]>,
     pub(crate) formals: Box<[PackedFlow]>,
-    pub(crate) result: PackedFlow,
+    pub(crate) parameters: Box<[PackedAbiParameter]>,
+    pub(crate) contexts: Box<[PackedAbiContext]>,
     pub(crate) type_parameters: Box<[PackedCallableTypeParameter]>,
-    pub(crate) variable_base: TypeVariableId,
+    pub(crate) default_text: Box<[u8]>,
+}
+
+impl PackedAbiCatalogInput {
+    pub(crate) fn empty(role: ProgramRole) -> Self {
+        Self {
+            role,
+            referenced_abi_fingerprint_v1: [0; 32],
+            callables: Box::new([]),
+            formals: Box::new([]),
+            parameters: Box::new([]),
+            contexts: Box::new([]),
+            type_parameters: Box::new([]),
+            default_text: Box::new([]),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2598,11 +2883,49 @@ pub(crate) struct PackedCallableTypeParameter {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PackedAbiCallableScheme {
-    formals: Span32,
-    result: PackedFlow,
-    type_parameters: Span32,
-    variable_base: TypeVariableId,
+pub(crate) struct PackedAbiCallableScheme {
+    pub(crate) name: SymbolId,
+    pub(crate) kind: KernelCallableKind,
+    pub(crate) intrinsic: Option<CheckedIntrinsicV1>,
+    pub(crate) external_identity: Option<CheckedExternalDeclarationIdentityV1>,
+    pub(crate) parameters: Span32,
+    pub(crate) contexts: Span32,
+    pub(crate) formals: Span32,
+    pub(crate) result: PackedFlow,
+    pub(crate) type_parameters: Span32,
+    pub(crate) variable_base: TypeVariableId,
+    pub(crate) variable_count: u32,
+    // `KernelAbiResultSpecialization` is a checker-only instruction consumed
+    // into solved call/result facts before this post-solve catalog is sealed.
+    // The exact rich-ABI fingerprint still includes it for currentness.
+    pub(crate) effect: CheckedEffectSummary,
+    pub(crate) contextual_operation: Option<KernelAbiContextualOperation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedAbiParameter {
+    pub(crate) name: SymbolId,
+    pub(crate) kind: CheckedParameterKind,
+    pub(crate) ordinal: u32,
+    pub(crate) requirement: PackedAbiParameterRequirement,
+    pub(crate) evaluation_scope: KernelParameterEvaluationScope,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PackedAbiParameterRequirement {
+    Required,
+    CallableProfile(SymbolId),
+    Tag(SymbolId),
+    ExactInteger(i64),
+    Text(Span32),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PackedAbiContext {
+    pub(crate) name: SymbolId,
+    pub(crate) kind: CheckedCallContextKind,
+    pub(crate) provider_parameter_ordinal: u32,
+    pub(crate) flow: PackedFlow,
 }
 
 const MISSING_SYNTHETIC_STATE_ORDINAL: u32 = u32::MAX;
@@ -2738,6 +3061,11 @@ pub(crate) struct DefinitionCodeBuilder {
     callable_type_parameters: Vec<PackedCallableTypeParameter>,
     abi_callable_schemes: Vec<PackedAbiCallableScheme>,
     abi_callable_formals: Vec<PackedFlow>,
+    abi_parameters: Vec<PackedAbiParameter>,
+    abi_contexts: Vec<PackedAbiContext>,
+    abi_default_text: Vec<u8>,
+    abi_role: ProgramRole,
+    referenced_abi_fingerprint_v1: [u8; 32],
     abi_schemes_installed: bool,
     execution_nodes: Vec<PackedExecutionNode>,
     execution_dependencies: Vec<PackedExpressionRef>,
@@ -2776,6 +3104,11 @@ impl DefinitionCodeBuilder {
             callable_type_parameters: Vec::new(),
             abi_callable_schemes: Vec::new(),
             abi_callable_formals: Vec::new(),
+            abi_parameters: Vec::new(),
+            abi_contexts: Vec::new(),
+            abi_default_text: Vec::new(),
+            abi_role: ProgramRole::default(),
+            referenced_abi_fingerprint_v1: [0; 32],
             abi_schemes_installed: false,
             execution_nodes: Vec::new(),
             execution_dependencies: Vec::new(),
@@ -2808,30 +3141,34 @@ impl DefinitionCodeBuilder {
     /// Install the immutable ABI schemes once, preserving their dense
     /// `KernelAbiCallableId` order and flattening all variable-sized payloads
     /// into permanent store columns.
-    pub(crate) fn install_abi_callable_schemes(
+    pub(crate) fn install_abi_catalog(
         &mut self,
-        schemes: Box<[PackedAbiCallableSchemeInput]>,
+        catalog: PackedAbiCatalogInput,
     ) -> Result<(), KernelSolveError> {
         if std::mem::replace(&mut self.abi_schemes_installed, true) {
             return Err(KernelSolveError::new(
-                "kernel definition-code ABI schemes may be installed only once",
+                "kernel definition-code ABI catalog may be installed only once",
             ));
         }
-        self.abi_callable_schemes.reserve(schemes.len());
-        for scheme in schemes.into_vec() {
-            let formals =
-                Span32::append(&mut self.abi_callable_formals, scheme.formals.into_vec())?;
-            let type_parameters = Span32::append(
-                &mut self.callable_type_parameters,
-                scheme.type_parameters.into_vec(),
-            )?;
-            self.abi_callable_schemes.push(PackedAbiCallableScheme {
-                formals,
-                result: scheme.result,
-                type_parameters,
-                variable_base: scheme.variable_base,
-            });
+        if !self.abi_callable_schemes.is_empty()
+            || !self.abi_callable_formals.is_empty()
+            || !self.abi_parameters.is_empty()
+            || !self.abi_contexts.is_empty()
+            || !self.abi_default_text.is_empty()
+            || !self.callable_type_parameters.is_empty()
+        {
+            return Err(KernelSolveError::new(
+                "kernel definition-code ABI catalog columns were populated before installation",
+            ));
         }
+        self.abi_callable_schemes = catalog.callables.into_vec();
+        self.abi_callable_formals = catalog.formals.into_vec();
+        self.abi_parameters = catalog.parameters.into_vec();
+        self.abi_contexts = catalog.contexts.into_vec();
+        self.callable_type_parameters = catalog.type_parameters.into_vec();
+        self.abi_default_text = catalog.default_text.into_vec();
+        self.abi_role = catalog.role;
+        self.referenced_abi_fingerprint_v1 = catalog.referenced_abi_fingerprint_v1;
         Ok(())
     }
 
@@ -3649,6 +3986,11 @@ impl DefinitionCodeBuilder {
             callable_type_parameters: self.callable_type_parameters.into_boxed_slice(),
             abi_callable_schemes: self.abi_callable_schemes.into_boxed_slice(),
             abi_callable_formals: self.abi_callable_formals.into_boxed_slice(),
+            abi_parameters: self.abi_parameters.into_boxed_slice(),
+            abi_contexts: self.abi_contexts.into_boxed_slice(),
+            abi_default_text: self.abi_default_text.into_boxed_slice(),
+            abi_role: self.abi_role,
+            referenced_abi_fingerprint_v1: self.referenced_abi_fingerprint_v1,
             execution_nodes: self.execution_nodes.into_boxed_slice(),
             execution_dependencies: self.execution_dependencies.into_boxed_slice(),
             execution_selectors: self.execution_selectors.into_boxed_slice(),
@@ -3747,6 +4089,62 @@ mod tests {
             .unwrap();
     }
 
+    fn test_abi_catalog(
+        name: SymbolId,
+        formals: Vec<PackedFlow>,
+        result: PackedFlow,
+        type_parameters: Box<[PackedCallableTypeParameter]>,
+        variable_base: TypeVariableId,
+        variable_count: u32,
+    ) -> PackedAbiCatalogInput {
+        let parameter_count = u32::try_from(formals.len()).expect("test ABI arity fits u32");
+        let parameters = (0..parameter_count)
+            .map(|ordinal| PackedAbiParameter {
+                name,
+                kind: CheckedParameterKind::Value,
+                ordinal,
+                requirement: PackedAbiParameterRequirement::Required,
+                evaluation_scope: KernelParameterEvaluationScope::Parent,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let type_parameter_count =
+            u32::try_from(type_parameters.len()).expect("test ABI type arity fits u32");
+        PackedAbiCatalogInput {
+            role: ProgramRole::Client,
+            referenced_abi_fingerprint_v1: [0; 32],
+            callables: Box::new([PackedAbiCallableScheme {
+                name,
+                kind: KernelCallableKind::Builtin,
+                intrinsic: None,
+                external_identity: None,
+                parameters: Span32 {
+                    start: 0,
+                    len: parameter_count,
+                },
+                contexts: Span32::default(),
+                formals: Span32 {
+                    start: 0,
+                    len: parameter_count,
+                },
+                result,
+                type_parameters: Span32 {
+                    start: 0,
+                    len: type_parameter_count,
+                },
+                variable_base,
+                variable_count,
+                effect: CheckedEffectSummary::default(),
+                contextual_operation: None,
+            }]),
+            formals: formals.into_boxed_slice(),
+            parameters,
+            contexts: Box::new([]),
+            type_parameters,
+            default_text: Box::new([]),
+        }
+    }
+
     fn build_callable_scheme_fixture(
         target: Option<KernelCallableSchemeId>,
         substitution_parameters: &[u32],
@@ -3762,6 +4160,7 @@ mod tests {
         let abi_result_source = TypeVariableId(102);
         let user_term = arena.variable(user_source);
         let abi_formal_term = arena.variable(abi_base);
+        let abi_context_term = arena.variable(TypeVariableId(101));
         let abi_result_term = arena.variable(abi_result_source);
         let user_flow = KernelArtifactFlowTermV1 {
             mode: FlowMode::Continuous,
@@ -3780,22 +4179,31 @@ mod tests {
             },
         ];
         let mut builder = DefinitionCodeBuilder::with_capacity(1, 2, 1);
-        builder.install_abi_callable_schemes(
-            vec![PackedAbiCallableSchemeInput {
-                formals: vec![PackedFlow {
-                    mode: FlowMode::Continuous,
-                    term: abi_formal_term,
-                }]
-                .into_boxed_slice(),
-                result: PackedFlow {
-                    mode: FlowMode::TickPresent,
-                    term: abi_result_term,
-                },
-                type_parameters: abi_parameters.into(),
-                variable_base: abi_base,
-            }]
-            .into_boxed_slice(),
-        )?;
+        let mut abi_catalog = test_abi_catalog(
+            function,
+            vec![PackedFlow {
+                mode: FlowMode::Continuous,
+                term: abi_formal_term,
+            }],
+            PackedFlow {
+                mode: FlowMode::TickPresent,
+                term: abi_result_term,
+            },
+            abi_parameters.into(),
+            abi_base,
+            3,
+        );
+        abi_catalog.callables[0].contexts = Span32 { start: 0, len: 1 };
+        abi_catalog.contexts = Box::new([PackedAbiContext {
+            name: function,
+            kind: CheckedCallContextKind::ElementState,
+            provider_parameter_ordinal: 0,
+            flow: PackedFlow {
+                mode: FlowMode::Continuous,
+                term: abi_context_term,
+            },
+        }]);
+        builder.install_abi_catalog(abi_catalog)?;
         let calls = [PackedCallFactsInput {
             expression: crate::KernelExpressionId(0),
             target,
@@ -3852,6 +4260,69 @@ mod tests {
             },
         )?;
         builder.finish(Arc::new(arena.freeze()))
+    }
+
+    #[test]
+    fn packed_abi_literal_defaults_borrow_one_exact_utf8_slab() {
+        let mut text = boon_contract::PackedTextCatalogBuilder::new();
+        let name = text
+            .intern_symbol("Defaults/text")
+            .expect("test ABI name interns")
+            .coordinate();
+        let arena = TypeTermArena::with_text(text.freeze());
+        let flow = PackedFlow {
+            mode: FlowMode::Continuous,
+            term: arena.text(),
+        };
+        let value = "žluťoučký\0猫";
+        let mut catalog =
+            test_abi_catalog(name, vec![flow], flow, Box::new([]), TypeVariableId(0), 0);
+        catalog.parameters[0].requirement = PackedAbiParameterRequirement::Text(Span32 {
+            start: 0,
+            len: u32::try_from(value.len()).expect("test literal length fits u32"),
+        });
+        catalog.default_text = value.as_bytes().into();
+        let mut builder = DefinitionCodeBuilder::with_capacity(0, 0, 0);
+        builder.install_abi_catalog(catalog).unwrap();
+        let store = builder.finish(Arc::new(arena.freeze())).unwrap();
+        let callable = store
+            .abi_callable_scheme(KernelAbiCallableId(0))
+            .expect("packed ABI callable exists");
+        let [parameter] = callable.parameters() else {
+            panic!("packed ABI callable retains one parameter")
+        };
+        let PackedAbiParameterRequirement::Text(span) = parameter.requirement else {
+            panic!("packed ABI parameter retains its text-default coordinate")
+        };
+        assert_eq!(callable.default_text(span), Some(value));
+    }
+
+    #[test]
+    fn packed_abi_symbol_defaults_preserve_empty_payloads() {
+        let mut text = boon_contract::PackedTextCatalogBuilder::new();
+        let name = text
+            .intern_symbol("Defaults/tag")
+            .expect("test ABI name interns")
+            .coordinate();
+        let empty = text
+            .intern_symbol("")
+            .expect("empty ABI default payload interns")
+            .coordinate();
+        let arena = TypeTermArena::with_text(text.freeze());
+        let flow = PackedFlow {
+            mode: FlowMode::Continuous,
+            term: arena.text(),
+        };
+        let mut catalog =
+            test_abi_catalog(name, vec![flow], flow, Box::new([]), TypeVariableId(0), 0);
+        catalog.parameters[0].requirement = PackedAbiParameterRequirement::Tag(empty);
+        let mut builder = DefinitionCodeBuilder::with_capacity(0, 0, 0);
+        builder.install_abi_catalog(catalog).unwrap();
+        let store = builder.finish(Arc::new(arena.freeze())).unwrap();
+        let callable = store
+            .abi_callable_scheme(KernelAbiCallableId(0))
+            .expect("packed ABI callable exists");
+        assert_eq!(callable.symbol(empty), Some(""));
     }
 
     #[test]
@@ -4301,22 +4772,20 @@ mod tests {
         };
         let mut builder = DefinitionCodeBuilder::with_capacity(1, 1, 0);
         builder
-            .install_abi_callable_schemes(
-                vec![PackedAbiCallableSchemeInput {
-                    formals: vec![PackedFlow {
-                        mode: flow.mode,
-                        term: flow.term,
-                    }]
-                    .into_boxed_slice(),
-                    result: PackedFlow {
-                        mode: flow.mode,
-                        term: flow.term,
-                    },
-                    type_parameters: Box::new([]),
-                    variable_base: TypeVariableId(0),
-                }]
-                .into_boxed_slice(),
-            )
+            .install_abi_catalog(test_abi_catalog(
+                function,
+                vec![PackedFlow {
+                    mode: flow.mode,
+                    term: flow.term,
+                }],
+                PackedFlow {
+                    mode: flow.mode,
+                    term: flow.term,
+                },
+                Box::new([]),
+                TypeVariableId(0),
+                0,
+            ))
             .unwrap();
         let error = builder
             .push(
@@ -4351,22 +4820,20 @@ mod tests {
 
         let mut builder = DefinitionCodeBuilder::with_capacity(1, 1, 0);
         builder
-            .install_abi_callable_schemes(
-                vec![PackedAbiCallableSchemeInput {
-                    formals: vec![PackedFlow {
-                        mode: flow.mode,
-                        term: flow.term,
-                    }]
-                    .into_boxed_slice(),
-                    result: PackedFlow {
-                        mode: flow.mode,
-                        term: flow.term,
-                    },
-                    type_parameters: Box::new([]),
-                    variable_base: TypeVariableId(0),
-                }]
-                .into_boxed_slice(),
-            )
+            .install_abi_catalog(test_abi_catalog(
+                function,
+                vec![PackedFlow {
+                    mode: flow.mode,
+                    term: flow.term,
+                }],
+                PackedFlow {
+                    mode: flow.mode,
+                    term: flow.term,
+                },
+                Box::new([]),
+                TypeVariableId(0),
+                0,
+            ))
             .unwrap();
         let duplicate_entries = [
             PackedCallEntry::Input {

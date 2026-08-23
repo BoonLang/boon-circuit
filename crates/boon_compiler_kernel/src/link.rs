@@ -6,7 +6,7 @@ pub use order::*;
 use crate::KernelLexicalBindingTarget;
 use crate::definition_code::DefinitionTypeMaterializationCache;
 use crate::{
-    KernelAbiContextualOperation, KernelAbiInput, KernelCallArgumentKind, KernelCallInputRoleRef,
+    KernelAbiContextualOperation, KernelCallArgumentKind, KernelCallInputRoleRef,
     KernelCallTargetRef, KernelCheckedSnapshot, KernelDeclarationReference, KernelDefinitionRef,
     KernelExternalTarget, KernelLexicalBindingTargetRef, KernelOwnerId, KernelProjectInput,
     KernelScopeReference, KernelStatementChildReference, KernelStatementReference,
@@ -21,16 +21,17 @@ use boon_checked::{
     CheckedDefinitionExecutionTemplateV1, CheckedDefinitionSelectorV1, CheckedEffectSummary,
     CheckedEvaluationScope, CheckedExprId, CheckedExpression, CheckedExpressionKind,
     CheckedImageKernelPublicationV1, CheckedImageRowDomainV2, CheckedList, CheckedListId,
-    CheckedMatchPattern, CheckedParameter, CheckedParameterKind, CheckedParameterRequirement,
-    CheckedPassedAccess, CheckedPatternBinding, CheckedProgram, CheckedProgramFields,
-    CheckedRecordField, CheckedResourceBinding, CheckedResourceProjectionRequirement,
-    CheckedRuntimeFlowTermProjectionV1, CheckedScope, CheckedScopeKind, CheckedSemanticPath,
-    CheckedShardCallableKindV2, CheckedShardOwnerKeyV2, CheckedShardProjectionKeyV2,
-    CheckedShardRegionV2, CheckedSource, CheckedSourceId, CheckedSourceRead, CheckedSpan,
-    CheckedState, CheckedStateId, CheckedStatement, CheckedStatementId, CheckedStatementKind,
-    CheckedTextSegment, CheckedTypeSubstitution, CheckedValueUse, ContextFormalId, DeclId,
-    FlowMode, FlowType, LexicalScopeId, ObjectShape, ProgramRole, SemanticOccurrence,
-    SemanticOccurrenceKind, SharedObjectShape, Type, TypeVar, Variant,
+    CheckedMatchPattern, CheckedParameter, CheckedParameterDefault, CheckedParameterKind,
+    CheckedParameterRequirement, CheckedPassedAccess, CheckedPatternBinding, CheckedProgram,
+    CheckedProgramFields, CheckedRecordField, CheckedResourceBinding,
+    CheckedResourceProjectionRequirement, CheckedRuntimeFlowTermProjectionV1, CheckedScope,
+    CheckedScopeKind, CheckedSemanticPath, CheckedShardCallableKindV2, CheckedShardOwnerKeyV2,
+    CheckedShardProjectionKeyV2, CheckedShardRegionV2, CheckedSource, CheckedSourceId,
+    CheckedSourceRead, CheckedSpan, CheckedState, CheckedStateId, CheckedStatement,
+    CheckedStatementId, CheckedStatementKind, CheckedTextSegment, CheckedTypeSubstitution,
+    CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId, ObjectShape,
+    ProgramRole, SemanticOccurrence, SemanticOccurrenceKind, SharedObjectShape, Type, TypeVar,
+    Variant,
 };
 use boon_contract::{PathId, SourceBundleDigestV1, SymbolId};
 use boon_syntax::StableOccurrenceKey;
@@ -92,7 +93,7 @@ pub struct KernelCheckedDefinitionLayout {
 pub struct KernelCheckedAbiCallableLayout {
     pub callable: crate::KernelAbiCallableId,
     pub declaration: DeclId,
-    pub parameters: Box<[DeclId]>,
+    pub parameters: KernelCheckedRowRange,
     pub type_variables: KernelCheckedRowRange,
 }
 
@@ -3979,6 +3980,14 @@ impl KernelSemanticInputConstructionV1 {
                     scheme.callable().0,
                 )));
             }
+            if callable.type_variables.len != scheme.variable_count() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel semantic ABI scheme {} has {} linked variables for {} packed variables",
+                    callable.callable.0,
+                    callable.type_variables.len,
+                    scheme.variable_count(),
+                )));
+            }
             for parameter in scheme.type_parameters() {
                 let expected_local = parameter
                     .source
@@ -5233,20 +5242,17 @@ impl KernelSemanticTypeMaterializer<'_> {
                         .abi_relocation(callable)
                         .expect("a semantic ABI type has a checked relocation");
                     self.variables.clear();
-                    for parameter in scheme.type_parameters() {
+                    for local in 0..scheme.variable_count() {
                         let linked = relocation
                             .type_variables
-                            .resolve(parameter.linked_local, "semantic ABI type variable")?;
-                        if self
-                            .variables
-                            .insert(TypeVar(parameter.source.0), TypeVar(linked))
-                            .is_some()
-                        {
-                            return Err(KernelCheckedLinkError::new(format!(
-                                "kernel semantic ABI scheme {} repeats packed parameter {}",
-                                callable.0, parameter.source.0,
-                            )));
-                        }
+                            .resolve(local, "semantic ABI type variable")?;
+                        let source = scheme.variable_base().0.checked_add(local).ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel semantic ABI scheme {} variable namespace overflows u32",
+                                callable.0,
+                            ))
+                        })?;
+                        self.variables.insert(TypeVar(source), TypeVar(linked));
                     }
                     self.alpha_end = relocation
                         .type_variables
@@ -6276,7 +6282,6 @@ fn checked_link_packed_authority_projection(
 
 #[allow(clippy::too_many_arguments)]
 fn checked_image_publication_v1(
-    project: &KernelProjectInput,
     source_bundle_digest_v1: SourceBundleDigestV1,
     role: ProgramRole,
     layout: &KernelCheckedLinkLayout,
@@ -6383,19 +6388,19 @@ fn checked_image_publication_v1(
         callable_count += 1;
     }
     for callable_layout in layout.abi_callables() {
-        let callable = project
-            .abi()
-            .callable_by_id(callable_layout.callable)
+        let callable = snapshot
+            .definition_code
+            .abi_callable_scheme(callable_layout.callable)
             .ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
                     "kernel publication has no ABI callable {}",
                     callable_layout.callable.0,
                 ))
             })?;
-        if callable.kind == crate::KernelCallableKind::User {
+        if callable.kind() == crate::KernelCallableKind::User {
             return Err(KernelCheckedLinkError::new(format!(
                 "kernel publication ABI unexpectedly contains user callable `{}`",
-                callable.name,
+                callable.name(),
             )));
         }
         let slot = callable_owners
@@ -6405,10 +6410,10 @@ fn checked_image_publication_v1(
             })?;
         if slot
             .replace(CheckedShardOwnerKeyV2::Callable {
-                role: callable.role,
-                callable_kind: checked_link_kernel_callable_kind(callable.kind),
-                name: callable.name.to_string(),
-                external_identity: callable.external_identity,
+                role: callable.role(),
+                callable_kind: checked_link_kernel_callable_kind(callable.kind()),
+                name: callable.name().to_owned(),
+                external_identity: callable.external_identity(),
             })
             .is_some()
         {
@@ -6533,9 +6538,9 @@ fn checked_image_publication_v1(
         }
     }
     for callable in layout.abi_callables() {
-        for declaration in
-            std::iter::once(callable.declaration).chain(callable.parameters.iter().copied())
-        {
+        for declaration in std::iter::once(callable.declaration).chain(
+            (0..callable.parameters.len).map(|ordinal| DeclId(callable.parameters.start + ordinal)),
+        ) {
             let projection = publication
                 .__kernel_intern_projection(root_definition.clone())
                 .map_err(&error)?;
@@ -7589,16 +7594,18 @@ impl KernelCheckedLinkLayout {
         }
         totals.callables = totals.user_callables;
         let definition_declarations_end = totals.declarations;
-        let referenced_abi_callables = referenced_abi_callable_ids(project, snapshot)?;
+        let referenced_abi_callables = referenced_abi_callable_ids(snapshot)?;
         let mut abi_callables = Vec::with_capacity(referenced_abi_callables.len());
         for callable_id in referenced_abi_callables {
-            let callable = project.abi().callable_by_id(callable_id).ok_or_else(|| {
+            let callable = snapshot
+                .definition_code
+                .abi_callable_scheme(callable_id)
+                .ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
-                    "kernel checked linker references ABI callable ID {} absent from its immutable project ABI",
+                    "kernel checked linker references ABI callable ID {} absent from its packed ABI catalog",
                     callable_id.0,
                 ))
             })?;
-            let name = callable.name.as_ref();
             let declaration = DeclId(totals.declarations);
             totals.declarations = totals.declarations.checked_add(1).ok_or_else(|| {
                 KernelCheckedLinkError::new(
@@ -7607,33 +7614,18 @@ impl KernelCheckedLinkLayout {
             })?;
             let parameter_range = take_range(
                 &mut totals.declarations,
-                callable.parameters.len(),
+                callable.parameters().len(),
                 "ABI parameter declaration",
             )?;
-            let parameters = (0..parameter_range.len)
-                .map(|ordinal| DeclId(parameter_range.start + ordinal))
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let type_variable_ordinals = abi_callable_type_variables(callable);
-            if type_variable_ordinals
-                .iter()
-                .enumerate()
-                .any(|(expected, variable)| variable.0 as usize != expected)
-            {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "kernel ABI callable `{name}` has a non-dense local type-variable namespace {:?}",
-                    type_variable_ordinals,
-                )));
-            }
             let type_variables = take_range(
                 &mut totals.type_variables,
-                type_variable_ordinals.len(),
+                callable.variable_count() as usize,
                 "ABI type variable",
             )?;
             abi_callables.push(KernelCheckedAbiCallableLayout {
                 callable: callable_id,
                 declaration,
-                parameters,
+                parameters: parameter_range,
                 type_variables,
             });
             totals.abi_callables = totals.abi_callables.checked_add(1).ok_or_else(|| {
@@ -7696,7 +7688,6 @@ impl KernelCheckedLinkLayout {
     /// order.
     fn packed_link_topology(
         &self,
-        project: &KernelProjectInput,
         snapshot: &KernelCheckedSnapshot,
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
@@ -7709,7 +7700,6 @@ impl KernelCheckedLinkLayout {
         let occurrence_targets =
             self.occurrence_targets(snapshot, &expression_declaration_targets)?;
         let checked_image_publication = checked_image_publication_v1(
-            project,
             source_bundle_digest_v1,
             role,
             self,
@@ -7738,7 +7728,6 @@ impl KernelCheckedLinkLayout {
     /// tools and differential tests keep using the explicit rich method.
     pub fn link_runtime_packed(
         &self,
-        project: &KernelProjectInput,
         snapshot: &KernelCheckedSnapshot,
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
@@ -7751,7 +7740,7 @@ impl KernelCheckedLinkLayout {
             resource_projections,
             occurrence_targets,
             checked_image_publication,
-        } = self.packed_link_topology(project, snapshot, source_bundle_digest_v1, role)?;
+        } = self.packed_link_topology(snapshot, source_bundle_digest_v1, role)?;
         let occurrence_count = occurrence_targets.len();
         let semantic_input = KernelSemanticInputConstructionV1::from_linked_rows(
             source_bundle_digest_v1,
@@ -7778,7 +7767,6 @@ impl KernelCheckedLinkLayout {
     /// targets resolve in the same namespace as user definitions.
     pub fn materialize_rows(
         &self,
-        project: &KernelProjectInput,
         snapshot: &KernelCheckedSnapshot,
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
@@ -7805,8 +7793,7 @@ impl KernelCheckedLinkLayout {
                             snapshot.definition_code.materialization_cache();
                         materialize_expression_rows(&mut expression_type_cache)
                     });
-                    let base =
-                        self.materialize_base_rows(project, snapshot, role, &mut type_cache)?;
+                    let base = self.materialize_base_rows(snapshot, role, &mut type_cache)?;
                     let expressions = expression_worker.join().map_err(|_| {
                         KernelCheckedLinkError::new(
                             "kernel checked expression materialization worker panicked",
@@ -7816,13 +7803,13 @@ impl KernelCheckedLinkLayout {
                 })?
             } else {
                 (
-                    self.materialize_base_rows(project, snapshot, role, &mut type_cache)?,
+                    self.materialize_base_rows(snapshot, role, &mut type_cache)?,
                     materialize_expression_rows(&mut type_cache)?,
                 )
             };
         #[cfg(target_family = "wasm")]
         let (base, (expressions, runtime_flow_terms)) = (
-            self.materialize_base_rows(project, snapshot, role, &mut type_cache)?,
+            self.materialize_base_rows(snapshot, role, &mut type_cache)?,
             materialize_expression_rows(&mut type_cache)?,
         );
         let KernelCheckedBaseRows {
@@ -7853,7 +7840,7 @@ impl KernelCheckedLinkLayout {
             resource_projections: semantic_resource_projections,
             occurrence_targets,
             checked_image_publication,
-        } = self.packed_link_topology(project, snapshot, source_bundle_digest_v1, role)?;
+        } = self.packed_link_topology(snapshot, source_bundle_digest_v1, role)?;
         let call_result_paths = match projection_demand {
             KernelCheckedRowProjectionDemand::RuntimePacked => Box::new([]),
             KernelCheckedRowProjectionDemand::EditorRich => self.materialize_call_result_paths(
@@ -8001,7 +7988,6 @@ impl KernelCheckedLinkLayout {
 
     fn materialize_base_rows(
         &self,
-        project: &KernelProjectInput,
         snapshot: &KernelCheckedSnapshot,
         role: ProgramRole,
         type_cache: &mut DefinitionTypeMaterializationCache,
@@ -8018,7 +8004,7 @@ impl KernelCheckedLinkLayout {
             self.materialize_user_callables_with_cache(snapshot, role, type_cache)?;
         let mut callables = user_callables.into_vec();
         let (abi_callables, abi_declarations) =
-            self.materialize_abi_callables_with_cache(project.abi(), snapshot, type_cache)?;
+            self.materialize_abi_callables_with_cache(snapshot, type_cache)?;
         callables.extend(abi_callables);
         declarations.extend(abi_declarations);
         Ok(KernelCheckedBaseRows {
@@ -10498,17 +10484,15 @@ impl KernelCheckedLinkLayout {
     /// ABI signature nevertheless share this one layout authority.
     pub fn materialize_abi_callables(
         &self,
-        abi: &KernelAbiInput,
         snapshot: &KernelCheckedSnapshot,
     ) -> Result<(Box<[CheckedCallableSignature]>, Box<[CheckedDeclaration]>), KernelCheckedLinkError>
     {
         let mut type_cache = snapshot.definition_code.materialization_cache();
-        self.materialize_abi_callables_with_cache(abi, snapshot, &mut type_cache)
+        self.materialize_abi_callables_with_cache(snapshot, &mut type_cache)
     }
 
     fn materialize_abi_callables_with_cache(
         &self,
-        abi: &KernelAbiInput,
         snapshot: &KernelCheckedSnapshot,
         type_cache: &mut DefinitionTypeMaterializationCache,
     ) -> Result<(Box<[CheckedCallableSignature]>, Box<[CheckedDeclaration]>), KernelCheckedLinkError>
@@ -10516,13 +10500,6 @@ impl KernelCheckedLinkLayout {
         let mut callables = Vec::with_capacity(self.totals.abi_callables as usize);
         let mut declarations = Vec::new();
         for layout in &self.abi_callables {
-            let callable = abi.callable_by_id(layout.callable).ok_or_else(|| {
-                KernelCheckedLinkError::new(format!(
-                    "kernel checked ABI materializer cannot find ID {} in its immutable ABI",
-                    layout.callable.0,
-                ))
-            })?;
-            let name = callable.name.as_ref();
             let scheme = snapshot
                 .definition_code
                 .abi_callable_scheme(layout.callable)
@@ -10532,19 +10509,27 @@ impl KernelCheckedLinkLayout {
                         layout.callable.0,
                     ))
                 })?;
-            if callable.parameters.len() != layout.parameters.len() {
+            let name = scheme.name();
+            if scheme.parameters().len() != layout.parameters.len as usize {
                 return Err(KernelCheckedLinkError::new(format!(
-                    "kernel checked ABI callable `{}` has {} parameters in its layout and {} in its contract",
+                    "kernel checked ABI callable `{}` has {} parameters in its layout and {} in its packed catalog",
                     name,
-                    layout.parameters.len(),
-                    callable.parameters.len(),
+                    layout.parameters.len,
+                    scheme.parameters().len(),
                 )));
             }
-            if scheme.formals().len() != callable.parameters.len() {
+            if scheme.formals().len() != scheme.parameters().len() {
                 return Err(KernelCheckedLinkError::new(format!(
-                    "kernel checked ABI callable `{name}` has {} packed formals and {} contract parameters",
+                    "kernel checked ABI callable `{name}` has {} packed formals and {} parameter rows",
                     scheme.formals().len(),
-                    callable.parameters.len(),
+                    scheme.parameters().len(),
+                )));
+            }
+            if layout.type_variables.len != scheme.variable_count() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel checked ABI callable `{name}` has {} linked variables and {} packed variables",
+                    layout.type_variables.len,
+                    scheme.variable_count(),
                 )));
             }
             let alpha_end = layout
@@ -10557,33 +10542,42 @@ impl KernelCheckedLinkLayout {
                     ))
                 })?;
             let mut variables = BTreeMap::<TypeVar, TypeVar>::new();
+            for local in 0..scheme.variable_count() {
+                variables.insert(
+                    TypeVar(
+                        scheme
+                            .variable_base()
+                            .0
+                            .checked_add(local)
+                            .ok_or_else(|| {
+                                KernelCheckedLinkError::new(format!(
+                                    "kernel checked ABI callable `{name}` packed variable namespace overflows u32"
+                                ))
+                            })?,
+                    ),
+                    TypeVar(layout.type_variables.resolve(local, "ABI type variable")?),
+                );
+            }
             for parameter in scheme.type_parameters() {
                 let linked = layout
                     .type_variables
                     .resolve(parameter.linked_local, "ABI type variable")?;
-                if variables
-                    .insert(TypeVar(parameter.source.0), TypeVar(linked))
-                    .is_some()
-                {
+                if variables.get(&TypeVar(parameter.source.0)).copied() != Some(TypeVar(linked)) {
                     return Err(KernelCheckedLinkError::new(format!(
-                        "kernel checked ABI callable `{name}` repeats packed parameter {}",
+                        "kernel checked ABI callable `{name}` has inconsistent packed parameter {}",
                         parameter.source.0,
                     )));
                 }
             }
             let mut next = alpha_end;
-            let parameters = callable
-                .parameters
+            let parameters = scheme
+                .parameters()
                 .iter()
-                .zip(layout.parameters.iter().copied())
+                .zip((0..layout.parameters.len).map(|ordinal| {
+                    DeclId(layout.parameters.start + ordinal)
+                }))
                 .zip(scheme.formals().iter().copied())
                 .map(|((parameter, decl_id), packed_flow)| {
-                    if parameter.flow_type.mode != packed_flow.mode {
-                        return Err(KernelCheckedLinkError::new(format!(
-                            "kernel checked ABI callable `{name}` parameter `{}` packed mode {:?} differs from contract mode {:?}",
-                            parameter.name, packed_flow.mode, parameter.flow_type.mode,
-                        )));
-                    }
                     let evaluation_scope = match parameter.evaluation_scope {
                         crate::KernelParameterEvaluationScope::Parent => {
                             CheckedEvaluationScope::Parent
@@ -10591,20 +10585,81 @@ impl KernelCheckedLinkLayout {
                         crate::KernelParameterEvaluationScope::Output { parameter_ordinal } => {
                             let formal = layout
                                 .parameters
-                                .get(parameter_ordinal as usize)
-                                .copied()
-                                .ok_or_else(|| {
+                                .resolve(parameter_ordinal, "ABI OUT parameter")
+                                .map(DeclId)
+                                .map_err(|_| {
                                     KernelCheckedLinkError::new(format!(
                                         "kernel checked ABI callable `{}` parameter `{}` targets missing OUT ordinal {parameter_ordinal}",
-                                        name, parameter.name,
+                                        name,
+                                        scheme.symbol(parameter.name).unwrap_or("<foreign>"),
                                     ))
                                 })?;
                             CheckedEvaluationScope::Output { formal }
                         }
                     };
+                    let parameter_name = scheme.symbol(parameter.name).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel checked ABI callable `{name}` has a foreign parameter-name symbol {}",
+                            parameter.name.as_u32(),
+                        ))
+                    })?;
+                    let requirement = match parameter.requirement {
+                        crate::PackedAbiParameterRequirement::Required => {
+                            CheckedParameterRequirement::Required
+                        }
+                        crate::PackedAbiParameterRequirement::CallableProfile(symbol) => {
+                            CheckedParameterRequirement::Optional {
+                                default: CheckedParameterDefault::CallableProfile {
+                                    profile: scheme
+                                        .symbol(symbol)
+                                        .ok_or_else(|| {
+                                            KernelCheckedLinkError::new(format!(
+                                                "kernel checked ABI callable `{name}` has a foreign profile symbol {}",
+                                                symbol.as_u32(),
+                                            ))
+                                        })?
+                                        .to_owned(),
+                                },
+                            }
+                        }
+                        crate::PackedAbiParameterRequirement::Tag(symbol) => {
+                            CheckedParameterRequirement::Optional {
+                                default: CheckedParameterDefault::Tag {
+                                    name: scheme
+                                        .symbol(symbol)
+                                        .ok_or_else(|| {
+                                            KernelCheckedLinkError::new(format!(
+                                                "kernel checked ABI callable `{name}` has a foreign tag symbol {}",
+                                                symbol.as_u32(),
+                                            ))
+                                        })?
+                                        .to_owned(),
+                                },
+                            }
+                        }
+                        crate::PackedAbiParameterRequirement::ExactInteger(value) => {
+                            CheckedParameterRequirement::Optional {
+                                default: CheckedParameterDefault::ExactInteger { value },
+                            }
+                        }
+                        crate::PackedAbiParameterRequirement::Text(span) => {
+                            CheckedParameterRequirement::Optional {
+                                default: CheckedParameterDefault::Text {
+                                    value: scheme
+                                        .default_text(span)
+                                        .ok_or_else(|| {
+                                            KernelCheckedLinkError::new(format!(
+                                                "kernel checked ABI callable `{name}` has an invalid default-text span"
+                                            ))
+                                        })?
+                                        .to_owned(),
+                                },
+                            }
+                        }
+                    };
                     Ok(CheckedParameter {
                         decl_id,
-                        name: parameter.name.to_string(),
+                        name: parameter_name.to_owned(),
                         kind: parameter.kind,
                         ordinal: parameter.ordinal as usize,
                         flow_type: FlowType {
@@ -10617,42 +10672,56 @@ impl KernelCheckedLinkLayout {
                                 packed_flow.term,
                             ),
                         },
-                        requirement: parameter.requirement.clone(),
+                        requirement,
                         evaluation_scope,
                         start: 0,
                         end: 0,
                     })
                 })
                 .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
-            let contexts = callable
-                .contexts
+            let contexts = scheme
+                .contexts()
                 .iter()
                 .map(|context| {
                     let provider = layout
                         .parameters
-                        .get(context.provider_parameter_ordinal as usize)
-                        .copied()
-                        .ok_or_else(|| {
+                        .resolve(
+                            context.provider_parameter_ordinal,
+                            "ABI context provider parameter",
+                        )
+                        .map(DeclId)
+                        .map_err(|_| {
                             KernelCheckedLinkError::new(format!(
                                 "kernel checked ABI callable `{}` context `{}` targets missing parameter ordinal {}",
-                                name, context.name, context.provider_parameter_ordinal,
+                                name,
+                                scheme.symbol(context.name).unwrap_or("<foreign>"),
+                                context.provider_parameter_ordinal,
                             ))
                         })?;
+                    let context_name = scheme.symbol(context.name).ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel checked ABI callable `{name}` has a foreign context-name symbol {}",
+                            context.name.as_u32(),
+                        ))
+                    })?;
                     Ok(CheckedCallableContext {
-                        name: context.name.to_string(),
+                        name: context_name.to_owned(),
                         kind: context.kind,
                         provider,
-                        flow_type: relocate_abi_flow_type(layout, &context.flow_type)?,
+                        flow_type: FlowType {
+                            mode: context.flow.mode,
+                            ty: snapshot.definition_code.materialize_linked_type_term(
+                                type_cache,
+                                &mut variables,
+                                &mut next,
+                                alpha_end,
+                                context.flow.term,
+                            ),
+                        },
                     })
                 })
                 .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
             let packed_result = scheme.result();
-            if callable.result.mode != packed_result.mode {
-                return Err(KernelCheckedLinkError::new(format!(
-                    "kernel checked ABI callable `{name}` packed result mode {:?} differs from contract mode {:?}",
-                    packed_result.mode, callable.result.mode,
-                )));
-            }
             let result = FlowType {
                 mode: packed_result.mode,
                 ty: snapshot.definition_code.materialize_linked_type_term(
@@ -10666,7 +10735,7 @@ impl KernelCheckedLinkLayout {
             callables.push(CheckedCallableSignature {
                 decl_id: layout.declaration,
                 scope_id: LexicalScopeId(0),
-                kind: match callable.kind {
+                kind: match scheme.kind() {
                     crate::KernelCallableKind::Builtin => CheckedCallableKind::Builtin,
                     crate::KernelCallableKind::External => CheckedCallableKind::External,
                     crate::KernelCallableKind::User => {
@@ -10677,18 +10746,18 @@ impl KernelCheckedLinkLayout {
                     }
                 },
                 name: name.to_string(),
-                intrinsic: callable.intrinsic,
-                external_identity: callable.external_identity,
+                intrinsic: scheme.intrinsic(),
+                external_identity: scheme.external_identity(),
                 parameters: parameters.clone(),
                 contexts,
                 context_formal: None,
                 result: result.clone(),
-                role: callable.role,
-                effect: callable.effect,
+                role: scheme.role(),
+                effect: scheme.effect(),
                 body: None,
                 result_expression: None,
-                contextual_operation: callable
-                    .contextual_operation
+                contextual_operation: scheme
+                    .contextual_operation()
                     .map(|operation| checked_abi_contextual_operation(layout, name, operation))
                     .transpose()?,
             });
@@ -10696,7 +10765,7 @@ impl KernelCheckedLinkLayout {
                 id: layout.declaration,
                 scope_id: LexicalScopeId(0),
                 name: name.to_string(),
-                kind: match callable.kind {
+                kind: match scheme.kind() {
                     crate::KernelCallableKind::Builtin => CheckedDeclarationKind::Builtin,
                     crate::KernelCallableKind::External => CheckedDeclarationKind::External,
                     crate::KernelCallableKind::User => unreachable!("validated above"),
@@ -14422,7 +14491,6 @@ fn type_variables_in_flow(flow: &FlowType) -> BTreeSet<TypeVar> {
 }
 
 fn referenced_abi_callable_ids(
-    project: &KernelProjectInput,
     snapshot: &KernelCheckedSnapshot,
 ) -> Result<BTreeSet<crate::KernelAbiCallableId>, KernelCheckedLinkError> {
     let mut callables = BTreeSet::new();
@@ -14508,27 +14576,27 @@ fn referenced_abi_callable_ids(
                             call.expression().0,
                         )));
                     }
-                    let callable = project.abi().callable_id(function).ok_or_else(|| {
-                        KernelCheckedLinkError::new(format!(
-                            "kernel definition {owner} references ABI callable `{function}` absent from its immutable project ABI",
-                        ))
-                    })?;
-                    if retained != crate::KernelCallableSchemeId::Abi(callable) {
+                    let crate::KernelCallableSchemeId::Abi(callable) = retained else {
                         return Err(KernelCheckedLinkError::new(format!(
-                            "kernel definition {owner} ABI call expression {} retained target {retained:?} instead of ABI ID {}",
+                            "kernel definition {owner} ABI call expression {} retained non-ABI target {retained:?}",
                             call.expression().0,
-                            callable.0,
                         )));
-                    }
+                    };
                     let scheme = snapshot
                         .definition_code
                         .abi_callable_scheme(callable)
                         .ok_or_else(|| {
-                            KernelCheckedLinkError::new(format!(
-                                "kernel definition {owner} calls missing packed ABI scheme {}",
-                                callable.0,
-                            ))
-                        })?;
+                        KernelCheckedLinkError::new(format!(
+                            "kernel definition {owner} references ABI callable `{function}` absent from its packed ABI catalog",
+                        ))
+                    })?;
+                    if scheme.name() != function {
+                        return Err(KernelCheckedLinkError::new(format!(
+                            "kernel definition {owner} ABI call expression {} names `{function}` but retained packed callable `{}`",
+                            call.expression().0,
+                            scheme.name(),
+                        )));
+                    }
                     callables.insert(callable);
                     scheme.type_parameters().len()
                 }
@@ -14550,28 +14618,6 @@ fn referenced_abi_callable_ids(
     Ok(callables)
 }
 
-fn abi_callable_type_variables(callable: &crate::KernelCallableAbiInput) -> BTreeSet<TypeVar> {
-    let mut variables = BTreeSet::new();
-    for parameter in &callable.parameters {
-        collect_flow_type_variables(&parameter.flow_type, &mut variables);
-    }
-    for context in &callable.contexts {
-        collect_flow_type_variables(&context.flow_type, &mut variables);
-    }
-    collect_flow_type_variables(&callable.result, &mut variables);
-    variables
-}
-
-fn relocate_abi_flow_type(
-    layout: &KernelCheckedAbiCallableLayout,
-    flow_type: &FlowType,
-) -> Result<FlowType, KernelCheckedLinkError> {
-    Ok(FlowType {
-        mode: flow_type.mode,
-        ty: relocate_type(layout.type_variables, &flow_type.ty)?,
-    })
-}
-
 fn checked_abi_contextual_operation(
     layout: &KernelCheckedAbiCallableLayout,
     name: &str,
@@ -14580,9 +14626,9 @@ fn checked_abi_contextual_operation(
     let parameter = |ordinal: u32, role: &str| {
         layout
             .parameters
-            .get(ordinal as usize)
-            .copied()
-            .ok_or_else(|| {
+            .resolve(ordinal, "ABI contextual parameter")
+            .map(DeclId)
+            .map_err(|_| {
                 KernelCheckedLinkError::new(format!(
                     "kernel ABI callable `{}` contextual {role} references missing parameter ordinal {ordinal}",
                     name,
@@ -15385,7 +15431,6 @@ mod tests {
         );
         let rows = layout
             .materialize_rows(
-                session.project(),
                 &snapshot,
                 SourceBundleDigestV1::new(
                     "generic-union.bn",
@@ -15505,7 +15550,6 @@ mod tests {
         );
         let rows = layout
             .materialize_rows(
-                session.project(),
                 &snapshot,
                 SourceBundleDigestV1::new(
                     "kernel-link-test.bn",
@@ -15551,7 +15595,6 @@ mod tests {
 
         let packed = layout
             .link_runtime_packed(
-                session.project(),
                 &snapshot,
                 SourceBundleDigestV1::new(
                     "kernel-link-test.bn",
@@ -15566,7 +15609,6 @@ mod tests {
             .expect("runtime linker must produce only compact authorities");
         let runtime_rows = layout
             .materialize_rows(
-                session.project(),
                 &snapshot,
                 SourceBundleDigestV1::new(
                     "kernel-link-test.bn",

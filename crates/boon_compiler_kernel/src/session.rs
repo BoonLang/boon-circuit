@@ -171,7 +171,6 @@ pub struct KernelProjectInput {
     /// Rich compatibility facts live only in the one-shot construction state
     /// and are released after code, interfaces, and receipts have been sealed.
     runtime_facts: Arc<crate::PackedDefinitionFactsStore>,
-    abi: Arc<KernelAbiInput>,
     text: ProjectTextSnapshot,
     /// One-shot state moved into `KernelSession` before this input can be
     /// observed as revision metadata. Keeping the arena and V14 basis together
@@ -183,6 +182,10 @@ pub struct KernelProjectInput {
 #[derive(Debug)]
 struct KernelProjectConstruction {
     definition_facts: Arc<[KernelDefinitionFactsInput]>,
+    /// Rich ABI input is consumed by graph compilation and compact ABI
+    /// packing. It must not survive as a second authority on the immutable
+    /// project once construction has been moved into a session.
+    abi: Arc<KernelAbiInput>,
     terms: crate::TypeTermArena,
     packed_input_term_count: usize,
     basis_fingerprints_v14: Arc<[[u8; 32]]>,
@@ -326,9 +329,9 @@ impl KernelProjectInput {
             },
             program: Arc::new(program),
             runtime_facts,
-            abi: Arc::new(abi),
             construction: Some(KernelProjectConstruction {
                 definition_facts,
+                abi: Arc::new(abi),
                 terms,
                 packed_input_term_count,
                 basis_fingerprints_v14,
@@ -436,10 +439,6 @@ impl KernelProjectInput {
         self.runtime_facts.definition(owner)
     }
 
-    pub fn abi(&self) -> &KernelAbiInput {
-        self.abi.as_ref()
-    }
-
     pub fn text(&self) -> &ProjectTextSnapshot {
         &self.text
     }
@@ -456,6 +455,7 @@ impl KernelProjectInput {
     ) -> Result<crate::KernelProjectProgram, KernelOwnerBuildError> {
         let KernelProjectConstruction {
             definition_facts,
+            abi,
             terms,
             packed_input_term_count,
             basis_fingerprints_v14,
@@ -464,7 +464,7 @@ impl KernelProjectInput {
             Arc::clone(&self.program),
             definition_facts,
             Arc::clone(&self.runtime_facts),
-            Arc::clone(&self.abi),
+            abi,
             self.text.clone(),
             terms,
             packed_input_term_count,

@@ -1890,7 +1890,7 @@ struct SolvedDefinitionCallFacts {
 struct SolvedProjectCallProjection {
     definitions: Box<[SolvedDefinitionCallFacts]>,
     diagnostics: Box<[SolvedDefinitionDiagnostics]>,
-    abi_schemes: Box<[crate::PackedAbiCallableSchemeInput]>,
+    abi_catalog: crate::PackedAbiCatalogInput,
 }
 
 /// Phase-local diagnostic row before it is appended to the packed interface
@@ -3818,6 +3818,10 @@ impl KernelCheckedSnapshot {
         self.definition_code.type_store()
     }
 
+    pub fn definition_code(&self) -> &Arc<DefinitionCodeStore> {
+        &self.definition_code
+    }
+
     pub fn dependencies(&self) -> &crate::KernelDefinitionDependencyGraph {
         &self.dependencies
     }
@@ -4590,7 +4594,7 @@ impl KernelProjectSolveSession {
         let SolvedProjectCallProjection {
             definitions: call_facts,
             diagnostics,
-            abi_schemes,
+            abi_catalog,
         } = call_projection;
         let interface = project_interface_snapshot(
             &self.program,
@@ -4622,7 +4626,7 @@ impl KernelProjectSolveSession {
             call_facts,
             &diagnostics,
             &resource_projection_facts,
-            abi_schemes,
+            abi_catalog,
         )?;
         let artifact = artifact.seal();
         let types = artifact.type_store();
@@ -6834,7 +6838,7 @@ fn build_definition_code_builder(
     call_facts: Box<[SolvedDefinitionCallFacts]>,
     diagnostics: &[SolvedDefinitionDiagnostics],
     resource_projection_facts: &[DefinitionResourceProjectionFacts],
-    abi_schemes: Box<[crate::PackedAbiCallableSchemeInput]>,
+    abi_catalog: crate::PackedAbiCatalogInput,
 ) -> Result<DefinitionCodeBuilder, KernelSolveError> {
     if call_facts.len() != owners.len()
         || diagnostics.len() != owners.len()
@@ -6851,7 +6855,7 @@ fn build_definition_code_builder(
     let mut builder =
         DefinitionCodeBuilder::with_capacity(owners.len(), flow_capacity, flow_capacity);
     builder.use_prepared_runtime_facts(runtime_facts)?;
-    builder.install_abi_callable_schemes(abi_schemes)?;
+    builder.install_abi_catalog(abi_catalog)?;
     let mut formal_roots = Vec::new();
     let mut expression_roots = Vec::new();
     let mut packed_formal_flows = Vec::new();
@@ -10095,12 +10099,12 @@ fn project_call_facts_and_diagnostics(
     public_formals: &[Box<[PackedFlow]>],
     retain_call_facts: bool,
 ) -> Result<SolvedProjectCallProjection, KernelSolveError> {
-    let abi_schemes = if retain_call_facts {
+    let abi_catalog = if retain_call_facts {
         let first_projection_variable = u32::try_from(artifact.work().variables)
             .expect("kernel solver variable namespace exceeds u32");
-        pack_abi_call_surfaces(abi, artifact.terms_mut(), first_projection_variable)
+        pack_abi_call_surfaces(abi, artifact.terms_mut(), first_projection_variable)?
     } else {
-        Box::new([])
+        crate::PackedAbiCatalogInput::empty(abi.role())
     };
     let mut project_call_facts = Vec::with_capacity(owners.len());
     let mut project_diagnostics = Vec::with_capacity(owners.len());
@@ -10263,7 +10267,7 @@ fn project_call_facts_and_diagnostics(
                     abi,
                     artifact,
                     public_results,
-                    &abi_schemes,
+                    &abi_catalog,
                     &mut call_scratch,
                     &mut actuals,
                     &mut substitutions,
@@ -10659,7 +10663,7 @@ fn project_call_facts_and_diagnostics(
     Ok(SolvedProjectCallProjection {
         definitions: project_call_facts.into_boxed_slice(),
         diagnostics: project_diagnostics.into_boxed_slice(),
-        abi_schemes,
+        abi_catalog,
     })
 }
 
@@ -10675,7 +10679,7 @@ fn project_abi_call_type_substitutions(
     abi: &crate::KernelAbiInput,
     artifact: &ComponentOutputSnapshot<'_>,
     public_results: &[PackedFlow],
-    packed_abi: &[crate::PackedAbiCallableSchemeInput],
+    packed_abi: &crate::PackedAbiCatalogInput,
     scratch: &mut crate::PackedCallTypeScratch,
     actuals: &mut Vec<(u32, TypeTermId)>,
     substitutions: &mut Vec<PackedCallTypeSubstitution>,
@@ -10699,7 +10703,11 @@ fn project_abi_call_type_substitutions(
     let target = abi
         .callable_by_id(target_id)
         .expect("validated ABI callable ID resolves");
-    let packed_target = &packed_abi[target_id.0 as usize];
+    let packed_target = &packed_abi.callables[target_id.0 as usize];
+    let packed_formals = packed_target
+        .formals
+        .get(&packed_abi.formals)
+        .expect("fresh packed ABI formal span is valid");
     actuals.clear();
     for input in call.inputs() {
         let Ok(KernelCallInputRoleRef::Abi { name }) = call.input_role(input) else {
@@ -10748,7 +10756,7 @@ fn project_abi_call_type_substitutions(
     .flatten();
     crate::derive_packed_call_type_substitutions(
         artifact.terms(),
-        &packed_target.formals,
+        packed_formals,
         packed_target.result,
         actuals,
         actual_result,
@@ -10792,74 +10800,206 @@ fn pack_abi_call_surfaces(
     abi: &crate::KernelAbiInput,
     terms: &mut crate::TypeTermArena,
     mut next_variable: u32,
-) -> Box<[crate::PackedAbiCallableSchemeInput]> {
+) -> Result<crate::PackedAbiCatalogInput, KernelSolveError> {
+    let referenced_abi_fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+        crate::KERNEL_CHECKED_REFERENCED_ABI_SEAL_DOMAIN_V1,
+        abi,
+    )
+    .map_err(|error| {
+        KernelSolveError::new(format!(
+            "cannot fingerprint packed kernel ABI input: {error}"
+        ))
+    })?;
     let mut parameter_scratch = crate::PackedCallableParameterTraversalScratch::default();
     let mut parameter_sources = Vec::new();
-    abi.callables()
-        .iter()
-        .map(|callable| {
-            let base = next_variable;
-            let mut variable_count = 0_u32;
-            for parameter in &callable.parameters {
-                extend_checked_type_variable_extent(&parameter.flow_type.ty, &mut variable_count);
-            }
-            for context in &callable.contexts {
-                extend_checked_type_variable_extent(&context.flow_type.ty, &mut variable_count);
-            }
-            extend_checked_type_variable_extent(&callable.result.ty, &mut variable_count);
-            let mut import = |ty: &Type| {
-                terms.import_checked_type(ty, &mut |source| {
-                    debug_assert!(source.0 < variable_count);
-                    TypeVariableId(
-                        base.checked_add(source.0)
-                            .expect("kernel ABI projection variable namespace exceeds u32"),
-                    )
-                })
+    let mut callables = Vec::with_capacity(abi.callables().len());
+    let mut formals = Vec::new();
+    let mut parameters = Vec::new();
+    let mut contexts = Vec::new();
+    let mut type_parameters = Vec::new();
+    let mut default_text = Vec::new();
+    for callable in abi.callables() {
+        let callable_name = terms
+            .text_snapshot()
+            .lookup_symbol(&callable.name)
+            .ok_or_else(|| {
+                KernelSolveError::new(format!(
+                    "packed ABI callable `{}` is absent from the project text authority",
+                    callable.name,
+                ))
+            })?;
+        let parameter_start = parameters.len();
+        for parameter in &callable.parameters {
+            let name = terms
+                .text_snapshot()
+                .lookup_symbol(&parameter.name)
+                .ok_or_else(|| {
+                    KernelSolveError::new(format!(
+                        "packed ABI callable `{}` parameter `{}` is absent from the project text authority",
+                        callable.name, parameter.name,
+                    ))
+                })?;
+            let requirement = match &parameter.requirement {
+                boon_checked::CheckedParameterRequirement::Required => {
+                    crate::PackedAbiParameterRequirement::Required
+                }
+                boon_checked::CheckedParameterRequirement::Optional { default } => match default {
+                    boon_checked::CheckedParameterDefault::CallableProfile { profile } => {
+                        crate::PackedAbiParameterRequirement::CallableProfile(
+                            terms.text_snapshot().lookup_symbol(profile).ok_or_else(|| {
+                                KernelSolveError::new(format!(
+                                    "packed ABI callable `{}` parameter `{}` profile `{profile}` is absent from the project text authority",
+                                    callable.name, parameter.name,
+                                ))
+                            })?,
+                        )
+                    }
+                    boon_checked::CheckedParameterDefault::Tag { name } => {
+                        crate::PackedAbiParameterRequirement::Tag(
+                            terms.text_snapshot().lookup_symbol(name).ok_or_else(|| {
+                                KernelSolveError::new(format!(
+                                    "packed ABI callable `{}` parameter `{}` tag `{name}` is absent from the project text authority",
+                                    callable.name, parameter.name,
+                                ))
+                            })?,
+                        )
+                    }
+                    boon_checked::CheckedParameterDefault::ExactInteger { value } => {
+                        crate::PackedAbiParameterRequirement::ExactInteger(*value)
+                    }
+                    boon_checked::CheckedParameterDefault::Text { value } => {
+                        let start = default_text.len();
+                        default_text.extend_from_slice(value.as_bytes());
+                        crate::PackedAbiParameterRequirement::Text(crate::Span32::from_bounds(
+                            start,
+                            default_text.len(),
+                            "ABI default text",
+                        )?)
+                    }
+                },
             };
-            let formals = callable
-                .parameters
+            parameters.push(crate::PackedAbiParameter {
+                name,
+                kind: parameter.kind,
+                ordinal: parameter.ordinal,
+                requirement,
+                evaluation_scope: parameter.evaluation_scope,
+            });
+        }
+        let parameter_span =
+            crate::Span32::from_bounds(parameter_start, parameters.len(), "ABI parameter")?;
+
+        let base = next_variable;
+        let mut variable_count = 0_u32;
+        for parameter in &callable.parameters {
+            extend_checked_type_variable_extent(&parameter.flow_type.ty, &mut variable_count);
+        }
+        for context in &callable.contexts {
+            extend_checked_type_variable_extent(&context.flow_type.ty, &mut variable_count);
+        }
+        extend_checked_type_variable_extent(&callable.result.ty, &mut variable_count);
+
+        let formal_start = formals.len();
+        let context_start = contexts.len();
+        for parameter in &callable.parameters {
+            formals.push(PackedFlow {
+                mode: parameter.flow_type.mode,
+                term: import_abi_type(terms, &parameter.flow_type.ty, base, variable_count),
+            });
+        }
+        for context in &callable.contexts {
+            let name = terms
+                .text_snapshot()
+                .lookup_symbol(&context.name)
+                .expect("validated ABI context name belongs to the frozen text authority");
+            contexts.push(crate::PackedAbiContext {
+                name,
+                kind: context.kind,
+                provider_parameter_ordinal: context.provider_parameter_ordinal,
+                flow: PackedFlow {
+                    mode: context.flow_type.mode,
+                    term: import_abi_type(terms, &context.flow_type.ty, base, variable_count),
+                },
+            });
+        }
+        let result = PackedFlow {
+            mode: callable.result.mode,
+            term: import_abi_type(terms, &callable.result.ty, base, variable_count),
+        };
+        let formal_span = crate::Span32::from_bounds(formal_start, formals.len(), "ABI formal")?;
+        let context_span =
+            crate::Span32::from_bounds(context_start, contexts.len(), "ABI context")?;
+        next_variable = next_variable.checked_add(variable_count).ok_or_else(|| {
+            KernelSolveError::new("kernel ABI projection variable namespace exceeds u32")
+        })?;
+        collect_packed_callable_type_parameter_sources(
+            terms,
+            formal_span
+                .get(&formals)
+                .expect("fresh packed ABI formal span is valid")
                 .iter()
-                .map(|parameter| PackedFlow {
-                    mode: parameter.flow_type.mode,
-                    term: import(&parameter.flow_type.ty),
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            let result = PackedFlow {
-                mode: callable.result.mode,
-                term: import(&callable.result.ty),
-            };
-            next_variable = next_variable
-                .checked_add(variable_count)
-                .expect("kernel ABI projection variable namespace exceeds u32");
-            collect_packed_callable_type_parameter_sources(
-                terms,
-                formals.iter().map(|formal| formal.term),
-                result.term,
-                &mut parameter_scratch,
-                &mut parameter_sources,
-            );
-            let type_parameters = parameter_sources
-                .iter()
-                .copied()
-                .map(|source| PackedCallableTypeParameter {
-                    source,
-                    linked_local: source
-                        .0
-                        .checked_sub(base)
-                        .expect("packed ABI parameter precedes its variable base"),
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice();
-            crate::PackedAbiCallableSchemeInput {
-                formals,
-                result,
-                type_parameters,
-                variable_base: TypeVariableId(base),
+                .map(|formal| formal.term),
+            result.term,
+            &mut parameter_scratch,
+            &mut parameter_sources,
+        );
+        let type_parameter_start = type_parameters.len();
+        type_parameters.extend(parameter_sources.iter().copied().map(|source| {
+            PackedCallableTypeParameter {
+                source,
+                linked_local: source
+                    .0
+                    .checked_sub(base)
+                    .expect("packed ABI parameter precedes its variable base"),
             }
-        })
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
+        }));
+        let type_parameter_span = crate::Span32::from_bounds(
+            type_parameter_start,
+            type_parameters.len(),
+            "ABI type parameter",
+        )?;
+        callables.push(crate::PackedAbiCallableScheme {
+            name: callable_name,
+            kind: callable.kind,
+            intrinsic: callable.intrinsic,
+            external_identity: callable.external_identity,
+            parameters: parameter_span,
+            contexts: context_span,
+            formals: formal_span,
+            result,
+            type_parameters: type_parameter_span,
+            variable_base: TypeVariableId(base),
+            variable_count,
+            effect: callable.effect,
+            contextual_operation: callable.contextual_operation,
+        });
+    }
+    Ok(crate::PackedAbiCatalogInput {
+        role: abi.role(),
+        referenced_abi_fingerprint_v1,
+        callables: callables.into_boxed_slice(),
+        formals: formals.into_boxed_slice(),
+        parameters: parameters.into_boxed_slice(),
+        contexts: contexts.into_boxed_slice(),
+        type_parameters: type_parameters.into_boxed_slice(),
+        default_text: default_text.into_boxed_slice(),
+    })
+}
+
+fn import_abi_type(
+    terms: &mut crate::TypeTermArena,
+    ty: &Type,
+    variable_base: u32,
+    variable_count: u32,
+) -> TypeTermId {
+    terms.import_checked_type(ty, &mut |source| {
+        debug_assert!(source.0 < variable_count);
+        TypeVariableId(
+            variable_base
+                .checked_add(source.0)
+                .expect("kernel ABI projection variable namespace exceeds u32"),
+        )
+    })
 }
 
 fn extend_checked_type_variable_extent(ty: &Type, extent: &mut u32) {

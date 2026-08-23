@@ -1326,7 +1326,6 @@ fn profile_kernel_owner_oracle_with_source_payloads_for_role(
                     let rows_started = Instant::now();
                     let mut rows = layout
                         .materialize_rows(
-                            kernel_input,
                             &checked,
                             project.source_bundle_digest_v1(),
                             role,
@@ -2619,8 +2618,6 @@ const KERNEL_CHECKED_DEFINITION_KEY_SEAL_DOMAIN_V1: &[u8] =
     b"boon.kernel-checked-definition-key-seal.v1\0";
 const KERNEL_CHECKED_PROGRAM_METADATA_SEAL_DOMAIN_V1: &[u8] =
     b"boon.kernel-checked-program-metadata-seal.v1\0";
-const KERNEL_CHECKED_REFERENCED_ABI_SEAL_DOMAIN_V1: &[u8] =
-    b"boon.kernel-checked-referenced-abi-seal.v1\0";
 
 fn append_kernel_checked_metadata_publication(
     fields: &CheckedProgramFields,
@@ -2834,17 +2831,11 @@ fn checked_construction_from_kernel(
     let layout_us = elapsed_us(phase_started.elapsed());
     #[cfg(test)]
     let mut direct_runtime_link = layout
-        .link_runtime_packed(
-            session.project(),
-            &snapshot,
-            project.source_bundle_digest_v1(),
-            role,
-        )
+        .link_runtime_packed(&snapshot, project.source_bundle_digest_v1(), role)
         .map_err(|error| format!("cannot build direct packed checked linker oracle: {error}"))?;
     let phase_started = Instant::now();
     let mut rows = layout
         .materialize_rows(
-            session.project(),
             &snapshot,
             project.source_bundle_digest_v1(),
             role,
@@ -2943,10 +2934,10 @@ fn checked_construction_from_kernel(
 
     #[cfg(test)]
     let direct_runtime_order = direct_runtime_link
-        .derive_packed_order_chains(session.project(), &layout, &snapshot)
+        .derive_packed_order_chains(&layout, &snapshot)
         .map_err(|error| format!("cannot derive direct packed checked order oracle: {error}"))?;
     let packed_order = rows
-        .derive_packed_order_chains(session.project(), &layout, &snapshot)
+        .derive_packed_order_chains(&layout, &snapshot)
         .map_err(|error| format!("cannot derive packed checked order chains: {error}"))?;
     #[cfg(test)]
     if direct_runtime_order != packed_order {
@@ -3025,11 +3016,7 @@ fn checked_construction_from_kernel(
         ),
     )
     .map_err(|error| format!("cannot seal dense kernel checked metadata: {error}"))?;
-    let referenced_abi_fingerprint = boon_contract::canonical_serde_hash_v1(
-        KERNEL_CHECKED_REFERENCED_ABI_SEAL_DOMAIN_V1,
-        session.project().abi(),
-    )
-    .map_err(|error| format!("cannot seal dense kernel referenced ABI: {error}"))?;
+    let referenced_abi_fingerprint = snapshot.definition_code().referenced_abi_fingerprint_v1();
     let checked_image_authority = CheckedImageKernelAuthorityV1 {
         schema: boon_checked::CHECKED_IMAGE_KERNEL_AUTHORITY_SCHEMA_V1.to_owned(),
         source_bundle_digest_v1: project.source_bundle_digest_v1(),

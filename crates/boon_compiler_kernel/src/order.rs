@@ -195,7 +195,6 @@ enum PackedOrderSemanticTextSegment<'a> {
 
 struct PackedOrderAnalyzer<'a> {
     input: &'a KernelSemanticInputConstructionV1,
-    abi: &'a KernelAbiInput,
     layout: &'a KernelCheckedLinkLayout,
     snapshot: &'a KernelCheckedSnapshot,
     lexical_by_expression: Box<[Option<PackedOrderLocalLocator>]>,
@@ -213,12 +212,11 @@ impl KernelCheckedRows {
     /// Derive order chains without reading any rich row in `self`.
     pub fn derive_packed_order_chains(
         &self,
-        project: &KernelProjectInput,
         layout: &KernelCheckedLinkLayout,
         snapshot: &KernelCheckedSnapshot,
     ) -> Result<KernelCheckedOrderDerivation, KernelCheckedLinkError> {
         self.semantic_input
-            .derive_packed_order_chains(project, layout, snapshot)
+            .derive_packed_order_chains(layout, snapshot)
     }
 }
 
@@ -226,36 +224,32 @@ impl KernelRuntimePackedLinkV1 {
     /// Derive order metadata directly from the packed runtime linker product.
     pub fn derive_packed_order_chains(
         &self,
-        project: &KernelProjectInput,
         layout: &KernelCheckedLinkLayout,
         snapshot: &KernelCheckedSnapshot,
     ) -> Result<KernelCheckedOrderDerivation, KernelCheckedLinkError> {
         self.semantic_input
-            .derive_packed_order_chains(project, layout, snapshot)
+            .derive_packed_order_chains(layout, snapshot)
     }
 }
 
 impl KernelSemanticInputConstructionV1 {
     fn derive_packed_order_chains(
         &self,
-        project: &KernelProjectInput,
         layout: &KernelCheckedLinkLayout,
         snapshot: &KernelCheckedSnapshot,
     ) -> Result<KernelCheckedOrderDerivation, KernelCheckedLinkError> {
-        PackedOrderAnalyzer::new(self, project, layout, snapshot)?.derive()
+        PackedOrderAnalyzer::new(self, layout, snapshot)?.derive()
     }
 }
 
 impl<'a> PackedOrderAnalyzer<'a> {
     fn new(
         input: &'a KernelSemanticInputConstructionV1,
-        project: &'a KernelProjectInput,
         layout: &'a KernelCheckedLinkLayout,
         snapshot: &'a KernelCheckedSnapshot,
     ) -> Result<Self, KernelCheckedLinkError> {
         if !Arc::ptr_eq(&input.definition_code, &snapshot.definition_code)
             || !Arc::ptr_eq(&input.program, &snapshot.program)
-            || !std::ptr::eq(project.program(), snapshot.program.as_ref())
         {
             return Err(KernelCheckedLinkError::new(
                 "packed order derivation cannot combine foreign checked authorities",
@@ -367,7 +361,6 @@ impl<'a> PackedOrderAnalyzer<'a> {
 
         let mut analyzer = Self {
             input,
-            abi: project.abi(),
             layout,
             snapshot,
             lexical_by_expression: lexical_by_expression.into_boxed_slice(),
@@ -637,14 +630,16 @@ impl<'a> PackedOrderAnalyzer<'a> {
                 })
             }
             crate::KernelCallableSchemeId::Abi(callable) => {
-                let parameter = self
-                    .abi
-                    .callable_by_id(callable)?
-                    .parameters
+                let scheme = self
+                    .snapshot
+                    .definition_code
+                    .abi_callable_scheme(callable)?;
+                let parameter = scheme
+                    .parameters()
                     .get(ordinal as usize)
                     .filter(|parameter| parameter.ordinal == ordinal)?;
                 Some(PackedOrderParameterRef {
-                    name: parameter.name.as_ref(),
+                    name: scheme.symbol(parameter.name)?,
                 })
             }
         }

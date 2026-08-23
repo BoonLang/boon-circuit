@@ -4,7 +4,7 @@ use crate::{
     KernelOwnerEdgeRole, KernelOwnerNodeKind, KernelOwnerProgramInput, KernelPattern,
     KernelRenderConstructorKind, KernelStatementKind,
 };
-use boon_checked::{FlowType, Type, Variant};
+use boon_checked::{CheckedParameterDefault, CheckedParameterRequirement, FlowType, Type, Variant};
 use boon_contract::{PackedTextCatalogBuilder, ProjectTextSnapshot};
 use boon_data::ExactRoundingRule;
 use boon_effect_schema::{ValueType, host_effect_spec};
@@ -116,6 +116,19 @@ fn visit_compatibility_project_text(
         collector.symbol(&callable.name)?;
         for parameter in &callable.parameters {
             collector.symbol(&parameter.name)?;
+            match &parameter.requirement {
+                CheckedParameterRequirement::Optional {
+                    default:
+                        CheckedParameterDefault::CallableProfile { profile }
+                        | CheckedParameterDefault::Tag { name: profile },
+                } => collector.symbol(profile)?,
+                CheckedParameterRequirement::Required
+                | CheckedParameterRequirement::Optional {
+                    default:
+                        CheckedParameterDefault::ExactInteger { .. }
+                        | CheckedParameterDefault::Text { .. },
+                } => {}
+            }
             collector.flow_type(&parameter.flow_type)?;
         }
         for context in &callable.contexts {

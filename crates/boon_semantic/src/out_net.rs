@@ -868,7 +868,7 @@ impl<Contract> OutNet<Contract> {
         let call_types = CallTypeCatalog::new(&calls)
             .expect("checked OUT test fixture has valid call type facts");
         let intent = crate::verified_intent::VerifiedSemanticIntentV1::build(
-            program,
+            crate::checked_view::CheckedProgramView::rich(program),
             &calls,
             &producer_roots,
             retained_definitions.clone(),
@@ -955,7 +955,7 @@ impl<Contract> OutNet<Contract> {
         let call_types = CallTypeCatalog::new(&calls)
             .expect("checked OUT test fixture has valid call type facts");
         let intent = crate::verified_intent::VerifiedSemanticIntentV1::build(
-            program,
+            crate::checked_view::CheckedProgramView::rich(program),
             &calls,
             &producer_roots,
             retained_definitions.clone(),

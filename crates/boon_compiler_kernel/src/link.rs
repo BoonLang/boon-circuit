@@ -3234,6 +3234,31 @@ impl<'a> Iterator for KernelSemanticDefinitionListIter<'a> {
 impl ExactSizeIterator for KernelSemanticDefinitionListIter<'_> {}
 
 impl KernelSemanticInputConstructionV1 {
+    fn local_row(
+        &self,
+        id: u32,
+        range: impl Fn(&KernelSemanticDefinitionRelocationV1) -> KernelCheckedRowRange,
+    ) -> Option<(KernelOwnerId, u32)> {
+        let end = self
+            .definition_relocations
+            .partition_point(|relocation| range(relocation).start <= id);
+        for owner in (0..end).rev() {
+            let row_range = range(self.definition_relocations.get(owner)?);
+            let local = id.checked_sub(row_range.start)?;
+            if local < row_range.len {
+                return Some((KernelOwnerId(u32::try_from(owner).ok()?), local));
+            }
+            // Empty definition-local ranges can share the next non-empty
+            // range's start. Continue through that equal-start group, but once
+            // the start precedes `id`, every earlier disjoint range ends no
+            // later and therefore cannot own the row.
+            if row_range.start < id {
+                break;
+            }
+        }
+        None
+    }
+
     fn definition_relocation(
         &self,
         owner: KernelOwnerId,
@@ -3369,30 +3394,39 @@ impl KernelSemanticInputConstructionV1 {
     }
 
     fn local_expression(&self, expression: CheckedExprId) -> Option<crate::PackedExpressionRef> {
-        let owner = self
-            .definition_relocations
-            .partition_point(|relocation| relocation.expressions.start <= expression.0)
-            .checked_sub(1)?;
-        let range = self.definition_relocations.get(owner)?.expressions;
-        let local = expression.0.checked_sub(range.start)?;
-        if local >= range.len {
-            return None;
-        }
+        let (owner, local) = self.local_row(expression.0, |relocation| relocation.expressions)?;
         Some(crate::PackedExpressionRef::new(
-            KernelOwnerId(u32::try_from(owner).ok()?),
+            owner,
             crate::KernelExpressionId(local),
         ))
     }
 
     fn local_declaration(&self, declaration: DeclId) -> Option<(KernelOwnerId, u32)> {
-        let owner = self
-            .definition_relocations
-            .partition_point(|relocation| relocation.declarations.start <= declaration.0)
-            .checked_sub(1)?;
-        let range = self.definition_relocations.get(owner)?.declarations;
-        let local = declaration.0.checked_sub(range.start)?;
-        let owner = KernelOwnerId(u32::try_from(owner).ok()?);
-        (local < range.len).then_some((owner, local))
+        self.local_row(declaration.0, |relocation| relocation.declarations)
+    }
+
+    fn local_scope(&self, scope: LexicalScopeId) -> Option<(KernelOwnerId, u32)> {
+        if scope.0 == 0 {
+            None
+        } else {
+            self.local_row(scope.0, |relocation| relocation.scopes)
+        }
+    }
+
+    fn local_statement(&self, statement: CheckedStatementId) -> Option<(KernelOwnerId, u32)> {
+        self.local_row(statement.0, |relocation| relocation.statements)
+    }
+
+    fn local_source(&self, source: CheckedSourceId) -> Option<(KernelOwnerId, u32)> {
+        self.local_row(source.0, |relocation| relocation.sources)
+    }
+
+    fn local_state(&self, state: CheckedStateId) -> Option<(KernelOwnerId, u32)> {
+        self.local_row(state.0, |relocation| relocation.states)
+    }
+
+    fn local_list(&self, list: CheckedListId) -> Option<(KernelOwnerId, u32)> {
+        self.local_row(list.0, |relocation| relocation.lists)
     }
 
     fn local_call(&self, call: CheckedCallId) -> Option<crate::PackedCallRef> {
@@ -4632,6 +4666,57 @@ impl KernelSemanticInputV1 {
             definition: None,
             ordinal: 0,
         }
+    }
+
+    pub const fn source_bundle_digest_v1(&self) -> SourceBundleDigestV1 {
+        self.construction.source_bundle_digest_v1
+    }
+
+    pub const fn role(&self) -> ProgramRole {
+        self.construction.role
+    }
+
+    pub fn entity_counts(&self) -> KernelSemanticEntityCountsV1 {
+        self.construction.entity_counts()
+    }
+
+    /// Resolve one final checked scope directly into its definition-local
+    /// packed row. Scope zero is the synthetic project root and owns no row.
+    pub fn scope(&self, scope: LexicalScopeId) -> Option<KernelSemanticScopeRef<'_>> {
+        if scope.0 == 0 {
+            return Some(self.project_root_scope());
+        }
+        let (owner, ordinal) = self.construction.local_scope(scope)?;
+        self.definition_rows(owner)?.scope(ordinal as usize)
+    }
+
+    pub fn statement(
+        &self,
+        statement: CheckedStatementId,
+    ) -> Option<KernelSemanticStatementRef<'_>> {
+        let (owner, ordinal) = self.construction.local_statement(statement)?;
+        self.definition_rows(owner)?.statement(ordinal as usize)
+    }
+
+    pub fn expression(&self, expression: CheckedExprId) -> Option<KernelSemanticExpressionRef<'_>> {
+        let expression = self.construction.local_expression(expression)?;
+        self.definition_rows(expression.owner())?
+            .expression(expression.expression().0 as usize)
+    }
+
+    pub fn source(&self, source: CheckedSourceId) -> Option<KernelSemanticSourceRef<'_>> {
+        let (owner, ordinal) = self.construction.local_source(source)?;
+        self.definition_rows(owner)?.source(ordinal as usize)
+    }
+
+    pub fn state(&self, state: CheckedStateId) -> Option<KernelSemanticStateRef<'_>> {
+        let (owner, ordinal) = self.construction.local_state(state)?;
+        self.definition_rows(owner)?.state(ordinal as usize)
+    }
+
+    pub fn list(&self, list: CheckedListId) -> Option<KernelSemanticListRef<'_>> {
+        let (owner, ordinal) = self.construction.local_list(list)?;
+        self.definition_rows(owner)?.list(ordinal as usize)
     }
 
     /// Iterate definitions in their sealed dense `KernelOwnerId` order.

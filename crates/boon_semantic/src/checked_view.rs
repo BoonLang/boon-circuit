@@ -1,549 +1,391 @@
-//! Allocation-free borrowed access to the checked program's base rows.
+//! Allocation-free borrowed access to checked base rows.
 //!
-//! The wrappers intentionally expose only data that a future packed semantic
-//! input can provide without reconstructing `CheckedProgramFields`. Calls and
-//! definition execution templates already have their own dual-source catalogs.
-//! Rich nested statement/expression variants remain accessible only through an
-//! explicitly rich-only method until the packed backend defines their views.
+//! Runtime lowering borrows the kernel's packed authority. Rich checked rows
+//! remain an explicit editor/oracle source. Every wrapper keeps the owning
+//! authority in its variant, so no bare text or type ID can escape and no
+//! compatibility row is reconstructed merely to inspect topology.
 
 #![allow(dead_code)]
 
 use boon_checked::{
-    CheckedCallableKind, CheckedCallableSignature, CheckedContextFormal, CheckedDeclaration,
-    CheckedDeclarationKind, CheckedEffectSummary, CheckedExprId, CheckedExpression,
-    CheckedExpressionKind, CheckedList, CheckedListId, CheckedListKeyPolicy, CheckedProgramFields,
-    CheckedScope, CheckedScopeKind, CheckedSemanticPath, CheckedSource, CheckedSourceId,
-    CheckedSpan, CheckedState, CheckedStateId, CheckedStateKind, CheckedStatement,
-    CheckedStatementId, CheckedStatementKind, CheckedTypeView, CheckedValueUse, ContextFormalId,
-    DeclId, FlowMode, FlowType, LexicalScopeId, ProgramRole, Type,
+    CheckedEffectSummary, CheckedExprId, CheckedExpression, CheckedList, CheckedListId,
+    CheckedProgramFields, CheckedScope, CheckedScopeKind, CheckedSource, CheckedSourceId,
+    CheckedState, CheckedStateId, CheckedStatement, CheckedStatementId, CheckedStatementKind,
+    DeclId, LexicalScopeId, OutputRootTypeEntry, ProgramRole,
+};
+use boon_compiler_kernel::{
+    KernelSemanticExpressionRef, KernelSemanticInputV1, KernelSemanticListRef,
+    KernelSemanticScopeRef, KernelSemanticSourceRef, KernelSemanticStateRef,
+    KernelSemanticStatementChildIter, KernelSemanticStatementKindRef, KernelSemanticStatementRef,
 };
 use boon_contract::SourceBundleDigestV1;
 
 #[derive(Clone, Copy)]
 enum CheckedProgramSource<'a> {
     Rich(&'a CheckedProgramFields),
-    // Future: Packed(&'a boon_compiler_kernel::KernelSemanticInputV1).
+    Packed(&'a KernelSemanticInputV1),
 }
 
-/// One immutable, allocation-free checked-image view for semantic lowering.
+/// One immutable checked-image view for semantic construction.
+///
+/// The view itself owns nothing. It may be copied freely during one semantic
+/// phase, but no value borrowing it is stored in the durable semantic image.
 #[derive(Clone, Copy)]
 pub(crate) struct CheckedProgramView<'a> {
     source: CheckedProgramSource<'a>,
 }
 
-macro_rules! borrowed_row {
-    ($wrapper:ident, $source:ident, $rich:ty) => {
-        #[derive(Clone, Copy)]
-        pub(crate) struct $wrapper<'a> {
-            source: $source<'a>,
-        }
-
-        #[derive(Clone, Copy)]
-        enum $source<'a> {
-            Rich(&'a $rich),
-            // Add the packed row variant with the packed program backend.
-        }
-
-        impl<'a> $wrapper<'a> {
-            fn rich(row: &'a $rich) -> Self {
-                Self {
-                    source: $source::Rich(row),
-                }
-            }
-        }
-    };
-}
-
-borrowed_row!(ScopeRef, ScopeSource, CheckedScope);
-borrowed_row!(DeclarationRef, DeclarationSource, CheckedDeclaration);
-borrowed_row!(StatementRef, StatementSource, CheckedStatement);
-borrowed_row!(ExpressionRef, ExpressionSource, CheckedExpression);
-borrowed_row!(CallableRef, CallableSource, CheckedCallableSignature);
-borrowed_row!(ContextFormalRef, ContextFormalSource, CheckedContextFormal);
-borrowed_row!(SourceRef, SourceSource, CheckedSource);
-borrowed_row!(StateRef, StateSource, CheckedState);
-borrowed_row!(ListRef, ListSource, CheckedList);
-
 #[derive(Clone, Copy)]
-enum TypeSource<'a> {
-    Rich(&'a Type),
-    // Future: store-qualified packed type reference.
-}
-
-/// Borrowed recursive-type inspection; never materializes or clones `Type`.
-#[derive(Clone, Copy)]
-pub(crate) struct TypeRef<'a> {
-    source: TypeSource<'a>,
-}
-
-impl<'a> TypeRef<'a> {
-    fn rich(ty: &'a Type) -> Self {
-        Self {
-            source: TypeSource::Rich(ty),
-        }
-    }
-}
-
-impl CheckedTypeView for TypeRef<'_> {
-    fn list_item(self) -> Option<Self> {
-        match self.source {
-            TypeSource::Rich(ty) => ty.list_item().map(TypeRef::rich),
-        }
-    }
-
-    fn is_text(self) -> bool {
-        match self.source {
-            TypeSource::Rich(ty) => ty.is_text(),
-        }
-    }
-
-    fn is_number(self) -> bool {
-        match self.source {
-            TypeSource::Rich(ty) => ty.is_number(),
-        }
-    }
-
-    fn is_render_contract(self) -> bool {
-        match self.source {
-            TypeSource::Rich(ty) => ty.is_render_contract(),
-        }
-    }
-
-    fn object_field(self, name: &str) -> Option<Self> {
-        match self.source {
-            TypeSource::Rich(ty) => ty.object_field(name).map(TypeRef::rich),
-        }
-    }
-
-    fn all_variants_are_bare_tags(self, predicate: impl FnMut(&str) -> bool) -> bool {
-        match self.source {
-            TypeSource::Rich(ty) => ty.all_variants_are_bare_tags(predicate),
-        }
-    }
+pub(crate) enum ScopeRef<'a> {
+    Rich(&'a CheckedScope),
+    Packed(KernelSemanticScopeRef<'a>),
 }
 
 #[derive(Clone, Copy)]
-enum FlowSource<'a> {
-    Rich(&'a FlowType),
-    // Future: store-qualified packed flow reference.
+pub(crate) enum StatementRef<'a> {
+    Rich(&'a CheckedStatement),
+    Packed(KernelSemanticStatementRef<'a>),
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct FlowRef<'a> {
-    source: FlowSource<'a>,
-}
-
-impl<'a> FlowRef<'a> {
-    fn rich(flow: &'a FlowType) -> Self {
-        Self {
-            source: FlowSource::Rich(flow),
-        }
-    }
-
-    pub(crate) fn mode(self) -> FlowMode {
-        match self.source {
-            FlowSource::Rich(flow) => flow.mode,
-        }
-    }
-
-    pub(crate) fn ty(self) -> TypeRef<'a> {
-        match self.source {
-            FlowSource::Rich(flow) => TypeRef::rich(&flow.ty),
-        }
-    }
+pub(crate) enum ExpressionRef<'a> {
+    Rich(&'a CheckedExpression),
+    Packed(KernelSemanticExpressionRef<'a>),
 }
 
 #[derive(Clone, Copy)]
-enum StringPathSource<'a> {
-    Rich(&'a [String]),
-    // Future: SymbolId range plus its text-catalog authority.
-}
-
-/// Borrowed authored path. Segments are returned as `&str`.
-#[derive(Clone, Copy)]
-pub(crate) struct StringPathRef<'a> {
-    source: StringPathSource<'a>,
-}
-
-impl<'a> StringPathRef<'a> {
-    fn rich(path: &'a [String]) -> Self {
-        Self {
-            source: StringPathSource::Rich(path),
-        }
-    }
-
-    pub(crate) fn len(self) -> usize {
-        match self.source {
-            StringPathSource::Rich(path) => path.len(),
-        }
-    }
-
-    pub(crate) fn is_empty(self) -> bool {
-        self.len() == 0
-    }
-
-    pub(crate) fn get(self, index: usize) -> Option<&'a str> {
-        match self.source {
-            StringPathSource::Rich(path) => path.get(index).map(String::as_str),
-        }
-    }
-
-    pub(crate) fn iter(self) -> impl Iterator<Item = &'a str> + 'a {
-        (0..self.len()).filter_map(move |index| self.get(index))
-    }
+pub(crate) enum SourceRef<'a> {
+    Rich(&'a CheckedSource),
+    Packed(KernelSemanticSourceRef<'a>),
 }
 
 #[derive(Clone, Copy)]
-enum SemanticPathSource<'a> {
-    Rich(&'a CheckedSemanticPath),
-    // Future: packed anchor plus SymbolId projection range.
+pub(crate) enum StateRef<'a> {
+    Rich(&'a CheckedState),
+    Packed(KernelSemanticStateRef<'a>),
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct SemanticPathRef<'a> {
-    source: SemanticPathSource<'a>,
+pub(crate) enum ListRef<'a> {
+    Rich(&'a CheckedList),
+    Packed(KernelSemanticListRef<'a>),
 }
 
-impl<'a> SemanticPathRef<'a> {
-    fn rich(path: &'a CheckedSemanticPath) -> Self {
-        Self {
-            source: SemanticPathSource::Rich(path),
-        }
-    }
-
-    pub(crate) fn anchor(self) -> DeclId {
-        match self.source {
-            SemanticPathSource::Rich(path) => path.anchor,
-        }
-    }
-
-    pub(crate) fn projection(self) -> StringPathRef<'a> {
-        match self.source {
-            SemanticPathSource::Rich(path) => StringPathRef::rich(&path.projection),
-        }
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StatementKindRef {
+    Function,
+    Field,
+    Source,
+    Hold,
+    List,
+    Block,
+    Spread,
+    Expression,
 }
 
-macro_rules! rich_copy_accessors {
-    ($wrapper:ident, $source:ident; $($method:ident -> $ty:ty = $field:ident),+ $(,)?) => {
-        impl $wrapper<'_> {
-            $(
-                pub(crate) fn $method(self) -> $ty {
-                    match self.source {
-                        $source::Rich(row) => row.$field,
-                    }
-                }
-            )+
-        }
-    };
+pub(crate) enum StatementChildIter<'a> {
+    Rich(std::slice::Iter<'a, CheckedStatementId>),
+    Packed(KernelSemanticStatementChildIter<'a>),
 }
 
-rich_copy_accessors!(ScopeRef, ScopeSource;
-    id -> LexicalScopeId = id,
-    parent -> Option<LexicalScopeId> = parent,
-    owner -> Option<DeclId> = owner,
-    kind -> CheckedScopeKind = kind,
-    span -> CheckedSpan = span,
-);
+impl Iterator for StatementChildIter<'_> {
+    type Item = CheckedStatementId;
 
-rich_copy_accessors!(DeclarationRef, DeclarationSource;
-    id -> DeclId = id,
-    scope -> LexicalScopeId = scope_id,
-    kind -> CheckedDeclarationKind = kind,
-    value -> Option<CheckedExprId> = value,
-    body_scope -> Option<LexicalScopeId> = body_scope,
-    span -> CheckedSpan = span,
-);
-
-impl<'a> DeclarationRef<'a> {
-    pub(crate) fn name(self) -> &'a str {
-        match self.source {
-            DeclarationSource::Rich(row) => &row.name,
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Rich(children) => children.next().copied(),
+            Self::Packed(children) => children.next(),
         }
     }
 
-    pub(crate) fn flow(self) -> FlowRef<'a> {
-        match self.source {
-            DeclarationSource::Rich(row) => FlowRef::rich(&row.flow_type),
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Rich(children) => children.size_hint(),
+            Self::Packed(children) => children.size_hint(),
         }
     }
 }
 
-rich_copy_accessors!(StatementRef, StatementSource;
-    id -> CheckedStatementId = id,
-    scope -> LexicalScopeId = scope_id,
-    value -> Option<CheckedExprId> = value,
-    value_use -> CheckedValueUse = value_use,
-    span -> CheckedSpan = span,
-);
+impl ExactSizeIterator for StatementChildIter<'_> {}
+
+impl ScopeRef<'_> {
+    pub(crate) fn id(self) -> LexicalScopeId {
+        match self {
+            Self::Rich(row) => row.id,
+            Self::Packed(row) => row.id(),
+        }
+    }
+
+    pub(crate) fn parent(self) -> Option<LexicalScopeId> {
+        match self {
+            Self::Rich(row) => row.parent,
+            Self::Packed(row) => row.parent(),
+        }
+    }
+
+    pub(crate) fn owner(self) -> Option<DeclId> {
+        match self {
+            Self::Rich(row) => row.owner,
+            Self::Packed(row) => row.owner(),
+        }
+    }
+
+    pub(crate) fn kind(self) -> CheckedScopeKind {
+        match self {
+            Self::Rich(row) => row.kind,
+            Self::Packed(row) => row.kind(),
+        }
+    }
+}
 
 impl<'a> StatementRef<'a> {
-    /// Transitional rich-only access. Do not use from packed-capable code.
-    pub(crate) fn rich_kind(self) -> &'a CheckedStatementKind {
-        match self.source {
-            StatementSource::Rich(row) => &row.kind,
+    pub(crate) fn id(self) -> CheckedStatementId {
+        match self {
+            Self::Rich(row) => row.id,
+            Self::Packed(row) => row.id(),
+        }
+    }
+
+    pub(crate) fn scope(self) -> LexicalScopeId {
+        match self {
+            Self::Rich(row) => row.scope_id,
+            Self::Packed(row) => row.scope(),
+        }
+    }
+
+    pub(crate) fn declaration(self) -> Option<DeclId> {
+        match self {
+            Self::Rich(row) => match row.kind {
+                CheckedStatementKind::Function { declaration }
+                | CheckedStatementKind::Field { declaration } => Some(declaration),
+                CheckedStatementKind::Source { declaration, .. }
+                | CheckedStatementKind::Hold { declaration, .. }
+                | CheckedStatementKind::List { declaration, .. } => declaration,
+                CheckedStatementKind::Block
+                | CheckedStatementKind::Spread
+                | CheckedStatementKind::Expression => None,
+            },
+            Self::Packed(row) => row.declaration(),
+        }
+    }
+
+    pub(crate) fn kind(self) -> StatementKindRef {
+        match self {
+            Self::Rich(row) => match row.kind {
+                CheckedStatementKind::Function { .. } => StatementKindRef::Function,
+                CheckedStatementKind::Field { .. } => StatementKindRef::Field,
+                CheckedStatementKind::Source { .. } => StatementKindRef::Source,
+                CheckedStatementKind::Hold { .. } => StatementKindRef::Hold,
+                CheckedStatementKind::List { .. } => StatementKindRef::List,
+                CheckedStatementKind::Block => StatementKindRef::Block,
+                CheckedStatementKind::Spread => StatementKindRef::Spread,
+                CheckedStatementKind::Expression => StatementKindRef::Expression,
+            },
+            Self::Packed(row) => match row.kind() {
+                KernelSemanticStatementKindRef::Function { .. } => StatementKindRef::Function,
+                KernelSemanticStatementKindRef::Field { .. } => StatementKindRef::Field,
+                KernelSemanticStatementKindRef::Source { .. } => StatementKindRef::Source,
+                KernelSemanticStatementKindRef::Hold { .. } => StatementKindRef::Hold,
+                KernelSemanticStatementKindRef::List { .. } => StatementKindRef::List,
+                KernelSemanticStatementKindRef::Block => StatementKindRef::Block,
+                KernelSemanticStatementKindRef::Spread => StatementKindRef::Spread,
+                KernelSemanticStatementKindRef::Expression => StatementKindRef::Expression,
+            },
+        }
+    }
+
+    pub(crate) fn value(self) -> Option<CheckedExprId> {
+        match self {
+            Self::Rich(row) => row.value,
+            Self::Packed(row) => row.value(),
+        }
+    }
+
+    pub(crate) fn children(self) -> StatementChildIter<'a> {
+        match self {
+            Self::Rich(row) => StatementChildIter::Rich(row.children.iter()),
+            Self::Packed(row) => StatementChildIter::Packed(row.children()),
         }
     }
 }
 
-rich_copy_accessors!(ExpressionRef, ExpressionSource;
-    id -> CheckedExprId = id,
-    scope -> LexicalScopeId = scope_id,
-    declaration -> Option<DeclId> = declaration,
-    effect -> CheckedEffectSummary = effect,
-    span -> CheckedSpan = span,
-);
-
-impl<'a> ExpressionRef<'a> {
-    pub(crate) fn flow(self) -> FlowRef<'a> {
-        match self.source {
-            ExpressionSource::Rich(row) => FlowRef::rich(&row.flow_type),
+impl ExpressionRef<'_> {
+    pub(crate) fn id(self) -> CheckedExprId {
+        match self {
+            Self::Rich(row) => row.id,
+            Self::Packed(row) => row.id(),
         }
     }
 
-    pub(crate) fn flush_type(self) -> Option<TypeRef<'a>> {
-        match self.source {
-            ExpressionSource::Rich(row) => row.flush_type.as_ref().map(TypeRef::rich),
-        }
-    }
-
-    /// Transitional rich-only access. Do not use from packed-capable code.
-    pub(crate) fn rich_kind(self) -> &'a CheckedExpressionKind {
-        match self.source {
-            ExpressionSource::Rich(row) => &row.kind,
+    pub(crate) fn effect(self) -> CheckedEffectSummary {
+        match self {
+            Self::Rich(row) => row.effect,
+            Self::Packed(row) => {
+                let effect = row.effect();
+                CheckedEffectSummary {
+                    reads_state: effect.reads_state,
+                    writes_state: effect.writes_state,
+                    emits_source: effect.emits_source,
+                    invokes_host: effect.invokes_host,
+                }
+            }
         }
     }
 }
-
-rich_copy_accessors!(CallableRef, CallableSource;
-    declaration -> DeclId = decl_id,
-    scope -> LexicalScopeId = scope_id,
-    kind -> CheckedCallableKind = kind,
-    context_formal -> Option<ContextFormalId> = context_formal,
-    role -> ProgramRole = role,
-    effect -> CheckedEffectSummary = effect,
-    body -> Option<CheckedStatementId> = body,
-    result_expression -> Option<CheckedExprId> = result_expression,
-);
-
-impl<'a> CallableRef<'a> {
-    pub(crate) fn name(self) -> &'a str {
-        match self.source {
-            CallableSource::Rich(row) => &row.name,
-        }
-    }
-
-    pub(crate) fn result(self) -> FlowRef<'a> {
-        match self.source {
-            CallableSource::Rich(row) => FlowRef::rich(&row.result),
-        }
-    }
-}
-
-rich_copy_accessors!(ContextFormalRef, ContextFormalSource;
-    id -> ContextFormalId = id,
-    callable -> DeclId = callable,
-);
-
-impl<'a> ContextFormalRef<'a> {
-    pub(crate) fn flow(self) -> FlowRef<'a> {
-        match self.source {
-            ContextFormalSource::Rich(row) => FlowRef::rich(&row.scheme.flow_type),
-        }
-    }
-
-    pub(crate) fn projection_count(self) -> usize {
-        match self.source {
-            ContextFormalSource::Rich(row) => row.scheme.projections.len(),
-        }
-    }
-
-    pub(crate) fn projection(self, index: usize) -> Option<StringPathRef<'a>> {
-        match self.source {
-            ContextFormalSource::Rich(row) => row
-                .scheme
-                .projections
-                .get(index)
-                .map(|path| StringPathRef::rich(path)),
-        }
-    }
-}
-
-macro_rules! resource_row {
-    ($wrapper:ident, $source:ident, $id_ty:ty, $type_method:ident, $type_field:ident) => {
-        impl<'a> $wrapper<'a> {
-            pub(crate) fn id(self) -> $id_ty {
-                match self.source {
-                    $source::Rich(row) => row.id,
-                }
-            }
-
-            pub(crate) fn declaration(self) -> DeclId {
-                match self.source {
-                    $source::Rich(row) => row.declaration,
-                }
-            }
-
-            pub(crate) fn statement(self) -> CheckedStatementId {
-                match self.source {
-                    $source::Rich(row) => row.statement,
-                }
-            }
-
-            pub(crate) fn owner_scope(self) -> LexicalScopeId {
-                match self.source {
-                    $source::Rich(row) => row.owner_scope,
-                }
-            }
-
-            pub(crate) fn path(self) -> SemanticPathRef<'a> {
-                match self.source {
-                    $source::Rich(row) => SemanticPathRef::rich(&row.path),
-                }
-            }
-
-            pub(crate) fn $type_method(self) -> TypeRef<'a> {
-                match self.source {
-                    $source::Rich(row) => TypeRef::rich(&row.$type_field),
-                }
-            }
-
-            pub(crate) fn span(self) -> CheckedSpan {
-                match self.source {
-                    $source::Rich(row) => row.span,
-                }
-            }
-        }
-    };
-}
-
-resource_row!(
-    SourceRef,
-    SourceSource,
-    CheckedSourceId,
-    payload_type,
-    payload_type
-);
-resource_row!(ListRef, ListSource, CheckedListId, item_type, item_type);
 
 impl SourceRef<'_> {
-    pub(crate) fn expression(self) -> CheckedExprId {
-        match self.source {
-            SourceSource::Rich(row) => row.expression,
-        }
-    }
-
-    pub(crate) fn interval_ms(self) -> Option<u64> {
-        match self.source {
-            SourceSource::Rich(row) => row.interval_ms,
-        }
-    }
-}
-
-impl<'a> StateRef<'a> {
-    pub(crate) fn id(self) -> CheckedStateId {
-        match self.source {
-            StateSource::Rich(row) => row.id,
-        }
-    }
-
-    pub(crate) fn binding_declaration(self) -> DeclId {
-        match self.source {
-            StateSource::Rich(row) => row.binding_declaration,
+    pub(crate) fn id(self) -> CheckedSourceId {
+        match self {
+            Self::Rich(row) => row.id,
+            Self::Packed(row) => row.id(),
         }
     }
 
     pub(crate) fn declaration(self) -> DeclId {
-        match self.source {
-            StateSource::Rich(row) => row.declaration,
+        match self {
+            Self::Rich(row) => row.declaration,
+            Self::Packed(row) => row.declaration(),
         }
     }
 
     pub(crate) fn statement(self) -> CheckedStatementId {
-        match self.source {
-            StateSource::Rich(row) => row.statement,
+        match self {
+            Self::Rich(row) => row.statement,
+            Self::Packed(row) => row.statement(),
         }
     }
 
     pub(crate) fn expression(self) -> CheckedExprId {
-        match self.source {
-            StateSource::Rich(row) => row.expression,
-        }
-    }
-
-    pub(crate) fn initial(self) -> CheckedExprId {
-        match self.source {
-            StateSource::Rich(row) => row.initial,
+        match self {
+            Self::Rich(row) => row.expression,
+            Self::Packed(row) => row.expression(),
         }
     }
 
     pub(crate) fn owner_scope(self) -> LexicalScopeId {
-        match self.source {
-            StateSource::Rich(row) => row.owner_scope,
+        match self {
+            Self::Rich(row) => row.owner_scope,
+            Self::Packed(row) => row.owner_scope(),
+        }
+    }
+}
+
+impl StateRef<'_> {
+    pub(crate) fn id(self) -> CheckedStateId {
+        match self {
+            Self::Rich(row) => row.id,
+            Self::Packed(row) => row.id(),
         }
     }
 
-    pub(crate) fn path(self) -> SemanticPathRef<'a> {
-        match self.source {
-            StateSource::Rich(row) => SemanticPathRef::rich(&row.path),
+    pub(crate) fn declaration(self) -> DeclId {
+        match self {
+            Self::Rich(row) => row.declaration,
+            Self::Packed(row) => row.declaration(),
         }
     }
 
-    pub(crate) fn kind(self) -> CheckedStateKind {
-        match self.source {
-            StateSource::Rich(row) => row.kind,
+    pub(crate) fn statement(self) -> CheckedStatementId {
+        match self {
+            Self::Rich(row) => row.statement,
+            Self::Packed(row) => row.statement(),
         }
     }
 
-    pub(crate) fn flow(self) -> FlowRef<'a> {
-        match self.source {
-            StateSource::Rich(row) => FlowRef::rich(&row.flow_type),
+    pub(crate) fn expression(self) -> CheckedExprId {
+        match self {
+            Self::Rich(row) => row.expression,
+            Self::Packed(row) => row.expression(),
         }
     }
 
-    pub(crate) fn span(self) -> CheckedSpan {
-        match self.source {
-            StateSource::Rich(row) => row.span,
+    pub(crate) fn initial(self) -> CheckedExprId {
+        match self {
+            Self::Rich(row) => row.initial,
+            Self::Packed(row) => row.initial(),
+        }
+    }
+
+    pub(crate) fn owner_scope(self) -> LexicalScopeId {
+        match self {
+            Self::Rich(row) => row.owner_scope,
+            Self::Packed(row) => row.owner_scope(),
         }
     }
 }
 
 impl ListRef<'_> {
+    pub(crate) fn id(self) -> CheckedListId {
+        match self {
+            Self::Rich(row) => row.id,
+            Self::Packed(row) => row.id(),
+        }
+    }
+
+    pub(crate) fn declaration(self) -> DeclId {
+        match self {
+            Self::Rich(row) => row.declaration,
+            Self::Packed(row) => row.declaration(),
+        }
+    }
+
+    pub(crate) fn statement(self) -> CheckedStatementId {
+        match self {
+            Self::Rich(row) => row.statement,
+            Self::Packed(row) => row.statement(),
+        }
+    }
+
     pub(crate) fn producer(self) -> CheckedExprId {
-        match self.source {
-            ListSource::Rich(row) => row.producer,
+        match self {
+            Self::Rich(row) => row.producer,
+            Self::Packed(row) => row.producer(),
         }
     }
 
-    pub(crate) fn capacity(self) -> Option<usize> {
-        match self.source {
-            ListSource::Rich(row) => row.capacity,
-        }
-    }
-
-    pub(crate) fn key_policy(self) -> CheckedListKeyPolicy {
-        match self.source {
-            ListSource::Rich(row) => row.key_policy,
+    pub(crate) fn owner_scope(self) -> LexicalScopeId {
+        match self {
+            Self::Rich(row) => row.owner_scope,
+            Self::Packed(row) => row.owner_scope(),
         }
     }
 }
 
-macro_rules! program_rows {
-    ($count:ident, $at:ident, $iter:ident, $field:ident, $row:ident) => {
+macro_rules! checked_rows {
+    (
+        $count:ident,
+        $at:ident,
+        $iter:ident,
+        $rich:ident,
+        $packed_count:ident,
+        $packed_get:ident,
+        $id:ident,
+        $row:ident
+    ) => {
         pub(crate) fn $count(self) -> usize {
             match self.source {
-                CheckedProgramSource::Rich(program) => program.$field.len(),
+                CheckedProgramSource::Rich(program) => program.$rich.len(),
+                CheckedProgramSource::Packed(input) => input.entity_counts().$packed_count,
             }
         }
 
         pub(crate) fn $at(self, index: usize) -> Option<$row<'a>> {
             match self.source {
-                CheckedProgramSource::Rich(program) => program.$field.get(index).map($row::rich),
+                CheckedProgramSource::Rich(program) => {
+                    let row = program.$rich.get(index)?;
+                    (row.id.0 as usize == index).then_some($row::Rich(row))
+                }
+                CheckedProgramSource::Packed(input) => input
+                    .$packed_get($id(u32::try_from(index).ok()?))
+                    .map($row::Packed),
             }
         }
 
-        pub(crate) fn $iter(self) -> impl Iterator<Item = $row<'a>> + 'a {
-            (0..self.$count()).filter_map(move |index| self.$at(index))
+        pub(crate) fn $iter(self) -> impl ExactSizeIterator<Item = $row<'a>> + 'a {
+            (0..self.$count()).map(move |index| {
+                self.$at(index)
+                    .expect("sealed checked base-row authority remains dense")
+            })
         }
     };
 }
@@ -555,71 +397,108 @@ impl<'a> CheckedProgramView<'a> {
         }
     }
 
+    pub(crate) fn packed(input: &'a KernelSemanticInputV1) -> Self {
+        Self {
+            source: CheckedProgramSource::Packed(input),
+        }
+    }
+
     pub(crate) fn source_bundle_digest(self) -> SourceBundleDigestV1 {
         match self.source {
             CheckedProgramSource::Rich(program) => program.source_bundle_digest_v1,
+            CheckedProgramSource::Packed(input) => input.source_bundle_digest_v1(),
         }
     }
 
     pub(crate) fn role(self) -> ProgramRole {
         match self.source {
             CheckedProgramSource::Rich(program) => program.role,
+            CheckedProgramSource::Packed(input) => input.role(),
         }
     }
 
     pub(crate) fn root_scope(self) -> LexicalScopeId {
         match self.source {
             CheckedProgramSource::Rich(program) => program.root_scope,
+            CheckedProgramSource::Packed(input) => input.project_root_scope().id(),
         }
     }
 
-    program_rows!(scope_count, scope_at, scopes, scopes, ScopeRef);
-    program_rows!(
-        declaration_count,
-        declaration_at,
-        declarations,
-        declarations,
-        DeclarationRef
+    /// Rich editor/oracle metadata remains independent of the packed
+    /// statement reconstruction. RuntimePacked deliberately has no duplicate
+    /// output-root table, so differential builds compare the two authorities.
+    pub(crate) fn rich_output_root_types(self) -> Option<&'a [OutputRootTypeEntry]> {
+        match self.source {
+            CheckedProgramSource::Rich(program) => {
+                Some(&program.lowering_metadata.output_root_types)
+            }
+            CheckedProgramSource::Packed(_) => None,
+        }
+    }
+
+    checked_rows!(
+        scope_count,
+        scope_at,
+        scopes,
+        scopes,
+        scopes,
+        scope,
+        LexicalScopeId,
+        ScopeRef
     );
-    program_rows!(
+    checked_rows!(
         statement_count,
         statement_at,
         statements,
         statements,
+        statements,
+        statement,
+        CheckedStatementId,
         StatementRef
     );
-    program_rows!(
+    checked_rows!(
         expression_count,
         expression_at,
         expressions,
         expressions,
+        expressions,
+        expression,
+        CheckedExprId,
         ExpressionRef
     );
-    program_rows!(
-        callable_count,
-        callable_at,
-        callables,
-        callables,
-        CallableRef
+    checked_rows!(
+        source_count,
+        source_at,
+        sources,
+        sources,
+        sources,
+        source,
+        CheckedSourceId,
+        SourceRef
     );
-    program_rows!(
-        context_formal_count,
-        context_formal_at,
-        context_formals,
-        context_formals,
-        ContextFormalRef
+    checked_rows!(
+        state_count,
+        state_at,
+        states,
+        states,
+        states,
+        state,
+        CheckedStateId,
+        StateRef
     );
-    program_rows!(source_count, source_at, sources, sources, SourceRef);
-    program_rows!(state_count, state_at, states, states, StateRef);
-    program_rows!(list_count, list_at, lists, lists, ListRef);
+    checked_rows!(
+        list_count,
+        list_at,
+        lists,
+        lists,
+        lists,
+        list,
+        CheckedListId,
+        ListRef
+    );
 
     pub(crate) fn scope(self, id: LexicalScopeId) -> Option<ScopeRef<'a>> {
         self.scope_at(id.0 as usize).filter(|row| row.id() == id)
-    }
-
-    pub(crate) fn declaration(self, id: DeclId) -> Option<DeclarationRef<'a>> {
-        self.declaration_at(id.0 as usize)
-            .filter(|row| row.id() == id)
     }
 
     pub(crate) fn statement(self, id: CheckedStatementId) -> Option<StatementRef<'a>> {
@@ -630,15 +509,6 @@ impl<'a> CheckedProgramView<'a> {
     pub(crate) fn expression(self, id: CheckedExprId) -> Option<ExpressionRef<'a>> {
         self.expression_at(id.0 as usize)
             .filter(|row| row.id() == id)
-    }
-
-    pub(crate) fn callable(self, declaration: DeclId) -> Option<CallableRef<'a>> {
-        self.callables()
-            .find(|row| row.declaration() == declaration)
-    }
-
-    pub(crate) fn context_formal(self, id: ContextFormalId) -> Option<ContextFormalRef<'a>> {
-        self.context_formals().find(|row| row.id() == id)
     }
 
     pub(crate) fn source(self, id: CheckedSourceId) -> Option<SourceRef<'a>> {

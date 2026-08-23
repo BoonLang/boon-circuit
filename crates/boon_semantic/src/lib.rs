@@ -2902,12 +2902,55 @@ fn elaborate_with_representation(
                 )
             })
             .unwrap_or_default();
-        verified_intent::VerifiedSemanticIntentV1::build(
-            &checked_program,
-            &calls,
-            &producer_roots,
-            retained_definitions,
-        )
+        #[cfg(any(test, feature = "test-packed-call-oracle"))]
+        {
+            if let Some(kernel_input) = kernel_input_ref {
+                let rich = verified_intent::VerifiedSemanticIntentV1::build(
+                    checked_view::CheckedProgramView::rich(&checked_program),
+                    &calls,
+                    &producer_roots,
+                    retained_definitions.clone(),
+                );
+                match rich {
+                    Err(error) => Err(error),
+                    Ok(rich) => {
+                        let packed = verified_intent::VerifiedSemanticIntentV1::build(
+                            checked_view::CheckedProgramView::packed(kernel_input),
+                            &calls,
+                            &producer_roots,
+                            retained_definitions,
+                        );
+                        match packed {
+                            Err(error) => Err(error),
+                            Ok(packed) if rich != packed => Err(format!(
+                                "packed verified semantic intent differs from rich oracle:\nrich={rich:#?}\npacked={packed:#?}"
+                            )),
+                            Ok(packed) => Ok(packed),
+                        }
+                    }
+                }
+            } else {
+                verified_intent::VerifiedSemanticIntentV1::build(
+                    checked_view::CheckedProgramView::rich(&checked_program),
+                    &calls,
+                    &producer_roots,
+                    retained_definitions,
+                )
+            }
+        }
+        #[cfg(not(any(test, feature = "test-packed-call-oracle")))]
+        {
+            let checked_view = kernel_input_ref.map_or_else(
+                || checked_view::CheckedProgramView::rich(&checked_program),
+                checked_view::CheckedProgramView::packed,
+            );
+            verified_intent::VerifiedSemanticIntentV1::build(
+                checked_view,
+                &calls,
+                &producer_roots,
+                retained_definitions,
+            )
+        }
     })
     .map_err(SemanticError::new)?;
     verified_intent.trace();
@@ -6719,7 +6762,7 @@ result:
             .expect("cached NovyWave artifact has valid call type facts");
         let retained = contextual_expansion::ordinary_callable_declarations(&fields, &calls, None);
         let intent = verified_intent::VerifiedSemanticIntentV1::build(
-            &fields,
+            checked_view::CheckedProgramView::rich(&fields),
             &calls,
             &producer_roots,
             retained,

@@ -1034,7 +1034,7 @@ impl SemanticProgram {
         } else {
             call_view::CallCatalog::rich(&self.checked_program).map_err(SemanticError::new)?
         };
-        validate_contextual_bindings(&self.checked_program, &calls)?;
+        validate_contextual_bindings(&calls)?;
         contextual_expansion::validate_checked_callable_and_call_inventory(
             &self.checked_program,
             &calls,
@@ -2878,7 +2878,7 @@ fn elaborate_with_representation(
     } else {
         call_view::CallCatalog::rich(&checked_program).map_err(SemanticError::new)?
     };
-    let call_types = call_view::CallTypeCatalog::new(&calls).map_err(SemanticError::new)?;
+    let mut call_types = call_view::CallTypeCatalog::new(&calls).map_err(SemanticError::new)?;
     let source_bundle_digest_v1 = checked_program.source_bundle_digest_v1;
     let role = checked_program.role;
     if trace_elaboration {
@@ -2888,7 +2888,7 @@ fn elaborate_with_representation(
             checked_program.declarations.len(),
             checked_program.statements.len(),
             checked_program.expressions.len(),
-            checked_program.callables.len(),
+            calls.callable_count(),
             calls.len(),
             checked_program.sources.len(),
             checked_program.states.len(),
@@ -2904,11 +2904,16 @@ fn elaborate_with_representation(
     )?;
     elaboration_phase!(
         "validate_contextual_bindings",
-        validate_contextual_bindings(&checked_program, &calls)
+        validate_contextual_bindings(&calls)
     )?;
     let producer_roots = elaboration_phase!(
         "resolve_producer_roots",
-        resolve_producer_roots(&checked_program, &producer_materializations)
+        resolve_producer_roots_with_catalog(
+            &checked_program,
+            &calls,
+            &call_types,
+            &producer_materializations,
+        )
     )?;
     let verified_intent = elaboration_phase!("verified_semantic_intent", {
         let retained_definitions = retain_ordinary_calls
@@ -2916,6 +2921,7 @@ fn elaborate_with_representation(
                 contextual_expansion::ordinary_callable_declarations(
                     &checked_program,
                     &calls,
+                    &call_types,
                     kernel_input_ref,
                 )
             })
@@ -3057,7 +3063,7 @@ fn elaborate_with_representation(
         contextual_expansion::derive_contextual_materializations(
             &checked_program,
             &calls,
-            &call_types,
+            &mut call_types,
             kernel_input_ref,
             &resolved_out_graph,
             verified_intent.retained_definitions(),
@@ -3077,7 +3083,7 @@ fn elaborate_with_representation(
             &resolved_out_graph,
             &materializations,
             materialization_expressions,
-            &expression_builder_indexes,
+            expression_builder_indexes,
             &required_ordinary_definitions,
             retain_ordinary_calls,
         )
@@ -4259,10 +4265,8 @@ fn concrete_checked_expression_type(
                                     port.call
                                 ))
                             })?;
-                        let callable = program
-                            .callables
-                            .iter()
-                            .find(|callable| callable.decl_id == instance.provenance.callable)
+                        let callable = calls
+                            .callable(instance.provenance.callable)
                             .ok_or_else(|| {
                                 SemanticError::new(format!(
                                     "evaluation port {port_id} references missing callable {}",
@@ -4270,15 +4274,26 @@ fn concrete_checked_expression_type(
                                 ))
                             })?;
                         let parameter = callable
-                            .parameters
-                            .iter()
-                            .find(|parameter| parameter.decl_id == port.formal)
+                            .parameters()
+                            .find(|parameter| parameter.declaration() == port.formal)
                             .ok_or_else(|| {
                                 SemanticError::new(format!(
                                     "evaluation port {port_id} references missing OUT formal {}",
                                     port.formal.0
                                 ))
-                        })?;
+                            })?;
+                        let parameter_type = call_types
+                            .parameter(
+                                calls,
+                                callable.declaration(),
+                                parameter.ordinal(),
+                            )
+                            .ok_or_else(|| {
+                                SemanticError::new(format!(
+                                    "evaluation port {port_id} OUT formal {} has no semantic type fact",
+                                    port.formal.0,
+                                ))
+                            })?;
                         // The formal belongs to the port call's callee scheme;
                         // that instance environment already embeds its parent
                         // composition. Caller/active keys are a different
@@ -4289,7 +4304,7 @@ fn concrete_checked_expression_type(
                             active_frames,
                         )?;
                         Ok(Some(apply_out_type_frame(
-                            &parameter.flow_type.ty,
+                            &parameter_type.ty,
                             output_substitutions.as_ref(),
                         )))
                     })
@@ -4400,18 +4415,20 @@ fn concrete_checked_expression_type(
                         let formal_type = graph
                             .call_instances
                             .get(port.call.as_usize())
-                            .and_then(|instance| {
-                                program.callables.iter().find(|callable| {
-                                    callable.decl_id == instance.provenance.callable
-                                })
-                            })
+                            .and_then(|instance| calls.callable(instance.provenance.callable))
                             .and_then(|callable| {
                                 callable
-                                    .parameters
-                                    .iter()
-                                    .find(|parameter| parameter.decl_id == port.formal)
+                                    .parameters()
+                                    .find(|parameter| parameter.declaration() == port.formal)
+                                    .and_then(|parameter| {
+                                        call_types.parameter(
+                                            calls,
+                                            callable.declaration(),
+                                            parameter.ordinal(),
+                                        )
+                                    })
                             })
-                            .map(|parameter| format!("{:?}", parameter.flow_type.ty))
+                            .map(|flow| format!("{:?}", flow.ty))
                             .unwrap_or_else(|| "<missing formal type>".to_owned());
                         format!(
                             "{} {:?} formal {} type {formal_type}",
@@ -4423,11 +4440,9 @@ fn concrete_checked_expression_type(
                     .frame
                     .and_then(|frame| graph.call_instances.get(frame.as_usize()))
                     .map(|instance| {
-                        let callable = program
-                            .callables
-                            .iter()
-                            .find(|callable| callable.decl_id == instance.provenance.callable)
-                            .map(|callable| callable.name.as_str())
+                        let callable = calls
+                            .callable(instance.provenance.callable)
+                            .map(|callable| callable.name())
                             .unwrap_or("<missing callable>");
                         let input = instance
                             .inputs
@@ -5303,112 +5318,62 @@ fn unify_out_contract_type_impl(
     Ok(())
 }
 
-fn validate_contextual_bindings(
-    program: &CheckedProgramFields,
-    calls: &call_view::CallCatalog<'_>,
-) -> Result<(), SemanticError> {
-    let callables = program
-        .callables
-        .iter()
-        .map(|callable| (callable.decl_id, callable))
-        .collect::<BTreeMap<_, _>>();
-    if callables.len() != program.callables.len() {
-        return Err(SemanticError::new(
-            "checked callable table contains duplicate declaration IDs",
-        ));
-    }
-
+fn validate_contextual_bindings(calls: &call_view::CallCatalog<'_>) -> Result<(), SemanticError> {
     let mut formals_by_id = BTreeMap::new();
-    let mut formals_by_callable = BTreeMap::new();
-    for formal in &program.context_formals {
-        if formals_by_id.insert(formal.id, formal).is_some() {
+    for callable in calls.callables() {
+        let Some(formal_id) = callable.context_formal_id() else {
+            continue;
+        };
+        let formal = calls
+            .context_formal(callable.declaration())
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "callable {} references missing contextual formal {}",
+                    callable.declaration().0,
+                    formal_id.0,
+                ))
+            })?;
+        if formal.id() != formal_id || formal.callable() != callable.declaration() {
             return Err(SemanticError::new(format!(
-                "checked contextual formal table contains duplicate formal {}",
-                formal.id.0
+                "callable {} references contextual formal {} owned by callable {}",
+                callable.declaration().0,
+                formal.id().0,
+                formal.callable().0,
             )));
         }
-        if formals_by_callable
-            .insert(formal.callable, formal)
+        if formals_by_id
+            .insert(formal_id, callable.declaration())
             .is_some()
         {
             return Err(SemanticError::new(format!(
-                "checked callable {} owns more than one contextual formal",
-                formal.callable.0
+                "checked contextual formal table contains duplicate formal {}",
+                formal_id.0
             )));
         }
-        let callable = callables.get(&formal.callable).ok_or_else(|| {
-            SemanticError::new(format!(
-                "contextual formal {} references missing callable {}",
-                formal.id.0, formal.callable.0
-            ))
-        })?;
-        if callable.kind != boon_checked::CheckedCallableKind::User {
+        if callable.kind() != boon_checked::CheckedCallableKind::User {
             return Err(SemanticError::new(format!(
                 "non-user callable {} owns contextual formal {}",
-                formal.callable.0, formal.id.0
-            )));
-        }
-        if callable.context_formal != Some(formal.id) {
-            return Err(SemanticError::new(format!(
-                "contextual formal {} is not the declared formal of callable {}",
-                formal.id.0, formal.callable.0
+                callable.declaration().0,
+                formal_id.0,
             )));
         }
     }
-    for callable in &program.callables {
-        match callable.context_formal {
-            Some(formal) => {
-                let definition = formals_by_id.get(&formal).ok_or_else(|| {
-                    SemanticError::new(format!(
-                        "callable {} references missing contextual formal {}",
-                        callable.decl_id.0, formal.0
-                    ))
-                })?;
-                if definition.callable != callable.decl_id {
-                    return Err(SemanticError::new(format!(
-                        "callable {} references contextual formal {} owned by callable {}",
-                        callable.decl_id.0, formal.0, definition.callable.0
-                    )));
-                }
-            }
-            None if formals_by_callable.contains_key(&callable.decl_id) => {
-                return Err(SemanticError::new(format!(
-                    "callable {} owns a contextual formal but does not declare it",
-                    callable.decl_id.0
-                )));
-            }
-            None => {}
-        }
-    }
-
-    let expressions = program
-        .expressions
-        .iter()
-        .map(|expression| expression.id)
-        .collect::<BTreeSet<_>>();
     for call in calls.calls() {
-        let callable = callables.get(&call.callable()).ok_or_else(|| {
+        let callable = calls.callable(call.callable()).ok_or_else(|| {
             SemanticError::new(format!(
                 "checked call {} references missing callable {}",
                 call.id().0,
                 call.callable().0
             ))
         })?;
-        let target_formal = callable.context_formal;
+        let target_formal = callable.context_formal_id();
         match call.context_binding() {
-            boon_checked::CheckedContextBinding::Explicit { value, .. } => {
+            boon_checked::CheckedContextBinding::Explicit { .. } => {
                 if target_formal.is_none() {
                     return Err(SemanticError::new(format!(
                         "checked call {} has explicit PASS context for noncontextual callable {}",
                         call.id().0,
                         call.callable().0
-                    )));
-                }
-                if !expressions.contains(&value) {
-                    return Err(SemanticError::new(format!(
-                        "checked call {} explicit PASS context references missing expression {}",
-                        call.id().0,
-                        value.0
                     )));
                 }
             }
@@ -5427,17 +5392,15 @@ fn validate_contextual_bindings(
                         formal.0
                     ))
                 })?;
-                let owner_callable = callables.get(&owner).ok_or_else(|| {
+                let owner_callable = calls.callable(owner).ok_or_else(|| {
                     SemanticError::new(format!(
                         "checked call {} inherits from missing owner callable {}",
                         call.id().0,
                         owner.0
                     ))
                 })?;
-                if owner_callable.context_formal != Some(formal)
-                    || formals_by_id
-                        .get(&formal)
-                        .is_none_or(|definition| definition.callable != owner)
+                if owner_callable.context_formal_id() != Some(formal)
+                    || formals_by_id.get(&formal).copied() != Some(owner)
                 {
                     return Err(SemanticError::new(format!(
                         "checked call {} inherits contextual formal {} outside owner callable {}",
@@ -5469,9 +5432,7 @@ fn validate_contextual_bindings(
                 )));
             };
             if substitution.formal != formal
-                || formals_by_id
-                    .get(&substitution.formal)
-                    .is_none_or(|definition| definition.callable != call.callable())
+                || formals_by_id.get(&substitution.formal).copied() != Some(call.callable())
             {
                 return Err(SemanticError::new(format!(
                     "checked call {} contextual substitution formal {} is not owned by callable {}",
@@ -5667,8 +5628,23 @@ fn canonical_producer_requests(
     Ok(requests)
 }
 
+#[cfg(test)]
 fn resolve_producer_roots(
     program: &CheckedProgramFields,
+    requests: &[ProducerMaterializationRequest],
+) -> Result<Vec<out_net::ProducerRootSpec>, SemanticError> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    let calls = call_view::CallCatalog::rich(program).map_err(SemanticError::new)?;
+    let call_types = call_view::CallTypeCatalog::new(&calls).map_err(SemanticError::new)?;
+    resolve_producer_roots_with_catalog(program, &calls, &call_types, requests)
+}
+
+fn resolve_producer_roots_with_catalog(
+    program: &CheckedProgramFields,
+    calls: &call_view::CallCatalog<'_>,
+    call_types: &call_view::CallTypeCatalog,
     requests: &[ProducerMaterializationRequest],
 ) -> Result<Vec<out_net::ProducerRootSpec>, SemanticError> {
     let first_statement = program
@@ -5682,18 +5658,25 @@ fn resolve_producer_roots(
         .cloned()
         .enumerate()
         .map(|(ordinal, request)| {
-            let callable = exact_producer_callable(program, &request)?;
-            if callable.result.mode != boon_checked::FlowMode::Continuous {
+            let callable = exact_producer_callable(calls, &request)?;
+            let callable_types = call_types
+                .callable(calls, callable.declaration())
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "producer function `{}` has no semantic callable type facts",
+                        request.local_function,
+                    ))
+                })?;
+            if callable_types.result.mode != boon_checked::FlowMode::Continuous {
                 return Err(SemanticError::new(format!(
                     "producer function `{}` result must be continuous, found {:?}",
-                    request.local_function, callable.result.mode
+                    request.local_function, callable_types.result.mode
                 )));
             }
             let out_parameters = callable
-                .parameters
-                .iter()
-                .filter(|parameter| parameter.kind != boon_checked::CheckedParameterKind::Value)
-                .map(|parameter| parameter.name.as_str())
+                .parameters()
+                .filter(|parameter| parameter.kind() != boon_checked::CheckedParameterKind::Value)
+                .map(|parameter| parameter.name())
                 .collect::<Vec<_>>();
             if !out_parameters.is_empty() {
                 return Err(SemanticError::new(format!(
@@ -5708,17 +5691,17 @@ fn resolve_producer_roots(
                     request.local_function
                 )));
             }
-            if callable.result_expression.is_none() {
+            if callable.result_expression().is_none() {
                 return Err(SemanticError::new(format!(
                     "producer function `{}` has no checked result expression",
                     request.local_function
                 )));
             }
-            if callable
+            if callable_types
                 .parameters
                 .iter()
-                .any(|parameter| runtime_type_contains_var(&parameter.flow_type.ty))
-                || runtime_type_contains_var(&callable.result.ty)
+                .any(|parameter| runtime_type_contains_var(&parameter.ty))
+                || runtime_type_contains_var(&callable_types.result.ty)
             {
                 return Err(SemanticError::new(format!(
                     "producer function `{}` has no concrete distributed boundary specialization",
@@ -5726,39 +5709,52 @@ fn resolve_producer_roots(
                 )));
             }
             let function = ProducerFunctionId(ordinal);
-            let mut parameters = callable.parameters.clone();
-            parameters.sort_by_key(|parameter| parameter.ordinal);
+            let mut parameters = callable.parameters().collect::<Vec<_>>();
+            parameters.sort_by_key(|parameter| parameter.ordinal());
             let parameters = parameters
                 .into_iter()
-                .map(|parameter| out_net::ProducerRootParameter {
-                    formal: parameter.decl_id,
-                    parameter: ProducerParameterId {
-                        function,
-                        ordinal: parameter.ordinal,
-                    },
-                    name: parameter.name,
-                    flow_type: parameter.flow_type,
+                .map(|parameter| {
+                    let flow_type = callable_types
+                        .parameters
+                        .get(parameter.ordinal())
+                        .cloned()
+                        .ok_or_else(|| {
+                            SemanticError::new(format!(
+                                "producer function `{}` parameter {} has no semantic type fact",
+                                request.local_function,
+                                parameter.ordinal(),
+                            ))
+                        })?;
+                    Ok(out_net::ProducerRootParameter {
+                        formal: parameter.declaration(),
+                        parameter: ProducerParameterId {
+                            function,
+                            ordinal: parameter.ordinal(),
+                        },
+                        name: parameter.name().to_owned(),
+                        flow_type,
+                    })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, SemanticError>>()?;
             let invocation = request.mode == ProducerMaterializationMode::Invocation;
             Ok(out_net::ProducerRootSpec {
                 identity: request.identity,
                 mode: request.mode,
-                callable: callable.decl_id,
+                callable: callable.declaration(),
                 function,
-                function_name: callable.name.clone(),
+                function_name: callable.name().to_owned(),
                 result_statement: ProducerResultStatementId(
                     first_statement.saturating_add(ordinal),
                 ),
-                result_declaration: callable.decl_id,
+                result_declaration: callable.declaration(),
                 result_path: format!("@producer/{}/result", digest_hex(&request.identity)),
                 result_type: if invocation {
                     boon_checked::FlowType {
                         mode: boon_checked::FlowMode::PresentOrAbsent,
-                        ty: callable.result.ty.clone(),
+                        ty: callable_types.result.ty.clone(),
                     }
                 } else {
-                    callable.result.clone()
+                    callable_types.result.clone()
                 },
                 parameters,
             })
@@ -5767,17 +5763,17 @@ fn resolve_producer_roots(
 }
 
 fn exact_producer_callable<'a>(
-    program: &'a CheckedProgramFields,
+    calls: &'a call_view::CallCatalog<'a>,
     request: &ProducerMaterializationRequest,
-) -> Result<&'a boon_checked::CheckedCallableSignature, SemanticError> {
-    let Some(callable) = program.callables.get(request.callable.as_usize()) else {
+) -> Result<call_view::CallableRef<'a>, SemanticError> {
+    let Some(callable) = calls.callable_at(request.callable.as_usize()) else {
         return Err(SemanticError::new(format!(
             "producer request references missing semantic callable {}",
             request.callable
         )));
     };
-    if callable.kind != boon_checked::CheckedCallableKind::User
-        || callable.name != request.local_function
+    if callable.kind() != boon_checked::CheckedCallableKind::User
+        || callable.name() != request.local_function
     {
         return Err(SemanticError::new(format!(
             "producer request callable {} does not exactly identify user function `{}`",
@@ -6219,7 +6215,9 @@ mod tests {
     ) -> BTreeSet<boon_checked::DeclId> {
         let calls = call_view::CallCatalog::rich(program)
             .expect("typechecked fixture has a valid call catalog");
-        contextual_expansion::ordinary_callable_declarations(program, &calls, None)
+        let call_types = call_view::CallTypeCatalog::new(&calls)
+            .expect("typechecked fixture has valid call type facts");
+        contextual_expansion::ordinary_callable_declarations(program, &calls, &call_types, None)
     }
 
     #[test]
@@ -6814,9 +6812,14 @@ result:
         let producer_roots = resolve_producer_roots(&fields, &[]).unwrap();
         let calls = call_view::CallCatalog::rich(&fields)
             .expect("cached NovyWave artifact has a valid call catalog");
-        let call_types = call_view::CallTypeCatalog::new(&calls)
+        let mut call_types = call_view::CallTypeCatalog::new(&calls)
             .expect("cached NovyWave artifact has valid call type facts");
-        let retained = contextual_expansion::ordinary_callable_declarations(&fields, &calls, None);
+        let retained = contextual_expansion::ordinary_callable_declarations(
+            &fields,
+            &calls,
+            &mut call_types,
+            None,
+        );
         let intent = verified_intent::VerifiedSemanticIntentV1::build(
             checked_view::CheckedProgramView::rich(&fields),
             &calls,
@@ -6951,11 +6954,16 @@ result:
             }
             frame = instance.parent;
         }
-        let retained = contextual_expansion::ordinary_callable_declarations(&fields, &calls, None);
-        contextual_expansion::derive_contextual_materializations(
+        let retained = contextual_expansion::ordinary_callable_declarations(
             &fields,
             &calls,
             &call_types,
+            None,
+        );
+        contextual_expansion::derive_contextual_materializations(
+            &fields,
+            &calls,
+            &mut call_types,
             None,
             &graph,
             &retained,

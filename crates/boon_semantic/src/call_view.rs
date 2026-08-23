@@ -18,13 +18,10 @@ use boon_compiler_kernel::{
     KernelCallableSchemeRef, KernelPackedFlowRef, KernelPackedTypeRef,
     KernelSemanticCallContextRef, KernelSemanticCallEntryRef, KernelSemanticCallRef,
     KernelSemanticCallableContextIter, KernelSemanticCallableContextRef,
-    KernelSemanticCallableParameterIter, KernelSemanticCallableParameterRef, KernelSemanticInputV1,
-    KernelSemanticParameterRequirementRef, KernelSemanticResolvedDeclarationRef,
-    KernelSemanticTypeMaterializer,
+    KernelSemanticCallableParameterIter, KernelSemanticCallableParameterRef,
+    KernelSemanticContextFormalRef, KernelSemanticInputV1, KernelSemanticParameterRequirementRef,
+    KernelSemanticResolvedDeclarationRef, KernelSemanticTypeMaterializer,
 };
-
-#[cfg(any(test, feature = "test-packed-call-oracle"))]
-use boon_compiler_kernel::KernelSemanticContextFormalRef;
 
 enum CallCatalogSource<'a> {
     Rich {
@@ -91,7 +88,6 @@ pub(crate) enum CallableContextIter<'a> {
 }
 
 #[derive(Clone, Copy)]
-#[cfg(any(test, feature = "test-packed-call-oracle"))]
 pub(crate) enum ContextFormalRef<'a> {
     Rich(&'a boon_checked::CheckedContextFormal),
     Packed(KernelSemanticContextFormalRef<'a>),
@@ -159,6 +155,7 @@ pub(crate) struct CallableTypeFacts {
     pub(crate) result: FlowType,
     pub(crate) parameters: Box<[FlowType]>,
     pub(crate) contexts: Box<[FlowType]>,
+    pub(crate) context_formal: Option<FlowType>,
 }
 
 /// The single rich-type ownership bridge for one semantic elaboration.
@@ -296,6 +293,23 @@ impl<'a> CallCatalog<'a> {
         }
     }
 
+    pub(crate) fn context_formal(&self, callable: DeclId) -> Option<ContextFormalRef<'a>> {
+        match &self.source {
+            CallCatalogSource::Rich { program, .. } => {
+                let formal = self.callable(callable)?.context_formal_id()?;
+                program
+                    .context_formals
+                    .iter()
+                    .find(|row| row.id == formal && row.callable == callable)
+                    .map(ContextFormalRef::Rich)
+            }
+            CallCatalogSource::Packed(input) => input
+                .callable(callable)?
+                .context_formal()
+                .map(ContextFormalRef::Packed),
+        }
+    }
+
     pub(crate) fn callable_count(&self) -> usize {
         match &self.source {
             CallCatalogSource::Rich { program, .. } => program.callables.len(),
@@ -390,6 +404,64 @@ impl<'a> CallCatalog<'a> {
     }
 
     fn validate(&self) -> Result<(), String> {
+        let mut context_formal_count = 0usize;
+        let mut previous_context_formal = None;
+        for (index, callable) in self.callables().enumerate() {
+            let declaration = callable.declaration();
+            if self.callable_index(declaration) != Some(index) {
+                return Err(format!(
+                    "checked callable {} has a stale catalog index at {index}",
+                    declaration.0,
+                ));
+            }
+            for (ordinal, parameter) in callable.parameters().enumerate() {
+                if parameter.ordinal() != ordinal {
+                    return Err(format!(
+                        "checked callable {} parameter {} is not canonical at ordinal {ordinal}",
+                        declaration.0,
+                        parameter.declaration().0,
+                    ));
+                }
+            }
+            let Some(formal_id) = callable.context_formal_id() else {
+                continue;
+            };
+            if previous_context_formal.is_some_and(|previous| previous >= formal_id) {
+                return Err(format!(
+                    "checked callable {} context formal {} is not strictly ordered",
+                    declaration.0, formal_id.0,
+                ));
+            }
+            previous_context_formal = Some(formal_id);
+            context_formal_count += 1;
+            let formal = self.context_formal(declaration).ok_or_else(|| {
+                format!(
+                    "checked callable {} references missing context formal {}",
+                    declaration.0, formal_id.0,
+                )
+            })?;
+            if formal.id() != formal_id || formal.callable() != declaration {
+                return Err(format!(
+                    "checked callable {} context formal {} has inconsistent ownership",
+                    declaration.0, formal_id.0,
+                ));
+            }
+            if callable.kind() != CheckedCallableKind::User {
+                return Err(format!(
+                    "non-user checked callable {} owns context formal {}",
+                    declaration.0, formal_id.0,
+                ));
+            }
+        }
+        let expected_context_formal_count = match &self.source {
+            CallCatalogSource::Rich { program, .. } => program.context_formals.len(),
+            CallCatalogSource::Packed(input) => input.entity_counts().context_formals,
+        };
+        if context_formal_count != expected_context_formal_count {
+            return Err(format!(
+                "checked callable catalog exposes {context_formal_count} context formals for {expected_context_formal_count} checked rows",
+            ));
+        }
         for (index, call) in self.calls().enumerate() {
             if matches!(&self.source, CallCatalogSource::Packed(_)) {
                 let expected = CheckedCallId(
@@ -1569,7 +1641,6 @@ impl<'a> CallableContextRef<'a> {
     }
 }
 
-#[cfg(any(test, feature = "test-packed-call-oracle"))]
 impl<'a> ContextFormalRef<'a> {
     pub(crate) fn id(self) -> ContextFormalId {
         match self {
@@ -1647,6 +1718,19 @@ impl<'a> DeclarationRef<'a> {
 }
 
 impl ParameterRequirementRef<'_> {
+    pub(crate) fn is_required(self) -> bool {
+        match self {
+            Self::Rich(row) => matches!(row, CheckedParameterRequirement::Required),
+            Self::Packed(KernelSemanticParameterRequirementRef::Required) => true,
+            Self::Packed(
+                KernelSemanticParameterRequirementRef::CallableProfile(_)
+                | KernelSemanticParameterRequirementRef::Tag(_)
+                | KernelSemanticParameterRequirementRef::ExactInteger(_)
+                | KernelSemanticParameterRequirementRef::Text(_),
+            ) => false,
+        }
+    }
+
     pub(crate) fn to_owned(self) -> CheckedParameterRequirement {
         match self {
             Self::Rich(row) => row.clone(),
@@ -1811,6 +1895,10 @@ impl CallTypeCatalog {
                 result: materializer.materialize_flow(callable.result())?,
                 parameters,
                 contexts,
+                context_formal: calls
+                    .context_formal(callable.declaration())
+                    .map(|formal| materializer.materialize_flow(formal.flow()))
+                    .transpose()?,
             });
         }
         let mut rows = Vec::new();
@@ -1902,6 +1990,18 @@ impl CallTypeCatalog {
         ordinal: usize,
     ) -> Option<&FlowType> {
         self.callable(calls, callable)?.parameters.get(ordinal)
+    }
+
+    pub(crate) fn take_context_formal(
+        &mut self,
+        calls: &CallCatalog<'_>,
+        callable: DeclId,
+    ) -> Option<FlowType> {
+        self.callables
+            .get_mut(calls.callable_index(callable)?)?
+            .as_mut()?
+            .context_formal
+            .take()
     }
 
     pub(crate) fn take_callable(
@@ -2115,5 +2215,24 @@ mod tests {
         let mut program = checked_fields("value: List/get(list: [1], position: 1)");
         program.calls[0].callable = DeclId(u32::MAX);
         assert!(CallCatalog::rich(&program).is_err());
+    }
+
+    #[test]
+    fn rich_catalog_rejects_missing_duplicate_and_foreign_context_formals() {
+        let source = "FUNCTION view() {\n    PASSED.store.value\n}\n";
+
+        let mut missing = checked_fields(source);
+        missing.context_formals.clear();
+        assert!(CallCatalog::rich(&missing).is_err());
+
+        let mut duplicate = checked_fields(source);
+        duplicate
+            .context_formals
+            .push(duplicate.context_formals[0].clone());
+        assert!(CallCatalog::rich(&duplicate).is_err());
+
+        let mut foreign = checked_fields(source);
+        foreign.context_formals[0].callable = DeclId(u32::MAX);
+        assert!(CallCatalog::rich(&foreign).is_err());
     }
 }

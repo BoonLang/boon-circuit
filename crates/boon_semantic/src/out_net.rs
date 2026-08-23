@@ -3279,7 +3279,14 @@ mod tests {
     fn retained_declarations(program: &CheckedProgramFields) -> BTreeSet<DeclId> {
         let calls = crate::call_view::CallCatalog::rich(program)
             .expect("typechecked fixture has a valid call catalog");
-        crate::contextual_expansion::ordinary_callable_declarations(program, &calls, None)
+        let call_types = crate::call_view::CallTypeCatalog::new(&calls)
+            .expect("typechecked fixture has valid call type facts");
+        crate::contextual_expansion::ordinary_callable_declarations(
+            program,
+            &calls,
+            &call_types,
+            None,
+        )
     }
 
     #[test]

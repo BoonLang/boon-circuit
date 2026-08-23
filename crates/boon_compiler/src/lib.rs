@@ -55,8 +55,29 @@ struct SemanticLowerProfile {
     ir_lower_ms: f64,
 }
 
+enum CheckedProgramForSemantic {
+    Rich(boon_checked::CheckedProgram),
+    RuntimePacked(boon_checked::RuntimePackedCheckedProgramV1),
+}
+
+impl CheckedProgramForSemantic {
+    fn role(&self) -> ProgramRole {
+        match self {
+            Self::Rich(program) => program.role,
+            Self::RuntimePacked(program) => program.role(),
+        }
+    }
+
+    fn expression_count(&self) -> usize {
+        match self {
+            Self::Rich(program) => program.expressions.len(),
+            Self::RuntimePacked(program) => program.expression_count(),
+        }
+    }
+}
+
 fn verify_and_lower_checked_profiled(
-    checked: boon_checked::CheckedProgram,
+    checked: CheckedProgramForSemantic,
     kernel_semantic_input: boon_compiler_kernel::KernelSemanticInputV1,
     producer_requests: &[boon_semantic::ProducerMaterializationRequest],
     cancellation: &mut CancellationProbe<'_>,
@@ -70,9 +91,19 @@ fn verify_and_lower_checked_profiled(
 > {
     cancellation.checkpoint()?;
     let semantic_started = Instant::now();
-    let semantic =
-        boon_semantic::elaborate_kernel(checked, kernel_semantic_input, producer_requests)
-            .map_err(|error| error.to_string())?;
+    let semantic = match checked {
+        CheckedProgramForSemantic::Rich(checked) => {
+            boon_semantic::elaborate_kernel(checked, kernel_semantic_input, producer_requests)
+        }
+        CheckedProgramForSemantic::RuntimePacked(checked) => {
+            boon_semantic::elaborate_kernel_runtime_packed(
+                checked,
+                kernel_semantic_input,
+                producer_requests,
+            )
+        }
+    }
+    .map_err(|error| error.to_string())?;
     let semantic_ms = elapsed_ms(semantic_started);
     cancellation.checkpoint()?;
     let contract_verify_started = Instant::now();
@@ -782,13 +813,19 @@ pub fn compile_artifact_oracle_pair(
         &parsed,
         &external_types,
     );
-    let (checked, _) = checked_program_from_output(
-        CheckedSyntaxRef::Assembled(&parsed),
-        check_output,
-        None,
-        None,
-        None,
-    )?;
+    let checked = check_output.program.ok_or_else(|| {
+        let diagnostics = check_output
+            .report
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        PlanError::new(format!(
+            "artifact-oracle source cannot be checked: {diagnostics}"
+        ))
+    })?;
     let retained = compile_checked_artifact_oracle_plan(
         checked.clone(),
         false,
@@ -937,7 +974,7 @@ fn check_editor_kernel_source(
 
 pub(crate) fn checked_source_from_checked_fields(
     syntax: ProjectSyntaxSnapshot,
-    fields: boon_checked::CheckedProgramFields,
+    mut fields: boon_checked::CheckedProgramFields,
     kernel_semantic_input: boon_compiler_kernel::KernelSemanticInputConstructionV1,
     diagnostics: &[boon_checked::TypeDiagnostic],
     parse_work: ParseWorkCounters,
@@ -952,26 +989,31 @@ pub(crate) fn checked_source_from_checked_fields(
     checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
     report_demand: CheckedReportDemand,
 ) -> CheckedSourceFromSource {
-    let metadata = &fields.lowering_metadata;
-    let render_slot_failure_count = metadata
+    let render_slot_failure_count = fields
+        .lowering_metadata
         .render_slot_table
         .slots
         .iter()
         .filter(|slot| !slot.diagnostics.is_empty())
         .count();
-    let unresolved_type_variable_count = metadata.dynamic_fallback_count.saturating_sub(
-        metadata
-            .expr_type_table
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry.flow_type.ty, boon_checked::Type::Unknown))
-            .count(),
-    );
+    let unknown_type_count = fields
+        .expressions
+        .iter()
+        .filter(|expression| matches!(expression.flow_type.ty, boon_checked::Type::Unknown))
+        .count();
+    let unresolved_type_variable_count = fields
+        .lowering_metadata
+        .dynamic_fallback_count
+        .saturating_sub(unknown_type_count);
     let report_has_errors = diagnostics
         .iter()
         .any(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
         || render_slot_failure_count > 0;
     let retain_rich_report = report_demand == CheckedReportDemand::Editor || report_has_errors;
+    if retain_rich_report {
+        boon_typecheck::populate_checked_report_type_tables(&mut fields);
+    }
+    let metadata = &fields.lowering_metadata;
     let builtin_signature_coverage = retain_rich_report
         .then(|| {
             let mut coverage = syntax.operators().to_vec();
@@ -1068,15 +1110,36 @@ pub(crate) fn checked_source_from_checked_fields(
         constraints: Vec::new(),
         diagnostics: report_diagnostics,
     };
-    let construction = (!report.has_errors()).then(|| {
-        // SAFETY: callers expose fields only after their checker has completed
-        // dense coverage, relocation, lowering-metadata validation, and source
-        // digest binding. This boundary deliberately grants diagnostics
-        // construction authority but not a runtime checked image.
-        unsafe {
-            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(fields)
+    let (construction, runtime_packed_construction) = if report.has_errors() {
+        (None, None)
+    } else {
+        match report_demand {
+            CheckedReportDemand::Runtime => {
+                // SAFETY: RuntimePacked fields have completed dense coverage,
+                // relocation, operational metadata validation, and source
+                // binding. The distinct wrapper records that duplicate rich
+                // report type tables are intentionally absent.
+                (
+                    None,
+                    Some(unsafe {
+                        boon_checked::RuntimePackedCheckedProgramConstructionV1::from_typechecker_fields_unchecked(fields)
+                    }),
+                )
+            }
+            CheckedReportDemand::Editor => {
+                // SAFETY: EditorRich completed the full checked-field and
+                // report-table invariants required by the rich construction.
+                (
+                    Some(unsafe {
+                        boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                            fields,
+                        )
+                    }),
+                    None,
+                )
+            }
         }
-    });
+    };
     let diagnostic_count = report.diagnostics.len()
         + report
             .render_slot_table
@@ -1097,6 +1160,7 @@ pub(crate) fn checked_source_from_checked_fields(
         output: boon_checked::CheckOutput {
             program: None,
             construction,
+            runtime_packed_construction,
             report,
         },
         profile: CheckedDiagnosticsProfile {
@@ -1201,7 +1265,8 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         checked_image_kernel_publication,
         kernel_semantic_input,
     } = checked_source;
-    let deferred_runtime_handoff = output.construction.is_some();
+    let deferred_runtime_handoff =
+        output.construction.is_some() || output.runtime_packed_construction.is_some();
     let runtime_handoff_started = Instant::now();
     let syntax = match &syntax_owner {
         CheckedSourceSyntax::Assembled(program) => CheckedSyntaxRef::Assembled(program),
@@ -1213,18 +1278,34 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         checked_call_seal_authority,
         checked_image_kernel_authority,
         checked_image_kernel_publication,
+        &kernel_semantic_input,
     )?;
     // Checked sealing is the final consumer of parser arenas on the ordinary
     // verified path. Release the project snapshot before semantic expansion
     // and backend construction so source/token/AST storage cannot contribute
     // to their peak RSS.
     drop(syntax_owner);
-    let kernel_pairing_receipt = kernel_pairing_receipt.ok_or_else(|| {
-        PlanError::new("kernel checked construction produced no semantic pairing receipt")
-    })?;
-    let kernel_semantic_input = kernel_semantic_input
-        .seal(&checked, &kernel_pairing_receipt)
-        .map_err(|error| PlanError::new(error.to_string()))?;
+    let kernel_semantic_input = match &checked {
+        CheckedProgramForSemantic::Rich(checked) => {
+            let kernel_pairing_receipt = kernel_pairing_receipt.as_ref().ok_or_else(|| {
+                PlanError::new("kernel checked construction produced no semantic pairing receipt")
+            })?;
+            kernel_semantic_input
+                .seal(checked, kernel_pairing_receipt)
+                .map_err(|error| PlanError::new(error.to_string()))?
+        }
+        CheckedProgramForSemantic::RuntimePacked(checked) => {
+            if kernel_pairing_receipt.is_some() {
+                return Err(PlanError::new(
+                    "RuntimePacked checked construction returned a detached pairing receipt",
+                )
+                .into());
+            }
+            kernel_semantic_input
+                .seal_runtime(checked.__kernel_checked_seal())
+                .map_err(|error| PlanError::new(error.to_string()))?
+        }
+    };
     if deferred_runtime_handoff {
         let runtime_handoff_ms = elapsed_ms(runtime_handoff_started);
         profile.typecheck_ms += runtime_handoff_ms;
@@ -1233,10 +1314,11 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
             eprintln!("boon_compiler deferred checked runtime handoff: {runtime_handoff_ms:.3}ms");
         }
     }
-    if checked.role != request.program_role {
+    if checked.role() != request.program_role {
         return Err(PlanError::new(format!(
             "checked program role {:?} differs from requested backend role {:?}",
-            checked.role, request.program_role
+            checked.role(),
+            request.program_role
         ))
         .into());
     }
@@ -1264,7 +1346,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
 
 #[allow(clippy::too_many_arguments)]
 fn finish_checked_program_to_machine_plan(
-    checked: boon_checked::CheckedProgram,
+    checked: CheckedProgramForSemantic,
     kernel_semantic_input: boon_compiler_kernel::KernelSemanticInputV1,
     source_unit_count: usize,
     parsed_expression_count: usize,
@@ -1284,26 +1366,42 @@ fn finish_checked_program_to_machine_plan(
     mut cancellation: CancellationProbe<'_>,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let finish_started = Instant::now();
-    let checked_expression_count = checked.expressions.len();
+    let checked_expression_count = checked.expression_count();
     let checked_call_count = kernel_semantic_input.call_count();
-    if !checked.calls.is_empty() && checked.calls.len() != checked_call_count {
-        return Err(PlanError::new(format!(
-            "rich checked call projection has {} rows but its paired packed authority has {checked_call_count}",
-            checked.calls.len(),
-        ))
-        .into());
+    if let CheckedProgramForSemantic::Rich(checked) = &checked {
+        if !checked.calls.is_empty() && checked.calls.len() != checked_call_count {
+            return Err(PlanError::new(format!(
+                "rich checked call projection has {} rows but its paired packed authority has {checked_call_count}",
+                checked.calls.len(),
+            ))
+            .into());
+        }
     }
     if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
-        eprintln!(
-            "boon_compiler checked_program scopes={} declarations={} statements={} expressions={} callables={} calls={} rich_call_rows={}",
-            checked.scopes.len(),
-            checked.declarations.len(),
-            checked.statements.len(),
-            checked.expressions.len(),
-            checked.callables.len(),
-            checked_call_count,
-            checked.calls.len(),
-        );
+        match &checked {
+            CheckedProgramForSemantic::Rich(checked) => eprintln!(
+                "boon_compiler checked_program representation=rich scopes={} declarations={} statements={} expressions={} callables={} calls={} rich_call_rows={}",
+                checked.scopes.len(),
+                checked.declarations.len(),
+                checked.statements.len(),
+                checked.expressions.len(),
+                checked.callables.len(),
+                checked_call_count,
+                checked.calls.len(),
+            ),
+            CheckedProgramForSemantic::RuntimePacked(_) => {
+                let counts = kernel_semantic_input.entity_counts();
+                eprintln!(
+                    "boon_compiler checked_program representation=runtime_packed scopes={} declarations={} statements={} expressions={} callables={} calls={} rich_call_rows=0",
+                    counts.scopes,
+                    counts.declarations,
+                    counts.statements,
+                    counts.expressions,
+                    counts.callables,
+                    counts.calls,
+                );
+            }
+        }
     }
     let lower_started = Instant::now();
     let (ir, request_graph, semantic_profile) =
@@ -1396,8 +1494,9 @@ fn checked_program_from_output(
     checked_call_seal_authority: Option<CheckedCallSealAuthority>,
     checked_image_kernel_authority: Option<Box<boon_checked::CheckedImageKernelAuthorityV1>>,
     checked_image_kernel_publication: Option<Box<boon_checked::CheckedImageKernelPublicationV1>>,
+    kernel_semantic_input: &boon_compiler_kernel::KernelSemanticInputConstructionV1,
 ) -> CompilerResult<(
-    boon_checked::CheckedProgram,
+    CheckedProgramForSemantic,
     Option<boon_checked::CheckedImageKernelPairingReceiptV1>,
 )> {
     if output.report.has_errors() {
@@ -1438,16 +1537,20 @@ fn checked_program_from_output(
         ))
         .into());
     }
-    match (output.program, output.construction) {
-        (Some(program), None) => Ok((program, None)),
-        (None, Some(construction)) => match syntax {
+    match (
+        output.program,
+        output.construction,
+        output.runtime_packed_construction,
+    ) {
+        (Some(program), None, None) => Ok((CheckedProgramForSemantic::Rich(program), None)),
+        (None, Some(construction), None) => match syntax {
             CheckedSyntaxRef::Assembled(program)
                 if checked_call_seal_authority.is_none()
                     && checked_image_kernel_authority.is_none()
                     && checked_image_kernel_publication.is_none() =>
             {
                 boon_typecheck::seal_checked_program_construction(program, construction)
-                    .map(|program| (program, None))
+                    .map(|program| (CheckedProgramForSemantic::Rich(program), None))
                     .map_err(|error| PlanError::new(error).into())
             }
             CheckedSyntaxRef::Assembled(_) => Err(PlanError::new(
@@ -1460,20 +1563,13 @@ fn checked_program_from_output(
                 checked_image_kernel_publication,
             ) {
                 (
-                    Some(CheckedCallSealAuthority::RuntimePacked { call_count }),
-                    Some(authority),
-                    Some(publication),
-                ) => {
-                    boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
-                        program,
-                        construction,
-                        call_count,
-                        &authority,
-                        *publication,
-                    )
-                    .map(|(program, receipt)| (program, Some(receipt)))
-                    .map_err(|error| PlanError::new(error).into())
-                }
+                    Some(CheckedCallSealAuthority::RuntimePacked { .. }),
+                    Some(_),
+                    Some(_),
+                ) => Err(PlanError::new(
+                    "RuntimePacked sidecars cannot seal a rich checked construction",
+                )
+                .into()),
                 (
                     Some(CheckedCallSealAuthority::EditorRich(call_occurrences)),
                     Some(authority),
@@ -1486,7 +1582,7 @@ fn checked_program_from_output(
                             &authority,
                             *publication,
                         )
-                        .map(|(program, receipt)| (program, Some(receipt)))
+                        .map(|(program, receipt)| (CheckedProgramForSemantic::Rich(program), Some(receipt)))
                         .map_err(|error| PlanError::new(error).into())
                 }
                 (Some(_), Some(_), None) => Err(PlanError::new(
@@ -1503,7 +1599,7 @@ fn checked_program_from_output(
                         construction,
                         &call_occurrences,
                     )
-                    .map(|program| (program, None))
+                    .map(|program| (CheckedProgramForSemantic::Rich(program), None))
                     .map_err(|error| PlanError::new(error).into())
                 }
                 (None, None, None) => {
@@ -1511,7 +1607,7 @@ fn checked_program_from_output(
                         program,
                         construction,
                     )
-                    .map(|program| (program, None))
+                    .map(|program| (CheckedProgramForSemantic::Rich(program), None))
                     .map_err(|error| PlanError::new(error).into())
                 }
                 _ => Err(PlanError::new(
@@ -1520,11 +1616,80 @@ fn checked_program_from_output(
                 .into()),
             },
         },
-        (Some(_), Some(_)) => Err(PlanError::new(
-            "typecheck produced both a sealed and construction-only CheckedProgram",
+        (None, None, Some(construction)) => match syntax {
+            CheckedSyntaxRef::Assembled(_) => Err(PlanError::new(
+                "assembled source cannot contain a RuntimePacked project construction",
+            )
+            .into()),
+            CheckedSyntaxRef::UnitNative(program) => match (
+                checked_call_seal_authority,
+                checked_image_kernel_authority,
+                checked_image_kernel_publication,
+            ) {
+                (
+                    Some(CheckedCallSealAuthority::RuntimePacked { call_count }),
+                    Some(authority),
+                    Some(publication),
+                ) => {
+                    let counts = kernel_semantic_input.entity_counts();
+                    if call_count != counts.calls {
+                        return Err(PlanError::new(format!(
+                            "RuntimePacked call seal count {call_count} differs from packed semantic count {}",
+                            counts.calls,
+                        ))
+                        .into());
+                    }
+                    let resource_routes = kernel_semantic_input
+                        .resource_route_pairs()
+                        .map(|(expression, target)| {
+                            boon_typecheck::RuntimePackedCheckedResourceRouteV1 {
+                                expression,
+                                target,
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    let context = boon_typecheck::RuntimePackedCheckedSealContextV1 {
+                        source_bundle_digest_v1: kernel_semantic_input.source_bundle_digest_v1(),
+                        role: kernel_semantic_input.role(),
+                        entity_counts: boon_typecheck::RuntimePackedCheckedEntityCountsV1 {
+                            scope_count: counts.scopes,
+                            declaration_count: counts.declarations,
+                            statement_count: counts.statements,
+                            expression_count: counts.expressions,
+                            callable_count: counts.callables,
+                            context_formal_count: counts.context_formals,
+                            call_count: counts.calls,
+                            pattern_binding_count: counts.pattern_bindings,
+                            source_count: counts.sources,
+                            state_count: counts.states,
+                            list_count: counts.lists,
+                            occurrence_count: counts.occurrences,
+                        },
+                        entity_route_digest_v1: kernel_semantic_input
+                            .checked_image_entity_route_digest_v1(),
+                        resource_routes: &resource_routes,
+                    };
+                    boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication(
+                        program,
+                        construction,
+                        context,
+                        *authority,
+                        *publication,
+                    )
+                    .map(|program| (CheckedProgramForSemantic::RuntimePacked(program), None))
+                    .map_err(|error| PlanError::new(error).into())
+                }
+                _ => Err(PlanError::new(
+                    "RuntimePacked construction has inconsistent checked-image sidecars",
+                )
+                .into()),
+            },
+        },
+        (Some(_), _, _) | (_, Some(_), Some(_)) => Err(PlanError::new(
+            "typecheck produced multiple sealed or construction-only checked capabilities",
         )
         .into()),
-        (None, None) => {
+        (None, None, None) => {
             Err(PlanError::new("typecheck produced no CheckedProgram for valid source").into())
         }
     }

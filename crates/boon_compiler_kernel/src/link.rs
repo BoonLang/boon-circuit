@@ -755,6 +755,7 @@ pub struct KernelSemanticInputConstructionV1 {
     resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
     resource_projection_by_expression: Box<[u32]>,
     rich_editor_projection_expected: bool,
+    checked_image_entity_route_digest_v1: boon_checked::CheckedImageEntityRouteDigestV1,
     checked_image_pairing: Arc<boon_checked::CheckedImageKernelPairingV1>,
 }
 
@@ -3874,6 +3875,22 @@ impl KernelSemanticInputConstructionV1 {
         }
     }
 
+    /// Expected exact entity-to-projection topology owned independently from
+    /// the move-only checked-image publication.
+    pub const fn checked_image_entity_route_digest_v1(
+        &self,
+    ) -> boon_checked::CheckedImageEntityRouteDigestV1 {
+        self.checked_image_entity_route_digest_v1
+    }
+
+    pub const fn source_bundle_digest_v1(&self) -> SourceBundleDigestV1 {
+        self.source_bundle_digest_v1
+    }
+
+    pub const fn role(&self) -> ProgramRole {
+        self.role
+    }
+
     /// Borrow exact resource expression/target routes without cloning their
     /// packed projection paths or required types.
     pub fn resource_route_pairs(
@@ -3895,6 +3912,7 @@ impl KernelSemanticInputConstructionV1 {
         pattern_bindings: Box<[KernelSemanticPatternBindingLocatorV1]>,
         resource_projections: Box<[KernelSemanticResourceProjectionLocatorV1]>,
         occurrence_count: usize,
+        checked_image_entity_route_digest_v1: boon_checked::CheckedImageEntityRouteDigestV1,
         checked_image_pairing: Arc<boon_checked::CheckedImageKernelPairingV1>,
     ) -> Result<Self, KernelCheckedLinkError> {
         if snapshot.definition_count() != layout.definitions.len()
@@ -4458,6 +4476,7 @@ impl KernelSemanticInputConstructionV1 {
                 projection_demand,
                 KernelCheckedRowProjectionDemand::EditorRich
             ),
+            checked_image_entity_route_digest_v1,
             checked_image_pairing,
         })
     }
@@ -4799,7 +4818,7 @@ impl KernelSemanticInputConstructionV1 {
                 handoff.local_image_digest,
             )
             .map_err(KernelCheckedLinkError::new)?;
-        self.validate_checked_handoff(handoff, checked.pairing_receipt())?;
+        self.validate_runtime_checked_handoff(handoff, checked.pairing_receipt())?;
         Ok(KernelSemanticInputV1 {
             construction: self,
             checked_image_digest: handoff.local_image_digest,
@@ -4814,6 +4833,24 @@ impl KernelSemanticInputConstructionV1 {
         pairing_receipt
             .__kernel_validate(&self.checked_image_pairing, handoff)
             .map_err(KernelCheckedLinkError::new)?;
+        self.validate_checked_handoff_contents(handoff)
+    }
+
+    fn validate_runtime_checked_handoff(
+        &self,
+        handoff: &boon_checked::CheckedImageHandoffV4,
+        pairing_receipt: &boon_checked::CheckedImageKernelPairingReceiptV1,
+    ) -> Result<(), KernelCheckedLinkError> {
+        pairing_receipt
+            .__kernel_validate_sealed(&self.checked_image_pairing, handoff)
+            .map_err(KernelCheckedLinkError::new)?;
+        self.validate_checked_handoff_contents(handoff)
+    }
+
+    fn validate_checked_handoff_contents(
+        &self,
+        handoff: &boon_checked::CheckedImageHandoffV4,
+    ) -> Result<(), KernelCheckedLinkError> {
         let routed_resources = handoff
             .entity_routes
             .iter()
@@ -4957,6 +4994,26 @@ impl KernelSemanticInputConstructionV1 {
 }
 
 impl KernelSemanticInputV1 {
+    /// Revalidate that a consumed RuntimePacked program is the exact sibling
+    /// of this already sealed semantic input. The expensive route proof ran at
+    /// `seal_runtime`; this final boundary is an O(1) pointer/digest check that
+    /// prevents independently sealed same-shaped capabilities from swapping.
+    #[doc(hidden)]
+    pub fn validate_runtime_checked_identity(
+        &self,
+        handoff: &boon_checked::CheckedImageHandoffV4,
+        pairing_receipt: &boon_checked::CheckedImageKernelPairingReceiptV1,
+    ) -> Result<(), KernelCheckedLinkError> {
+        if self.checked_image_digest != handoff.local_image_digest {
+            return Err(KernelCheckedLinkError::new(
+                "kernel semantic input and RuntimePacked program have different checked images",
+            ));
+        }
+        pairing_receipt
+            .__kernel_validate_identity(&self.construction.checked_image_pairing, handoff)
+            .map_err(KernelCheckedLinkError::new)
+    }
+
     fn definition_relocation(
         &self,
         owner: KernelOwnerId,
@@ -5003,6 +5060,14 @@ impl KernelSemanticInputV1 {
 
     pub fn entity_counts(&self) -> KernelSemanticEntityCountsV1 {
         self.construction.entity_counts()
+    }
+
+    /// Expected exact entity-to-projection topology owned independently from
+    /// the move-only checked-image publication.
+    pub const fn checked_image_entity_route_digest_v1(
+        &self,
+    ) -> boon_checked::CheckedImageEntityRouteDigestV1 {
+        self.construction.checked_image_entity_route_digest_v1
     }
 
     /// Iterate callable schemes in the exact dense order used by semantic
@@ -8991,6 +9056,10 @@ impl KernelCheckedLinkLayout {
             checked_image_publication,
         } = self.packed_link_topology(snapshot, source_bundle_digest_v1, role)?;
         let occurrence_count = occurrence_targets.len();
+        let (checked_image_pairing, checked_image_entity_route_digest_v1) =
+            checked_image_publication
+                .__kernel_pairing_with_entity_route_digest()
+                .map_err(KernelCheckedLinkError::new)?;
         let semantic_input = KernelSemanticInputConstructionV1::from_linked_rows(
             source_bundle_digest_v1,
             role,
@@ -9002,7 +9071,8 @@ impl KernelCheckedLinkLayout {
             pattern_bindings,
             resource_projections,
             occurrence_count,
-            checked_image_publication.__kernel_pairing(),
+            checked_image_entity_route_digest_v1,
+            checked_image_pairing,
         )?;
         Ok(KernelRuntimePackedLinkV1 {
             semantic_input,
@@ -9180,6 +9250,10 @@ impl KernelCheckedLinkLayout {
                 ));
             }
         }
+        let (checked_image_pairing, checked_image_entity_route_digest_v1) =
+            checked_image_publication
+                .__kernel_pairing_with_entity_route_digest()
+                .map_err(KernelCheckedLinkError::new)?;
         let semantic_input = KernelSemanticInputConstructionV1::from_linked_rows(
             source_bundle_digest_v1,
             role,
@@ -9191,7 +9265,8 @@ impl KernelCheckedLinkLayout {
             packed_pattern_bindings,
             semantic_resource_projections,
             occurrence_targets.len(),
-            checked_image_publication.__kernel_pairing(),
+            checked_image_entity_route_digest_v1,
+            checked_image_pairing,
         )?;
         #[cfg(debug_assertions)]
         if matches!(

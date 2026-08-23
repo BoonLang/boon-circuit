@@ -57,6 +57,48 @@ fn owner_function_type_table(callables: &[CheckedCallableSignature]) -> Function
     FunctionTypeTable { entries }
 }
 
+fn owner_expr_type_table(fields: &CheckedProgramFields) -> ExprTypeTable {
+    ExprTypeTable {
+        entries: fields
+            .expressions
+            .iter()
+            .map(|expression| ExprTypeEntry {
+                expr_id: expression.id.0 as usize,
+                flow_type: expression.flow_type.clone(),
+            })
+            .collect(),
+    }
+}
+
+pub(crate) fn checked_report_type_tables(
+    fields: &CheckedProgramFields,
+) -> (ExprTypeTable, FunctionTypeTable) {
+    (
+        owner_expr_type_table(fields),
+        owner_function_type_table(&fields.callables),
+    )
+}
+
+/// Materialize report-only rich type tables on explicit editor/error demand.
+///
+/// Ordinary runtime compilation keeps the expression and callable types in
+/// their existing checked rows and packed kernel authority. Building these
+/// two tables eagerly would clone every recursive type solely so a successful
+/// request could immediately discard the duplicate projection.
+pub fn populate_checked_report_type_tables(fields: &mut CheckedProgramFields) {
+    if fields.lowering_metadata.expr_type_table.entries.is_empty() {
+        fields.lowering_metadata.expr_type_table = owner_expr_type_table(fields);
+    }
+    if fields
+        .lowering_metadata
+        .function_type_table
+        .entries
+        .is_empty()
+    {
+        fields.lowering_metadata.function_type_table = owner_function_type_table(&fields.callables);
+    }
+}
+
 fn owner_named_value_type_table(
     syntax: &crate::TypecheckSyntaxProgram,
     fields: &CheckedProgramFields,
@@ -308,33 +350,49 @@ pub fn derive_project_checked_lowering_metadata(
     fields: &CheckedProgramFields,
     diagnostics: &[TypeDiagnostic],
 ) -> Result<CheckedProgramLoweringMetadata, CheckedMetadataError> {
+    derive_project_checked_lowering_metadata_with_report_types(project, fields, diagnostics, true)
+}
+
+/// Derive the operational lowering metadata used by successful runtime
+/// compilation without cloning the report-only expression and function type
+/// tables. An editor request or a failing runtime check can materialize those
+/// tables later through [`populate_checked_report_type_tables`].
+pub fn derive_project_runtime_checked_lowering_metadata(
+    project: &ProjectSyntaxSnapshot,
+    fields: &CheckedProgramFields,
+    diagnostics: &[TypeDiagnostic],
+) -> Result<CheckedProgramLoweringMetadata, CheckedMetadataError> {
+    derive_project_checked_lowering_metadata_with_report_types(project, fields, diagnostics, false)
+}
+
+fn derive_project_checked_lowering_metadata_with_report_types(
+    project: &ProjectSyntaxSnapshot,
+    fields: &CheckedProgramFields,
+    diagnostics: &[TypeDiagnostic],
+    retain_report_type_tables: bool,
+) -> Result<CheckedProgramLoweringMetadata, CheckedMetadataError> {
     if fields.source_bundle_digest_v1 != project.source_bundle_digest_v1() {
         return Err(CheckedMetadataError::new(
             "checked rows and parser snapshot have different source bundle digests",
         ));
     }
     let syntax = crate::TypecheckSyntaxProgram::UnitNative(project.clone());
-    let expr_type_table = ExprTypeTable {
-        entries: fields
-            .expressions
-            .iter()
-            .map(|expression| ExprTypeEntry {
-                expr_id: expression.id.0 as usize,
-                flow_type: expression.flow_type.clone(),
-            })
-            .collect(),
-    };
-    let unknown_type_count = expr_type_table
-        .entries
+    let unknown_type_count = fields
+        .expressions
         .iter()
-        .filter(|entry| matches!(entry.flow_type.ty, Type::Unknown))
+        .filter(|expression| matches!(expression.flow_type.ty, Type::Unknown))
         .count();
     let mut unresolved = BTreeSet::new();
-    for entry in &expr_type_table.entries {
-        crate::collect_type_vars(&entry.flow_type.ty, &mut unresolved);
+    for expression in &fields.expressions {
+        crate::collect_type_vars(&expression.flow_type.ty, &mut unresolved);
     }
+    let expr_type_table = retain_report_type_tables
+        .then(|| owner_expr_type_table(fields))
+        .unwrap_or_default();
     let source_payload_shape_table = crate::checked_source_payload_shape_table(fields);
-    let function_type_table = owner_function_type_table(&fields.callables);
+    let function_type_table = retain_report_type_tables
+        .then(|| owner_function_type_table(&fields.callables))
+        .unwrap_or_default();
     let named_value_type_table =
         owner_named_value_type_table(&syntax, fields).map_err(CheckedMetadataError::new)?;
     let output_root_types = owner_output_root_types(&syntax, fields)?;
@@ -349,6 +407,7 @@ pub fn derive_project_checked_lowering_metadata(
         &named_value_type_table,
         &output_root_types,
         &host_port_table,
+        retain_report_type_tables,
     )
     .map_err(CheckedMetadataError::new)?;
     Ok(CheckedProgramLoweringMetadata {

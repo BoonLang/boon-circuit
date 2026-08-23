@@ -10,8 +10,9 @@ mod owner_shard;
 mod type_terms;
 #[doc(hidden)]
 pub use checked_image_publication::{
-    CheckedImageKernelPairingReceiptV1, CheckedImageKernelPairingV1,
-    CheckedImageKernelProjectionIdV1, CheckedImageKernelPublicationV1,
+    CheckedImageEntityRouteDigestV1, CheckedImageKernelPairingReceiptV1,
+    CheckedImageKernelPairingV1, CheckedImageKernelProjectionIdV1, CheckedImageKernelPublicationV1,
+    checked_image_entity_route_digest_v1, checked_image_projection_key_digest_v4,
 };
 pub use owner_shard::*;
 pub use type_terms::*;
@@ -2480,6 +2481,19 @@ pub struct CheckedProgram {
     runtime_flow_terms: CheckedRuntimeFlowTermHandoffV1,
 }
 
+/// Sealed RuntimePacked program retaining transitional base rows without
+/// exposing them as a complete rich [`CheckedProgram`].
+///
+/// Semantic lowering consumes this value. Inspection and generic rich
+/// sealing APIs cannot accept it, so an intentionally omitted report table
+/// cannot masquerade as a complete editor projection.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct RuntimePackedCheckedProgramV1 {
+    fields: CheckedProgramFields,
+    checked: RuntimePackedCheckedSealV1,
+}
+
 /// Move-only checked authority produced for the compact RuntimePacked path.
 ///
 /// Unlike [`CheckedProgram`], this capability does not retain a rich
@@ -2496,8 +2510,39 @@ pub struct RuntimePackedCheckedSealV1 {
 }
 
 impl RuntimePackedCheckedSealV1 {
+    /// Reconstitute the move-only RuntimePacked seal after the typechecker has
+    /// validated all three proof products as one immutable construction.
+    ///
+    /// Safe callers may consume a seal with [`Self::into_parts`], but cannot
+    /// join those parts again. In particular, changing the public handoff rows
+    /// while retaining an earlier pairing receipt must not recreate checked
+    /// authority:
+    ///
+    /// ```compile_fail
+    /// use boon_checked::{
+    ///     CheckedImageHandoffV4, CheckedImageKernelPairingReceiptV1,
+    ///     CheckedRuntimeFlowTermHandoffV1, RuntimePackedCheckedSealV1,
+    /// };
+    ///
+    /// fn reconstruct(
+    ///     handoff: CheckedImageHandoffV4,
+    ///     receipt: CheckedImageKernelPairingReceiptV1,
+    ///     flow_terms: CheckedRuntimeFlowTermHandoffV1,
+    /// ) -> RuntimePackedCheckedSealV1 {
+    ///     RuntimePackedCheckedSealV1::__typechecker_new(handoff, receipt, flow_terms)
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the RuntimePacked typechecker seal. It must have
+    /// compared the entity-route digest of `image_handoff` with the independent
+    /// packed semantic construction, then created `pairing_receipt` and
+    /// `runtime_flow_terms` from that exact, since-unmodified handoff and the
+    /// same checked construction. None of the three arguments may have been
+    /// separated, mutated, and recombined after that validation.
     #[doc(hidden)]
-    pub fn __typechecker_new(
+    pub unsafe fn __typechecker_new(
         image_handoff: CheckedImageHandoffV4,
         pairing_receipt: CheckedImageKernelPairingReceiptV1,
         runtime_flow_terms: CheckedRuntimeFlowTermHandoffV1,
@@ -2547,6 +2592,20 @@ impl RuntimePackedCheckedSealV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CheckedProgramConstruction {
     #[serde(flatten)]
+    fields: CheckedProgramFields,
+}
+
+/// Transitional RuntimePacked construction with no rich report-table
+/// invariant.
+///
+/// This capability is intentionally distinct from
+/// [`CheckedProgramConstruction`]. Its expression and callable types remain
+/// authoritative in the checked rows and packed kernel input, while the
+/// duplicate editor/report type tables may stay empty. It can only be
+/// consumed by the RuntimePacked typechecker seal.
+#[doc(hidden)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimePackedCheckedProgramConstructionV1 {
     fields: CheckedProgramFields,
 }
 
@@ -3356,6 +3415,78 @@ impl CheckedProgramConstruction {
     }
 }
 
+impl RuntimePackedCheckedProgramConstructionV1 {
+    /// Publish RuntimePacked fields without claiming rich editor-table
+    /// completeness or granting semantic-lowering authority.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the successful dense RuntimePacked checker path and
+    /// must preserve every operational checked-field invariant. Only the
+    /// explicitly report-only expression/function type tables may be absent.
+    pub unsafe fn from_typechecker_fields_unchecked(fields: CheckedProgramFields) -> Self {
+        Self { fields }
+    }
+
+    #[doc(hidden)]
+    pub fn __typechecker_fields(&self) -> &CheckedProgramFields {
+        &self.fields
+    }
+
+    #[doc(hidden)]
+    pub fn __typechecker_into_fields(self) -> CheckedProgramFields {
+        self.fields
+    }
+}
+
+impl RuntimePackedCheckedProgramV1 {
+    /// Grant the transitional RuntimePacked semantic capability after the
+    /// compact checked-image seal has validated the sibling fields.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the RuntimePacked typechecker seal and must prove
+    /// that `fields` and `checked` came from the same completed construction.
+    #[doc(hidden)]
+    pub unsafe fn __typechecker_new(
+        fields: CheckedProgramFields,
+        checked: RuntimePackedCheckedSealV1,
+    ) -> Self {
+        Self { fields, checked }
+    }
+
+    #[doc(hidden)]
+    pub fn __kernel_checked_seal(&self) -> &RuntimePackedCheckedSealV1 {
+        &self.checked
+    }
+
+    pub fn role(&self) -> ProgramRole {
+        self.fields.role
+    }
+
+    pub fn expression_count(&self) -> usize {
+        self.fields.expressions.len()
+    }
+
+    #[doc(hidden)]
+    pub fn __semantic_into_parts(
+        self,
+    ) -> (
+        CheckedProgramFields,
+        CheckedImageHandoffV4,
+        CheckedImageKernelPairingReceiptV1,
+        CheckedRuntimeFlowTermHandoffV1,
+    ) {
+        let (image_handoff, pairing_receipt, runtime_flow_terms) = self.checked.into_parts();
+        (
+            self.fields,
+            image_handoff,
+            pairing_receipt,
+            runtime_flow_terms,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CheckedPatternBinding {
     pub declaration: DeclId,
@@ -3499,6 +3630,10 @@ pub struct CheckOutput {
     /// It can be inspected for editor projections but must be explicitly
     /// sealed by the typechecker before semantic lowering.
     pub construction: Option<CheckedProgramConstruction>,
+    /// Successful RuntimePacked construction. This intentionally cannot be
+    /// inspected or sealed as a complete rich editor construction.
+    #[doc(hidden)]
+    pub runtime_packed_construction: Option<RuntimePackedCheckedProgramConstructionV1>,
     pub report: TypeCheckReport,
 }
 
@@ -3509,6 +3644,16 @@ impl CheckOutput {
         self.program
             .as_deref()
             .or_else(|| self.construction.as_deref())
+    }
+
+    /// Borrow transitional RuntimePacked fields for explicit projection code
+    /// owned by the typechecker. Generic rich callers must use
+    /// [`Self::checked_program_fields`], which deliberately excludes them.
+    #[doc(hidden)]
+    pub fn __typechecker_runtime_packed_fields(&self) -> Option<&CheckedProgramFields> {
+        self.runtime_packed_construction
+            .as_ref()
+            .map(RuntimePackedCheckedProgramConstructionV1::__typechecker_fields)
     }
 }
 

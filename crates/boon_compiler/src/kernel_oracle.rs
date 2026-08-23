@@ -2622,6 +2622,7 @@ const KERNEL_CHECKED_PROGRAM_METADATA_SEAL_DOMAIN_V1: &[u8] =
 fn append_kernel_checked_metadata_publication(
     fields: &CheckedProgramFields,
     publication: &mut CheckedImageKernelPublicationV1,
+    projection_demand: KernelCheckedProjectionDemand,
 ) -> Result<(), String> {
     let root_owner = boon_checked::CheckedShardOwnerKeyV2::ProgramTopLevel { role: fields.role };
     let root_definition = publication.__kernel_intern_projection(CheckedShardProjectionKeyV2 {
@@ -2675,27 +2676,65 @@ fn append_kernel_checked_metadata_publication(
             .unwrap_or(root_definition);
         publication.__kernel_publish_rows(projection, 1)?;
     }
-    for entry in &fields.lowering_metadata.expr_type_table.entries {
-        let projection = fields
-            .expressions
-            .get(entry.expr_id)
-            .and_then(|expression| {
-                publication.__kernel_projection_for_route(
-                    CheckedImageRowDomainV2::Expression,
-                    expression.id.0 as usize,
-                )
-            })
-            .unwrap_or(root_definition);
-        publication.__kernel_publish_rows(projection, 1)?;
-    }
-    for entry in &fields.lowering_metadata.function_type_table.entries {
-        let projection = publication
-            .__kernel_projection_for_route(
-                CheckedImageRowDomainV2::Callable,
-                entry.callable.0 as usize,
-            )
-            .unwrap_or(root_definition);
-        publication.__kernel_publish_rows(projection, 1)?;
+    match projection_demand {
+        KernelCheckedProjectionDemand::RuntimePacked => {
+            for expression in &fields.expressions {
+                let projection = publication
+                    .__kernel_projection_for_route(
+                        CheckedImageRowDomainV2::Expression,
+                        expression.id.0 as usize,
+                    )
+                    .ok_or_else(|| {
+                        format!(
+                            "RuntimePacked metadata references missing Expression route {}",
+                            expression.id.0,
+                        )
+                    })?;
+                publication.__kernel_publish_rows(projection, 1)?;
+            }
+            for callable in fields
+                .callables
+                .iter()
+                .filter(|callable| callable.kind == boon_checked::CheckedCallableKind::User)
+            {
+                let projection = publication
+                    .__kernel_projection_for_route(
+                        CheckedImageRowDomainV2::Callable,
+                        callable.decl_id.0 as usize,
+                    )
+                    .ok_or_else(|| {
+                        format!(
+                            "RuntimePacked metadata references missing Callable route {}",
+                            callable.decl_id.0,
+                        )
+                    })?;
+                publication.__kernel_publish_rows(projection, 1)?;
+            }
+        }
+        KernelCheckedProjectionDemand::EditorRich => {
+            for entry in &fields.lowering_metadata.expr_type_table.entries {
+                let projection = fields
+                    .expressions
+                    .get(entry.expr_id)
+                    .and_then(|expression| {
+                        publication.__kernel_projection_for_route(
+                            CheckedImageRowDomainV2::Expression,
+                            expression.id.0 as usize,
+                        )
+                    })
+                    .unwrap_or(root_definition);
+                publication.__kernel_publish_rows(projection, 1)?;
+            }
+            for entry in &fields.lowering_metadata.function_type_table.entries {
+                let projection = publication
+                    .__kernel_projection_for_route(
+                        CheckedImageRowDomainV2::Callable,
+                        entry.callable.0 as usize,
+                    )
+                    .unwrap_or(root_definition);
+                publication.__kernel_publish_rows(projection, 1)?;
+            }
+        }
     }
     let named_values = &fields.lowering_metadata.named_value_type_table;
     if named_values.checked_statement_sites.len() != named_values.entries.len() {
@@ -3003,10 +3042,24 @@ fn checked_construction_from_kernel(
     }
     diagnostics.extend(order_diagnostics);
     canonicalize_type_diagnostics(&mut diagnostics);
-    fields.lowering_metadata =
-        boon_typecheck::derive_project_checked_lowering_metadata(project, &fields, &diagnostics)
-            .map_err(|error| format!("cannot finalize dense kernel checked metadata: {error}"))?;
-    append_kernel_checked_metadata_publication(&fields, &mut checked_image_publication)?;
+    fields.lowering_metadata = match projection_demand {
+        KernelCheckedProjectionDemand::RuntimePacked => {
+            boon_typecheck::derive_project_runtime_checked_lowering_metadata(
+                project,
+                &fields,
+                &diagnostics,
+            )
+        }
+        KernelCheckedProjectionDemand::EditorRich => {
+            boon_typecheck::derive_project_checked_lowering_metadata(project, &fields, &diagnostics)
+        }
+    }
+    .map_err(|error| format!("cannot finalize dense kernel checked metadata: {error}"))?;
+    append_kernel_checked_metadata_publication(
+        &fields,
+        &mut checked_image_publication,
+        projection_demand,
+    )?;
     let program_metadata_fingerprint = boon_contract::canonical_serde_hash_v1(
         KERNEL_CHECKED_PROGRAM_METADATA_SEAL_DOMAIN_V1,
         &(
@@ -12121,6 +12174,57 @@ mod tests {
     use std::fs;
     use std::path::Path;
     use std::time::Instant;
+
+    fn seal_runtime_packed_test_program(
+        project: &ProjectSyntaxSnapshot,
+        fields: boon_checked::CheckedProgramFields,
+        semantic_input: &boon_compiler_kernel::KernelSemanticInputConstructionV1,
+        authority: boon_checked::CheckedImageKernelAuthorityV1,
+        publication: boon_checked::CheckedImageKernelPublicationV1,
+    ) -> Result<boon_checked::RuntimePackedCheckedProgramV1, String> {
+        let counts = semantic_input.entity_counts();
+        let resource_routes = semantic_input
+            .resource_route_pairs()
+            .map(
+                |(expression, target)| boon_typecheck::RuntimePackedCheckedResourceRouteV1 {
+                    expression,
+                    target,
+                },
+            )
+            .collect::<Vec<_>>();
+        let context = boon_typecheck::RuntimePackedCheckedSealContextV1 {
+            source_bundle_digest_v1: semantic_input.source_bundle_digest_v1(),
+            role: semantic_input.role(),
+            entity_counts: boon_typecheck::RuntimePackedCheckedEntityCountsV1 {
+                scope_count: counts.scopes,
+                declaration_count: counts.declarations,
+                statement_count: counts.statements,
+                expression_count: counts.expressions,
+                callable_count: counts.callables,
+                context_formal_count: counts.context_formals,
+                call_count: counts.calls,
+                pattern_binding_count: counts.pattern_bindings,
+                source_count: counts.sources,
+                state_count: counts.states,
+                list_count: counts.lists,
+                occurrence_count: counts.occurrences,
+            },
+            entity_route_digest_v1: semantic_input.checked_image_entity_route_digest_v1(),
+            resource_routes: &resource_routes,
+        };
+        let construction = unsafe {
+            boon_checked::RuntimePackedCheckedProgramConstructionV1::from_typechecker_fields_unchecked(
+                fields,
+            )
+        };
+        boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication(
+            project,
+            construction,
+            context,
+            authority,
+            publication,
+        )
+    }
 
     fn checked_image_first_difference(
         direct: &boon_checked::CheckedImageHandoffV4,
@@ -21703,28 +21807,17 @@ ordered_mutual:
                 .expect("derive independent rich definition-execution oracle");
         assert!(!rich.is_empty(), "fixture must contain a callable template");
         assert_eq!(rich.as_ref(), derived.as_slice());
-        let packed_call_count = checked.semantic_input.call_count();
-
-        // SAFETY: the runtime fields and publication come from the same
-        // completed dense construction; this test binds the moved packed
-        // authority through the ordinary checked-image pairing route.
-        let construction = unsafe {
-            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
-                checked.fields,
-            )
-        };
-        let (program, pairing) =
-            boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
-                &project,
-                construction,
-                packed_call_count,
-                &checked.checked_image_authority,
-                checked.checked_image_publication,
-            )
-            .expect("seal runtime-packed definition-execution fixture");
+        let program = seal_runtime_packed_test_program(
+            &project,
+            checked.fields,
+            &checked.semantic_input,
+            checked.checked_image_authority,
+            checked.checked_image_publication,
+        )
+        .expect("seal runtime-packed definition-execution fixture");
         let packed = checked
             .semantic_input
-            .seal(&program, &pairing)
+            .seal_runtime(program.__kernel_checked_seal())
             .expect("bind packed definition-execution authority");
         packed
             .validate_rich_definition_execution_templates(&rich)
@@ -21922,6 +22015,96 @@ ordered_mutual:
     }
 
     #[test]
+    fn runtime_packed_keeps_report_only_type_tables_lazy_and_exact() {
+        let source = concat!(
+            "FUNCTION double(input) {\n",
+            "    input + input\n",
+            "}\n",
+            "value: double(input: 2)\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse lazy runtime metadata fixture");
+        let mut runtime = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::RuntimePacked,
+        )
+        .expect("derive RuntimePacked lazy metadata fixture");
+        let editor = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("derive EditorRich metadata oracle");
+
+        assert!(
+            runtime
+                .fields
+                .lowering_metadata
+                .expr_type_table
+                .entries
+                .is_empty()
+        );
+        assert!(
+            runtime
+                .fields
+                .lowering_metadata
+                .function_type_table
+                .entries
+                .is_empty()
+        );
+        assert_eq!(
+            editor
+                .fields
+                .lowering_metadata
+                .expr_type_table
+                .entries
+                .len(),
+            editor.fields.expressions.len(),
+        );
+        assert!(
+            !editor
+                .fields
+                .lowering_metadata
+                .function_type_table
+                .entries
+                .is_empty()
+        );
+
+        let mut duplicate_callable = runtime.fields.clone();
+        let duplicate = duplicate_callable
+            .callables
+            .iter()
+            .find(|callable| callable.kind == boon_checked::CheckedCallableKind::User)
+            .expect("fixture contains one user callable")
+            .clone();
+        duplicate_callable.callables.push(duplicate);
+        let error = boon_typecheck::derive_project_runtime_checked_lowering_metadata(
+            &project,
+            &duplicate_callable,
+            &runtime.diagnostics,
+        )
+        .expect_err("RuntimePacked metadata must retain callable identity validation");
+        assert!(
+            error
+                .to_string()
+                .contains("resolves to 2 checked user callables"),
+            "unexpected duplicate callable error: {error}",
+        );
+
+        boon_typecheck::populate_checked_report_type_tables(&mut runtime.fields);
+        assert_eq!(
+            runtime.fields.lowering_metadata.expr_type_table,
+            editor.fields.lowering_metadata.expr_type_table,
+        );
+        assert_eq!(
+            runtime.fields.lowering_metadata.function_type_table,
+            editor.fields.lowering_metadata.function_type_table,
+        );
+    }
+
+    #[test]
     fn packed_resource_semantics_match_rich_replay_and_require_the_packed_authority() {
         let source = concat!(
             "store: [\n",
@@ -22007,23 +22190,14 @@ ordered_mutual:
         )
         .expect("build runtime-packed semantic fixture");
         assert!(compact.fields.resource_projection_requirements.is_empty());
-        let compact_call_count = compact.semantic_input.call_count();
-        // SAFETY: this is the completed dense runtime construction. The test
-        // intentionally withholds its packed semantic token afterward.
-        let compact_construction = unsafe {
-            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
-                compact.fields,
-            )
-        };
-        let (compact_program, _compact_pairing) =
-            boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
-                &project,
-                compact_construction,
-                compact_call_count,
-                &compact.checked_image_authority,
-                compact.checked_image_publication,
-            )
-            .expect("seal runtime-packed checked image");
+        let compact_program = seal_runtime_packed_test_program(
+            &project,
+            compact.fields,
+            &compact.semantic_input,
+            compact.checked_image_authority,
+            compact.checked_image_publication,
+        )
+        .expect("seal runtime-packed checked image");
 
         let independent = checked_construction_from_kernel(
             &project,
@@ -22031,44 +22205,46 @@ ordered_mutual:
             KernelCheckedProjectionDemand::RuntimePacked,
         )
         .expect("build independent same-shaped packed fixture");
-        let independent_call_count = independent.semantic_input.call_count();
-        // SAFETY: this is a separately completed dense construction used to
-        // prove that content equality cannot substitute for provenance.
-        let independent_construction = unsafe {
-            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
-                independent.fields,
-            )
-        };
-        let (independent_program, independent_pairing) =
-            boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
-                &project,
-                independent_construction,
-                independent_call_count,
-                &independent.checked_image_authority,
-                independent.checked_image_publication,
-            )
-            .expect("seal independent same-shaped checked image");
+        let independent_program = seal_runtime_packed_test_program(
+            &project,
+            independent.fields,
+            &independent.semantic_input,
+            independent.checked_image_authority,
+            independent.checked_image_publication,
+        )
+        .expect("seal independent same-shaped checked image");
         assert_eq!(
-            compact_program.image_handoff().local_image_digest,
-            independent_program.image_handoff().local_image_digest,
+            compact_program
+                .__kernel_checked_seal()
+                .image_handoff()
+                .local_image_digest,
+            independent_program
+                .__kernel_checked_seal()
+                .image_handoff()
+                .local_image_digest,
             "fixture must prove provenance rather than content mismatch",
         );
-        let mismatch = compact
+        let compact_input = compact
             .semantic_input
-            .seal(&independent_program, &independent_pairing)
-            .expect_err("same-shaped independent constructions must not cross-pair");
+            .seal_runtime(compact_program.__kernel_checked_seal())
+            .expect("bind the first same-shaped construction to its own input");
+        let independent_input = independent
+            .semantic_input
+            .seal_runtime(independent_program.__kernel_checked_seal())
+            .expect("bind the second same-shaped construction to its own input");
+        let mismatch =
+            boon_semantic::elaborate_kernel_runtime_packed(independent_program, compact_input, &[])
+                .expect_err(
+                    "independently sealed same-shaped capabilities must not swap at semantic entry",
+                );
         assert!(
             mismatch
                 .to_string()
                 .contains("different construction identities"),
-            "unexpected cross-pair error: {mismatch}",
+            "unexpected post-seal cross-pair error: {mismatch}",
         );
-        let error = boon_semantic::elaborate(compact_program, &[])
-            .expect_err("compact resource rows without packed authority must fail closed");
-        assert!(
-            error.to_string().contains("rich semantic input contains 0"),
-            "unexpected missing packed-authority error: {error}",
-        );
+        drop(independent_input);
+        drop(compact_program);
     }
 
     #[test]
@@ -22122,24 +22298,17 @@ FUNCTION stateful_row(row) {
         .expect("build RuntimePacked definition-template fixture");
         assert!(packed.diagnostics.is_empty(), "{:#?}", packed.diagnostics);
         assert!(packed.fields.definition_execution_templates.is_empty());
-        let packed_call_count = packed.semantic_input.call_count();
-        let packed_construction = unsafe {
-            boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
-                packed.fields,
-            )
-        };
-        let (packed_program, packed_pairing) =
-            boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
-                &project,
-                packed_construction,
-                packed_call_count,
-                &packed.checked_image_authority,
-                packed.checked_image_publication,
-            )
-            .expect("seal RuntimePacked definition-template fixture");
+        let packed_program = seal_runtime_packed_test_program(
+            &project,
+            packed.fields,
+            &packed.semantic_input,
+            packed.checked_image_authority,
+            packed.checked_image_publication,
+        )
+        .expect("seal RuntimePacked definition-template fixture");
         let packed_input = packed
             .semantic_input
-            .seal(&packed_program, &packed_pairing)
+            .seal_runtime(packed_program.__kernel_checked_seal())
             .expect("bind RuntimePacked definition-template authority");
         assert!(
             packed_input.definition_execution_templates().len() >= 2,
@@ -22485,17 +22654,21 @@ FUNCTION stateful_row(row) {
         );
         drop(rich_input);
         assert_eq!(
-            packed_program.image_handoff().local_image_digest,
+            packed_program
+                .__kernel_checked_seal()
+                .image_handoff()
+                .local_image_digest,
             rich_program.image_handoff().local_image_digest,
         );
         assert_eq!(
-            packed_program.image_handoff(),
+            packed_program.__kernel_checked_seal().image_handoff(),
             rich_program.image_handoff(),
             "runtime packed and editor-rich checked-image handoffs must be identical",
         );
 
-        let packed_semantic = boon_semantic::elaborate_kernel(packed_program, packed_input, &[])
-            .expect("RuntimePacked definition templates elaborate");
+        let packed_semantic =
+            boon_semantic::elaborate_kernel_runtime_packed(packed_program, packed_input, &[])
+                .expect("RuntimePacked definition templates elaborate");
         let rich_semantic = boon_semantic::elaborate(rich_program, &[])
             .expect("EditorRich definition templates elaborate");
         #[cfg(feature = "test-packed-call-oracle")]
@@ -23038,37 +23211,28 @@ FUNCTION stateful_row(row) {
             let expression_rows = checked.fields.expressions.len();
             let call_rows = checked.semantic_input.call_count();
             let definition_rows = checked.fields.declarations.len();
-            let replay_fields = replay_parity.then(|| checked.fields.clone());
             let seal_started = Instant::now();
-            // SAFETY: the dense construction helper validates the complete
-            // linked graph and lowering metadata before returning.
-            let construction = unsafe {
-                boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
-                    checked.fields,
-                )
-            };
-            let sealed = if replay_parity {
-                boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
+            let seal_us;
+            if replay_parity {
+                let replay_fields = checked.fields.clone();
+                // SAFETY: EditorRich validates complete rich metadata before
+                // exposing its construction to this explicit oracle.
+                let construction = unsafe {
+                    boon_checked::CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                        checked.fields,
+                    )
+                };
+                let sealed =
+                    boon_typecheck::seal_project_checked_program_construction_with_kernel_publication(
                     &project,
                     construction,
                     &checked.call_occurrences,
                     &checked.checked_image_authority,
                     checked.checked_image_publication,
                 )
-                .expect("seal NovyWave EditorRich checked image")
-            } else {
-                boon_typecheck::seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
-                    &project,
-                    construction,
-                    call_rows,
-                    &checked.checked_image_authority,
-                    checked.checked_image_publication,
-                )
-                .map(|(program, _)| program)
-                .expect("seal NovyWave RuntimePacked checked image")
-            };
-            let seal_us = elapsed_us(seal_started.elapsed());
-            if let Some(replay_fields) = replay_fields {
+                .expect("seal NovyWave EditorRich checked image");
+                seal_us = elapsed_us(seal_started.elapsed());
+
                 // SAFETY: this is an opt-in differential oracle over the same
                 // completed fields. It is deliberately outside `seal_us`.
                 let replay_construction = unsafe {
@@ -23092,6 +23256,16 @@ FUNCTION stateful_row(row) {
                     checked_image_first_difference(sealed.image_handoff(), replay.image_handoff(),),
                 );
                 eprintln!("kernel-novywave checked_image_replay_parity=true replay_us={replay_us}");
+            } else {
+                let _sealed = seal_runtime_packed_test_program(
+                    &project,
+                    checked.fields,
+                    &checked.semantic_input,
+                    checked.checked_image_authority,
+                    checked.checked_image_publication,
+                )
+                .expect("seal NovyWave RuntimePacked checked image");
+                seal_us = elapsed_us(seal_started.elapsed());
             }
             eprintln!(
                 "kernel-novywave production_checked=true profile={} construction_us={} seal_us={} total_us={} owners={} declarations={} expressions={} calls={} linked_operations={} activations={}",

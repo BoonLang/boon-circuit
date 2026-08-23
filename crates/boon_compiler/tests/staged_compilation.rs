@@ -46,14 +46,18 @@ fn staged_check_and_finish_match_monolithic_compilation() {
         "successful runtime staging must not mirror lowering-owned rich type tables in its report",
     );
     assert!(
-        checked
-            .output
-            .checked_program_fields()
-            .unwrap()
-            .resource_projection_requirements
-            .is_empty(),
-        "ordinary verified staging must not materialize rich resource DTOs",
+        checked.output.checked_program_fields().is_none()
+            && checked.output.runtime_packed_construction.is_some(),
+        "successful runtime staging must expose only the distinct RuntimePacked construction",
     );
+    let runtime_type_hints = boon_typecheck::project_type_hints_for_project(
+        checked
+            .syntax
+            .unit_native()
+            .expect("runtime staging keeps unit-native syntax"),
+        &checked.output,
+    );
+    assert!(!runtime_type_hints.entries.is_empty());
     let staged_parse_work = checked.profile.parse_work;
     let staged_typecheck_work = checked.profile.typecheck_work;
     let staged = finish_checked_machine_plan(
@@ -90,6 +94,14 @@ fn staged_check_and_finish_match_monolithic_compilation() {
             .is_empty(),
         "editor staging must explicitly project rich resource DTOs",
     );
+    let editor_type_hints = boon_typecheck::project_type_hints_for_project(
+        editor_checked
+            .syntax
+            .unit_native()
+            .expect("editor staging keeps unit-native syntax"),
+        &editor_checked.output,
+    );
+    assert_eq!(runtime_type_hints, editor_type_hints);
     let editor_staged = finish_checked_machine_plan(
         editor_checked,
         CheckedCompileRequest::new(

@@ -15639,7 +15639,6 @@ fn checked_declaration_canonical_path(
     Some(segments.join("."))
 }
 
-const CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V4: &[u8] = b"boon.checked-image-projection-key.v4\0";
 const CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-row-payload.v4\0";
 const CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-row.v4\0";
 const CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V4: &[u8] = b"boon.checked-image-shard.v4\0";
@@ -15749,11 +15748,7 @@ impl CheckedImageHandoffBuilderV4 {
             u32::try_from(self.projections.len())
                 .map_err(|_| "checked image projection registry exceeds u32".to_owned())?,
         );
-        let stable_key_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V4,
-            &projection,
-        )
-        .map_err(|error| format!("failed to hash checked projection key: {error}"))?;
+        let stable_key_digest = boon_checked::checked_image_projection_key_digest_v4(&projection)?;
         let kernel_authority_seal = self
             .kernel_authority
             .as_ref()
@@ -16183,7 +16178,7 @@ fn checked_image_kernel_authority_context_from_publication(
                 definition.root_scope.0,
             ));
         }
-        validate_runtime_packed_definition_owner(role, ordinal, definition, &key.owner)?;
+        validate_runtime_packed_definition_owner(role, ordinal, &key.owner)?;
         definition_seal_rows
             .entry(key.owner.clone())
             .or_default()
@@ -16837,7 +16832,7 @@ fn checked_image_handoff_from_kernel_publication_parts(
     String,
 > {
     let (source_bundle_digest_v1, role, projections, routes, pairing) =
-        publication.__typechecker_into_parts();
+        publication.__typechecker_into_parts()?;
     if source_bundle_digest_v1 != expected_source_bundle_digest_v1 || role != expected_role {
         return Err(
             "kernel checked-image publication differs from its completed checked program"
@@ -17052,6 +17047,7 @@ pub struct RuntimePackedCheckedSealContextV1<'a> {
     pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub role: ProgramRole,
     pub entity_counts: RuntimePackedCheckedEntityCountsV1,
+    pub entity_route_digest_v1: boon_checked::CheckedImageEntityRouteDigestV1,
     pub resource_routes: &'a [RuntimePackedCheckedResourceRouteV1],
 }
 
@@ -17094,6 +17090,13 @@ pub fn seal_project_runtime_packed_checked_authority_with_kernel_publication(
         authority_context,
         publication,
     )?;
+    let actual_route_digest = boon_checked::checked_image_entity_route_digest_v1(&image_handoff)?;
+    if actual_route_digest != context.entity_route_digest_v1 {
+        return Err(
+            "compact checked-image entity routes differ from their packed semantic authority"
+                .to_owned(),
+        );
+    }
     validate_runtime_packed_entity_routes(
         &image_handoff,
         context.role,
@@ -17105,6 +17108,7 @@ pub fn seal_project_runtime_packed_checked_authority_with_kernel_publication(
     let pairing_receipt = boon_checked::CheckedImageKernelPairingReceiptV1::__typechecker_new(
         pairing,
         &image_handoff,
+        actual_route_digest,
     );
     let runtime_flow_terms = checked_runtime_flow_term_handoff_from_projection(
         authority.runtime_flow_terms,
@@ -17113,36 +17117,32 @@ pub fn seal_project_runtime_packed_checked_authority_with_kernel_publication(
         context.role,
         &image_handoff,
     )?;
-    Ok(boon_checked::RuntimePackedCheckedSealV1::__typechecker_new(
-        image_handoff,
-        pairing_receipt,
-        runtime_flow_terms,
-    ))
+    // SAFETY: `actual_route_digest` was compared with the independently owned
+    // packed-semantic digest above. The receipt and flow terms were then made
+    // from this exact, unmodified handoff and the same consumed construction.
+    Ok(unsafe {
+        boon_checked::RuntimePackedCheckedSealV1::__typechecker_new(
+            image_handoff,
+            pairing_receipt,
+            runtime_flow_terms,
+        )
+    })
 }
 
-/// Seal a RuntimePacked checked construction without materializing rich call
-/// rows or parser-owned structural occurrence routes.
+/// Seal the explicitly distinct RuntimePacked construction.
 ///
-/// The sibling packed semantic input owns the authoritative call facts. Its
-/// dense call count is therefore required explicitly, while the move-only
-/// kernel publication supplies the checked-image invocation projections and
-/// their authored-site identities. The publication pairing is returned only
-/// after source, role, authority, and exact dense Call-route coverage have all
-/// been validated against this construction.
+/// The sibling packed semantic input supplies exact entity counts and resource
+/// routes. The move-only authority and publication are validated across every
+/// routed domain, then embedded in a RuntimePacked-only program capability;
+/// no incomplete rich [`CheckedProgram`] can escape this boundary.
 #[doc(hidden)]
-pub fn seal_project_runtime_packed_checked_program_construction_with_kernel_publication_and_pairing(
+pub fn seal_project_runtime_packed_checked_program_construction_with_kernel_publication(
     parsed: &ProjectSyntaxSnapshot,
-    construction: CheckedProgramConstruction,
-    packed_call_count: usize,
-    authority: &CheckedImageKernelAuthorityV1,
+    construction: boon_checked::RuntimePackedCheckedProgramConstructionV1,
+    context: RuntimePackedCheckedSealContextV1<'_>,
+    authority: CheckedImageKernelAuthorityV1,
     publication: boon_checked::CheckedImageKernelPublicationV1,
-) -> Result<
-    (
-        CheckedProgram,
-        boon_checked::CheckedImageKernelPairingReceiptV1,
-    ),
-    String,
-> {
+) -> Result<boon_checked::RuntimePackedCheckedProgramV1, String> {
     let fields = construction.__typechecker_into_fields();
     if !fields.calls.is_empty() {
         return Err(format!(
@@ -17157,15 +17157,72 @@ pub fn seal_project_runtime_packed_checked_program_construction_with_kernel_publ
             parsed.source_bundle_digest_v1()
         ));
     }
-    let (image_handoff, pairing) =
-        checked_image_handoff_from_kernel_publication(&fields, authority, publication)?;
-    validate_runtime_packed_call_routes(&image_handoff, packed_call_count)?;
-    let pairing_receipt = boon_checked::CheckedImageKernelPairingReceiptV1::__typechecker_new(
-        pairing,
-        &image_handoff,
-    );
-    let program = seal_kernel_checked_program_fields(fields, image_handoff, Some(authority))?;
-    Ok((program, pairing_receipt))
+    if fields.role != context.role
+        || fields.source_bundle_digest_v1 != context.source_bundle_digest_v1
+    {
+        return Err(
+            "RuntimePacked checked fields differ from their compact seal context".to_owned(),
+        );
+    }
+    let retained_counts = [
+        (
+            "scope",
+            fields.scopes.len(),
+            context.entity_counts.scope_count,
+        ),
+        (
+            "declaration",
+            fields.declarations.len(),
+            context.entity_counts.declaration_count,
+        ),
+        (
+            "statement",
+            fields.statements.len(),
+            context.entity_counts.statement_count,
+        ),
+        (
+            "expression",
+            fields.expressions.len(),
+            context.entity_counts.expression_count,
+        ),
+        (
+            "callable",
+            fields.callables.len(),
+            context.entity_counts.callable_count,
+        ),
+        (
+            "context formal",
+            fields.context_formals.len(),
+            context.entity_counts.context_formal_count,
+        ),
+        (
+            "source",
+            fields.sources.len(),
+            context.entity_counts.source_count,
+        ),
+        (
+            "state",
+            fields.states.len(),
+            context.entity_counts.state_count,
+        ),
+        ("list", fields.lists.len(), context.entity_counts.list_count),
+    ];
+    for (kind, rich_count, packed_count) in retained_counts {
+        if rich_count != packed_count {
+            return Err(format!(
+                "RuntimePacked checked construction has {rich_count} rich {kind} rows for {packed_count} packed entities",
+            ));
+        }
+    }
+    let checked = seal_project_runtime_packed_checked_authority_with_kernel_publication(
+        parsed,
+        context,
+        authority,
+        publication,
+    )?;
+    // SAFETY: the explicit RuntimePacked construction, compact seal context,
+    // and consumed authority/publication were validated together above.
+    Ok(unsafe { boon_checked::RuntimePackedCheckedProgramV1::__typechecker_new(fields, checked) })
 }
 
 fn validate_runtime_packed_call_routes(
@@ -17264,7 +17321,7 @@ fn validate_runtime_packed_definition_roots(
                 definition.root_scope.0,
             ));
         }
-        validate_runtime_packed_definition_owner(role, ordinal, definition, &key.owner)?;
+        validate_runtime_packed_definition_owner(role, ordinal, &key.owner)?;
     }
     Ok(())
 }
@@ -17272,19 +17329,10 @@ fn validate_runtime_packed_definition_roots(
 fn validate_runtime_packed_definition_owner(
     role: ProgramRole,
     ordinal: usize,
-    definition: &CheckedImageDefinitionAuthoritySealV1,
     owner: &CheckedShardOwnerKeyV2,
 ) -> Result<(), String> {
     let owner_role = match owner {
-        CheckedShardOwnerKeyV2::ProgramTopLevel { role } => {
-            if definition.root_scope.0 != 0 {
-                return Err(format!(
-                    "compact checked top-level definition {ordinal} has non-root scope {}",
-                    definition.root_scope.0,
-                ));
-            }
-            *role
-        }
+        CheckedShardOwnerKeyV2::ProgramTopLevel { role } => *role,
         CheckedShardOwnerKeyV2::Callable {
             role,
             callable_kind: CheckedShardCallableKindV2::User,
@@ -17401,12 +17449,7 @@ fn validate_runtime_packed_entity_routes(
                 "compact checked image definition {ordinal} Scope route {scope} is not a definition projection",
             ));
         }
-        validate_runtime_packed_definition_owner(
-            role,
-            ordinal,
-            definition,
-            &projection.stable_key.owner,
-        )?;
+        validate_runtime_packed_definition_owner(role, ordinal, &projection.stable_key.owner)?;
     }
     Ok(())
 }
@@ -17791,9 +17834,11 @@ fn seal_project_checked_program_construction_with_kernel_publication_inner(
             }
         }
     }
+    let actual_route_digest = boon_checked::checked_image_entity_route_digest_v1(&image_handoff)?;
     let pairing_receipt = boon_checked::CheckedImageKernelPairingReceiptV1::__typechecker_new(
         pairing,
         &image_handoff,
+        actual_route_digest,
     );
     let program = seal_kernel_checked_program_fields(fields, image_handoff, Some(authority))?;
     Ok((program, pairing_receipt))
@@ -17910,49 +17955,61 @@ fn validate_structural_lowering_metadata(
     named_values: &NamedValueTypeTable,
     outputs: &[OutputRootTypeEntry],
     host_ports: &HostPortTable,
+    validate_report_type_tables: bool,
 ) -> Result<(), String> {
     validate_source_payload_shape_table(program, lookup, source_payloads)?;
 
     let user_callable_count = lookup.user_callables.values().map(Vec::len).sum::<usize>();
-    if functions.entries.len() != user_callable_count {
-        return Err(format!(
-            "function type metadata has {} entries for {} checked user callables",
-            functions.entries.len(),
-            user_callable_count
-        ));
-    }
-    for entry in &functions.entries {
-        let matches = lookup
-            .user_callables
-            .get(&entry.callable)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let [callable] = matches else {
+    for (callable, matches) in &lookup.user_callables {
+        if matches.len() != 1 {
             return Err(format!(
                 "function type identity {} resolves to {} checked user callables",
-                entry.callable.0,
-                matches.len()
+                callable.0,
+                matches.len(),
             ));
-        };
-        if callable.name != entry.name
-            || callable.result != entry.result
-            || callable.effect != entry.effect
-            || callable.parameters.len() != entry.parameters.len()
-            || callable
-                .parameters
-                .iter()
-                .zip(&entry.parameters)
-                .any(|(checked, metadata)| {
-                    checked.decl_id != metadata.formal
-                        || checked.ordinal != metadata.ordinal
-                        || checked.name != metadata.name
-                        || checked.flow_type != metadata.flow_type
-                })
-        {
+        }
+    }
+    if validate_report_type_tables {
+        if functions.entries.len() != user_callable_count {
             return Err(format!(
-                "function type identity {} differs from its exact checked signature",
-                entry.callable.0
+                "function type metadata has {} entries for {} checked user callables",
+                functions.entries.len(),
+                user_callable_count
             ));
+        }
+        for entry in &functions.entries {
+            let matches = lookup
+                .user_callables
+                .get(&entry.callable)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let [callable] = matches else {
+                return Err(format!(
+                    "function type identity {} resolves to {} checked user callables",
+                    entry.callable.0,
+                    matches.len()
+                ));
+            };
+            if callable.name != entry.name
+                || callable.result != entry.result
+                || callable.effect != entry.effect
+                || callable.parameters.len() != entry.parameters.len()
+                || callable
+                    .parameters
+                    .iter()
+                    .zip(&entry.parameters)
+                    .any(|(checked, metadata)| {
+                        checked.decl_id != metadata.formal
+                            || checked.ordinal != metadata.ordinal
+                            || checked.name != metadata.name
+                            || checked.flow_type != metadata.flow_type
+                    })
+            {
+                return Err(format!(
+                    "function type identity {} differs from its exact checked signature",
+                    entry.callable.0
+                ));
+            }
         }
     }
 
@@ -21218,17 +21275,28 @@ fn project_type_hints_syntax(
         if let Some(checked) = output.checked_program_fields() {
             let metadata = &checked.lowering_metadata;
             (
-                &metadata.expr_type_table,
-                &metadata.function_type_table,
+                Cow::Borrowed(&metadata.expr_type_table),
+                Cow::Borrowed(&metadata.function_type_table),
                 &metadata.render_slot_table,
-                &metadata.source_payload_shape_table,
+                metadata.source_payload_shape_table.as_slice(),
+            )
+        } else if let Some(checked) = output.__typechecker_runtime_packed_fields() {
+            let (expressions, functions) = checked_metadata::checked_report_type_tables(checked);
+            (
+                Cow::Owned(expressions),
+                Cow::Owned(functions),
+                &checked.lowering_metadata.render_slot_table,
+                checked
+                    .lowering_metadata
+                    .source_payload_shape_table
+                    .as_slice(),
             )
         } else {
             (
-                &output.report.expr_type_table,
-                &output.report.function_type_table,
+                Cow::Borrowed(&output.report.expr_type_table),
+                Cow::Borrowed(&output.report.function_type_table),
                 &output.report.render_slot_table,
-                &output.report.source_payload_shape_table,
+                output.report.source_payload_shape_table.as_slice(),
             )
         };
 
@@ -21255,8 +21323,8 @@ fn project_type_hints_syntax(
     let bindings = name_bindings(program, &source_payload_types);
     type_hint_table(
         program,
-        expr_type_table,
-        function_type_table,
+        expr_type_table.as_ref(),
+        function_type_table.as_ref(),
         render_slot_table,
         &syntax_payloads,
         &bindings,
@@ -22673,6 +22741,7 @@ impl CheckedProgramDatabase {
             &named_value_type_table,
             &output_root_types,
             &host_port_table,
+            true,
         ) {
             self.diagnostics.push(diagnostic_at_line(1, error));
         }
@@ -22998,6 +23067,7 @@ impl CheckedProgramDatabase {
             CheckOutput {
                 program,
                 construction,
+                runtime_packed_construction: None,
                 report,
             },
             TypeCheckProfile {

@@ -289,7 +289,7 @@ struct CheckedProgramLookup<'a> {
     declarations_by_id: Vec<Option<Option<usize>>>,
     statements_by_id: Vec<Option<Option<usize>>>,
     scopes_by_id: Vec<Option<Option<usize>>>,
-    declarations_by_scope_and_name: Vec<BTreeMap<String, Option<DeclId>>>,
+    declarations_by_scope_and_name: Vec<Vec<(&'a str, Option<DeclId>)>>,
     pattern_bindings_by_declaration: Vec<Option<Option<usize>>>,
     statements_by_value: Vec<Vec<usize>>,
     element_contexts_by_declaration: Vec<Option<Option<(CheckedCallId, usize)>>>,
@@ -786,7 +786,10 @@ fn checked_call_named_input<'a>(
 }
 
 impl<'catalog> CheckedProgramLookup<'catalog> {
-    fn new(program: &CheckedProgramFields, calls: &'catalog CallCatalog<'catalog>) -> Self {
+    fn new(
+        program: &'catalog CheckedProgramFields,
+        calls: &'catalog CallCatalog<'catalog>,
+    ) -> Self {
         let mut expressions_by_id = Vec::new();
         for (index, expression) in program.expressions.iter().enumerate() {
             insert_dense_index(&mut expressions_by_id, expression.id.0 as usize, index);
@@ -828,15 +831,39 @@ impl<'catalog> CheckedProgramLookup<'catalog> {
                 current = parent;
             }
         }
-        let mut declarations_by_scope_and_name = vec![BTreeMap::new(); program.scopes.len()];
+        let mut declarations_per_scope = vec![0usize; program.scopes.len()];
+        for declaration in &program.declarations {
+            if let Some(count) = declarations_per_scope.get_mut(declaration.scope_id.0 as usize) {
+                *count += 1;
+            }
+        }
+        let mut declarations_by_scope_and_name = declarations_per_scope
+            .into_iter()
+            .map(Vec::with_capacity)
+            .collect::<Vec<Vec<(&str, Option<DeclId>)>>>();
         for declaration in &program.declarations {
             if let Some(declarations) =
                 declarations_by_scope_and_name.get_mut(declaration.scope_id.0 as usize)
             {
-                declarations
-                    .entry(declaration.name.clone())
-                    .and_modify(|entry| *entry = None)
-                    .or_insert(Some(declaration.id));
+                declarations.push((declaration.name.as_str(), Some(declaration.id)));
+            }
+        }
+        for declarations in &mut declarations_by_scope_and_name {
+            declarations.sort_unstable_by_key(|(name, _)| *name);
+            let mut group_start = 0;
+            while group_start < declarations.len() {
+                let mut group_end = group_start + 1;
+                while group_end < declarations.len()
+                    && declarations[group_end].0 == declarations[group_start].0
+                {
+                    group_end += 1;
+                }
+                if group_end - group_start > 1 {
+                    for (_, declaration) in &mut declarations[group_start..group_end] {
+                        *declaration = None;
+                    }
+                }
+                group_start = group_end;
             }
         }
         let mut pattern_bindings_by_declaration = Vec::new();
@@ -1023,7 +1050,14 @@ impl<'catalog> CheckedProgramLookup<'catalog> {
     ) -> Option<DeclId> {
         self.declarations_by_scope_and_name
             .get(scope.0 as usize)?
-            .get(name)
+            .binary_search_by_key(&name, |(candidate, _)| *candidate)
+            .ok()
+            .and_then(|index| {
+                self.declarations_by_scope_and_name
+                    .get(scope.0 as usize)?
+                    .get(index)
+            })
+            .map(|(_, declaration)| declaration)
             .copied()
             .flatten()
     }

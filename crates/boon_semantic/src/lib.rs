@@ -36,8 +36,8 @@ pub use storage_contract::*;
 pub use view_contract::*;
 
 use boon_checked::{
-    CheckedExternalDeclarationIdentityV1, CheckedImageRowDomainV2, CheckedProgram,
-    CheckedProgramFields, DeclId, runtime_type_contains_var,
+    CheckedExternalDeclarationIdentityV1, CheckedImageHandoffV4, CheckedImageRowDomainV2,
+    CheckedProgram, CheckedProgramFields, DeclId, runtime_type_contains_var,
 };
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
@@ -2743,7 +2743,7 @@ pub fn elaborate_with_external_event_identities(
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
 ) -> Result<SemanticProgram, SemanticError> {
     elaborate_with_representation(
-        checked_program,
+        CheckedProgramInput::Rich(checked_program),
         producer_materializations,
         external_event_identities,
         true,
@@ -2764,7 +2764,27 @@ pub fn elaborate_kernel(
     producer_materializations: &[ProducerMaterializationRequest],
 ) -> Result<SemanticProgram, SemanticError> {
     elaborate_with_representation(
-        checked_program,
+        CheckedProgramInput::Rich(checked_program),
+        producer_materializations,
+        &[],
+        true,
+        Some(kernel_input),
+    )
+}
+
+/// Consume the explicitly distinct RuntimePacked checked capability.
+///
+/// Its transitional base rows are private to semantic construction and cannot
+/// be inspected or resealed as a complete rich editor program. This boundary
+/// will shrink as the remaining consumers move onto the packed checked view.
+#[doc(hidden)]
+pub fn elaborate_kernel_runtime_packed(
+    checked_program: boon_checked::RuntimePackedCheckedProgramV1,
+    kernel_input: boon_compiler_kernel::KernelSemanticInputV1,
+    producer_materializations: &[ProducerMaterializationRequest],
+) -> Result<SemanticProgram, SemanticError> {
+    elaborate_with_representation(
+        CheckedProgramInput::RuntimePacked(checked_program),
         producer_materializations,
         &[],
         true,
@@ -2783,11 +2803,45 @@ pub fn elaborate_flat_test_oracle(
     checked_program: CheckedProgram,
     producer_materializations: &[ProducerMaterializationRequest],
 ) -> Result<SemanticProgram, SemanticError> {
-    elaborate_with_representation(checked_program, producer_materializations, &[], false, None)
+    elaborate_with_representation(
+        CheckedProgramInput::Rich(checked_program),
+        producer_materializations,
+        &[],
+        false,
+        None,
+    )
+}
+
+enum CheckedProgramInput {
+    Rich(CheckedProgram),
+    RuntimePacked(boon_checked::RuntimePackedCheckedProgramV1),
+}
+
+impl CheckedProgramInput {
+    fn into_semantic_parts(
+        self,
+    ) -> (
+        CheckedProgramFields,
+        CheckedImageHandoffV4,
+        Option<boon_checked::CheckedImageKernelPairingReceiptV1>,
+        boon_checked::CheckedRuntimeFlowTermHandoffV1,
+    ) {
+        match self {
+            Self::Rich(program) => {
+                let (fields, handoff, runtime_flow_terms) = program.into_semantic_parts();
+                (fields, handoff, None, runtime_flow_terms)
+            }
+            Self::RuntimePacked(program) => {
+                let (fields, handoff, pairing_receipt, runtime_flow_terms) =
+                    program.__semantic_into_parts();
+                (fields, handoff, Some(pairing_receipt), runtime_flow_terms)
+            }
+        }
+    }
 }
 
 fn elaborate_with_representation(
-    checked_program: CheckedProgram,
+    checked_program: CheckedProgramInput,
     producer_materializations: &[ProducerMaterializationRequest],
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
     retain_ordinary_calls: bool,
@@ -2818,7 +2872,7 @@ fn elaborate_with_representation(
         }};
     }
 
-    let (mut checked_program, checked_handoff, runtime_flow_terms) =
+    let (mut checked_program, checked_handoff, runtime_pairing_receipt, runtime_flow_terms) =
         checked_program.into_semantic_parts();
     let resource_route_count = checked_handoff
         .entity_routes
@@ -2826,6 +2880,11 @@ fn elaborate_with_representation(
         .filter(|route| route.domain == CheckedImageRowDomainV2::ResourceProjection)
         .count();
     if let Some(kernel_input) = kernel_input_ref {
+        if let Some(pairing_receipt) = runtime_pairing_receipt.as_ref() {
+            kernel_input
+                .validate_runtime_checked_identity(&checked_handoff, pairing_receipt)
+                .map_err(|error| SemanticError::new(error.to_string()))?;
+        }
         if resource_route_count != kernel_input.resource_projection_count() {
             return Err(SemanticError::new(format!(
                 "kernel semantic input has {} resource projections but checked image routes {resource_route_count}",
@@ -2859,6 +2918,10 @@ fn elaborate_with_representation(
         ));
         drop(std::mem::take(
             &mut checked_program.definition_execution_templates,
+        ));
+    } else if runtime_pairing_receipt.is_some() {
+        return Err(SemanticError::new(
+            "RuntimePacked checked program has no sibling kernel semantic input",
         ));
     } else if resource_route_count != checked_program.resource_projection_requirements.len() {
         return Err(SemanticError::new(format!(

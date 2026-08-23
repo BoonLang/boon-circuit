@@ -15125,6 +15125,9 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                 let call = self.call(*call)?;
                 let signature = self.callable(call.callable)?;
                 if signature.kind == CheckedCallableKind::User {
+                    if frames.iter().any(|frame| frame.callable == call.callable) {
+                        return None;
+                    }
                     let result = signature.result_expression?;
                     let bindings = call
                         .entries
@@ -15292,6 +15295,14 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                     return false;
                 };
                 if signature.kind == CheckedCallableKind::User {
+                    if frames.iter().any(|frame| frame.callable == call.callable) {
+                        // Totality records whether evaluation can produce an
+                        // error value. Recursion is not itself such an error,
+                        // so close the cycle coinductively just like the
+                        // active-expression guard above.
+                        active.remove(&(expression, frame_path));
+                        return true;
+                    }
                     let Some(result) = signature.result_expression else {
                         active.remove(&(expression, frame_path));
                         return false;

@@ -1,25 +1,20 @@
-//! Packed-call derivation of checked list-order metadata.
+//! Packed derivation of checked list-order metadata.
 //!
-//! Expression semantics still borrow the completed rich expression rows while
-//! the checked-model migration is in progress. Call topology, substitutions,
-//! result types, spans, and invocation frames come directly from permanent
-//! definition-code columns; RuntimePacked compilation therefore never needs a
-//! rich `CheckedCall` projection merely to derive order chains.
+//! Order analysis borrows the permanent owner/fact/type columns directly. It
+//! never constructs rich checked expressions, declarations, callables, or
+//! source rows. Invocation state is a compact parent-linked frame arena; text
+//! leaves borrow the existing text/literal authorities and paths retain
+//! `SymbolId`s until the final checked output boundary.
 
 use super::*;
 use boon_checked::{
-    CheckedCallOrderChain, CheckedEffectSummary, CheckedOrderChain, CheckedOrderDirection,
-    CheckedOrderKey, CheckedParameter, CheckedTypeSubstitution,
-    apply_checked_type_substitutions_once,
+    CheckedCallOrderChain, CheckedOrderChain, CheckedOrderDirection, CheckedOrderKey,
+    CheckedTypeSubstitution, apply_checked_type_substitutions_once,
 };
+use boon_contract::SymbolId;
 use boon_data::{Bits, ExactNumber};
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
 
-/// Presentation-independent order diagnostic emitted by the packed analyzer.
-///
-/// The compiler facade owns Boon-facing type labels. Keeping that formatting
-/// above the dependency firewall lets this module retain only the exact type
-/// already required by `CheckedOrderKey`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelCheckedOrderDiagnostic {
     pub span: CheckedSpan,
@@ -40,176 +35,373 @@ pub struct KernelCheckedOrderDerivation {
     pub diagnostics: Box<[KernelCheckedOrderDiagnostic]>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackedOrderFrameId(u32);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PackedOrderFrame {
+    parent: Option<PackedOrderFrameId>,
     call: CheckedCallId,
-    callable: DeclId,
-    bindings: BTreeMap<DeclId, CheckedExprId>,
+    target_owner: KernelOwnerId,
+    target_root_statement: crate::KernelStatementId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PackedOrderWalkKind {
+    State,
+    Semantic,
+    Total,
+    Pure,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackedOrderVisit {
+    kind: PackedOrderWalkKind,
+    expression: CheckedExprId,
+    frame: Option<PackedOrderFrameId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackedOrderLocalLocator {
+    owner: KernelOwnerId,
+    ordinal: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PackedOrderSourceRoute {
+    anchor: DeclId,
+    source: CheckedSourceId,
+    expression: CheckedExprId,
+    symbol_start: u32,
+    symbol_len: u32,
+}
+
+#[derive(Clone, Copy)]
+struct PackedOrderExpressionRef<'a> {
+    owner: KernelOwnerId,
+    local: crate::KernelExpressionId,
+    definition: KernelDefinitionRef<'a>,
+    node: &'a crate::PackedKernelOwnerNode,
+    facts: crate::PackedDefinitionFactsRef<'a>,
+    presentation: &'a crate::PackedExpressionPresentation,
+    payload: crate::PackedExpressionPayload,
+    shape: Option<&'a crate::PackedExecutionShape>,
+    lexical: Option<&'a crate::PackedLexicalBinding>,
+    call: Option<KernelCheckedPackedCallRef<'a>>,
+}
+
+impl<'a> PackedOrderExpressionRef<'a> {
+    fn inputs(self) -> &'a [crate::PackedKernelOwnerInputEdge] {
+        self.node.inputs(self.definition.input())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PackedOrderDeclarationRef<'a> {
+    owner: KernelOwnerId,
+    local: crate::KernelDeclarationId,
+    definition: KernelDefinitionRef<'a>,
+    row: &'a crate::PackedDeclaration,
+    presentation: &'a crate::PackedDeclarationPresentation,
+}
+
+#[derive(Clone, Copy)]
+struct PackedOrderParameterRef<'a> {
+    name: &'a str,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PackedOrderState {
-    Ordered(AnalyzedOrderChain),
+enum PackedOrderState<'a> {
+    Ordered(AnalyzedOrderChain<'a>),
     Unordered,
     Deferred,
     Invalid { call_path: Vec<CheckedCallId> },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct AnalyzedOrderChain {
+struct AnalyzedOrderChain<'a> {
     checked: CheckedOrderChain,
-    semantic: Vec<PackedOrderSemanticKey>,
+    semantic: Vec<PackedOrderSemanticKey<'a>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PackedOrderSemanticKey {
-    key: Option<PackedOrderSemanticExpression>,
-    direction: PackedOrderSemanticDirection,
+struct PackedOrderSemanticKey<'a> {
+    key: Option<PackedOrderSemanticExpression<'a>>,
+    direction: PackedOrderSemanticDirection<'a>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PackedOrderSemanticDirection {
+enum PackedOrderSemanticDirection<'a> {
     Ascending,
     Descending,
-    Dynamic(Option<PackedOrderSemanticExpression>),
+    Dynamic(Option<PackedOrderSemanticExpression<'a>>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PackedOrderSemanticExpression {
-    Row(Vec<String>),
+enum PackedOrderSemanticFunction<'a> {
+    Named(&'a str),
+    Latest,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PackedOrderSemanticInputName<'a> {
+    Named(&'a str),
+    Index(u32),
+    Passed,
+}
+
+/// Temporary structural value used only to compare order keys across branches.
+/// Text and numeric leaves borrow packed storage; identifier paths retain
+/// global `SymbolId`s rather than cloning strings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PackedOrderSemanticExpression<'a> {
+    Row(Vec<SymbolId>),
     Capture {
-        path: String,
-        projection: Vec<String>,
+        path: Vec<SymbolId>,
+        projection: Vec<SymbolId>,
     },
     Project {
-        input: Box<PackedOrderSemanticExpression>,
-        fields: Vec<String>,
+        input: Box<PackedOrderSemanticExpression<'a>>,
+        fields: Vec<SymbolId>,
     },
-    Text(String),
-    TextTemplate(Vec<PackedOrderSemanticTextSegment>),
-    Number(ExactNumber),
-    Bits(Bits),
-    Tag(String),
+    Text(&'a str),
+    TextTemplate(Vec<PackedOrderSemanticTextSegment<'a>>),
+    Number(&'a ExactNumber),
+    Bits(&'a Bits),
+    Tag(&'a str),
     Call {
-        function: String,
-        inputs: Vec<(String, PackedOrderSemanticExpression)>,
+        function: PackedOrderSemanticFunction<'a>,
+        inputs: Vec<(
+            PackedOrderSemanticInputName<'a>,
+            PackedOrderSemanticExpression<'a>,
+        )>,
     },
     Infix {
-        operator: String,
-        left: Box<PackedOrderSemanticExpression>,
-        right: Box<PackedOrderSemanticExpression>,
+        operator: &'a str,
+        left: Box<PackedOrderSemanticExpression<'a>>,
+        right: Box<PackedOrderSemanticExpression<'a>>,
     },
     Select {
-        input: Box<PackedOrderSemanticExpression>,
-        outputs: Vec<PackedOrderSemanticExpression>,
+        input: Box<PackedOrderSemanticExpression<'a>>,
+        outputs: Vec<PackedOrderSemanticExpression<'a>>,
     },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-enum PackedOrderSemanticTextSegment {
-    Static(String),
-    Dynamic(PackedOrderSemanticExpression),
+enum PackedOrderSemanticTextSegment<'a> {
+    Static(&'a str),
+    Dynamic(PackedOrderSemanticExpression<'a>),
 }
 
 struct PackedOrderAnalyzer<'a> {
-    rows: &'a KernelCheckedRows,
+    input: &'a KernelSemanticInputConstructionV1,
+    abi: &'a KernelAbiInput,
     layout: &'a KernelCheckedLinkLayout,
     snapshot: &'a KernelCheckedSnapshot,
-    declarations: BTreeMap<DeclId, &'a CheckedDeclaration>,
-    callables: BTreeMap<DeclId, &'a CheckedCallableSignature>,
-    pattern_bindings: BTreeMap<DeclId, &'a CheckedPatternBinding>,
-    active: BTreeSet<(CheckedExprId, Vec<CheckedCallId>)>,
+    lexical_by_expression: Box<[Option<PackedOrderLocalLocator>]>,
+    shape_by_expression: Box<[Option<PackedOrderLocalLocator>]>,
+    call_by_expression: Box<[Option<CheckedCallId>]>,
+    source_routes: Vec<PackedOrderSourceRoute>,
+    source_route_symbols: Vec<SymbolId>,
+    frames: Vec<PackedOrderFrame>,
+    active: Vec<PackedOrderVisit>,
     type_cache: DefinitionTypeMaterializationCache,
-    substitutions: BTreeMap<CheckedCallId, Box<[CheckedTypeSubstitution]>>,
+    substitutions: Vec<Option<Box<[CheckedTypeSubstitution]>>>,
 }
 
 impl KernelCheckedRows {
-    /// Derive list-order chains without reading `self.calls`.
-    ///
-    /// This method must run after every definition span relocation has been
-    /// installed. It rejects a foreign layout/snapshot and validates the
-    /// packed call-to-parameter seal before interpreting any expression.
+    /// Derive order chains without reading any rich row in `self`.
     pub fn derive_packed_order_chains(
         &self,
+        project: &KernelProjectInput,
         layout: &KernelCheckedLinkLayout,
         snapshot: &KernelCheckedSnapshot,
     ) -> Result<KernelCheckedOrderDerivation, KernelCheckedLinkError> {
-        PackedOrderAnalyzer::new(self, layout, snapshot)?.derive()
+        self.semantic_input
+            .derive_packed_order_chains(project, layout, snapshot)
+    }
+}
+
+impl KernelRuntimePackedLinkV1 {
+    /// Derive order metadata directly from the packed runtime linker product.
+    pub fn derive_packed_order_chains(
+        &self,
+        project: &KernelProjectInput,
+        layout: &KernelCheckedLinkLayout,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<KernelCheckedOrderDerivation, KernelCheckedLinkError> {
+        self.semantic_input
+            .derive_packed_order_chains(project, layout, snapshot)
+    }
+}
+
+impl KernelSemanticInputConstructionV1 {
+    fn derive_packed_order_chains(
+        &self,
+        project: &KernelProjectInput,
+        layout: &KernelCheckedLinkLayout,
+        snapshot: &KernelCheckedSnapshot,
+    ) -> Result<KernelCheckedOrderDerivation, KernelCheckedLinkError> {
+        PackedOrderAnalyzer::new(self, project, layout, snapshot)?.derive()
     }
 }
 
 impl<'a> PackedOrderAnalyzer<'a> {
     fn new(
-        rows: &'a KernelCheckedRows,
+        input: &'a KernelSemanticInputConstructionV1,
+        project: &'a KernelProjectInput,
         layout: &'a KernelCheckedLinkLayout,
         snapshot: &'a KernelCheckedSnapshot,
     ) -> Result<Self, KernelCheckedLinkError> {
-        if !Arc::ptr_eq(
-            &rows.semantic_input.definition_code,
-            &snapshot.definition_code,
-        ) {
+        if !Arc::ptr_eq(&input.definition_code, &snapshot.definition_code)
+            || !Arc::ptr_eq(&input.program, &snapshot.program)
+            || !std::ptr::eq(project.program(), snapshot.program.as_ref())
+        {
             return Err(KernelCheckedLinkError::new(
-                "packed order derivation cannot combine a foreign checked snapshot",
+                "packed order derivation cannot combine foreign checked authorities",
             ));
         }
+        if input.definition_count != snapshot.definition_count()
+            || input.expression_count != layout.totals.expressions
+            || input.call_count != layout.totals.calls
+        {
+            return Err(KernelCheckedLinkError::new(
+                "packed order derivation received mismatched dense link ranges",
+            ));
+        }
+
+        let expression_count = input.expression_count as usize;
+        let mut lexical_by_expression = vec![None; expression_count];
+        let mut shape_by_expression = vec![None; expression_count];
+        let mut call_by_expression = vec![None; expression_count];
+        for definition in snapshot.definition_refs() {
+            let owner = definition.owner();
+            let facts = definition.runtime_facts();
+            for (ordinal, binding) in facts.lexical_bindings().iter().enumerate() {
+                let expression = input
+                    .relocate_expression(crate::PackedExpressionRef::new(owner, binding.expression))
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "packed order lexical binding references missing expression {}:{}",
+                            owner.0, binding.expression.0,
+                        ))
+                    })?;
+                let slot = lexical_by_expression
+                    .get_mut(expression.0 as usize)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(
+                            "packed order lexical expression is outside its dense range",
+                        )
+                    })?;
+                if slot
+                    .replace(PackedOrderLocalLocator {
+                        owner,
+                        ordinal: u32::try_from(ordinal).map_err(|_| {
+                            KernelCheckedLinkError::new(
+                                "packed order lexical-binding count exceeds u32",
+                            )
+                        })?,
+                    })
+                    .is_some()
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "packed order repeats lexical binding for expression {}",
+                        expression.0,
+                    )));
+                }
+            }
+            for (ordinal, shape) in facts.execution_shapes().iter().enumerate() {
+                let expression = input
+                    .relocate_expression(crate::PackedExpressionRef::new(owner, shape.expression()))
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "packed order execution shape references missing expression {}:{}",
+                            owner.0,
+                            shape.expression().0,
+                        ))
+                    })?;
+                let slot = shape_by_expression
+                    .get_mut(expression.0 as usize)
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(
+                            "packed order shaped expression is outside its dense range",
+                        )
+                    })?;
+                if slot
+                    .replace(PackedOrderLocalLocator {
+                        owner,
+                        ordinal: u32::try_from(ordinal).map_err(|_| {
+                            KernelCheckedLinkError::new(
+                                "packed order execution-shape count exceeds u32",
+                            )
+                        })?,
+                    })
+                    .is_some()
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "packed order repeats execution shape for expression {}",
+                        expression.0,
+                    )));
+                }
+            }
+        }
+        layout.for_each_packed_call(snapshot, |call| {
+            let id = call.id()?;
+            let expression = call.expression()?;
+            let slot = call_by_expression
+                .get_mut(expression.0 as usize)
+                .ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "packed order call {} references missing expression {}",
+                        id.0, expression.0,
+                    ))
+                })?;
+            if slot.replace(id).is_some() {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "packed order repeats call expression {}",
+                    expression.0,
+                )));
+            }
+            Ok(())
+        })?;
+
         let mut analyzer = Self {
-            rows,
+            input,
+            abi: project.abi(),
             layout,
             snapshot,
-            declarations: rows
-                .declarations
-                .iter()
-                .map(|declaration| (declaration.id, declaration))
-                .collect(),
-            callables: rows
-                .callables
-                .iter()
-                .map(|callable| (callable.decl_id, callable))
-                .collect(),
-            pattern_bindings: rows
-                .pattern_bindings
-                .iter()
-                .map(|binding| (binding.declaration, binding))
-                .collect(),
-            active: BTreeSet::new(),
+            lexical_by_expression: lexical_by_expression.into_boxed_slice(),
+            shape_by_expression: shape_by_expression.into_boxed_slice(),
+            call_by_expression: call_by_expression.into_boxed_slice(),
+            source_routes: Vec::new(),
+            source_route_symbols: Vec::new(),
+            frames: Vec::new(),
+            active: Vec::new(),
             type_cache: snapshot.definition_code.materialization_cache(),
-            substitutions: BTreeMap::new(),
+            substitutions: (0..input.call_count).map(|_| None).collect(),
         };
+        analyzer.build_source_routes()?;
         analyzer.validate()?;
         Ok(analyzer)
     }
 
-    fn validate(&mut self) -> Result<(), KernelCheckedLinkError> {
+    fn validate(&self) -> Result<(), KernelCheckedLinkError> {
         self.layout.for_each_packed_call(self.snapshot, |call| {
             let id = call.id()?;
             let expression = call.expression()?;
-            if self
-                .rows
-                .expressions
-                .get(expression.0 as usize)
-                .is_none_or(|row| row.id != expression)
-            {
+            if self.expression(expression).is_none() {
                 return Err(KernelCheckedLinkError::new(format!(
-                    "packed order call {} references missing checked expression {}",
+                    "packed order call {} references missing packed expression {}",
                     id.0, expression.0,
                 )));
             }
-            let callable = call.callable()?;
-            let signature = self.callables.get(&callable).copied().ok_or_else(|| {
+            let code = call.code()?;
+            let symbol = code.call_function(call.ordinal as usize).ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
-                    "packed order call {} references missing callable {}",
-                    id.0, callable.0,
+                    "packed order call {} has no function symbol",
+                    id.0,
                 ))
             })?;
-            let code = call.code()?;
-            let symbol = code
-                .call_function(call.ordinal as usize)
-                .ok_or_else(|| {
-                    KernelCheckedLinkError::new(format!(
-                        "packed order call {} has no function symbol",
-                        id.0,
-                    ))
-                })?;
             self.snapshot
                 .definition_code
                 .symbol(symbol)
@@ -235,26 +427,21 @@ impl<'a> PackedOrderAnalyzer<'a> {
                     id.0,
                 ))
             })?;
-            self.rows
-                .semantic_input
-                .rebase_span(call.owner, span)
-                .ok_or_else(|| {
-                    KernelCheckedLinkError::new(format!(
-                        "packed order call {} was analyzed before span relocation",
-                        id.0,
-                    ))
-                })?;
+            self.input.rebase_span(call.owner, span).ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "packed order call {} was analyzed before span relocation",
+                    id.0,
+                ))
+            })?;
             call.context_binding()?;
             for entry in call.entries()? {
-                self.parameter(signature, entry.parameter_ordinal())
-                    .ok_or_else(|| {
-                        KernelCheckedLinkError::new(format!(
-                            "packed order call {} entry references missing exact parameter ordinal {} on callable {}",
-                            id.0,
-                            entry.parameter_ordinal(),
-                            callable.0,
-                        ))
-                    })?;
+                if self.parameter(call, entry.parameter_ordinal()).is_none() {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "packed order call {} entry references missing exact parameter ordinal {}",
+                        id.0,
+                        entry.parameter_ordinal(),
+                    )));
+                }
             }
             let target = call.target()?;
             let facts = code
@@ -265,15 +452,16 @@ impl<'a> PackedOrderAnalyzer<'a> {
                         id.0,
                     ))
                 })?;
-            let mut seen = BTreeSet::new();
+            let mut seen = Vec::with_capacity(facts.len());
             for substitution in facts {
                 let linked = self.linked_type_parameter(target, substitution.variable)?;
-                if !seen.insert(linked) {
+                if seen.contains(&linked) {
                     return Err(KernelCheckedLinkError::new(format!(
                         "packed order call {} repeats target type parameter {}",
                         id.0, linked.0,
                     )));
                 }
+                seen.push(linked);
             }
             Ok(())
         })
@@ -282,10 +470,10 @@ impl<'a> PackedOrderAnalyzer<'a> {
     fn derive(mut self) -> Result<KernelCheckedOrderDerivation, KernelCheckedLinkError> {
         let mut chains = Vec::new();
         let mut diagnostics = Vec::new();
-        for ordinal in 0..self.rows.semantic_input.call_count {
+        for ordinal in 0..self.input.call_count {
             let id = CheckedCallId(ordinal);
             let call = self.layout.packed_call(self.snapshot, id)?;
-            match self.call_state(call, &[]) {
+            match self.call_state(call, None) {
                 PackedOrderState::Invalid { call_path } => {
                     diagnostics.push(KernelCheckedOrderDiagnostic {
                         span: self.order_chain_diagnostic_span(&call_path, self.call_span(call)),
@@ -293,17 +481,11 @@ impl<'a> PackedOrderAnalyzer<'a> {
                     });
                 }
                 PackedOrderState::Ordered(chain) => {
-                    chains.push(CheckedCallOrderChain {
-                        call: id,
-                        chain: chain.checked.clone(),
-                    });
-                    for key in chain.checked.keys {
+                    for key in &chain.checked.keys {
                         let span = self.order_chain_diagnostic_span(
                             &key.call_path,
-                            self.rows
-                                .expressions
-                                .get(key.key.0 as usize)
-                                .map_or(self.call_span(call), |expression| expression.span),
+                            self.expression_span(key.key)
+                                .unwrap_or_else(|| self.call_span(call)),
                         );
                         if !type_is_deferred_order_key(&key.key_type)
                             && !type_is_orderable_key(&key.key_type)
@@ -328,10 +510,16 @@ impl<'a> PackedOrderAnalyzer<'a> {
                             });
                         }
                     }
+                    chains.push(CheckedCallOrderChain {
+                        call: id,
+                        chain: chain.checked,
+                    });
                 }
                 PackedOrderState::Unordered | PackedOrderState::Deferred => {}
             }
         }
+        debug_assert!(self.frames.is_empty());
+        debug_assert!(self.active.is_empty());
         chains.sort_by_key(|entry| entry.call);
         Ok(KernelCheckedOrderDerivation {
             chains: chains.into_boxed_slice(),
@@ -339,119 +527,154 @@ impl<'a> PackedOrderAnalyzer<'a> {
         })
     }
 
+    fn expression(&self, id: CheckedExprId) -> Option<PackedOrderExpressionRef<'a>> {
+        let local = self.input.local_expression(id)?;
+        let owner = local.owner();
+        let expression = local.expression();
+        let definition = self.snapshot.definition(owner)?;
+        let facts = definition.runtime_facts();
+        let node = definition.input().node(expression)?;
+        let presentation = facts
+            .expression_presentations()
+            .get(expression.0 as usize)
+            .filter(|row| row.expression == expression)?;
+        let payload = *facts.expression_payloads().get(expression.0 as usize)?;
+        let lexical = self
+            .lexical_by_expression
+            .get(id.0 as usize)
+            .copied()
+            .flatten()
+            .and_then(|locator| {
+                (locator.owner == owner)
+                    .then(|| facts.lexical_bindings().get(locator.ordinal as usize))
+                    .flatten()
+            });
+        let shape = self
+            .shape_by_expression
+            .get(id.0 as usize)
+            .copied()
+            .flatten()
+            .and_then(|locator| {
+                (locator.owner == owner)
+                    .then(|| facts.execution_shapes().get(locator.ordinal as usize))
+                    .flatten()
+            });
+        let call = self
+            .call_by_expression
+            .get(id.0 as usize)
+            .copied()
+            .flatten()
+            .and_then(|call| self.call(call));
+        Some(PackedOrderExpressionRef {
+            owner,
+            local: expression,
+            definition,
+            node,
+            facts,
+            presentation,
+            payload,
+            shape,
+            lexical,
+            call,
+        })
+    }
+
+    fn declaration(&self, id: DeclId) -> Option<PackedOrderDeclarationRef<'a>> {
+        let (owner, local) = self.input.local_declaration(id)?;
+        let local = crate::KernelDeclarationId(local);
+        let definition = self.snapshot.definition(owner)?;
+        let facts = definition.runtime_facts();
+        let row = facts
+            .declarations()
+            .get(local.0 as usize)
+            .filter(|row| row.id == local)?;
+        let presentation = facts
+            .declaration_presentations()
+            .get(local.0 as usize)
+            .filter(|row| row.declaration == local)?;
+        Some(PackedOrderDeclarationRef {
+            owner,
+            local,
+            definition,
+            row,
+            presentation,
+        })
+    }
+
     fn call(&self, id: CheckedCallId) -> Option<KernelCheckedPackedCallRef<'a>> {
         self.layout.packed_call(self.snapshot, id).ok()
     }
 
-    fn declaration(&self, id: DeclId) -> Option<&'a CheckedDeclaration> {
-        self.declarations.get(&id).copied()
-    }
-
-    fn callable(&self, id: DeclId) -> Option<&'a CheckedCallableSignature> {
-        self.callables.get(&id).copied()
-    }
-
-    fn pattern_binding(&self, id: DeclId) -> Option<&'a CheckedPatternBinding> {
-        self.pattern_bindings.get(&id).copied()
-    }
-
-    fn signature(&self, call: KernelCheckedPackedCallRef<'a>) -> &'a CheckedCallableSignature {
-        self.callable(
-            call.callable()
-                .expect("validated packed order call has a callable relocation"),
-        )
-        .expect("validated packed order call has a checked signature")
-    }
-
-    fn parameter<'signature>(
+    fn parameter(
         &self,
-        signature: &'signature CheckedCallableSignature,
+        call: KernelCheckedPackedCallRef<'a>,
         ordinal: u32,
-    ) -> Option<&'signature CheckedParameter> {
-        let ordinal = usize::try_from(ordinal).ok()?;
-        let mut matches = signature
-            .parameters
-            .iter()
-            .filter(|parameter| parameter.ordinal == ordinal);
-        let parameter = matches.next()?;
-        matches.next().is_none().then_some(parameter)
+    ) -> Option<PackedOrderParameterRef<'a>> {
+        match call.target().ok()? {
+            crate::KernelCallableSchemeId::User(owner) => {
+                let definition = self.snapshot.definition(owner)?;
+                let root = definition.linkage().root_statement?;
+                let mut matches =
+                    definition
+                        .runtime_facts()
+                        .declarations()
+                        .iter()
+                        .filter(|declaration| {
+                            matches!(
+                                declaration.origin,
+                                crate::KernelDeclarationOrigin::Parameter {
+                                    statement,
+                                    ordinal: candidate,
+                                } if statement == root && candidate == ordinal
+                            )
+                        });
+                let declaration = matches.next()?;
+                if matches.next().is_some() {
+                    return None;
+                }
+                Some(PackedOrderParameterRef {
+                    name: definition.input().symbol(declaration.name)?,
+                })
+            }
+            crate::KernelCallableSchemeId::Abi(callable) => {
+                let parameter = self
+                    .abi
+                    .callable_by_id(callable)?
+                    .parameters
+                    .get(ordinal as usize)
+                    .filter(|parameter| parameter.ordinal == ordinal)?;
+                Some(PackedOrderParameterRef {
+                    name: parameter.name.as_ref(),
+                })
+            }
+        }
     }
 
     fn input(&self, call: KernelCheckedPackedCallRef<'a>, name: &str) -> Option<CheckedExprId> {
-        let signature = self.signature(call);
-        call.entries()
-            .expect("validated packed order call has entries")
-            .iter()
-            .find_map(|entry| match entry {
-                crate::PackedCallEntry::Input {
-                    parameter_ordinal,
-                    value,
-                    ..
-                } if self
-                    .parameter(signature, *parameter_ordinal)
-                    .is_some_and(|parameter| parameter.name == name) =>
-                {
-                    self.rows.semantic_input.relocate_value(call.owner, *value)
-                }
-                crate::PackedCallEntry::Input { .. }
-                | crate::PackedCallEntry::FreshOut { .. }
-                | crate::PackedCallEntry::ForwardOut { .. } => None,
-            })
-    }
-
-    fn input_bindings(
-        &self,
-        call: KernelCheckedPackedCallRef<'a>,
-    ) -> BTreeMap<DeclId, CheckedExprId> {
-        let signature = self.signature(call);
-        call.entries()
-            .expect("validated packed order call has entries")
-            .iter()
-            .filter_map(|entry| match entry {
-                crate::PackedCallEntry::Input {
-                    parameter_ordinal,
-                    value,
-                    ..
-                } => Some((
-                    self.parameter(signature, *parameter_ordinal)
-                        .expect("validated packed entry parameter exists")
-                        .decl_id,
-                    self.rows
-                        .semantic_input
-                        .relocate_value(call.owner, *value)
-                        .expect("validated packed call input relocates"),
-                )),
-                crate::PackedCallEntry::FreshOut { .. }
-                | crate::PackedCallEntry::ForwardOut { .. } => None,
-            })
-            .collect()
-    }
-
-    fn input_values(&self, call: KernelCheckedPackedCallRef<'a>) -> Vec<CheckedExprId> {
-        call.entries()
-            .expect("validated packed order call has entries")
-            .iter()
-            .filter_map(|entry| match entry {
-                crate::PackedCallEntry::Input { value, .. } => {
-                    self.rows.semantic_input.relocate_value(call.owner, *value)
-                }
-                crate::PackedCallEntry::FreshOut { .. }
-                | crate::PackedCallEntry::ForwardOut { .. } => None,
-            })
-            .chain(self.explicit_context_value(call))
-            .collect()
+        call.entries().ok()?.iter().find_map(|entry| match entry {
+            crate::PackedCallEntry::Input {
+                parameter_ordinal,
+                value,
+                ..
+            } if self
+                .parameter(call, *parameter_ordinal)
+                .is_some_and(|parameter| parameter.name == name) =>
+            {
+                self.input.relocate_value(call.owner, *value)
+            }
+            crate::PackedCallEntry::Input { .. }
+            | crate::PackedCallEntry::FreshOut { .. }
+            | crate::PackedCallEntry::ForwardOut { .. } => None,
+        })
     }
 
     fn explicit_context_value(
         &self,
         call: KernelCheckedPackedCallRef<'a>,
     ) -> Option<CheckedExprId> {
-        match call
-            .context_binding()
-            .expect("validated packed order call has a context binding")
-        {
+        match call.context_binding().ok()? {
             crate::PackedCallContextBinding::Explicit { value, .. } => {
-                self.rows.semantic_input.relocate_value(call.owner, value)
+                self.input.relocate_value(call.owner, value)
             }
             crate::PackedCallContextBinding::None
             | crate::PackedCallContextBinding::Inherited { .. } => None,
@@ -476,10 +699,15 @@ impl<'a> PackedOrderAnalyzer<'a> {
             .expect("validated packed order call has code")
             .call_span(call.ordinal as usize)
             .expect("validated packed order call has a span");
-        self.rows
-            .semantic_input
+        self.input
             .rebase_span(call.owner, span)
             .expect("packed order derivation runs after span relocation")
+    }
+
+    fn expression_span(&self, expression: CheckedExprId) -> Option<CheckedSpan> {
+        let expression = self.expression(expression)?;
+        self.input
+            .rebase_span(expression.owner, expression.presentation.span.materialize())
     }
 
     fn call_may_return_ordered_list(&self, call: KernelCheckedPackedCallRef<'a>) -> bool {
@@ -590,7 +818,7 @@ impl<'a> PackedOrderAnalyzer<'a> {
         call: KernelCheckedPackedCallRef<'a>,
     ) -> &[CheckedTypeSubstitution] {
         let id = call.id().expect("validated packed order call has an ID");
-        if !self.substitutions.contains_key(&id) {
+        if self.substitutions[id.0 as usize].is_none() {
             let code = call.code().expect("validated packed order call has code");
             let alpha_start = self
                 .layout
@@ -619,92 +847,512 @@ impl<'a> PackedOrderAnalyzer<'a> {
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            self.substitutions.insert(id, substitutions);
+            self.substitutions[id.0 as usize] = Some(substitutions);
         }
-        self.substitutions
-            .get(&id)
+        self.substitutions[id.0 as usize]
+            .as_deref()
             .expect("packed order substitution cache was populated")
+    }
+
+    fn materialized_expression_type(&mut self, expression: CheckedExprId) -> Type {
+        let Some(local) = self.input.local_expression(expression) else {
+            return Type::Unknown;
+        };
+        let Some(code) = self.snapshot.definition_code.definition(local.owner()) else {
+            return Type::Unknown;
+        };
+        let Ok(layout) = self.layout.definition(local.owner()) else {
+            return Type::Unknown;
+        };
+        code.linked_materializer(&mut self.type_cache, layout.type_variables.start)
+            .materialize_published_expression(local.expression().0 as usize)
+            .map(|flow| flow.ty)
+            .unwrap_or(Type::Unknown)
+    }
+
+    fn push_user_frame(
+        &mut self,
+        parent: Option<PackedOrderFrameId>,
+        call: KernelCheckedPackedCallRef<'a>,
+        target_owner: KernelOwnerId,
+    ) -> PackedOrderFrameId {
+        let target_root_statement = self
+            .snapshot
+            .definition(target_owner)
+            .and_then(|definition| definition.linkage().root_statement)
+            .expect("validated user-call target has a root statement");
+        let id = PackedOrderFrameId(
+            u32::try_from(self.frames.len()).expect("packed order frame depth exceeds u32"),
+        );
+        self.frames.push(PackedOrderFrame {
+            parent,
+            call: call.id().expect("validated packed call has an ID"),
+            target_owner,
+            target_root_statement,
+        });
+        id
+    }
+
+    fn pop_user_frame(&mut self, id: PackedOrderFrameId) {
+        debug_assert_eq!(self.frames.len(), id.0 as usize + 1);
+        self.frames.pop();
+    }
+
+    fn frame(&self, id: PackedOrderFrameId) -> PackedOrderFrame {
+        *self
+            .frames
+            .get(id.0 as usize)
+            .expect("active packed order frame ID remains in range")
+    }
+
+    fn frame_contains_owner(
+        &self,
+        mut frame: Option<PackedOrderFrameId>,
+        owner: KernelOwnerId,
+    ) -> bool {
+        while let Some(id) = frame {
+            let row = self.frame(id);
+            if row.target_owner == owner {
+                return true;
+            }
+            frame = row.parent;
+        }
+        false
+    }
+
+    fn frame_actual(
+        &self,
+        target: DeclId,
+        mut frame: Option<PackedOrderFrameId>,
+    ) -> Option<(CheckedExprId, Option<PackedOrderFrameId>)> {
+        let declaration = self.declaration(target)?;
+        let crate::KernelDeclarationOrigin::Parameter { statement, ordinal } =
+            declaration.row.origin
+        else {
+            return None;
+        };
+        while let Some(id) = frame {
+            let row = self.frame(id);
+            if row.target_owner == declaration.owner && row.target_root_statement == statement {
+                let call = self.call(row.call)?;
+                let value = call.entries().ok()?.iter().find_map(|entry| match entry {
+                    crate::PackedCallEntry::Input {
+                        parameter_ordinal,
+                        value,
+                        ..
+                    } if *parameter_ordinal == ordinal => {
+                        self.input.relocate_value(call.owner, *value)
+                    }
+                    crate::PackedCallEntry::Input { .. }
+                    | crate::PackedCallEntry::FreshOut { .. }
+                    | crate::PackedCallEntry::ForwardOut { .. } => None,
+                })?;
+                return Some((value, row.parent));
+            }
+            frame = row.parent;
+        }
+        None
+    }
+
+    fn call_path(
+        &self,
+        mut frame: Option<PackedOrderFrameId>,
+        terminal: CheckedCallId,
+    ) -> Vec<CheckedCallId> {
+        let mut path = Vec::new();
+        while let Some(id) = frame {
+            let row = self.frame(id);
+            path.push(row.call);
+            frame = row.parent;
+        }
+        path.reverse();
+        path.push(terminal);
+        path
+    }
+
+    fn begin_visit(
+        &mut self,
+        kind: PackedOrderWalkKind,
+        expression: CheckedExprId,
+        frame: Option<PackedOrderFrameId>,
+    ) -> bool {
+        let visit = PackedOrderVisit {
+            kind,
+            expression,
+            frame,
+        };
+        if self.active.contains(&visit) {
+            return false;
+        }
+        self.active.push(visit);
+        true
+    }
+
+    fn end_visit(
+        &mut self,
+        kind: PackedOrderWalkKind,
+        expression: CheckedExprId,
+        frame: Option<PackedOrderFrameId>,
+    ) {
+        debug_assert_eq!(
+            self.active.pop(),
+            Some(PackedOrderVisit {
+                kind,
+                expression,
+                frame,
+            })
+        );
+    }
+
+    fn linked_value(
+        &self,
+        expression: PackedOrderExpressionRef<'a>,
+        encoded: crate::KernelExpressionId,
+    ) -> Option<CheckedExprId> {
+        let value = expression
+            .definition
+            .resolve_value(encoded, expression.local.0 as usize)
+            .ok()?;
+        self.input.relocate_value(expression.owner, value)
+    }
+
+    fn exact_input(
+        &self,
+        expression: PackedOrderExpressionRef<'a>,
+        role: crate::PackedKernelOwnerEdgeRole,
+    ) -> Option<CheckedExprId> {
+        let mut inputs = expression
+            .inputs()
+            .iter()
+            .filter(|input| input.role == role);
+        let input = inputs.next()?;
+        if inputs.next().is_some() {
+            return None;
+        }
+        self.linked_value(expression, input.expression)
+    }
+
+    fn declaration_value(
+        &self,
+        declaration: PackedOrderDeclarationRef<'a>,
+    ) -> Option<CheckedExprId> {
+        let value = declaration.row.value?;
+        let value = declaration
+            .definition
+            .resolve_value(value, declaration.local.0 as usize)
+            .ok()?;
+        self.input.relocate_value(declaration.owner, value)
+    }
+
+    fn path_symbols(&self, path: PathId) -> Option<Vec<SymbolId>> {
+        Some(self.snapshot.program.path(path)?.iter().collect())
+    }
+
+    fn path_is_empty(&self, path: PathId) -> bool {
+        self.snapshot
+            .program
+            .path(path)
+            .is_some_and(|path| path.is_empty())
+    }
+
+    fn build_source_routes(&mut self) -> Result<(), KernelCheckedLinkError> {
+        let snapshot = self.snapshot;
+        let mut alias_projection = Vec::new();
+        let mut seen_anchors = Vec::new();
+        for definition in snapshot.definition_refs() {
+            let owner = definition.owner();
+            for source in definition.runtime_facts().sources() {
+                let source_id = self.layout.source(owner, source.id.0)?;
+                let source_declaration = self.layout.declaration(owner, source.declaration)?;
+                let source_expression = self
+                    .layout
+                    .expression(owner, KernelValueReference::Local(source.expression))?;
+                let source_projection = self.path_symbols(source.projection).ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "packed order SOURCE {}:{} references a foreign projection",
+                        owner.0, source.id.0,
+                    ))
+                })?;
+                self.push_source_route(
+                    source_declaration,
+                    source_id,
+                    source_expression,
+                    &source_projection,
+                )?;
+                let source_row = self.declaration(source_declaration).ok_or_else(|| {
+                    KernelCheckedLinkError::new(format!(
+                        "packed order SOURCE declaration {} has no packed row",
+                        source_declaration.0,
+                    ))
+                })?;
+                alias_projection.clear();
+                alias_projection.push(source_row.row.name);
+                alias_projection.extend(source_projection.iter().copied());
+                seen_anchors.clear();
+                let mut scope_owner = source_row.owner;
+                let mut scope = source_row.presentation.scope;
+                while let Some(anchor) =
+                    self.layout
+                        .lexical_declaration_for_scope(snapshot, scope_owner, scope)?
+                {
+                    if seen_anchors.contains(&anchor) || anchor == source_declaration {
+                        break;
+                    }
+                    seen_anchors.push(anchor);
+                    self.push_source_route(
+                        anchor,
+                        source_id,
+                        source_expression,
+                        &alias_projection,
+                    )?;
+                    let Some(parent) = self.declaration(anchor) else {
+                        break;
+                    };
+                    alias_projection.insert(0, parent.row.name);
+                    scope_owner = parent.owner;
+                    scope = parent.presentation.scope;
+                }
+            }
+        }
+        self.source_routes
+            .sort_unstable_by_key(|route| (route.anchor, Reverse(route.symbol_len), route.source));
+        Ok(())
+    }
+
+    fn push_source_route(
+        &mut self,
+        anchor: DeclId,
+        source: CheckedSourceId,
+        expression: CheckedExprId,
+        symbols: &[SymbolId],
+    ) -> Result<(), KernelCheckedLinkError> {
+        let symbol_start = u32::try_from(self.source_route_symbols.len()).map_err(|_| {
+            KernelCheckedLinkError::new("packed order SOURCE-route symbols exceed u32")
+        })?;
+        let symbol_len = u32::try_from(symbols.len()).map_err(|_| {
+            KernelCheckedLinkError::new("packed order SOURCE-route path exceeds u32")
+        })?;
+        self.source_route_symbols.extend_from_slice(symbols);
+        self.source_routes.push(PackedOrderSourceRoute {
+            anchor,
+            source,
+            expression,
+            symbol_start,
+            symbol_len,
+        });
+        Ok(())
+    }
+
+    fn source_route_symbols(&self, route: PackedOrderSourceRoute) -> Option<&[SymbolId]> {
+        let start = route.symbol_start as usize;
+        let end = start.checked_add(route.symbol_len as usize)?;
+        self.source_route_symbols.get(start..end)
+    }
+
+    fn source_expression_for_read(
+        &self,
+        target: DeclId,
+        projection: PathId,
+    ) -> Option<CheckedExprId> {
+        let projection = self.snapshot.program.path(projection)?;
+        let start = self
+            .source_routes
+            .partition_point(|route| route.anchor < target);
+        let mut matched: Option<PackedOrderSourceRoute> = None;
+        for route in self.source_routes[start..]
+            .iter()
+            .copied()
+            .take_while(|route| route.anchor == target)
+        {
+            let symbols = self.source_route_symbols(route)?;
+            if symbols.len() > projection.len()
+                || !symbols
+                    .iter()
+                    .copied()
+                    .zip(projection.iter())
+                    .all(|(left, right)| left == right)
+            {
+                continue;
+            }
+            if let Some(previous) = matched {
+                if previous.symbol_len == route.symbol_len {
+                    return None;
+                }
+                break;
+            }
+            matched = Some(route);
+        }
+        matched.map(|route| route.expression)
+    }
+
+    fn read_provider(&self, target: DeclId, projection: PathId) -> Option<CheckedExprId> {
+        self.declaration(target)
+            .and_then(|declaration| self.declaration_value(declaration))
+            .or_else(|| self.source_expression_for_read(target, projection))
+    }
+
+    fn pattern_binding(
+        &self,
+        declaration: DeclId,
+    ) -> Option<KernelSemanticPatternBindingLocatorV1> {
+        self.input
+            .pattern_bindings
+            .binary_search_by_key(&declaration, |binding| binding.declaration)
+            .ok()
+            .and_then(|index| self.input.pattern_bindings.get(index))
+            .copied()
+    }
+
+    fn declaration_canonical_path(
+        &self,
+        declaration: PackedOrderDeclarationRef<'a>,
+    ) -> Option<Vec<SymbolId>> {
+        if !matches!(
+            declaration.row.kind,
+            crate::KernelDeclarationKind::Field
+                | crate::KernelDeclarationKind::Source
+                | crate::KernelDeclarationKind::Hold
+                | crate::KernelDeclarationKind::List
+        ) {
+            return None;
+        }
+        let mut segments = vec![declaration.row.name];
+        let mut owner = declaration.owner;
+        let mut scope = declaration.presentation.scope;
+        let mut remaining = (self.input.scope_count as usize)
+            .saturating_add(self.input.definition_count)
+            .saturating_add(1);
+        loop {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            match scope {
+                KernelScopeReference::ProjectRoot => break,
+                KernelScopeReference::Containing => {
+                    let definition = self.snapshot.definition(owner)?;
+                    scope = definition.runtime_facts().containing_scope();
+                }
+                KernelScopeReference::Owner {
+                    owner: provider,
+                    scope: provider_scope,
+                } => {
+                    owner = provider;
+                    scope = KernelScopeReference::Local(provider_scope);
+                }
+                KernelScopeReference::Local(local) => {
+                    let definition = self.snapshot.definition(owner)?;
+                    let row = definition
+                        .runtime_facts()
+                        .scopes()
+                        .get(local.0 as usize)
+                        .filter(|row| row.id == local)?;
+                    if row.kind == crate::KernelScopeKind::Function {
+                        return None;
+                    }
+                    if let Some(anchor) = row.owner {
+                        let anchor = self.layout.declaration(owner, anchor).ok()?;
+                        if let Some(anchor) = self.declaration(anchor)
+                            && matches!(
+                                anchor.row.kind,
+                                crate::KernelDeclarationKind::Field
+                                    | crate::KernelDeclarationKind::Source
+                                    | crate::KernelDeclarationKind::Hold
+                                    | crate::KernelDeclarationKind::List
+                            )
+                        {
+                            segments.push(anchor.row.name);
+                        }
+                    }
+                    scope = row.parent;
+                }
+            }
+        }
+        segments.reverse();
+        Some(segments)
     }
 
     fn expression_state(
         &mut self,
         expression: CheckedExprId,
-        frames: &[PackedOrderFrame],
-    ) -> PackedOrderState {
-        let frame_path = frames.iter().map(|frame| frame.call).collect::<Vec<_>>();
-        if !self.active.insert((expression, frame_path.clone())) {
+        frame: Option<PackedOrderFrameId>,
+    ) -> PackedOrderState<'a> {
+        if !self.begin_visit(PackedOrderWalkKind::State, expression, frame) {
             return PackedOrderState::Deferred;
         }
-        let result = self.rows.expressions.get(expression.0 as usize).map_or(
-            PackedOrderState::Unordered,
-            |expression| match &expression.kind {
-                CheckedExpressionKind::Call { call } => self
-                    .call(*call)
-                    .map_or(PackedOrderState::Unordered, |call| {
-                        self.call_state(call, frames)
-                    }),
-                CheckedExpressionKind::Read {
-                    target,
-                    projection,
-                    source,
-                } if projection.is_empty() => {
-                    if let Some((frame_index, value)) =
-                        frames.iter().enumerate().rev().find_map(|(index, frame)| {
-                            frame
-                                .bindings
-                                .get(target)
-                                .copied()
-                                .map(|value| (index, value))
-                        })
-                    {
-                        self.expression_state(value, &frames[..frame_index])
-                    } else if let Some(value) = self
-                        .declaration(*target)
-                        .and_then(|declaration| declaration.value)
-                        .or_else(|| {
-                            source
-                                .as_ref()
-                                .and_then(|source| self.source_expression(source))
-                        })
-                    {
-                        self.expression_state(value, frames)
-                    } else if self.declaration(*target).is_some_and(|declaration| {
-                        declaration.kind == CheckedDeclarationKind::ValueParameter
-                    }) {
-                        PackedOrderState::Deferred
-                    } else {
-                        PackedOrderState::Unordered
+        let result =
+            self.expression(expression)
+                .map_or(PackedOrderState::Unordered, |expression| {
+                    if let Some(call) = expression.call {
+                        return self.call_state(call, frame);
                     }
-                }
-                CheckedExpressionKind::Block {
-                    result: Some(result),
-                    ..
-                }
-                | CheckedExpressionKind::Then {
-                    output: Some(result),
-                    ..
-                }
-                | CheckedExpressionKind::MatchArm {
-                    output: Some(result),
-                    ..
-                } => self.expression_state(*result, frames),
-                CheckedExpressionKind::Latest { branches }
-                | CheckedExpressionKind::When { arms: branches, .. }
-                | CheckedExpressionKind::While { arms: branches, .. } => {
-                    self.merge_branch_states(branches, frames)
-                }
-                _ => PackedOrderState::Unordered,
-            },
-        );
-        self.active.remove(&(expression, frame_path));
+                    if let Some(binding) = expression.lexical
+                        && binding.access == crate::KernelLexicalAccess::Read
+                        && self.path_is_empty(binding.projection)
+                        && let crate::KernelLexicalBindingTargetInput::Declaration(target) =
+                            binding.target
+                        && let Some(target) =
+                            self.input.relocate_declaration(expression.owner, target)
+                    {
+                        if let Some((value, parent)) = self.frame_actual(target, frame) {
+                            return self.expression_state(value, parent);
+                        }
+                        if let Some(value) = self.read_provider(target, binding.projection) {
+                            return self.expression_state(value, frame);
+                        }
+                        return if self.declaration(target).is_some_and(|declaration| {
+                            declaration.row.kind == crate::KernelDeclarationKind::ValueParameter
+                        }) {
+                            PackedOrderState::Deferred
+                        } else {
+                            PackedOrderState::Unordered
+                        };
+                    }
+                    match expression.node.kind {
+                        crate::PackedKernelOwnerNodeKind::Block => expression
+                            .shape
+                            .and_then(|shape| match shape {
+                                crate::PackedExecutionShape::Block {
+                                    result: Some(result),
+                                    ..
+                                } => self.linked_value(expression, *result),
+                                _ => None,
+                            })
+                            .map_or(PackedOrderState::Unordered, |result| {
+                                self.expression_state(result, frame)
+                            }),
+                        crate::PackedKernelOwnerNodeKind::Then => self
+                            .exact_input(expression, crate::PackedKernelOwnerEdgeRole::ThenOutput)
+                            .map_or(PackedOrderState::Unordered, |output| {
+                                self.expression_state(output, frame)
+                            }),
+                        crate::PackedKernelOwnerNodeKind::MatchArm { .. } => self
+                            .exact_input(expression, crate::PackedKernelOwnerEdgeRole::MatchOutput)
+                            .map_or(PackedOrderState::Unordered, |output| {
+                                self.expression_state(output, frame)
+                            }),
+                        crate::PackedKernelOwnerNodeKind::Latest => self.merge_branch_states(
+                            expression,
+                            crate::PackedKernelOwnerEdgeRole::LatestBranch,
+                            frame,
+                        ),
+                        crate::PackedKernelOwnerNodeKind::When => self.merge_branch_states(
+                            expression,
+                            crate::PackedKernelOwnerEdgeRole::WhenArm,
+                            frame,
+                        ),
+                        _ => PackedOrderState::Unordered,
+                    }
+                });
+        self.end_visit(PackedOrderWalkKind::State, expression, frame);
         result
     }
 
     fn call_state(
         &mut self,
         call: KernelCheckedPackedCallRef<'a>,
-        frames: &[PackedOrderFrame],
-    ) -> PackedOrderState {
+        frame: Option<PackedOrderFrameId>,
+    ) -> PackedOrderState<'a> {
         if !self.call_may_return_ordered_list(call) {
             return PackedOrderState::Unordered;
         }
@@ -713,7 +1361,7 @@ impl<'a> PackedOrderAnalyzer<'a> {
                 let Some(key) = self.input(call, "key") else {
                     return PackedOrderState::Unordered;
                 };
-                let (key, semantic) = self.order_key(call, key, frames);
+                let (key, semantic) = self.order_key(call, key, frame);
                 PackedOrderState::Ordered(AnalyzedOrderChain {
                     checked: CheckedOrderChain { keys: vec![key] },
                     semantic: vec![semantic],
@@ -723,12 +1371,12 @@ impl<'a> PackedOrderAnalyzer<'a> {
                 let Some(list) = self.input(call, "list") else {
                     return PackedOrderState::Unordered;
                 };
-                match self.expression_state(list, frames) {
+                match self.expression_state(list, frame) {
                     PackedOrderState::Ordered(mut chain) => {
                         let Some(key) = self.input(call, "key") else {
                             return PackedOrderState::Unordered;
                         };
-                        let (key, semantic) = self.order_key(call, key, frames);
+                        let (key, semantic) = self.order_key(call, key, frame);
                         chain.checked.keys.push(key);
                         chain.semantic.push(semantic);
                         PackedOrderState::Ordered(chain)
@@ -738,13 +1386,10 @@ impl<'a> PackedOrderAnalyzer<'a> {
                         PackedOrderState::Invalid { call_path }
                     }
                     PackedOrderState::Unordered => PackedOrderState::Invalid {
-                        call_path: frames
-                            .iter()
-                            .map(|frame| frame.call)
-                            .chain(std::iter::once(
-                                call.id().expect("validated packed order call has an ID"),
-                            ))
-                            .collect(),
+                        call_path: self.call_path(
+                            frame,
+                            call.id().expect("validated packed order call has an ID"),
+                        ),
                     },
                 }
             }
@@ -752,30 +1397,30 @@ impl<'a> PackedOrderAnalyzer<'a> {
             | "List/page" => self
                 .input(call, "list")
                 .map_or(PackedOrderState::Unordered, |list| {
-                    self.expression_state(list, frames)
+                    self.expression_state(list, frame)
                 }),
-            _ => {
-                let signature = self.signature(call);
-                if signature.kind != CheckedCallableKind::User {
-                    return PackedOrderState::Unordered;
+            _ => match call
+                .target()
+                .expect("validated packed order call has a target")
+            {
+                crate::KernelCallableSchemeId::Abi(_) => PackedOrderState::Unordered,
+                crate::KernelCallableSchemeId::User(owner) => {
+                    if self.frame_contains_owner(frame, owner) {
+                        return PackedOrderState::Deferred;
+                    }
+                    let Some(result) = self
+                        .input
+                        .definition_relocation(owner)
+                        .map(|relocation| relocation.result_expression)
+                    else {
+                        return PackedOrderState::Unordered;
+                    };
+                    let nested = self.push_user_frame(frame, call, owner);
+                    let result = self.expression_state(result, Some(nested));
+                    self.pop_user_frame(nested);
+                    result
                 }
-                if frames
-                    .iter()
-                    .any(|frame| frame.callable == signature.decl_id)
-                {
-                    return PackedOrderState::Deferred;
-                }
-                let Some(result) = signature.result_expression else {
-                    return PackedOrderState::Unordered;
-                };
-                let mut nested = frames.to_vec();
-                nested.push(PackedOrderFrame {
-                    call: call.id().expect("validated packed order call has an ID"),
-                    callable: signature.decl_id,
-                    bindings: self.input_bindings(call),
-                });
-                self.expression_state(result, &nested)
-            }
+            },
         }
     }
 
@@ -783,63 +1428,57 @@ impl<'a> PackedOrderAnalyzer<'a> {
         &mut self,
         call: KernelCheckedPackedCallRef<'a>,
         key: CheckedExprId,
-        frames: &[PackedOrderFrame],
-    ) -> (CheckedOrderKey, PackedOrderSemanticKey) {
-        let mut key_type = self
-            .rows
-            .expressions
-            .get(key.0 as usize)
-            .map(|expression| expression.flow_type.ty.clone())
-            .unwrap_or(Type::Unknown);
+        frame: Option<PackedOrderFrameId>,
+    ) -> (CheckedOrderKey, PackedOrderSemanticKey<'a>) {
+        let mut key_type = self.materialized_expression_type(key);
         key_type =
             apply_checked_type_substitutions_once(&key_type, self.materialized_substitutions(call));
-        for frame in frames.iter().rev() {
-            if let Some(frame_call) = self.call(frame.call) {
+        let mut current = frame;
+        while let Some(id) = current {
+            let row = self.frame(id);
+            if let Some(frame_call) = self.call(row.call) {
                 key_type = apply_checked_type_substitutions_once(
                     &key_type,
                     self.materialized_substitutions(frame_call),
                 );
             }
+            current = row.parent;
         }
-        let (direction, semantic_direction) = self.order_direction(call, frames);
+        let (direction, semantic_direction) = self.order_direction(call, frame);
         let id = call.id().expect("validated packed order call has an ID");
         let checked = CheckedOrderKey {
-            call_path: frames
-                .iter()
-                .map(|frame| frame.call)
-                .chain(std::iter::once(id))
-                .collect(),
+            call_path: self.call_path(frame, id),
             key,
             direction,
             key_type,
-            pure: self.expression_is_pure(key, frames, &mut BTreeSet::new()),
-            total: self.expression_is_total(key, frames, &mut BTreeSet::new()),
+            pure: self.expression_is_pure(key, frame),
+            total: self.expression_is_total(key, frame),
         };
         let semantic = PackedOrderSemanticKey {
-            key: self.semantic_expression(key, frames, &mut BTreeSet::new()),
+            key: self.semantic_expression(key, frame),
             direction: semantic_direction,
         };
         (checked, semantic)
     }
 
     fn order_direction(
-        &self,
+        &mut self,
         call: KernelCheckedPackedCallRef<'a>,
-        frames: &[PackedOrderFrame],
-    ) -> (CheckedOrderDirection, PackedOrderSemanticDirection) {
+        frame: Option<PackedOrderFrameId>,
+    ) -> (CheckedOrderDirection, PackedOrderSemanticDirection<'a>) {
         let Some(expression) = self.input(call, "direction") else {
             return (
                 CheckedOrderDirection::Ascending,
                 PackedOrderSemanticDirection::Ascending,
             );
         };
-        let semantic = self.semantic_expression(expression, frames, &mut BTreeSet::new());
+        let semantic = self.semantic_expression(expression, frame);
         match semantic {
-            Some(PackedOrderSemanticExpression::Tag(value)) if value == "Ascending" => (
+            Some(PackedOrderSemanticExpression::Tag("Ascending")) => (
                 CheckedOrderDirection::Ascending,
                 PackedOrderSemanticDirection::Ascending,
             ),
-            Some(PackedOrderSemanticExpression::Tag(value)) if value == "Descending" => (
+            Some(PackedOrderSemanticExpression::Tag("Descending")) => (
                 CheckedOrderDirection::Descending,
                 PackedOrderSemanticDirection::Descending,
             ),
@@ -850,544 +1489,736 @@ impl<'a> PackedOrderAnalyzer<'a> {
         }
     }
 
+    fn semantic_project(
+        input: PackedOrderSemanticExpression<'a>,
+        fields: Vec<SymbolId>,
+    ) -> PackedOrderSemanticExpression<'a> {
+        if fields.is_empty() {
+            input
+        } else {
+            PackedOrderSemanticExpression::Project {
+                input: Box::new(input),
+                fields,
+            }
+        }
+    }
+
     fn semantic_expression(
-        &self,
+        &mut self,
         expression: CheckedExprId,
-        frames: &[PackedOrderFrame],
-        active: &mut BTreeSet<(CheckedExprId, Vec<CheckedCallId>)>,
-    ) -> Option<PackedOrderSemanticExpression> {
-        let frame_path = frames.iter().map(|frame| frame.call).collect::<Vec<_>>();
-        if !active.insert((expression, frame_path.clone())) {
+        frame: Option<PackedOrderFrameId>,
+    ) -> Option<PackedOrderSemanticExpression<'a>> {
+        if !self.begin_visit(PackedOrderWalkKind::Semantic, expression, frame) {
             return None;
         }
-        let Some(expression_value) = self.rows.expressions.get(expression.0 as usize) else {
-            active.remove(&(expression, frame_path));
-            return None;
-        };
-        let project = |input: PackedOrderSemanticExpression, fields: &[String]| {
-            if fields.is_empty() {
-                input
-            } else {
-                PackedOrderSemanticExpression::Project {
-                    input: Box::new(input),
-                    fields: fields.to_vec(),
-                }
-            }
-        };
-        let result = (|| match &expression_value.kind {
-            CheckedExpressionKind::Read {
-                target,
-                projection,
-                source,
-            } => {
-                if let Some((frame_index, value)) =
-                    frames.iter().enumerate().rev().find_map(|(index, frame)| {
-                        frame
-                            .bindings
-                            .get(target)
-                            .copied()
-                            .map(|value| (index, value))
-                    })
-                {
-                    self.semantic_expression(value, &frames[..frame_index], active)
-                        .map(|value| project(value, projection))
-                } else {
-                    let declaration = self.declaration(*target);
-                    if declaration.is_some_and(|declaration| {
-                        matches!(
-                            declaration.kind,
-                            CheckedDeclarationKind::OutParameter | CheckedDeclarationKind::FreshOut
-                        )
-                    }) {
-                        Some(PackedOrderSemanticExpression::Row(projection.clone()))
-                    } else if let Some(binding) = self.pattern_binding(*target) {
-                        let mut fields = binding.projection.clone();
-                        fields.extend(projection.iter().cloned());
-                        self.semantic_expression(binding.selector, frames, active)
-                            .map(|value| project(value, &fields))
-                    } else {
-                        let declared_value = declaration
-                            .and_then(|declaration| declaration.value)
-                            .or_else(|| {
-                                source
-                                    .as_ref()
-                                    .and_then(|source| self.source_expression(source))
-                            });
-                        let expanded = declared_value.and_then(|value| {
-                            self.semantic_expression(value, frames, active)
-                                .map(|value| project(value, projection))
-                        });
+        let result = (|| {
+            let expression = self.expression(expression)?;
+            if let Some(binding) = expression.lexical {
+                return match binding.target {
+                    crate::KernelLexicalBindingTargetInput::Declaration(target)
+                        if binding.access == crate::KernelLexicalAccess::Read =>
+                    {
+                        let target = self.input.relocate_declaration(expression.owner, target)?;
+                        let projection = self.path_symbols(binding.projection)?;
+                        if let Some((value, parent)) = self.frame_actual(target, frame) {
+                            return self
+                                .semantic_expression(value, parent)
+                                .map(|value| Self::semantic_project(value, projection));
+                        }
+                        let declaration = self.declaration(target);
+                        if declaration.is_some_and(|declaration| {
+                            matches!(
+                                declaration.row.kind,
+                                crate::KernelDeclarationKind::OutParameter
+                                    | crate::KernelDeclarationKind::FreshOut
+                            )
+                        }) {
+                            return Some(PackedOrderSemanticExpression::Row(projection));
+                        }
+                        if let Some(binding) = self.pattern_binding(target) {
+                            let mut fields = Vec::with_capacity(
+                                projection
+                                    .len()
+                                    .saturating_add(usize::from(binding.projection.is_some())),
+                            );
+                            fields.extend(binding.projection);
+                            fields.extend(projection);
+                            return self
+                                .semantic_expression(binding.selector, frame)
+                                .map(|value| Self::semantic_project(value, fields));
+                        }
+                        let expanded = self
+                            .read_provider(target, binding.projection)
+                            .and_then(|value| self.semantic_expression(value, frame))
+                            .map(|value| Self::semantic_project(value, projection.clone()));
                         expanded.or_else(|| {
                             declaration.and_then(|declaration| {
                                 self.declaration_canonical_path(declaration).map(|path| {
-                                    PackedOrderSemanticExpression::Capture {
-                                        path,
-                                        projection: projection.clone(),
-                                    }
+                                    PackedOrderSemanticExpression::Capture { path, projection }
                                 })
                             })
                         })
                     }
-                }
-            }
-            CheckedExpressionKind::ExternalRead { canonical_path, .. } => {
-                Some(PackedOrderSemanticExpression::Capture {
-                    path: canonical_path.clone(),
-                    projection: Vec::new(),
-                })
-            }
-            CheckedExpressionKind::Text { value } => {
-                Some(PackedOrderSemanticExpression::Text(value.clone()))
-            }
-            CheckedExpressionKind::TextTemplate { segments } => segments
-                .iter()
-                .map(|segment| match segment {
-                    CheckedTextSegment::Static { value } => {
-                        Some(PackedOrderSemanticTextSegment::Static(value.clone()))
+                    crate::KernelLexicalBindingTargetInput::RuntimeContext
+                        if binding.access == crate::KernelLexicalAccess::Read =>
+                    {
+                        let crate::PackedExpressionPayload::LexicalPath(path) = expression.payload
+                        else {
+                            return None;
+                        };
+                        Some(PackedOrderSemanticExpression::Capture {
+                            path: self.path_symbols(path)?,
+                            projection: Vec::new(),
+                        })
                     }
-                    CheckedTextSegment::Dynamic { value } => self
-                        .semantic_expression(*value, frames, active)
-                        .map(PackedOrderSemanticTextSegment::Dynamic),
-                })
-                .collect::<Option<Vec<_>>>()
-                .map(PackedOrderSemanticExpression::TextTemplate),
-            CheckedExpressionKind::Number { value } => {
-                Some(PackedOrderSemanticExpression::Number(value.clone()))
+                    crate::KernelLexicalBindingTargetInput::Declaration(_)
+                    | crate::KernelLexicalBindingTargetInput::ContextFormal { .. }
+                    | crate::KernelLexicalBindingTargetInput::Value { .. }
+                    | crate::KernelLexicalBindingTargetInput::RuntimeContext => None,
+                };
             }
-            CheckedExpressionKind::Bits { value } => {
-                Some(PackedOrderSemanticExpression::Bits(value.clone()))
-            }
-            CheckedExpressionKind::Absent | CheckedExpressionKind::Flush { .. } => None,
-            CheckedExpressionKind::Tag { name } => {
-                Some(PackedOrderSemanticExpression::Tag(name.clone()))
-            }
-            CheckedExpressionKind::Call { call } => {
-                let call = self.call(*call)?;
-                let signature = self.signature(call);
-                if signature.kind == CheckedCallableKind::User {
-                    let result = signature.result_expression?;
-                    let mut nested = frames.to_vec();
-                    nested.push(PackedOrderFrame {
-                        call: call.id().ok()?,
-                        callable: signature.decl_id,
-                        bindings: self.input_bindings(call),
-                    });
-                    self.semantic_expression(result, &nested, active)
-                } else {
-                    let mut inputs = Vec::new();
-                    for entry in call.entries().ok()? {
-                        if let crate::PackedCallEntry::Input {
-                            parameter_ordinal,
-                            value,
-                            ..
-                        } = entry
-                        {
-                            let parameter = self.parameter(signature, *parameter_ordinal)?;
-                            let value = self
-                                .rows
-                                .semantic_input
-                                .relocate_value(call.owner, *value)?;
+            if let Some(call) = expression.call {
+                return match call
+                    .target()
+                    .expect("validated packed order call has a target")
+                {
+                    crate::KernelCallableSchemeId::User(owner) => {
+                        if self.frame_contains_owner(frame, owner) {
+                            return None;
+                        }
+                        let result = self.input.definition_relocation(owner)?.result_expression;
+                        let nested = self.push_user_frame(frame, call, owner);
+                        let result = self.semantic_expression(result, Some(nested));
+                        self.pop_user_frame(nested);
+                        result
+                    }
+                    crate::KernelCallableSchemeId::Abi(_) => {
+                        let mut inputs = Vec::new();
+                        for entry in call.entries().ok()? {
+                            if let crate::PackedCallEntry::Input {
+                                parameter_ordinal,
+                                value,
+                                ..
+                            } = entry
+                            {
+                                let parameter = self.parameter(call, *parameter_ordinal)?;
+                                let value = self.input.relocate_value(call.owner, *value)?;
+                                inputs.push((
+                                    PackedOrderSemanticInputName::Named(parameter.name),
+                                    self.semantic_expression(value, frame)?,
+                                ));
+                            }
+                        }
+                        if let Some(value) = self.explicit_context_value(call) {
                             inputs.push((
-                                parameter.name.clone(),
-                                self.semantic_expression(value, frames, active)?,
+                                PackedOrderSemanticInputName::Passed,
+                                self.semantic_expression(value, frame)?,
                             ));
                         }
+                        Some(PackedOrderSemanticExpression::Call {
+                            function: PackedOrderSemanticFunction::Named(self.call_function(call)),
+                            inputs,
+                        })
                     }
-                    if let Some(value) = self.explicit_context_value(call) {
+                };
+            }
+            match expression.node.kind {
+                crate::PackedKernelOwnerNodeKind::Text => {
+                    let crate::PackedExpressionPayload::Text(value) = expression.payload else {
+                        return None;
+                    };
+                    Some(PackedOrderSemanticExpression::Text(
+                        expression.facts.literal_text(value),
+                    ))
+                }
+                crate::PackedKernelOwnerNodeKind::TextTemplate => {
+                    let segments = expression.facts.template_segments(expression.payload)?;
+                    segments
+                        .iter()
+                        .map(|segment| match segment {
+                            crate::PackedTextTemplateSegment::Static(value) => {
+                                Some(PackedOrderSemanticTextSegment::Static(
+                                    expression.facts.literal_text(*value),
+                                ))
+                            }
+                            crate::PackedTextTemplateSegment::Dynamic(ordinal) => expression
+                                .inputs()
+                                .iter()
+                                .filter(|input| {
+                                    input.role == crate::PackedKernelOwnerEdgeRole::TextDynamic
+                                })
+                                .nth(*ordinal as usize)
+                                .and_then(|input| self.linked_value(expression, input.expression))
+                                .and_then(|value| self.semantic_expression(value, frame))
+                                .map(PackedOrderSemanticTextSegment::Dynamic),
+                        })
+                        .collect::<Option<Vec<_>>>()
+                        .map(PackedOrderSemanticExpression::TextTemplate)
+                }
+                crate::PackedKernelOwnerNodeKind::Number => {
+                    let crate::PackedExpressionPayload::Number(value) = expression.payload else {
+                        return None;
+                    };
+                    Some(PackedOrderSemanticExpression::Number(
+                        expression.facts.number(value),
+                    ))
+                }
+                crate::PackedKernelOwnerNodeKind::Bits(_) => {
+                    let crate::PackedExpressionPayload::Bits(value) = expression.payload else {
+                        return None;
+                    };
+                    Some(PackedOrderSemanticExpression::Bits(
+                        expression.facts.bits(value),
+                    ))
+                }
+                crate::PackedKernelOwnerNodeKind::Tag(name) => Some(
+                    PackedOrderSemanticExpression::Tag(expression.definition.input().symbol(name)?),
+                ),
+                crate::PackedKernelOwnerNodeKind::Infix { operation } => self
+                    .exact_input(expression, crate::PackedKernelOwnerEdgeRole::InfixLeft)
+                    .and_then(|left| self.semantic_expression(left, frame))
+                    .zip(
+                        self.exact_input(expression, crate::PackedKernelOwnerEdgeRole::InfixRight)
+                            .and_then(|right| self.semantic_expression(right, frame)),
+                    )
+                    .map(|(left, right)| PackedOrderSemanticExpression::Infix {
+                        operator: expression
+                            .definition
+                            .input()
+                            .symbol(operation)
+                            .unwrap_or(""),
+                        left: Box::new(left),
+                        right: Box::new(right),
+                    }),
+                crate::PackedKernelOwnerNodeKind::Block => expression
+                    .shape
+                    .and_then(|shape| match shape {
+                        crate::PackedExecutionShape::Block {
+                            result: Some(result),
+                            ..
+                        } => self.linked_value(expression, *result),
+                        _ => None,
+                    })
+                    .and_then(|result| self.semantic_expression(result, frame)),
+                crate::PackedKernelOwnerNodeKind::Then => self
+                    .exact_input(expression, crate::PackedKernelOwnerEdgeRole::ThenOutput)
+                    .and_then(|output| self.semantic_expression(output, frame)),
+                crate::PackedKernelOwnerNodeKind::MatchArm { .. } => self
+                    .exact_input(expression, crate::PackedKernelOwnerEdgeRole::MatchOutput)
+                    .and_then(|output| self.semantic_expression(output, frame)),
+                crate::PackedKernelOwnerNodeKind::Latest => {
+                    let mut inputs = Vec::new();
+                    for (index, input) in expression
+                        .inputs()
+                        .iter()
+                        .filter(|input| {
+                            input.role == crate::PackedKernelOwnerEdgeRole::LatestBranch
+                        })
+                        .enumerate()
+                    {
+                        let value = self.linked_value(expression, input.expression)?;
                         inputs.push((
-                            "PASS".to_owned(),
-                            self.semantic_expression(value, frames, active)?,
+                            PackedOrderSemanticInputName::Index(u32::try_from(index).ok()?),
+                            self.semantic_expression(value, frame)?,
                         ));
                     }
                     Some(PackedOrderSemanticExpression::Call {
-                        function: self.call_function(call).to_owned(),
+                        function: PackedOrderSemanticFunction::Latest,
                         inputs,
                     })
                 }
+                crate::PackedKernelOwnerNodeKind::When => {
+                    let input =
+                        self.exact_input(expression, crate::PackedKernelOwnerEdgeRole::WhenInput)?;
+                    let input = self.semantic_expression(input, frame)?;
+                    let outputs = expression
+                        .inputs()
+                        .iter()
+                        .filter(|edge| edge.role == crate::PackedKernelOwnerEdgeRole::WhenArm)
+                        .map(|edge| {
+                            self.linked_value(expression, edge.expression)
+                                .and_then(|arm| self.semantic_expression(arm, frame))
+                        })
+                        .collect::<Option<Vec<_>>>()?;
+                    Some(PackedOrderSemanticExpression::Select {
+                        input: Box::new(input),
+                        outputs,
+                    })
+                }
+                crate::PackedKernelOwnerNodeKind::Source(_)
+                | crate::PackedKernelOwnerNodeKind::Absent
+                | crate::PackedKernelOwnerNodeKind::Byte
+                | crate::PackedKernelOwnerNodeKind::Record { .. }
+                | crate::PackedKernelOwnerNodeKind::Collection { .. }
+                | crate::PackedKernelOwnerNodeKind::MapEntry
+                | crate::PackedKernelOwnerNodeKind::FormalRead { .. }
+                | crate::PackedKernelOwnerNodeKind::ContextRead { .. }
+                | crate::PackedKernelOwnerNodeKind::LexicalRead { .. }
+                | crate::PackedKernelOwnerNodeKind::ValueRead { .. }
+                | crate::PackedKernelOwnerNodeKind::DerivedRead { .. }
+                | crate::PackedKernelOwnerNodeKind::PatternRead { .. }
+                | crate::PackedKernelOwnerNodeKind::CollectionItemRead
+                | crate::PackedKernelOwnerNodeKind::FreshOut
+                | crate::PackedKernelOwnerNodeKind::UserCall { .. }
+                | crate::PackedKernelOwnerNodeKind::RenderConstructor { .. }
+                | crate::PackedKernelOwnerNodeKind::PureBuiltin { .. }
+                | crate::PackedKernelOwnerNodeKind::FixedAbiCall { .. }
+                | crate::PackedKernelOwnerNodeKind::HostEffect { .. }
+                | crate::PackedKernelOwnerNodeKind::Draining
+                | crate::PackedKernelOwnerNodeKind::Hold
+                | crate::PackedKernelOwnerNodeKind::Arrow
+                | crate::PackedKernelOwnerNodeKind::Delimiter
+                | crate::PackedKernelOwnerNodeKind::Unknown
+                | crate::PackedKernelOwnerNodeKind::Flush
+                | crate::PackedKernelOwnerNodeKind::FieldProjection { .. }
+                | crate::PackedKernelOwnerNodeKind::Known(_) => None,
             }
-            CheckedExpressionKind::Infix { left, op, right } => self
-                .semantic_expression(*left, frames, active)
-                .zip(self.semantic_expression(*right, frames, active))
-                .map(|(left, right)| PackedOrderSemanticExpression::Infix {
-                    operator: op.clone(),
-                    left: Box::new(left),
-                    right: Box::new(right),
-                }),
-            CheckedExpressionKind::Block {
-                result: Some(result),
-                ..
-            }
-            | CheckedExpressionKind::Then {
-                output: Some(result),
-                ..
-            }
-            | CheckedExpressionKind::MatchArm {
-                output: Some(result),
-                ..
-            } => self.semantic_expression(*result, frames, active),
-            CheckedExpressionKind::Latest { branches } => branches
-                .iter()
-                .enumerate()
-                .map(|(index, branch)| {
-                    self.semantic_expression(*branch, frames, active)
-                        .map(|value| (index.to_string(), value))
-                })
-                .collect::<Option<Vec<_>>>()
-                .map(|inputs| PackedOrderSemanticExpression::Call {
-                    function: "LATEST".to_owned(),
-                    inputs,
-                }),
-            CheckedExpressionKind::When { input, arms }
-            | CheckedExpressionKind::While { input, arms } => self
-                .semantic_expression(*input, frames, active)
-                .zip(
-                    arms.iter()
-                        .map(|arm| self.semantic_expression(*arm, frames, active))
-                        .collect::<Option<Vec<_>>>(),
-                )
-                .map(|(input, outputs)| PackedOrderSemanticExpression::Select {
-                    input: Box::new(input),
-                    outputs,
-                }),
-            CheckedExpressionKind::Passed { .. }
-            | CheckedExpressionKind::Drain { .. }
-            | CheckedExpressionKind::TaggedObject { .. }
-            | CheckedExpressionKind::Source
-            | CheckedExpressionKind::Draining { .. }
-            | CheckedExpressionKind::Hold { .. }
-            | CheckedExpressionKind::Then { output: None, .. }
-            | CheckedExpressionKind::MatchArm { output: None, .. }
-            | CheckedExpressionKind::Block { result: None, .. }
-            | CheckedExpressionKind::Object { .. }
-            | CheckedExpressionKind::List { .. }
-            | CheckedExpressionKind::MapEntry { .. }
-            | CheckedExpressionKind::Map { .. }
-            | CheckedExpressionKind::Set { .. }
-            | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Bytes { .. }
-            | CheckedExpressionKind::Delimiter
-            | CheckedExpressionKind::Invalid { .. } => None,
         })();
-        active.remove(&(expression, frame_path));
+        self.end_visit(PackedOrderWalkKind::Semantic, expression, frame);
         result
     }
 
     fn expression_is_total(
-        &self,
+        &mut self,
         expression: CheckedExprId,
-        frames: &[PackedOrderFrame],
-        active: &mut BTreeSet<(CheckedExprId, Vec<CheckedCallId>)>,
+        frame: Option<PackedOrderFrameId>,
     ) -> bool {
-        let frame_path = frames.iter().map(|frame| frame.call).collect::<Vec<_>>();
-        if !active.insert((expression, frame_path.clone())) {
+        if !self.begin_visit(PackedOrderWalkKind::Total, expression, frame) {
             return true;
         }
-        let Some(expression_value) = self.rows.expressions.get(expression.0 as usize) else {
-            active.remove(&(expression, frame_path));
-            return false;
-        };
-        let total = match &expression_value.kind {
-            CheckedExpressionKind::Read { target, source, .. } => {
-                if let Some((frame_index, value)) =
-                    frames.iter().enumerate().rev().find_map(|(index, frame)| {
-                        frame
-                            .bindings
-                            .get(target)
-                            .copied()
-                            .map(|value| (index, value))
-                    })
-                {
-                    self.expression_is_total(value, &frames[..frame_index], active)
-                } else {
-                    self.declaration(*target)
-                        .and_then(|declaration| declaration.value)
-                        .or_else(|| {
-                            source
-                                .as_ref()
-                                .and_then(|source| self.source_expression(source))
-                        })
-                        .is_none_or(|value| self.expression_is_total(value, frames, active))
-                }
-            }
-            CheckedExpressionKind::Call { call } => {
-                let Some(call) = self.call(*call) else {
-                    active.remove(&(expression, frame_path));
-                    return false;
-                };
-                let signature = self.signature(call);
-                if signature.kind == CheckedCallableKind::User {
-                    let Some(result) = signature.result_expression else {
-                        active.remove(&(expression, frame_path));
-                        return false;
-                    };
-                    let mut nested = frames.to_vec();
-                    nested.push(PackedOrderFrame {
-                        call: call.id().expect("validated packed order call has an ID"),
-                        callable: signature.decl_id,
-                        bindings: self.input_bindings(call),
-                    });
-                    self.expression_is_total(result, &nested, active)
-                } else {
-                    !order_key_call_is_error_capable(self.call_function(call))
-                        && self
-                            .input_values(call)
-                            .into_iter()
-                            .all(|value| self.expression_is_total(value, frames, active))
-                }
-            }
-            CheckedExpressionKind::TextTemplate { segments } => {
-                segments.iter().all(|segment| match segment {
-                    CheckedTextSegment::Static { .. } => true,
-                    CheckedTextSegment::Dynamic { value } => {
-                        self.expression_is_total(*value, frames, active)
+        let total = (|| {
+            let expression = self.expression(expression)?;
+            if let Some(binding) = expression.lexical {
+                return Some(match binding.target {
+                    crate::KernelLexicalBindingTargetInput::Declaration(target)
+                        if binding.access == crate::KernelLexicalAccess::Read =>
+                    {
+                        let Some(target) =
+                            self.input.relocate_declaration(expression.owner, target)
+                        else {
+                            return Some(false);
+                        };
+                        if let Some((value, parent)) = self.frame_actual(target, frame) {
+                            self.expression_is_total(value, parent)
+                        } else {
+                            self.read_provider(target, binding.projection)
+                                .is_none_or(|value| self.expression_is_total(value, frame))
+                        }
                     }
-                })
+                    crate::KernelLexicalBindingTargetInput::RuntimeContext
+                        if binding.access == crate::KernelLexicalAccess::Read =>
+                    {
+                        true
+                    }
+                    crate::KernelLexicalBindingTargetInput::Declaration(_)
+                    | crate::KernelLexicalBindingTargetInput::ContextFormal { .. }
+                    | crate::KernelLexicalBindingTargetInput::Value { .. }
+                    | crate::KernelLexicalBindingTargetInput::RuntimeContext => false,
+                });
             }
-            CheckedExpressionKind::Infix { left, op, right } => {
-                !matches!(op.as_str(), "+" | "-" | "*" | "/" | "%")
-                    && self.expression_is_total(*left, frames, active)
-                    && self.expression_is_total(*right, frames, active)
+            if let Some(call) = expression.call {
+                return Some(
+                    match call
+                        .target()
+                        .expect("validated packed order call has a target")
+                    {
+                        crate::KernelCallableSchemeId::User(owner) => {
+                            if self.frame_contains_owner(frame, owner) {
+                                // Totality is an error-capability analysis, not
+                                // a termination proof. A recursive revisit is
+                                // therefore the same coinductive success used
+                                // by the generic active-visit guard above.
+                                return Some(true);
+                            }
+                            let Some(result) = self
+                                .input
+                                .definition_relocation(owner)
+                                .map(|relocation| relocation.result_expression)
+                            else {
+                                return Some(false);
+                            };
+                            let nested = self.push_user_frame(frame, call, owner);
+                            let total = self.expression_is_total(result, Some(nested));
+                            self.pop_user_frame(nested);
+                            total
+                        }
+                        crate::KernelCallableSchemeId::Abi(_) => {
+                            if order_key_call_is_error_capable(self.call_function(call)) {
+                                false
+                            } else {
+                                let mut total = true;
+                                for entry in
+                                    call.entries().expect("validated packed call has entries")
+                                {
+                                    if let crate::PackedCallEntry::Input { value, .. } = entry
+                                        && let Some(value) =
+                                            self.input.relocate_value(call.owner, *value)
+                                        && !self.expression_is_total(value, frame)
+                                    {
+                                        total = false;
+                                        break;
+                                    }
+                                }
+                                total
+                                    && self
+                                        .explicit_context_value(call)
+                                        .is_none_or(|value| self.expression_is_total(value, frame))
+                            }
+                        }
+                    },
+                );
             }
-            CheckedExpressionKind::Block {
-                result: Some(result),
-                ..
-            }
-            | CheckedExpressionKind::Then {
-                output: Some(result),
-                ..
-            }
-            | CheckedExpressionKind::MatchArm {
-                output: Some(result),
-                ..
-            } => self.expression_is_total(*result, frames, active),
-            CheckedExpressionKind::Latest { branches } => branches
-                .iter()
-                .all(|branch| self.expression_is_total(*branch, frames, active)),
-            CheckedExpressionKind::When { input, arms }
-            | CheckedExpressionKind::While { input, arms } => {
-                self.expression_is_total(*input, frames, active)
-                    && arms
-                        .iter()
-                        .all(|arm| self.expression_is_total(*arm, frames, active))
-            }
-            CheckedExpressionKind::Text { .. }
-            | CheckedExpressionKind::Number { .. }
-            | CheckedExpressionKind::Bits { .. }
-            | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Tag { .. }
-            | CheckedExpressionKind::ExternalRead { .. } => true,
-            CheckedExpressionKind::MapEntry { key, value } => {
-                self.expression_is_total(*key, frames, active)
-                    && self.expression_is_total(*value, frames, active)
-            }
-            CheckedExpressionKind::Map { entries } => entries
-                .iter()
-                .all(|entry| self.expression_is_total(*entry, frames, active)),
-            CheckedExpressionKind::Set { items } => items
-                .iter()
-                .all(|item| self.expression_is_total(*item, frames, active)),
-            CheckedExpressionKind::Absent
-            | CheckedExpressionKind::Flush { .. }
-            | CheckedExpressionKind::Passed { .. }
-            | CheckedExpressionKind::Drain { .. }
-            | CheckedExpressionKind::TaggedObject { .. }
-            | CheckedExpressionKind::Source
-            | CheckedExpressionKind::Draining { .. }
-            | CheckedExpressionKind::Hold { .. }
-            | CheckedExpressionKind::Then { output: None, .. }
-            | CheckedExpressionKind::MatchArm { output: None, .. }
-            | CheckedExpressionKind::Block { result: None, .. }
-            | CheckedExpressionKind::Object { .. }
-            | CheckedExpressionKind::List { .. }
-            | CheckedExpressionKind::Bytes { .. }
-            | CheckedExpressionKind::Delimiter
-            | CheckedExpressionKind::Invalid { .. } => false,
-        };
-        active.remove(&(expression, frame_path));
+            Some(match expression.node.kind {
+                crate::PackedKernelOwnerNodeKind::Text => {
+                    matches!(expression.payload, crate::PackedExpressionPayload::Text(_))
+                }
+                crate::PackedKernelOwnerNodeKind::Number => {
+                    matches!(
+                        expression.payload,
+                        crate::PackedExpressionPayload::Number(_)
+                    )
+                }
+                crate::PackedKernelOwnerNodeKind::Byte => {
+                    matches!(expression.payload, crate::PackedExpressionPayload::Byte(_))
+                }
+                crate::PackedKernelOwnerNodeKind::Bits(_) => {
+                    matches!(expression.payload, crate::PackedExpressionPayload::Bits(_))
+                }
+                crate::PackedKernelOwnerNodeKind::Tag(_) => true,
+                crate::PackedKernelOwnerNodeKind::TextTemplate => expression
+                    .inputs()
+                    .iter()
+                    .filter(|edge| edge.role == crate::PackedKernelOwnerEdgeRole::TextDynamic)
+                    .all(|edge| {
+                        self.linked_value(expression, edge.expression)
+                            .is_some_and(|value| self.expression_is_total(value, frame))
+                    }),
+                crate::PackedKernelOwnerNodeKind::Infix { operation } => {
+                    let operation = expression
+                        .definition
+                        .input()
+                        .symbol(operation)
+                        .unwrap_or("");
+                    !matches!(operation, "+" | "-" | "*" | "/" | "%")
+                        && self
+                            .exact_input(expression, crate::PackedKernelOwnerEdgeRole::InfixLeft)
+                            .is_some_and(|left| self.expression_is_total(left, frame))
+                        && self
+                            .exact_input(expression, crate::PackedKernelOwnerEdgeRole::InfixRight)
+                            .is_some_and(|right| self.expression_is_total(right, frame))
+                }
+                crate::PackedKernelOwnerNodeKind::Block => expression
+                    .shape
+                    .and_then(|shape| match shape {
+                        crate::PackedExecutionShape::Block {
+                            result: Some(result),
+                            ..
+                        } => self.linked_value(expression, *result),
+                        _ => None,
+                    })
+                    .is_some_and(|result| self.expression_is_total(result, frame)),
+                crate::PackedKernelOwnerNodeKind::Then => self
+                    .exact_input(expression, crate::PackedKernelOwnerEdgeRole::ThenOutput)
+                    .is_some_and(|output| self.expression_is_total(output, frame)),
+                crate::PackedKernelOwnerNodeKind::MatchArm { .. } => self
+                    .exact_input(expression, crate::PackedKernelOwnerEdgeRole::MatchOutput)
+                    .is_some_and(|output| self.expression_is_total(output, frame)),
+                crate::PackedKernelOwnerNodeKind::Latest => expression
+                    .inputs()
+                    .iter()
+                    .filter(|edge| edge.role == crate::PackedKernelOwnerEdgeRole::LatestBranch)
+                    .all(|edge| {
+                        self.linked_value(expression, edge.expression)
+                            .is_some_and(|branch| self.expression_is_total(branch, frame))
+                    }),
+                crate::PackedKernelOwnerNodeKind::When => expression
+                    .inputs()
+                    .iter()
+                    .filter(|edge| {
+                        matches!(
+                            edge.role,
+                            crate::PackedKernelOwnerEdgeRole::WhenInput
+                                | crate::PackedKernelOwnerEdgeRole::WhenArm
+                        )
+                    })
+                    .all(|edge| {
+                        self.linked_value(expression, edge.expression)
+                            .is_some_and(|value| self.expression_is_total(value, frame))
+                    }),
+                crate::PackedKernelOwnerNodeKind::MapEntry => expression
+                    .inputs()
+                    .iter()
+                    .filter(|edge| {
+                        matches!(
+                            edge.role,
+                            crate::PackedKernelOwnerEdgeRole::MapKey
+                                | crate::PackedKernelOwnerEdgeRole::MapValue
+                        )
+                    })
+                    .all(|edge| {
+                        self.linked_value(expression, edge.expression)
+                            .is_some_and(|value| self.expression_is_total(value, frame))
+                    }),
+                crate::PackedKernelOwnerNodeKind::Collection {
+                    kind: crate::KernelCollectionKind::Map,
+                    ..
+                } => expression
+                    .inputs()
+                    .iter()
+                    .filter(|edge| edge.role == crate::PackedKernelOwnerEdgeRole::MapEntry)
+                    .all(|edge| {
+                        self.linked_value(expression, edge.expression)
+                            .is_some_and(|value| self.expression_is_total(value, frame))
+                    }),
+                crate::PackedKernelOwnerNodeKind::Collection {
+                    kind: crate::KernelCollectionKind::Set,
+                    ..
+                } => expression
+                    .inputs()
+                    .iter()
+                    .filter(|edge| edge.role == crate::PackedKernelOwnerEdgeRole::CollectionItem)
+                    .all(|edge| {
+                        self.linked_value(expression, edge.expression)
+                            .is_some_and(|value| self.expression_is_total(value, frame))
+                    }),
+                crate::PackedKernelOwnerNodeKind::Source(_)
+                | crate::PackedKernelOwnerNodeKind::Absent
+                | crate::PackedKernelOwnerNodeKind::Record { .. }
+                | crate::PackedKernelOwnerNodeKind::Collection { .. }
+                | crate::PackedKernelOwnerNodeKind::FormalRead { .. }
+                | crate::PackedKernelOwnerNodeKind::ContextRead { .. }
+                | crate::PackedKernelOwnerNodeKind::LexicalRead { .. }
+                | crate::PackedKernelOwnerNodeKind::ValueRead { .. }
+                | crate::PackedKernelOwnerNodeKind::DerivedRead { .. }
+                | crate::PackedKernelOwnerNodeKind::PatternRead { .. }
+                | crate::PackedKernelOwnerNodeKind::CollectionItemRead
+                | crate::PackedKernelOwnerNodeKind::FreshOut
+                | crate::PackedKernelOwnerNodeKind::UserCall { .. }
+                | crate::PackedKernelOwnerNodeKind::RenderConstructor { .. }
+                | crate::PackedKernelOwnerNodeKind::PureBuiltin { .. }
+                | crate::PackedKernelOwnerNodeKind::FixedAbiCall { .. }
+                | crate::PackedKernelOwnerNodeKind::HostEffect { .. }
+                | crate::PackedKernelOwnerNodeKind::Draining
+                | crate::PackedKernelOwnerNodeKind::Hold
+                | crate::PackedKernelOwnerNodeKind::Arrow
+                | crate::PackedKernelOwnerNodeKind::Delimiter
+                | crate::PackedKernelOwnerNodeKind::Unknown
+                | crate::PackedKernelOwnerNodeKind::Flush
+                | crate::PackedKernelOwnerNodeKind::FieldProjection { .. }
+                | crate::PackedKernelOwnerNodeKind::Known(_) => false,
+            })
+        })()
+        .unwrap_or(false);
+        self.end_visit(PackedOrderWalkKind::Total, expression, frame);
         total
     }
 
     fn merge_branch_states(
         &mut self,
-        branches: &[CheckedExprId],
-        frames: &[PackedOrderFrame],
-    ) -> PackedOrderState {
-        let mut states = branches
+        expression: PackedOrderExpressionRef<'a>,
+        role: crate::PackedKernelOwnerEdgeRole,
+        frame: Option<PackedOrderFrameId>,
+    ) -> PackedOrderState<'a> {
+        let branches = expression
+            .inputs()
             .iter()
-            .map(|branch| self.expression_state(*branch, frames));
-        let Some(first) = states.next() else {
-            return PackedOrderState::Unordered;
-        };
-        states.fold(first, |left, right| match (left, right) {
-            (PackedOrderState::Invalid { call_path }, _)
-            | (_, PackedOrderState::Invalid { call_path }) => {
-                PackedOrderState::Invalid { call_path }
-            }
-            (PackedOrderState::Ordered(left), PackedOrderState::Ordered(right))
-                if left.semantic == right.semantic =>
-            {
-                PackedOrderState::Ordered(left)
-            }
-            (PackedOrderState::Deferred, _) | (_, PackedOrderState::Deferred) => {
-                PackedOrderState::Deferred
-            }
-            _ => PackedOrderState::Unordered,
-        })
+            .filter(|input| input.role == role);
+        let mut state = None;
+        for branch in branches {
+            let Some(branch) = self.linked_value(expression, branch.expression) else {
+                return PackedOrderState::Unordered;
+            };
+            let next = self.expression_state(branch, frame);
+            state = Some(match (state, next) {
+                (None, next) => next,
+                (Some(PackedOrderState::Invalid { call_path }), _)
+                | (_, PackedOrderState::Invalid { call_path }) => {
+                    PackedOrderState::Invalid { call_path }
+                }
+                (Some(PackedOrderState::Ordered(left)), PackedOrderState::Ordered(right))
+                    if left.semantic == right.semantic =>
+                {
+                    PackedOrderState::Ordered(left)
+                }
+                (Some(PackedOrderState::Deferred), _) | (_, PackedOrderState::Deferred) => {
+                    PackedOrderState::Deferred
+                }
+                _ => PackedOrderState::Unordered,
+            });
+        }
+        state.unwrap_or(PackedOrderState::Unordered)
     }
 
     fn expression_is_pure(
-        &self,
+        &mut self,
         expression: CheckedExprId,
-        frames: &[PackedOrderFrame],
-        active: &mut BTreeSet<(CheckedExprId, Vec<CheckedCallId>)>,
+        frame: Option<PackedOrderFrameId>,
     ) -> bool {
-        let frame_path = frames.iter().map(|frame| frame.call).collect::<Vec<_>>();
-        if !active.insert((expression, frame_path.clone())) {
+        if !self.begin_visit(PackedOrderWalkKind::Pure, expression, frame) {
             return true;
         }
-        let Some(expression) = self.rows.expressions.get(expression.0 as usize) else {
-            return false;
-        };
-        if expression.flow_type.mode != FlowMode::Continuous
-            || expression.effect != CheckedEffectSummary::default()
-        {
-            active.remove(&(expression.id, frame_path));
-            return false;
-        }
-        let children = match &expression.kind {
-            CheckedExpressionKind::Read {
-                target,
-                projection,
-                source,
-            } if projection.is_empty() => {
-                if let Some((frame_index, value)) =
-                    frames.iter().enumerate().rev().find_map(|(index, frame)| {
-                        frame
-                            .bindings
-                            .get(target)
-                            .copied()
-                            .map(|value| (index, value))
-                    })
-                {
-                    let pure = self.expression_is_pure(value, &frames[..frame_index], active);
-                    active.remove(&(expression.id, frame_path));
-                    return pure;
-                }
-                self.declaration(*target)
-                    .and_then(|declaration| declaration.value)
-                    .or_else(|| {
-                        source
-                            .as_ref()
-                            .and_then(|source| self.source_expression(source))
-                    })
-                    .into_iter()
-                    .collect()
-            }
-            CheckedExpressionKind::Call { call } => self
-                .call(*call)
-                .map(|call| self.input_values(call))
-                .unwrap_or_default(),
-            CheckedExpressionKind::TextTemplate { segments } => segments
-                .iter()
-                .filter_map(|segment| match segment {
-                    CheckedTextSegment::Static { .. } => None,
-                    CheckedTextSegment::Dynamic { value } => Some(*value),
-                })
-                .collect(),
-            CheckedExpressionKind::TaggedObject { fields, .. }
-            | CheckedExpressionKind::Object { fields } => {
-                fields.iter().map(|field| field.value).collect()
-            }
-            CheckedExpressionKind::Draining { input }
-            | CheckedExpressionKind::Hold { initial: input, .. } => vec![*input],
-            CheckedExpressionKind::Flush { payload } => vec![*payload],
-            CheckedExpressionKind::Latest { branches } => branches.clone(),
-            CheckedExpressionKind::When { input, arms }
-            | CheckedExpressionKind::While { input, arms } => std::iter::once(*input)
-                .chain(arms.iter().copied())
-                .collect(),
-            CheckedExpressionKind::Then { input, output } => std::iter::once(*input)
-                .chain(output.iter().copied())
-                .collect(),
-            CheckedExpressionKind::Infix { left, right, .. } => vec![*left, *right],
-            CheckedExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
-            CheckedExpressionKind::Block { bindings, result } => bindings
-                .iter()
-                .map(|binding| binding.value)
-                .chain(result.iter().copied())
-                .collect(),
-            CheckedExpressionKind::List { items, .. }
-            | CheckedExpressionKind::Bytes { items, .. }
-            | CheckedExpressionKind::Set { items } => items.clone(),
-            CheckedExpressionKind::Map { entries } => entries.clone(),
-            CheckedExpressionKind::MapEntry { key, value } => vec![*key, *value],
-            CheckedExpressionKind::Passed { .. }
-            | CheckedExpressionKind::ExternalRead { .. }
-            | CheckedExpressionKind::Drain { .. }
-            | CheckedExpressionKind::Read { .. }
-            | CheckedExpressionKind::Text { .. }
-            | CheckedExpressionKind::Number { .. }
-            | CheckedExpressionKind::Bits { .. }
-            | CheckedExpressionKind::BytesByte { .. }
-            | CheckedExpressionKind::Absent
-            | CheckedExpressionKind::Tag { .. }
-            | CheckedExpressionKind::Source
-            | CheckedExpressionKind::Delimiter
-            | CheckedExpressionKind::Invalid { .. } => Vec::new(),
-        };
-        let pure = children
-            .into_iter()
-            .all(|child| self.expression_is_pure(child, frames, active));
-        active.remove(&(expression.id, frame_path));
-        pure
-    }
-
-    fn source_expression(&self, read: &CheckedSourceRead) -> Option<CheckedExprId> {
-        self.rows
-            .sources
-            .get(read.source.0 as usize)
-            .filter(|source| source.id == read.source)
-            .map(|source| source.expression)
-    }
-
-    fn declaration_canonical_path(&self, declaration: &CheckedDeclaration) -> Option<String> {
-        if !matches!(
-            declaration.kind,
-            CheckedDeclarationKind::Field
-                | CheckedDeclarationKind::Source
-                | CheckedDeclarationKind::Hold
-                | CheckedDeclarationKind::List
-        ) {
-            return None;
-        }
-        let mut segments = vec![declaration.name.clone()];
-        let mut scope = declaration.scope_id;
-        let mut visited = BTreeSet::new();
-        while scope != LexicalScopeId(0) && visited.insert(scope) {
-            let current = self
-                .rows
-                .scopes
-                .iter()
-                .find(|candidate| candidate.id == scope)?;
-            if current.kind == CheckedScopeKind::Function {
-                return None;
-            }
-            if let Some(owner) = current.owner
-                && let Some(owner) = self.declaration(owner)
-                && matches!(
-                    owner.kind,
-                    CheckedDeclarationKind::Field
-                        | CheckedDeclarationKind::Source
-                        | CheckedDeclarationKind::Hold
-                        | CheckedDeclarationKind::List
-                )
+        let pure = (|| {
+            let expression = self.expression(expression)?;
+            let flow = expression
+                .definition
+                .code()
+                .published_expression(expression.local.0 as usize)?;
+            let effect = expression.definition.expression_effect(expression.local)?;
+            if flow.mode != FlowMode::Continuous || effect != crate::KernelEffectSummary::default()
             {
-                segments.push(owner.name.clone());
+                return Some(false);
             }
-            scope = current.parent?;
-        }
-        segments.reverse();
-        Some(segments.join("."))
+            if let Some(binding) = expression.lexical {
+                if binding.access == crate::KernelLexicalAccess::Read
+                    && self.path_is_empty(binding.projection)
+                    && let crate::KernelLexicalBindingTargetInput::Declaration(target) =
+                        binding.target
+                    && let Some(target) = self.input.relocate_declaration(expression.owner, target)
+                {
+                    if let Some((value, parent)) = self.frame_actual(target, frame) {
+                        return Some(self.expression_is_pure(value, parent));
+                    }
+                    return Some(
+                        self.read_provider(target, binding.projection)
+                            .is_none_or(|value| self.expression_is_pure(value, frame)),
+                    );
+                }
+                return Some(true);
+            }
+            if let Some(call) = expression.call {
+                for entry in call
+                    .entries()
+                    .expect("validated packed order call has entries")
+                {
+                    if let crate::PackedCallEntry::Input { value, .. } = entry {
+                        let Some(value) = self.input.relocate_value(call.owner, *value) else {
+                            return Some(false);
+                        };
+                        if !self.expression_is_pure(value, frame) {
+                            return Some(false);
+                        }
+                    }
+                }
+                return Some(
+                    self.explicit_context_value(call)
+                        .is_none_or(|value| self.expression_is_pure(value, frame)),
+                );
+            }
+
+            let all_role = |this: &mut Self, role: crate::PackedKernelOwnerEdgeRole| -> bool {
+                expression
+                    .inputs()
+                    .iter()
+                    .filter(|edge| edge.role == role)
+                    .all(|edge| {
+                        this.linked_value(expression, edge.expression)
+                            .is_some_and(|value| this.expression_is_pure(value, frame))
+                    })
+            };
+            Some(match expression.node.kind {
+                crate::PackedKernelOwnerNodeKind::TextTemplate => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::TextDynamic)
+                }
+                crate::PackedKernelOwnerNodeKind::Record { .. } => {
+                    let Some(shape) = expression.shape else {
+                        return Some(false);
+                    };
+                    let Some(fields) = expression.facts.execution_fields(shape) else {
+                        return Some(false);
+                    };
+                    fields.iter().all(|field| {
+                        self.linked_value(expression, field.value)
+                            .is_some_and(|value| self.expression_is_pure(value, frame))
+                    })
+                }
+                crate::PackedKernelOwnerNodeKind::Draining => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::DrainingInput)
+                }
+                crate::PackedKernelOwnerNodeKind::Hold => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::HoldInitial)
+                }
+                crate::PackedKernelOwnerNodeKind::Flush => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::FlushPayload)
+                }
+                crate::PackedKernelOwnerNodeKind::Latest => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::LatestBranch)
+                }
+                crate::PackedKernelOwnerNodeKind::When => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::WhenInput)
+                        && all_role(self, crate::PackedKernelOwnerEdgeRole::WhenArm)
+                }
+                crate::PackedKernelOwnerNodeKind::Then => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::ThenInput)
+                        && all_role(self, crate::PackedKernelOwnerEdgeRole::ThenOutput)
+                }
+                crate::PackedKernelOwnerNodeKind::Infix { .. } => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::InfixLeft)
+                        && all_role(self, crate::PackedKernelOwnerEdgeRole::InfixRight)
+                }
+                crate::PackedKernelOwnerNodeKind::MatchArm { .. } => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::MatchOutput)
+                }
+                crate::PackedKernelOwnerNodeKind::Block => {
+                    let Some(shape) = expression.shape else {
+                        return Some(false);
+                    };
+                    let Some(bindings) = expression.facts.execution_bindings(shape) else {
+                        return Some(false);
+                    };
+                    bindings.iter().all(|binding| {
+                        self.linked_value(expression, binding.value)
+                            .is_some_and(|value| self.expression_is_pure(value, frame))
+                    }) && match shape {
+                        crate::PackedExecutionShape::Block { result, .. } => {
+                            result.is_none_or(|result| {
+                                self.linked_value(expression, result)
+                                    .is_some_and(|value| self.expression_is_pure(value, frame))
+                            })
+                        }
+                        _ => false,
+                    }
+                }
+                crate::PackedKernelOwnerNodeKind::Collection {
+                    kind: crate::KernelCollectionKind::Map,
+                    ..
+                } => all_role(self, crate::PackedKernelOwnerEdgeRole::MapEntry),
+                crate::PackedKernelOwnerNodeKind::Collection { .. } => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::CollectionItem)
+                }
+                crate::PackedKernelOwnerNodeKind::MapEntry => {
+                    all_role(self, crate::PackedKernelOwnerEdgeRole::MapKey)
+                        && all_role(self, crate::PackedKernelOwnerEdgeRole::MapValue)
+                }
+                crate::PackedKernelOwnerNodeKind::Source(_)
+                | crate::PackedKernelOwnerNodeKind::Absent
+                | crate::PackedKernelOwnerNodeKind::Text
+                | crate::PackedKernelOwnerNodeKind::Number
+                | crate::PackedKernelOwnerNodeKind::Byte
+                | crate::PackedKernelOwnerNodeKind::Bits(_)
+                | crate::PackedKernelOwnerNodeKind::Tag(_)
+                | crate::PackedKernelOwnerNodeKind::FormalRead { .. }
+                | crate::PackedKernelOwnerNodeKind::ContextRead { .. }
+                | crate::PackedKernelOwnerNodeKind::LexicalRead { .. }
+                | crate::PackedKernelOwnerNodeKind::ValueRead { .. }
+                | crate::PackedKernelOwnerNodeKind::DerivedRead { .. }
+                | crate::PackedKernelOwnerNodeKind::PatternRead { .. }
+                | crate::PackedKernelOwnerNodeKind::CollectionItemRead
+                | crate::PackedKernelOwnerNodeKind::FreshOut
+                | crate::PackedKernelOwnerNodeKind::UserCall { .. }
+                | crate::PackedKernelOwnerNodeKind::RenderConstructor { .. }
+                | crate::PackedKernelOwnerNodeKind::PureBuiltin { .. }
+                | crate::PackedKernelOwnerNodeKind::FixedAbiCall { .. }
+                | crate::PackedKernelOwnerNodeKind::HostEffect { .. }
+                | crate::PackedKernelOwnerNodeKind::Arrow
+                | crate::PackedKernelOwnerNodeKind::Delimiter
+                | crate::PackedKernelOwnerNodeKind::Unknown
+                | crate::PackedKernelOwnerNodeKind::FieldProjection { .. }
+                | crate::PackedKernelOwnerNodeKind::Known(_) => true,
+            })
+        })()
+        .unwrap_or(false);
+        self.end_visit(PackedOrderWalkKind::Pure, expression, frame);
+        pure
     }
 
     fn order_chain_diagnostic_span(

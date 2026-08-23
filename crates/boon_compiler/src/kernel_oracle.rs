@@ -2832,6 +2832,15 @@ fn checked_construction_from_kernel(
     let layout = KernelCheckedLinkLayout::new(session.project(), &snapshot)
         .map_err(|error| format!("cannot build dense kernel checked layout: {error}"))?;
     let layout_us = elapsed_us(phase_started.elapsed());
+    #[cfg(test)]
+    let mut direct_runtime_link = layout
+        .link_runtime_packed(
+            session.project(),
+            &snapshot,
+            project.source_bundle_digest_v1(),
+            role,
+        )
+        .map_err(|error| format!("cannot build direct packed checked linker oracle: {error}"))?;
     let phase_started = Instant::now();
     let mut rows = layout
         .materialize_rows(
@@ -2925,12 +2934,27 @@ fn checked_construction_from_kernel(
             source.start_byte,
         )
         .map_err(|error| format!("cannot rebase dense kernel checked rows: {error}"))?;
+        #[cfg(test)]
+        direct_runtime_link
+            .rebase_definition_spans(definition.owner, source.start_line, source.start_byte)
+            .map_err(|error| format!("cannot rebase direct packed checked linker: {error}"))?;
     }
     let seals_and_rebase_us = elapsed_us(phase_started.elapsed());
 
+    #[cfg(test)]
+    let direct_runtime_order = direct_runtime_link
+        .derive_packed_order_chains(session.project(), &layout, &snapshot)
+        .map_err(|error| format!("cannot derive direct packed checked order oracle: {error}"))?;
     let packed_order = rows
-        .derive_packed_order_chains(&layout, &snapshot)
+        .derive_packed_order_chains(session.project(), &layout, &snapshot)
         .map_err(|error| format!("cannot derive packed checked order chains: {error}"))?;
+    #[cfg(test)]
+    if direct_runtime_order != packed_order {
+        return Err(
+            "direct packed checked order derivation differs from the transitional row linker"
+                .to_owned(),
+        );
+    }
     let mut order_diagnostics = present_kernel_checked_order_diagnostics(&packed_order.diagnostics);
 
     let phase_started = Instant::now();
@@ -21524,6 +21548,48 @@ result: reorder(
                 &root.type_substitutions,
             ),
         );
+    }
+
+    #[test]
+    fn packed_order_recursive_key_converges_without_growing_frames_forever() {
+        let source = r#"
+FUNCTION recursive_key(value) {
+    recursive_key(value: value)
+}
+
+FUNCTION mutually_recursive_key_a(value) {
+    mutually_recursive_key_b(value: value)
+}
+
+FUNCTION mutually_recursive_key_b(value) {
+    mutually_recursive_key_a(value: value)
+}
+
+rows: LIST { [rank: 1] }
+ordered_direct:
+    rows
+    |> List/sort_by(item, key: recursive_key(value: item.rank), direction: Ascending)
+ordered_mutual:
+    rows
+    |> List/sort_by(item, key: mutually_recursive_key_a(value: item.rank), direction: Ascending)
+"#;
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse recursive packed order-key fixture");
+        let packed = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::RuntimePacked,
+        )
+        .expect("derive RuntimePacked recursive order key without unbounded frame growth");
+        let rich = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::EditorRich,
+        )
+        .expect("derive EditorRich recursive order-key oracle without unbounded frame growth");
+        assert_eq!(packed.fields.order_chains, rich.fields.order_chains);
+        assert_eq!(packed.diagnostics, rich.diagnostics);
     }
 
     #[test]

@@ -2536,8 +2536,9 @@ impl RuntimePackedCheckedSealV1 {
     /// # Safety
     ///
     /// The caller must be the RuntimePacked typechecker seal. It must have
-    /// compared the entity-route digest of `image_handoff` with the independent
-    /// packed semantic construction, then created `pairing_receipt` and
+    /// compared the entity-route digest of `image_handoff` with the frozen
+    /// sibling copy in the packed semantic construction, then created
+    /// `pairing_receipt` and
     /// `runtime_flow_terms` from that exact, since-unmodified handoff and the
     /// same checked construction. None of the three arguments may have been
     /// separated, mutated, and recombined after that validation.
@@ -2595,14 +2596,16 @@ pub struct CheckedProgramConstruction {
     fields: CheckedProgramFields,
 }
 
-/// Transitional RuntimePacked construction with no rich report-table
-/// invariant.
+/// Transitional RuntimePacked construction with no rich report-table or
+/// callable-table invariant.
 ///
 /// This capability is intentionally distinct from
-/// [`CheckedProgramConstruction`]. Its expression and callable types remain
-/// authoritative in the checked rows and packed kernel input, while the
-/// duplicate editor/report type tables may stay empty. It can only be
-/// consumed by the RuntimePacked typechecker seal.
+/// [`CheckedProgramConstruction`]. Expression types remain authoritative in
+/// the retained checked expression rows and packed kernel input; callable and
+/// context types live only in the packed kernel input until semantic lowering
+/// moves their one required rich projection into final semantic rows. The
+/// duplicate rich callable/context and editor/report tables stay empty. This
+/// value can only be consumed by the RuntimePacked typechecker seal.
 #[doc(hidden)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RuntimePackedCheckedProgramConstructionV1 {

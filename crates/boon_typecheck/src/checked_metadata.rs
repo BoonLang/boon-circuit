@@ -57,6 +57,209 @@ fn owner_function_type_table(callables: &[CheckedCallableSignature]) -> Function
     FunctionTypeTable { entries }
 }
 
+fn runtime_function_type_table(
+    syntax: &crate::TypecheckSyntaxProgram,
+    fields: &CheckedProgramFields,
+) -> Result<FunctionTypeTable, String> {
+    fn collect_functions<'a>(statements: &'a [AstStatement], target: &mut Vec<&'a AstStatement>) {
+        for statement in statements {
+            if matches!(statement.kind, AstStatementKind::Function { .. }) {
+                target.push(statement);
+            }
+            collect_functions(&statement.children, target);
+        }
+    }
+
+    fn merge_effect(target: &mut CheckedEffectSummary, source: CheckedEffectSummary) {
+        target.reads_state |= source.reads_state;
+        target.writes_state |= source.writes_state;
+        target.emits_source |= source.emits_source;
+        target.invokes_host |= source.invokes_host;
+    }
+
+    let statements = fields
+        .statements
+        .iter()
+        .map(|statement| (statement.id, statement))
+        .collect::<BTreeMap<_, _>>();
+    let declarations = fields
+        .declarations
+        .iter()
+        .map(|declaration| (declaration.id, declaration))
+        .collect::<BTreeMap<_, _>>();
+    let scopes = fields
+        .scopes
+        .iter()
+        .map(|scope| (scope.id, scope))
+        .collect::<BTreeMap<_, _>>();
+    let function_body_scopes = fields
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.kind == CheckedDeclarationKind::Function)
+        .filter_map(|declaration| declaration.body_scope)
+        .collect::<BTreeSet<_>>();
+    let mut parameters = BTreeMap::new();
+    for declaration in fields.declarations.iter().filter(|declaration| {
+        function_body_scopes.contains(&declaration.scope_id)
+            && matches!(
+                declaration.kind,
+                CheckedDeclarationKind::ValueParameter | CheckedDeclarationKind::OutParameter
+            )
+    }) {
+        if parameters
+            .insert(
+                (declaration.scope_id, declaration.name.as_str()),
+                declaration,
+            )
+            .is_some()
+        {
+            return Err(format!(
+                "checked function scope {} repeats parameter `{}`",
+                declaration.scope_id.0, declaration.name,
+            ));
+        }
+    }
+
+    let mut function_owner_by_scope = BTreeMap::new();
+    for scope in &fields.scopes {
+        let mut current = scope.id;
+        let mut visited = BTreeSet::new();
+        let owner = loop {
+            if !visited.insert(current) {
+                return Err(format!(
+                    "checked lexical scope {} contains a parent cycle",
+                    scope.id.0,
+                ));
+            }
+            let current_scope = scopes
+                .get(&current)
+                .ok_or_else(|| format!("checked program has no lexical scope {}", current.0))?;
+            if current_scope.kind == CheckedScopeKind::Function {
+                break current_scope.owner;
+            }
+            let Some(parent) = current_scope.parent else {
+                break None;
+            };
+            current = parent;
+        };
+        function_owner_by_scope.insert(scope.id, owner);
+    }
+    let mut effects = BTreeMap::<DeclId, CheckedEffectSummary>::new();
+    for expression in &fields.expressions {
+        if let Some(owner) = function_owner_by_scope
+            .get(&expression.scope_id)
+            .copied()
+            .flatten()
+        {
+            merge_effect(effects.entry(owner).or_default(), expression.effect);
+        }
+    }
+
+    let mut syntax_functions = Vec::new();
+    for statements in syntax.root_statement_units() {
+        collect_functions(statements, &mut syntax_functions);
+    }
+    let mut entries = Vec::with_capacity(syntax_functions.len());
+    for statement in syntax_functions {
+        let AstStatementKind::Function {
+            name,
+            parameters: syntax_parameters,
+        } = &statement.kind
+        else {
+            unreachable!("function inventory contains only function statements")
+        };
+        let statement_id = syntax.checked_statement_id(statement.id);
+        let checked_statement = statements.get(&statement_id).ok_or_else(|| {
+            format!(
+                "function `{name}` has no checked statement {}",
+                statement_id.0,
+            )
+        })?;
+        let CheckedStatementKind::Function { declaration } = checked_statement.kind else {
+            return Err(format!(
+                "function `{name}` checked statement {} has a non-function kind",
+                statement_id.0,
+            ));
+        };
+        let callable = declarations.get(&declaration).ok_or_else(|| {
+            format!(
+                "function `{name}` references missing declaration {}",
+                declaration.0,
+            )
+        })?;
+        if callable.kind != CheckedDeclarationKind::Function || callable.name != *name {
+            return Err(format!(
+                "function `{name}` disagrees with checked declaration {}",
+                declaration.0,
+            ));
+        }
+        let body_scope = callable.body_scope.ok_or_else(|| {
+            format!(
+                "function `{name}` declaration {} has no body scope",
+                declaration.0,
+            )
+        })?;
+        let mut checked_parameters = Vec::with_capacity(syntax_parameters.len());
+        for parameter in syntax_parameters {
+            let checked = parameters
+                .get(&(body_scope, parameter.name.as_str()))
+                .ok_or_else(|| {
+                    format!(
+                        "function `{name}` has no checked parameter `{}` in scope {}",
+                        parameter.name, body_scope.0,
+                    )
+                })?;
+            let expected_kind = match parameter.kind {
+                boon_syntax::AstParameterKind::Value => CheckedDeclarationKind::ValueParameter,
+                boon_syntax::AstParameterKind::Out => CheckedDeclarationKind::OutParameter,
+            };
+            if checked.kind != expected_kind {
+                return Err(format!(
+                    "function `{name}` parameter `{}` has the wrong checked kind",
+                    parameter.name,
+                ));
+            }
+            checked_parameters.push(FunctionTypeParameterEntry {
+                formal: checked.id,
+                ordinal: parameter.ordinal,
+                name: checked.name.clone(),
+                flow_type: checked.flow_type.clone(),
+            });
+        }
+        let Type::Function { args, result } = &callable.flow_type.ty else {
+            return Err(format!(
+                "function `{name}` declaration {} has no function type",
+                declaration.0,
+            ));
+        };
+        let mut expected_args = args.iter();
+        let value_args_match = checked_parameters
+            .iter()
+            .zip(syntax_parameters)
+            .filter(|(_, parameter)| parameter.kind == boon_syntax::AstParameterKind::Value)
+            .all(|(parameter, _)| {
+                expected_args
+                    .next()
+                    .is_some_and(|expected| expected == &parameter.flow_type.ty)
+            })
+            && expected_args.next().is_none();
+        if !value_args_match {
+            return Err(format!(
+                "function `{name}` parameter declarations disagree with its checked function type",
+            ));
+        }
+        entries.push(FunctionTypeEntry {
+            callable: declaration,
+            name: callable.name.clone(),
+            parameters: checked_parameters,
+            result: result.as_ref().clone(),
+            effect: effects.get(&declaration).copied().unwrap_or_default(),
+        });
+    }
+    entries.sort_by_key(|entry| entry.callable);
+    Ok(FunctionTypeTable { entries })
+}
+
 fn owner_expr_type_table(fields: &CheckedProgramFields) -> ExprTypeTable {
     ExprTypeTable {
         entries: fields
@@ -71,20 +274,23 @@ fn owner_expr_type_table(fields: &CheckedProgramFields) -> ExprTypeTable {
 }
 
 pub(crate) fn checked_report_type_tables(
+    syntax: &crate::TypecheckSyntaxProgram,
     fields: &CheckedProgramFields,
-) -> (ExprTypeTable, FunctionTypeTable) {
-    (
+) -> Result<(ExprTypeTable, FunctionTypeTable), String> {
+    Ok((
         owner_expr_type_table(fields),
-        owner_function_type_table(&fields.callables),
-    )
+        runtime_function_type_table(syntax, fields)?,
+    ))
 }
 
 /// Materialize report-only rich type tables on explicit editor/error demand.
 ///
-/// Ordinary runtime compilation keeps the expression and callable types in
-/// their existing checked rows and packed kernel authority. Building these
-/// two tables eagerly would clone every recursive type solely so a successful
-/// request could immediately discard the duplicate projection.
+/// Rich/editor construction keeps expression and callable types in its checked
+/// rows. Ordinary RuntimePacked construction omits callable rows entirely and
+/// therefore never calls this compatibility helper; an editor demand projects
+/// those rows from the retained packed kernel snapshot first. Building either
+/// report table eagerly would clone recursive types solely so a successful
+/// runtime request could immediately discard the duplicate projection.
 pub fn populate_checked_report_type_tables(fields: &mut CheckedProgramFields) {
     if fields.lowering_metadata.expr_type_table.entries.is_empty() {
         fields.lowering_metadata.expr_type_table = owner_expr_type_table(fields);
@@ -433,4 +639,81 @@ fn derive_project_checked_lowering_metadata_with_report_types(
         dynamic_fallback_count: unknown_type_count + unresolved.len(),
         diagnostics: diagnostics.to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compact_function_table_reconstruction_matches_exact_editor_rows() {
+        let fixtures = [
+            (
+                "nested",
+                r#"
+container: BLOCK {
+    FUNCTION nested(value) {
+        value + 1
+    }
+}
+"#,
+            ),
+            (
+                "structured-out",
+                r#"
+FUNCTION wrapped(list, row: OUT, new) {
+    list |> List/map(item: row, new: [value: new])
+}
+rows: LIST { [value: 1] }
+result: rows |> wrapped(row, new: row.value + 1)
+"#,
+            ),
+            (
+                "host-effect",
+                r#"
+FUNCTION random_byte() {
+    Random/bytes(byte_count: 1)
+}
+value: random_byte()
+"#,
+            ),
+            (
+                "event-flow",
+                r#"
+FUNCTION pulses(count) {
+    count |> Stream/pulses()
+}
+value: pulses(count: 3)
+"#,
+            ),
+        ];
+
+        for (label, source) in fixtures {
+            let project = boon_parser::parse_project_syntax(
+                "app/RUN.bn",
+                [("app/RUN.bn".to_owned(), source.to_owned())],
+            )
+            .unwrap_or_else(|error| panic!("{label} fixture must parse: {error}"));
+            let output = crate::check_project_editor_program_profiled_with_external_types(
+                &project,
+                &ExternalTypeEnvironment::default(),
+            )
+            .0;
+            assert!(
+                !output.report.has_errors(),
+                "{label} editor fixture diagnostics: {:#?}",
+                output.report.diagnostics,
+            );
+            let fields = output
+                .checked_program_fields()
+                .unwrap_or_else(|| panic!("{label} editor fixture has no checked fields"));
+            let syntax = crate::TypecheckSyntaxProgram::UnitNative(project);
+            let reconstructed = runtime_function_type_table(&syntax, fields)
+                .unwrap_or_else(|error| panic!("{label} reconstruction failed: {error}"));
+            assert_eq!(
+                reconstructed, fields.lowering_metadata.function_type_table,
+                "{label} compact reconstruction differs from exact EditorRich rows",
+            );
+        }
+    }
 }

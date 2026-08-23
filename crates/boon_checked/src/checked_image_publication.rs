@@ -8,11 +8,12 @@ use crate::{
     CheckedImageHandoffV4, CheckedImageRowDomainV2, CheckedShardProjectionKeyV2, ProgramRole,
     SourceBundleDigestV1,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
-const CHECKED_IMAGE_KERNEL_ROUTE_PAIRING_DOMAIN_V1: &[u8] =
-    b"boon.checked-image-kernel-route-pairing.v1\0";
+const CHECKED_IMAGE_KERNEL_ROUTE_PAIRING_DOMAIN_V2: &[u8] =
+    b"boon.checked-image-kernel-route-pairing.v2\0";
 const CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V4: &[u8] = b"boon.checked-image-projection-key.v4\0";
 
 /// Process-local construction identity shared by exactly one packed semantic
@@ -29,8 +30,10 @@ pub struct CheckedImageKernelPairingV1 {
 }
 
 /// Compact identity of every routed checked entity and its exact stable
-/// projection key. The packed semantic construction owns an independent copy
-/// so a malformed publication cannot certify its own owner topology.
+/// projection key. The packed semantic construction freezes a sibling copy so
+/// later mutation or cross-pairing cannot silently change the sealed topology.
+/// A future dense checked image will derive its expected routes from a separate
+/// ownership plan instead of this transitional publication-derived digest.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckedImageEntityRouteDigestV1([u8; 32]);
@@ -39,12 +42,55 @@ fn checked_image_route_digest(
     mut routes: Vec<(CheckedImageRowDomainV2, u32, [u8; 32])>,
 ) -> Result<CheckedImageEntityRouteDigestV1, String> {
     routes.sort_unstable_by_key(|(domain, dense_index, _)| (*domain, *dense_index));
-    boon_contract::canonical_serde_hash_v1_streaming(
-        CHECKED_IMAGE_KERNEL_ROUTE_PAIRING_DOMAIN_V1,
-        &routes,
-    )
-    .map(CheckedImageEntityRouteDigestV1)
-    .map_err(|error| format!("failed to hash checked-image entity routes: {error}"))
+    let mut hasher = Sha256::new();
+    hasher.update(CHECKED_IMAGE_KERNEL_ROUTE_PAIRING_DOMAIN_V2);
+    hasher.update(
+        u64::try_from(routes.len())
+            .map_err(|_| "checked-image route count exceeds u64".to_owned())?
+            .to_be_bytes(),
+    );
+    for (domain, dense_index, projection_digest) in routes {
+        hasher.update([checked_image_row_domain_code_v2(domain)]);
+        hasher.update(dense_index.to_be_bytes());
+        hasher.update(projection_digest);
+    }
+    Ok(CheckedImageEntityRouteDigestV1(hasher.finalize().into()))
+}
+
+/// Stable fixed-width encoding for the process-local route capability.
+///
+/// Do not derive this from the Rust discriminant: the explicit mapping keeps
+/// the proof format independent of compiler layout and makes additions review
+/// visible. The precomputed projection digest names the exact owner and region,
+/// so route sealing never serializes or clones their strings a second time.
+fn checked_image_row_domain_code_v2(domain: CheckedImageRowDomainV2) -> u8 {
+    match domain {
+        CheckedImageRowDomainV2::Header => 0,
+        CheckedImageRowDomainV2::Scope => 1,
+        CheckedImageRowDomainV2::Declaration => 2,
+        CheckedImageRowDomainV2::Statement => 3,
+        CheckedImageRowDomainV2::Expression => 4,
+        CheckedImageRowDomainV2::Callable => 5,
+        CheckedImageRowDomainV2::ContextFormal => 6,
+        CheckedImageRowDomainV2::Call => 7,
+        CheckedImageRowDomainV2::CallResultPath => 8,
+        CheckedImageRowDomainV2::OrderChain => 9,
+        CheckedImageRowDomainV2::PatternBinding => 10,
+        CheckedImageRowDomainV2::ResourceProjection => 11,
+        CheckedImageRowDomainV2::Source => 12,
+        CheckedImageRowDomainV2::State => 13,
+        CheckedImageRowDomainV2::List => 14,
+        CheckedImageRowDomainV2::Occurrence => 15,
+        CheckedImageRowDomainV2::SourceUnitMetadata => 16,
+        CheckedImageRowDomainV2::SourcePayloadShape => 17,
+        CheckedImageRowDomainV2::HostPort => 18,
+        CheckedImageRowDomainV2::OutputRootType => 19,
+        CheckedImageRowDomainV2::ExpressionType => 20,
+        CheckedImageRowDomainV2::FunctionType => 21,
+        CheckedImageRowDomainV2::NamedValueType => 22,
+        CheckedImageRowDomainV2::RenderSlot => 23,
+        CheckedImageRowDomainV2::Diagnostic => 24,
+    }
 }
 
 /// Shared stable-key identity used by direct packed publication and the
@@ -239,8 +285,8 @@ impl CheckedImageKernelPublicationV1 {
             .map(|(pairing, _)| pairing)
     }
 
-    /// Finalize the process-local pairing and return the independently owned
-    /// route identity installed into the sibling packed semantic construction.
+    /// Finalize the process-local pairing and return the frozen route identity
+    /// installed into the sibling packed semantic construction.
     #[doc(hidden)]
     pub fn __kernel_pairing_with_entity_route_digest(
         &self,
@@ -430,6 +476,7 @@ impl CheckedImageKernelPublicationV1 {
             ProgramRole,
             Vec<(
                 CheckedShardProjectionKeyV2,
+                [u8; 32],
                 u32,
                 u32,
                 Vec<CheckedImageKernelProjectionIdV1>,
@@ -452,6 +499,7 @@ impl CheckedImageKernelPublicationV1 {
                 .map(|projection| {
                     (
                         projection.key,
+                        projection.key_digest,
                         projection.row_count,
                         projection.dependency_row_count,
                         projection.relocations,

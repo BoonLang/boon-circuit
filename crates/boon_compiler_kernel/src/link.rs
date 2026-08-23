@@ -3875,8 +3875,40 @@ impl KernelSemanticInputConstructionV1 {
         }
     }
 
-    /// Expected exact entity-to-projection topology owned independently from
-    /// the move-only checked-image publication.
+    /// Resolve one definition's authority scope from the packed relocation
+    /// table without constructing a rich callable signature.
+    pub fn definition_authority_root_scope(
+        &self,
+        owner: KernelOwnerId,
+    ) -> Result<LexicalScopeId, KernelCheckedLinkError> {
+        self.definition_relocation(owner)
+            .map(|relocation| relocation.authority_root_scope)
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel semantic input references missing definition {}",
+                    owner.0,
+                ))
+            })
+    }
+
+    /// Iterate user-callable declarations from the packed scheme locator.
+    /// Runtime metadata publication needs only these dense IDs, never names,
+    /// parameter vectors, or recursive rich types.
+    pub fn user_callable_declarations(&self) -> impl Iterator<Item = DeclId> + '_ {
+        self.callable_schemes.iter().filter_map(|scheme| {
+            let crate::KernelCallableSchemeId::User(owner) = *scheme else {
+                return None;
+            };
+            Some(
+                self.definition_relocation(owner)
+                    .expect("sealed user callable has a definition relocation")
+                    .callable,
+            )
+        })
+    }
+
+    /// Frozen exact entity-to-projection topology copied into the sibling
+    /// semantic construction before the publication crosses the typechecker.
     pub const fn checked_image_entity_route_digest_v1(
         &self,
     ) -> boon_checked::CheckedImageEntityRouteDigestV1 {
@@ -5062,8 +5094,8 @@ impl KernelSemanticInputV1 {
         self.construction.entity_counts()
     }
 
-    /// Expected exact entity-to-projection topology owned independently from
-    /// the move-only checked-image publication.
+    /// Frozen exact entity-to-projection topology copied into the sibling
+    /// semantic construction before the publication crosses the typechecker.
     pub const fn checked_image_entity_route_digest_v1(
         &self,
     ) -> boon_checked::CheckedImageEntityRouteDigestV1 {
@@ -9112,7 +9144,12 @@ impl KernelCheckedLinkLayout {
                             snapshot.definition_code.materialization_cache();
                         materialize_expression_rows(&mut expression_type_cache)
                     });
-                    let base = self.materialize_base_rows(snapshot, role, &mut type_cache)?;
+                    let base = self.materialize_base_rows(
+                        snapshot,
+                        role,
+                        projection_demand,
+                        &mut type_cache,
+                    )?;
                     let expressions = expression_worker.join().map_err(|_| {
                         KernelCheckedLinkError::new(
                             "kernel checked expression materialization worker panicked",
@@ -9122,13 +9159,13 @@ impl KernelCheckedLinkLayout {
                 })?
             } else {
                 (
-                    self.materialize_base_rows(snapshot, role, &mut type_cache)?,
+                    self.materialize_base_rows(snapshot, role, projection_demand, &mut type_cache)?,
                     materialize_expression_rows(&mut type_cache)?,
                 )
             };
         #[cfg(target_family = "wasm")]
         let (base, (expressions, runtime_flow_terms)) = (
-            self.materialize_base_rows(snapshot, role, &mut type_cache)?,
+            self.materialize_base_rows(snapshot, role, projection_demand, &mut type_cache)?,
             materialize_expression_rows(&mut type_cache)?,
         );
         let KernelCheckedBaseRows {
@@ -9314,6 +9351,7 @@ impl KernelCheckedLinkLayout {
         &self,
         snapshot: &KernelCheckedSnapshot,
         role: ProgramRole,
+        projection_demand: KernelCheckedRowProjectionDemand,
         type_cache: &mut DefinitionTypeMaterializationCache,
     ) -> Result<KernelCheckedBaseRows, KernelCheckedLinkError> {
         let scopes = self.materialize_scopes(snapshot)?;
@@ -9324,11 +9362,19 @@ impl KernelCheckedLinkLayout {
         let sources = self.materialize_sources_with_cache(snapshot, type_cache)?;
         let states = self.materialize_states_with_cache(snapshot, type_cache)?;
         let lists = self.materialize_lists_with_cache(snapshot, type_cache)?;
-        let (user_callables, context_formals) =
-            self.materialize_user_callables_with_cache(snapshot, role, type_cache)?;
-        let mut callables = user_callables.into_vec();
+        let (mut callables, context_formals): (
+            Vec<CheckedCallableSignature>,
+            Box<[CheckedContextFormal]>,
+        ) = match projection_demand {
+            KernelCheckedRowProjectionDemand::RuntimePacked => (Vec::new(), Box::new([])),
+            KernelCheckedRowProjectionDemand::EditorRich => {
+                let (callables, context_formals) =
+                    self.materialize_user_callables_with_cache(snapshot, role, type_cache)?;
+                (callables.into_vec(), context_formals)
+            }
+        };
         let (abi_callables, abi_declarations) =
-            self.materialize_abi_callables_with_cache(snapshot, type_cache)?;
+            self.materialize_abi_callables_with_cache(snapshot, projection_demand, type_cache)?;
         callables.extend(abi_callables);
         declarations.extend(abi_declarations);
         Ok(KernelCheckedBaseRows {
@@ -11812,16 +11858,25 @@ impl KernelCheckedLinkLayout {
     ) -> Result<(Box<[CheckedCallableSignature]>, Box<[CheckedDeclaration]>), KernelCheckedLinkError>
     {
         let mut type_cache = snapshot.definition_code.materialization_cache();
-        self.materialize_abi_callables_with_cache(snapshot, &mut type_cache)
+        self.materialize_abi_callables_with_cache(
+            snapshot,
+            KernelCheckedRowProjectionDemand::EditorRich,
+            &mut type_cache,
+        )
     }
 
     fn materialize_abi_callables_with_cache(
         &self,
         snapshot: &KernelCheckedSnapshot,
+        projection_demand: KernelCheckedRowProjectionDemand,
         type_cache: &mut DefinitionTypeMaterializationCache,
     ) -> Result<(Box<[CheckedCallableSignature]>, Box<[CheckedDeclaration]>), KernelCheckedLinkError>
     {
-        let mut callables = Vec::with_capacity(self.totals.abi_callables as usize);
+        let callable_capacity = match projection_demand {
+            KernelCheckedRowProjectionDemand::RuntimePacked => 0,
+            KernelCheckedRowProjectionDemand::EditorRich => self.totals.abi_callables as usize,
+        };
+        let mut callables = Vec::with_capacity(callable_capacity);
         let mut declarations = Vec::new();
         for layout in &self.abi_callables {
             let scheme = snapshot
@@ -12003,10 +12058,14 @@ impl KernelCheckedLinkLayout {
                     })
                 })
                 .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
-            let contexts = scheme
-                .contexts()
-                .iter()
-                .map(|context| {
+            let contexts = if matches!(
+                projection_demand,
+                KernelCheckedRowProjectionDemand::EditorRich
+            ) {
+                scheme
+                    .contexts()
+                    .iter()
+                    .map(|context| {
                     let provider = layout
                         .parameters
                         .resolve(
@@ -12043,8 +12102,11 @@ impl KernelCheckedLinkLayout {
                             ),
                         },
                     })
-                })
-                .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?;
+                    })
+                    .collect::<Result<Vec<_>, KernelCheckedLinkError>>()?
+            } else {
+                Vec::new()
+            };
             let packed_result = scheme.result();
             let result = FlowType {
                 mode: packed_result.mode,
@@ -12056,35 +12118,40 @@ impl KernelCheckedLinkLayout {
                     packed_result.term,
                 ),
             };
-            callables.push(CheckedCallableSignature {
-                decl_id: layout.declaration,
-                scope_id: LexicalScopeId(0),
-                kind: match scheme.kind() {
-                    crate::KernelCallableKind::Builtin => CheckedCallableKind::Builtin,
-                    crate::KernelCallableKind::External => CheckedCallableKind::External,
-                    crate::KernelCallableKind::User => {
-                        return Err(KernelCheckedLinkError::new(format!(
-                            "kernel immutable ABI unexpectedly contains user callable `{}`",
-                            name,
-                        )));
-                    }
-                },
-                name: name.to_string(),
-                intrinsic: scheme.intrinsic(),
-                external_identity: scheme.external_identity(),
-                parameters: parameters.clone(),
-                contexts,
-                context_formal: None,
-                result: result.clone(),
-                role: scheme.role(),
-                effect: scheme.effect(),
-                body: None,
-                result_expression: None,
-                contextual_operation: scheme
-                    .contextual_operation()
-                    .map(|operation| checked_abi_contextual_operation(layout, name, operation))
-                    .transpose()?,
-            });
+            if matches!(
+                projection_demand,
+                KernelCheckedRowProjectionDemand::EditorRich
+            ) {
+                callables.push(CheckedCallableSignature {
+                    decl_id: layout.declaration,
+                    scope_id: LexicalScopeId(0),
+                    kind: match scheme.kind() {
+                        crate::KernelCallableKind::Builtin => CheckedCallableKind::Builtin,
+                        crate::KernelCallableKind::External => CheckedCallableKind::External,
+                        crate::KernelCallableKind::User => {
+                            return Err(KernelCheckedLinkError::new(format!(
+                                "kernel immutable ABI unexpectedly contains user callable `{}`",
+                                name,
+                            )));
+                        }
+                    },
+                    name: name.to_string(),
+                    intrinsic: scheme.intrinsic(),
+                    external_identity: scheme.external_identity(),
+                    parameters: parameters.clone(),
+                    contexts,
+                    context_formal: None,
+                    result: result.clone(),
+                    role: scheme.role(),
+                    effect: scheme.effect(),
+                    body: None,
+                    result_expression: None,
+                    contextual_operation: scheme
+                        .contextual_operation()
+                        .map(|operation| checked_abi_contextual_operation(layout, name, operation))
+                        .transpose()?,
+                });
+            }
             declarations.push(CheckedDeclaration {
                 id: layout.declaration,
                 scope_id: LexicalScopeId(0),
@@ -12123,11 +12190,11 @@ impl KernelCheckedLinkLayout {
                 span: CheckedSpan::default(),
             }));
         }
-        self.validate_materialized_count(
-            "ABI callable",
-            callables.len(),
-            self.totals.abi_callables,
-        )?;
+        let expected_callables = match projection_demand {
+            KernelCheckedRowProjectionDemand::RuntimePacked => 0,
+            KernelCheckedRowProjectionDemand::EditorRich => self.totals.abi_callables,
+        };
+        self.validate_materialized_count("ABI callable", callables.len(), expected_callables)?;
         let expected_declarations = self
             .totals
             .declarations

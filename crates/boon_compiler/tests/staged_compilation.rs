@@ -130,6 +130,54 @@ fn staged_check_and_finish_match_monolithic_compilation() {
 }
 
 #[test]
+fn runtime_function_type_hints_match_editor_projection() {
+    const FUNCTION_SOURCE: &str = r#"
+FUNCTION double(input) {
+    input + input
+}
+
+value: double(input: 21)
+"#;
+    let runtime = check_runtime_source(CompilerCheckRequest::source_text(
+        "runtime-function-hints.bn",
+        FUNCTION_SOURCE,
+        ProgramRole::Server,
+    ))
+    .unwrap();
+    let editor = check_editor_source(CompilerCheckRequest::source_text(
+        "runtime-function-hints.bn",
+        FUNCTION_SOURCE,
+        ProgramRole::Server,
+    ))
+    .unwrap();
+    let runtime_hints = boon_typecheck::project_type_hints_for_project(
+        runtime
+            .syntax
+            .unit_native()
+            .expect("runtime staging keeps unit-native syntax"),
+        &runtime.output,
+    );
+    let editor_hints = boon_typecheck::project_type_hints_for_project(
+        editor
+            .syntax
+            .unit_native()
+            .expect("editor staging keeps unit-native syntax"),
+        &editor.output,
+    );
+
+    assert_eq!(runtime_hints, editor_hints);
+    for category in ["function_signature", "function_return", "function_arg"] {
+        assert!(
+            runtime_hints
+                .entries
+                .iter()
+                .any(|hint| hint.category == category),
+            "RuntimePacked on-demand hints omitted `{category}`: {runtime_hints:#?}",
+        );
+    }
+}
+
+#[test]
 fn staged_finish_rejects_checked_errors() {
     let checked = check_runtime_source(CompilerCheckRequest::source_text(
         "staged-error.bn",

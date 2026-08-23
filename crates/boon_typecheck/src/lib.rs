@@ -15744,11 +15744,30 @@ impl CheckedImageHandoffBuilderV4 {
         if let Some(id) = self.ids.get(&projection) {
             return Ok(*id);
         }
+        let stable_key_digest = boon_checked::checked_image_projection_key_digest_v4(&projection)?;
+        self.intern_prehashed(projection, stable_key_digest)
+    }
+
+    /// Intern a projection whose digest was already issued by the opaque
+    /// kernel publication. RuntimePacked conversion uses this path so the
+    /// stable owner/region strings are hashed once, not once per handoff.
+    fn intern_prehashed(
+        &mut self,
+        projection: CheckedShardProjectionKeyV2,
+        stable_key_digest: [u8; 32],
+    ) -> Result<PendingCheckedProjectionIdV2, String> {
+        if let Some(id) = self.ids.get(&projection).copied() {
+            if self.projections[id.as_usize()].stable_key_digest != stable_key_digest {
+                return Err(format!(
+                    "checked image projection {projection:?} has conflicting stable digests"
+                ));
+            }
+            return Ok(id);
+        }
         let id = PendingCheckedProjectionIdV2(
             u32::try_from(self.projections.len())
                 .map_err(|_| "checked image projection registry exceeds u32".to_owned())?,
         );
-        let stable_key_digest = boon_checked::checked_image_projection_key_digest_v4(&projection)?;
         let kernel_authority_seal = self
             .kernel_authority
             .as_ref()
@@ -16842,10 +16861,10 @@ fn checked_image_handoff_from_kernel_publication_parts(
 
     let mut builder = CheckedImageHandoffBuilderV4::new(Some(authority));
     let mut pending_ids = Vec::with_capacity(projections.len());
-    for (key, _, _, _) in &projections {
-        pending_ids.push(builder.intern(key.clone())?);
+    for (key, stable_key_digest, _, _, _) in &projections {
+        pending_ids.push(builder.intern_prehashed(key.clone(), *stable_key_digest)?);
     }
-    for (ordinal, (_, row_count, dependency_row_count, relocations)) in
+    for (ordinal, (_, _, row_count, dependency_row_count, relocations)) in
         projections.into_iter().enumerate()
     {
         let projection = pending_ids[ordinal];
@@ -17117,7 +17136,7 @@ pub fn seal_project_runtime_packed_checked_authority_with_kernel_publication(
         context.role,
         &image_handoff,
     )?;
-    // SAFETY: `actual_route_digest` was compared with the independently owned
+    // SAFETY: `actual_route_digest` was compared with the frozen sibling
     // packed-semantic digest above. The receipt and flow terms were then made
     // from this exact, unmodified handoff and the same consumed construction.
     Ok(unsafe {
@@ -17149,6 +17168,16 @@ pub fn seal_project_runtime_packed_checked_program_construction_with_kernel_publ
             "RuntimePacked checked construction retains {} rich call rows",
             fields.calls.len(),
         ));
+    }
+    for (kind, count) in [
+        ("callable", fields.callables.len()),
+        ("context formal", fields.context_formals.len()),
+    ] {
+        if count != 0 {
+            return Err(format!(
+                "RuntimePacked checked construction retains {count} rich {kind} rows",
+            ));
+        }
     }
     if fields.source_bundle_digest_v1 != parsed.source_bundle_digest_v1() {
         return Err(format!(
@@ -17184,16 +17213,6 @@ pub fn seal_project_runtime_packed_checked_program_construction_with_kernel_publ
             "expression",
             fields.expressions.len(),
             context.entity_counts.expression_count,
-        ),
-        (
-            "callable",
-            fields.callables.len(),
-            context.entity_counts.callable_count,
-        ),
-        (
-            "context formal",
-            fields.context_formals.len(),
-            context.entity_counts.context_formal_count,
         ),
         (
             "source",
@@ -21281,7 +21300,10 @@ fn project_type_hints_syntax(
                 metadata.source_payload_shape_table.as_slice(),
             )
         } else if let Some(checked) = output.__typechecker_runtime_packed_fields() {
-            let (expressions, functions) = checked_metadata::checked_report_type_tables(checked);
+            let (expressions, functions) = checked_metadata::checked_report_type_tables(
+                program, checked,
+            )
+            .expect("validated RuntimePacked rows must reconstruct their on-demand type hints");
             (
                 Cow::Owned(expressions),
                 Cow::Owned(functions),

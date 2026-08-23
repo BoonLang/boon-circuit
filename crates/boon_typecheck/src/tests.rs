@@ -382,6 +382,8 @@ fn runtime_packed_publication_fixture() -> RuntimePackedPublicationFixture {
         .into_boxed_slice();
     let mut packed_fields = rich_fields;
     packed_fields.calls.clear();
+    packed_fields.callables.clear();
+    packed_fields.context_formals.clear();
     let packed_construction = unsafe {
         boon_checked::RuntimePackedCheckedProgramConstructionV1::from_typechecker_fields_unchecked(
             packed_fields,
@@ -838,6 +840,45 @@ fn runtime_packed_kernel_publication_requires_empty_rich_calls() {
     )
     .expect_err("RuntimePacked boundary must reject retained rich calls");
     assert!(error.contains("retains 1 rich call rows"), "{error}");
+}
+
+#[test]
+fn runtime_packed_kernel_publication_requires_empty_rich_callables() {
+    let fixture = runtime_packed_publication_fixture();
+    let publication = runtime_packed_publication_with_call_routes(
+        &fixture.authority_handoff,
+        fixture.authority.source_bundle_digest_v1,
+        fixture.authority.role,
+        &[0],
+    )
+    .expect("fixture rebuilds the packed publication");
+    let mut fields = fixture.rich_construction.__typechecker_into_fields();
+    fields.calls.clear();
+    fields.context_formals.clear();
+    let rich_callable_count = fields.callables.len();
+    let construction = unsafe {
+        boon_checked::RuntimePackedCheckedProgramConstructionV1::from_typechecker_fields_unchecked(
+            fields,
+        )
+    };
+    let error = seal_project_runtime_packed_checked_program_construction_with_kernel_publication(
+        &fixture.project,
+        construction,
+        RuntimePackedCheckedSealContextV1 {
+            source_bundle_digest_v1: fixture.authority.source_bundle_digest_v1,
+            role: fixture.authority.role,
+            entity_counts: fixture.entity_counts,
+            entity_route_digest_v1: fixture.entity_route_digest_v1,
+            resource_routes: &fixture.resource_routes,
+        },
+        fixture.authority,
+        publication,
+    )
+    .expect_err("RuntimePacked boundary must reject retained rich callables");
+    assert!(
+        error.contains(&format!("retains {rich_callable_count} rich callable rows")),
+        "{error}",
+    );
 }
 
 #[test]

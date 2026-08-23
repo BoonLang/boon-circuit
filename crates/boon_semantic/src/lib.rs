@@ -3562,10 +3562,8 @@ fn resolve_out_contracts(
                     "OUT port {port_index} references missing call instance {call_id}"
                 ))
             })?;
-        let callable = program
-            .callables
-            .iter()
-            .find(|callable| callable.decl_id == instance.provenance.callable)
+        let callable = calls
+            .callable(instance.provenance.callable)
             .ok_or_else(|| {
                 SemanticError::new(format!(
                     "OUT port {port_index} references missing callable {}",
@@ -3573,12 +3571,19 @@ fn resolve_out_contracts(
                 ))
             })?;
         let parameter = callable
-            .parameters
-            .iter()
-            .find(|parameter| parameter.decl_id == formal)
+            .parameters()
+            .find(|parameter| parameter.declaration() == formal)
             .ok_or_else(|| {
                 SemanticError::new(format!(
                     "OUT port {port_index} references missing formal {}",
+                    formal.0
+                ))
+            })?;
+        let parameter_flow = call_types
+            .parameter(calls, callable.declaration(), parameter.ordinal())
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "OUT port {port_index} has no materialized type for formal {}",
                     formal.0
                 ))
             })?;
@@ -3612,12 +3617,19 @@ fn resolve_out_contracts(
             .collect::<Vec<_>>();
         for input in ordered_inputs {
             let input_parameter = callable
-                .parameters
-                .iter()
-                .find(|parameter| parameter.decl_id == input.formal)
+                .parameters()
+                .find(|parameter| parameter.declaration() == input.formal)
                 .ok_or_else(|| {
                     SemanticError::new(format!(
                         "OUT call instance {call_id} references missing input formal {}",
+                        input.formal.0
+                    ))
+                })?;
+            let input_parameter_flow = call_types
+                .parameter(calls, callable.declaration(), input_parameter.ordinal())
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "OUT call instance {call_id} has no materialized type for input formal {}",
                         input.formal.0
                     ))
                 })?;
@@ -3641,8 +3653,8 @@ fn resolve_out_contracts(
                     .map_err(|error| {
                         SemanticError::new(format!(
                             "OUT call instance {call_id} `{}` input `{}` with {} local and {} parent substitution(s): {error}",
-                            callable.name,
-                            input_parameter.name,
+                            callable.name(),
+                            input_parameter.name(),
                             substitutions.len(),
                             parent_substitutions.len(),
                         ))
@@ -3654,12 +3666,12 @@ fn resolve_out_contracts(
             };
             let actual = canonical_runtime_out_actual(actual);
             release_provisional_out_contract_bindings(
-                &input_parameter.flow_type.ty,
+                &input_parameter_flow.ty,
                 &actual,
                 &mut substitutions,
                 &mut provisional_variables,
             );
-            unify_out_contract_type(&input_parameter.flow_type.ty, &actual, &mut substitutions)
+            unify_out_contract_type(&input_parameter_flow.ty, &actual, &mut substitutions)
                 .map_err(|error| {
                     let provenance_line = program
                         .expressions
@@ -3668,22 +3680,22 @@ fn resolve_out_contracts(
                         .map_or(0, |expression| expression.span.line);
                     SemanticError::new(format!(
                         "OUT call instance {call_id} `{}` at checked expression {} line {provenance_line} input `{}` pattern {:?} with {} substitution(s): {error}",
-                        callable.name,
+                        callable.name(),
                         instance.provenance.expression.0,
-                        input_parameter.name,
-                        input_parameter.flow_type.ty,
+                        input_parameter.name(),
+                        input_parameter_flow.ty,
                         substitutions.len(),
                     ))
                 })?;
         }
-        let resolved_type = apply_out_type_frame(&parameter.flow_type.ty, &substitutions);
+        let resolved_type = apply_out_type_frame(&parameter_flow.ty, &substitutions);
         if !out_contract_type_is_resolved(&resolved_type) {
             return Err(SemanticError::new(format!(
                 "OUT port {port_index} has unresolved type {resolved_type:?}"
             )));
         }
         let flow_type = boon_checked::FlowType {
-            mode: parameter.flow_type.mode,
+            mode: parameter_flow.mode,
             ty: resolved_type.clone(),
         };
         let lexical_scope = program
@@ -3716,7 +3728,7 @@ fn resolve_out_contracts(
                         checked_call.0
                     ))
                 })?,
-            None => callable.role,
+            None => callable.role(),
         };
         graph.ports[port_index].contract = OutPortContractV1 {
             flow_type: flow_type.clone(),
@@ -3925,19 +3937,27 @@ fn concrete_checked_expression_type(
                     }
                 }
                 let mut substitutions = graph.type_substitution_environment(instance_id);
-                let callable = program
-                    .callables
-                    .iter()
-                    .find(|callable| callable.decl_id == instance.provenance.callable)
+                let callable = calls
+                    .callable(instance.provenance.callable)
                     .ok_or_else(|| {
                         SemanticError::new(format!(
                             "CALL expression {} references missing callable {}",
                             scoped.expression.0, instance.provenance.callable.0
                         ))
                     })?;
+                let callable_types = call_types
+                    .callable(calls, callable.declaration())
+                    .ok_or_else(|| {
+                        SemanticError::new(format!(
+                            "CALL expression {} has no materialized type facts for callable {}",
+                            scoped.expression.0,
+                            callable.declaration().0
+                        ))
+                    })?;
                 let mut provisional_variables =
                     instance.local_type_variables().collect::<BTreeSet<_>>();
-                let checked_result = apply_out_type_frame(&callable.result.ty, &substitutions);
+                let checked_result =
+                    apply_out_type_frame(&callable_types.result.ty, &substitutions);
                 if out_contract_type_is_resolved(&checked_result) {
                     // The checked call already owns a concrete result contract.
                     // Re-walking unrelated monomorphic inputs here would
@@ -3971,13 +3991,24 @@ fn concrete_checked_expression_type(
                 let mut deferred_inputs = Vec::new();
                 for input in ordered_inputs {
                     let parameter = callable
-                        .parameters
-                        .iter()
-                        .find(|parameter| parameter.decl_id == input.formal)
+                        .parameters()
+                        .find(|parameter| parameter.declaration() == input.formal)
                         .ok_or_else(|| {
                             SemanticError::new(format!(
                                 "CALL expression {} references missing input formal {} on `{}`",
-                                scoped.expression.0, input.formal.0, callable.name
+                                scoped.expression.0,
+                                input.formal.0,
+                                callable.name()
+                            ))
+                        })?;
+                    let parameter_flow = call_types
+                        .parameter(calls, callable.declaration(), parameter.ordinal())
+                        .ok_or_else(|| {
+                            SemanticError::new(format!(
+                                "CALL expression {} has no materialized type for input formal {} on `{}`",
+                                scoped.expression.0,
+                                input.formal.0,
+                                callable.name()
                             ))
                         })?;
                     let actual = match &input.value {
@@ -4006,25 +4037,27 @@ fn concrete_checked_expression_type(
                     };
                     if out_contract_type_contains_empty_list_placeholder(&actual) {
                         deferred_inputs.push((
-                            parameter.name.clone(),
-                            parameter.flow_type.ty.clone(),
+                            parameter.name().to_owned(),
+                            parameter_flow.ty.clone(),
                             actual,
                         ));
                         continue;
                     }
                     release_provisional_out_contract_bindings(
-                        &parameter.flow_type.ty,
+                        &parameter_flow.ty,
                         &actual,
                         &mut substitutions,
                         &mut provisional_variables,
                     );
-                    unify_out_contract_type(&parameter.flow_type.ty, &actual, &mut substitutions)
+                    unify_out_contract_type(&parameter_flow.ty, &actual, &mut substitutions)
                         .map_err(|error| {
-                        SemanticError::new(format!(
-                            "CALL expression {} `{}` input `{}`: {error}",
-                            scoped.expression.0, callable.name, parameter.name
-                        ))
-                    })?;
+                            SemanticError::new(format!(
+                                "CALL expression {} `{}` input `{}`: {error}",
+                                scoped.expression.0,
+                                callable.name(),
+                                parameter.name()
+                            ))
+                        })?;
                 }
                 for (parameter_name, parameter_type, actual) in deferred_inputs {
                     let expected = apply_out_type_frame(&parameter_type, &substitutions);
@@ -4044,16 +4077,17 @@ fn concrete_checked_expression_type(
                     .map_err(|error| {
                         SemanticError::new(format!(
                             "CALL expression {} `{}` input `{parameter_name}`: {error}",
-                            scoped.expression.0, callable.name
+                            scoped.expression.0,
+                            callable.name()
                         ))
                     })?;
                 }
-                let result = apply_out_type_frame(&callable.result.ty, &substitutions);
+                let result = apply_out_type_frame(&callable_types.result.ty, &substitutions);
                 if out_contract_type_is_resolved(&result) {
                     return Ok(result);
                 }
-                if callable.kind == boon_checked::CheckedCallableKind::User
-                    && let Some(result_expression) = callable.result_expression
+                if callable.kind() == boon_checked::CheckedCallableKind::User
+                    && let Some(result_expression) = callable.result_expression()
                 {
                     let child_frames = ActiveOutTypeFrames {
                         frame: Some(instance_id),

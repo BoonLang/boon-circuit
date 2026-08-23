@@ -2621,6 +2621,7 @@ const KERNEL_CHECKED_PROGRAM_METADATA_SEAL_DOMAIN_V1: &[u8] =
 
 fn append_kernel_checked_metadata_publication(
     fields: &CheckedProgramFields,
+    semantic_input: &boon_compiler_kernel::KernelSemanticInputConstructionV1,
     publication: &mut CheckedImageKernelPublicationV1,
     projection_demand: KernelCheckedProjectionDemand,
 ) -> Result<(), String> {
@@ -2692,20 +2693,16 @@ fn append_kernel_checked_metadata_publication(
                     })?;
                 publication.__kernel_publish_rows(projection, 1)?;
             }
-            for callable in fields
-                .callables
-                .iter()
-                .filter(|callable| callable.kind == boon_checked::CheckedCallableKind::User)
-            {
+            for callable in semantic_input.user_callable_declarations() {
                 let projection = publication
                     .__kernel_projection_for_route(
                         CheckedImageRowDomainV2::Callable,
-                        callable.decl_id.0 as usize,
+                        callable.0 as usize,
                     )
                     .ok_or_else(|| {
                         format!(
                             "RuntimePacked metadata references missing Callable route {}",
-                            callable.decl_id.0,
+                            callable.0,
                         )
                     })?;
                 publication.__kernel_publish_rows(projection, 1)?;
@@ -2778,6 +2775,7 @@ fn checked_construction_from_kernel(
     role: boon_checked::ProgramRole,
     projection_demand: KernelCheckedProjectionDemand,
 ) -> Result<KernelCheckedConstruction, String> {
+    let requested_projection_demand = projection_demand;
     let trace = std::env::var_os("BOON_KERNEL_TRACE").is_some();
     let total_started = Instant::now();
     let phase_started = Instant::now();
@@ -2863,6 +2861,18 @@ fn checked_construction_from_kernel(
         &interfaces,
     )?;
     let diagnostics_presentation_us = elapsed_us(phase_started.elapsed());
+    // Failing requests are report/editor products: they must retain the rich
+    // callable and context rows needed to present complete type tables. A
+    // successful RuntimePacked request is the only path allowed to omit them.
+    let projection_demand = if projection_demand == KernelCheckedProjectionDemand::RuntimePacked
+        && diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
+    {
+        KernelCheckedProjectionDemand::EditorRich
+    } else {
+        projection_demand
+    };
     let solve_work = snapshot.work;
     let phase_started = Instant::now();
     let layout = KernelCheckedLinkLayout::new(session.project(), &snapshot)
@@ -2902,30 +2912,16 @@ fn checked_construction_from_kernel(
                     definition.owner.0
                 )
             })?;
-        // A FUNCTION header statement is declared in its containing scope,
-        // while the stable checked owner is established by the callable body
-        // scope. Non-callable child definitions inherit the owner through the
-        // scope of their public declaration. Using the root statement for both
-        // cases incorrectly grouped every top-level FUNCTION under the program
-        // owner and left its user-callable shards without an authority seal.
+        // The packed relocation plan already owns the exact definition scope.
+        // Reading it directly avoids reconstructing callable signatures merely
+        // to recover an ID that the linker assigned in the first place.
         let root_scope = rows
-            .callables
-            .iter()
-            .find(|callable| {
-                callable.kind == boon_checked::CheckedCallableKind::User
-                    && callable.decl_id == definition.public_declaration
-            })
-            .map(|callable| callable.scope_id)
-            .or_else(|| {
-                rows.declarations
-                    .iter()
-                    .find(|declaration| declaration.id == definition.public_declaration)
-                    .map(|declaration| declaration.scope_id)
-            })
-            .ok_or_else(|| {
+            .semantic_input
+            .definition_authority_root_scope(definition.owner)
+            .map_err(|error| {
                 format!(
-                    "dense kernel checked definition {} has no relocated public declaration {}",
-                    definition.owner.0, definition.public_declaration.0
+                    "dense kernel checked definition {} has no authority root scope: {error}",
+                    definition.owner.0,
                 )
             })?;
         let definition_key_digest = boon_contract::canonical_serde_hash_v1(
@@ -3042,6 +3038,22 @@ fn checked_construction_from_kernel(
     }
     diagnostics.extend(order_diagnostics);
     canonicalize_type_diagnostics(&mut diagnostics);
+    if requested_projection_demand == KernelCheckedProjectionDemand::RuntimePacked
+        && projection_demand == KernelCheckedProjectionDemand::RuntimePacked
+        && diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
+    {
+        // Order validation runs after the compact linker has produced its
+        // semantic input. If it is the first source of an error, repeat once
+        // with the explicit EditorRich projection rather than fabricating a
+        // partial report from RuntimePacked fields.
+        return checked_construction_from_kernel(
+            project,
+            role,
+            KernelCheckedProjectionDemand::EditorRich,
+        );
+    }
     fields.lowering_metadata = match projection_demand {
         KernelCheckedProjectionDemand::RuntimePacked => {
             boon_typecheck::derive_project_runtime_checked_lowering_metadata(
@@ -3057,6 +3069,7 @@ fn checked_construction_from_kernel(
     .map_err(|error| format!("cannot finalize dense kernel checked metadata: {error}"))?;
     append_kernel_checked_metadata_publication(
         &fields,
+        &semantic_input,
         &mut checked_image_publication,
         projection_demand,
     )?;
@@ -21474,7 +21487,7 @@ FUNCTION address(row) {{
     }
 
     #[test]
-    fn runtime_packed_order_chains_and_failures_match_editor_rich() {
+    fn failing_runtime_order_request_promotes_and_matches_editor_rich() {
         let source = r#"
 rows: LIST { [rank: 1] }
 ordered:
@@ -21502,7 +21515,11 @@ partial_key: text_rows |> List/sort_by(item, key: item.rank |> Text/to_number())
         )
         .expect("derive EditorRich order-chain oracle fixture");
 
-        assert!(packed.fields.calls.is_empty());
+        assert_eq!(
+            packed.projection_demand,
+            KernelCheckedProjectionDemand::EditorRich,
+        );
+        assert!(!packed.fields.calls.is_empty());
         assert!(!rich.fields.calls.is_empty());
         assert_eq!(packed.fields.order_chains, rich.fields.order_chains);
         assert_eq!(packed.diagnostics, rich.diagnostics);
@@ -22015,7 +22032,7 @@ ordered_mutual:
     }
 
     #[test]
-    fn runtime_packed_keeps_report_only_type_tables_lazy_and_exact() {
+    fn runtime_packed_omits_rich_callable_rows_and_editor_tables_remain_exact() {
         let source = concat!(
             "FUNCTION double(input) {\n",
             "    input + input\n",
@@ -22025,7 +22042,7 @@ ordered_mutual:
         let project =
             parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
                 .expect("parse lazy runtime metadata fixture");
-        let mut runtime = checked_construction_from_kernel(
+        let runtime = checked_construction_from_kernel(
             &project,
             boon_checked::ProgramRole::Server,
             KernelCheckedProjectionDemand::RuntimePacked,
@@ -22046,6 +22063,8 @@ ordered_mutual:
                 .entries
                 .is_empty()
         );
+        assert!(runtime.fields.callables.is_empty());
+        assert!(runtime.fields.context_formals.is_empty());
         assert!(
             runtime
                 .fields
@@ -22072,7 +22091,7 @@ ordered_mutual:
                 .is_empty()
         );
 
-        let mut duplicate_callable = runtime.fields.clone();
+        let mut duplicate_callable = editor.fields.clone();
         let duplicate = duplicate_callable
             .callables
             .iter()
@@ -22083,7 +22102,7 @@ ordered_mutual:
         let error = boon_typecheck::derive_project_runtime_checked_lowering_metadata(
             &project,
             &duplicate_callable,
-            &runtime.diagnostics,
+            &editor.diagnostics,
         )
         .expect_err("RuntimePacked metadata must retain callable identity validation");
         assert!(
@@ -22093,14 +22112,61 @@ ordered_mutual:
             "unexpected duplicate callable error: {error}",
         );
 
-        boon_typecheck::populate_checked_report_type_tables(&mut runtime.fields);
+        let mut deferred_editor = editor.fields.clone();
+        deferred_editor.lowering_metadata.expr_type_table = Default::default();
+        deferred_editor.lowering_metadata.function_type_table = Default::default();
+        boon_typecheck::populate_checked_report_type_tables(&mut deferred_editor);
         assert_eq!(
-            runtime.fields.lowering_metadata.expr_type_table,
+            deferred_editor.lowering_metadata.expr_type_table,
             editor.fields.lowering_metadata.expr_type_table,
         );
         assert_eq!(
-            runtime.fields.lowering_metadata.function_type_table,
+            deferred_editor.lowering_metadata.function_type_table,
             editor.fields.lowering_metadata.function_type_table,
+        );
+    }
+
+    #[test]
+    fn failing_runtime_request_promotes_to_complete_editor_projection() {
+        let source = concat!(
+            "FUNCTION double(input) {\n",
+            "    input + input\n",
+            "}\n",
+            "value: double(input: \"not a number\")\n",
+        );
+        let project =
+            parse_project_syntax("app/RUN.bn", [("app/RUN.bn".to_owned(), source.to_owned())])
+                .expect("parse failing RuntimePacked report fixture");
+        let checked = checked_construction_from_kernel(
+            &project,
+            boon_checked::ProgramRole::Server,
+            KernelCheckedProjectionDemand::RuntimePacked,
+        )
+        .expect("failing runtime request still produces a checked report");
+
+        assert!(
+            checked.diagnostics.iter().any(|diagnostic| {
+                diagnostic.severity == boon_checked::DiagnosticSeverity::Error
+            })
+        );
+        assert_eq!(
+            checked.projection_demand,
+            KernelCheckedProjectionDemand::EditorRich,
+        );
+        assert!(
+            checked
+                .fields
+                .callables
+                .iter()
+                .any(|callable| { callable.kind == boon_checked::CheckedCallableKind::User })
+        );
+        assert!(
+            !checked
+                .fields
+                .lowering_metadata
+                .function_type_table
+                .entries
+                .is_empty()
         );
     }
 

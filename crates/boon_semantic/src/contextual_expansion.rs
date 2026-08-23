@@ -780,7 +780,7 @@ fn checked_call_named_input<'a>(
     name: &str,
 ) -> Option<CheckedExprId> {
     calls.entries(call).find_map(|entry| {
-        (entry.parameter().name == name)
+        (entry.parameter().name() == name)
             .then(|| entry.input().map(|(value, _, _)| value))
             .flatten()
     })
@@ -2188,80 +2188,106 @@ fn contextual_delimiter_runtime_kind(ty: &Type) -> Option<SemanticExpressionKind
 }
 
 fn semantic_callable_inventory(
-    program: &CheckedProgramFields,
+    calls: &crate::call_view::CallCatalog<'_>,
+    call_types: &mut crate::call_view::CallTypeCatalog,
     semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
     completed_context_formals: &BTreeMap<ContextFormalId, FlowType>,
 ) -> Result<(Vec<SemanticCallable>, BTreeMap<DeclId, SemanticCallableId>), ExpansionError> {
     let mut callable_ids = BTreeMap::new();
-    let mut callables = Vec::with_capacity(program.callables.len());
-    for (index, callable) in program.callables.iter().enumerate() {
+    let mut callables = Vec::with_capacity(calls.callable_count());
+    for (index, callable) in calls.callables().enumerate() {
         let id = SemanticCallableId(index);
-        if callable_ids.insert(callable.decl_id, id).is_some() {
+        let declaration = callable.declaration();
+        if callable_ids.insert(declaration, id).is_some() {
             return Err(ExpansionError::InvalidLocalBindings(format!(
                 "checked callable {} is defined more than once",
-                callable.decl_id.0
+                declaration.0
+            )));
+        }
+        let crate::call_view::CallableTypeFacts {
+            result,
+            parameters: parameter_types,
+            contexts: context_types,
+        } = call_types
+            .take_callable(calls, declaration)
+            .ok_or_else(|| {
+                ExpansionError::InvalidLocalBindings(format!(
+                    "checked callable {} has no materialized type facts",
+                    declaration.0,
+                ))
+            })?;
+        if parameter_types.len() != callable.parameter_count()
+            || context_types.len() != callable.context_count()
+        {
+            return Err(ExpansionError::InvalidLocalBindings(format!(
+                "checked callable {} type facts disagree with its parameter/context topology",
+                declaration.0,
             )));
         }
         let scope = semantic_scope_ids
-            .get(&callable.scope_id)
+            .get(&callable.scope())
             .copied()
             .ok_or_else(|| {
                 ExpansionError::InvalidLocalBindings(format!(
                     "checked callable {} references missing semantic scope {}",
-                    callable.decl_id.0, callable.scope_id.0
+                    declaration.0,
+                    callable.scope().0,
                 ))
             })?;
+        let parameters = callable
+            .parameters()
+            .zip(parameter_types.into_vec())
+            .map(|(parameter, flow_type)| SemanticCallableParameter {
+                id: semantic_parameter_id(id, parameter.ordinal()),
+                formal: parameter.declaration(),
+                ordinal: parameter.ordinal(),
+                name: parameter.name().to_owned(),
+                kind: parameter.kind(),
+                flow_type,
+                requirement: parameter.requirement().to_owned(),
+                evaluation_scope: parameter.evaluation_scope(),
+                start: parameter.start(),
+                end: parameter.end(),
+            })
+            .collect();
+        let contexts = callable
+            .contexts()
+            .zip(context_types.into_vec())
+            .map(|(context, flow_type)| SemanticCallableContext {
+                name: context.name().to_owned(),
+                kind: context.kind(),
+                provider: context.provider(),
+                flow_type,
+            })
+            .collect();
+        let context_formal = callable.context_formal_id();
         callables.push(SemanticCallable {
             id,
-            checked_callable: callable.decl_id,
+            checked_callable: declaration,
             scope,
-            kind: callable.kind,
-            name: callable.name.clone(),
-            external_identity: callable.external_identity,
-            parameters: callable
-                .parameters
-                .iter()
-                .map(|parameter| SemanticCallableParameter {
-                    id: semantic_parameter_id(id, parameter.ordinal),
-                    formal: parameter.decl_id,
-                    ordinal: parameter.ordinal,
-                    name: parameter.name.clone(),
-                    kind: parameter.kind,
-                    flow_type: parameter.flow_type.clone(),
-                    requirement: parameter.requirement.clone(),
-                    evaluation_scope: parameter.evaluation_scope,
-                    start: parameter.start,
-                    end: parameter.end,
-                })
-                .collect(),
-            contexts: callable
-                .contexts
-                .iter()
-                .map(|context| SemanticCallableContext {
-                    name: context.name.clone(),
-                    kind: context.kind,
-                    provider: context.provider,
-                    flow_type: context.flow_type.clone(),
-                })
-                .collect(),
-            context_formal: callable.context_formal,
-            context_parameter: callable.context_formal.and_then(|formal| {
+            kind: callable.kind(),
+            name: callable.name().to_owned(),
+            external_identity: callable.external_identity(),
+            parameters,
+            contexts,
+            context_formal,
+            context_parameter: context_formal.and_then(|formal| {
                 completed_context_formals
                     .get(&formal)
                     .cloned()
                     .map(|flow_type| SemanticCallableContextParameter {
-                        id: semantic_parameter_id(id, callable.parameters.len()),
+                        id: semantic_parameter_id(id, callable.parameter_count()),
                         formal,
                         name: "PASSED".to_owned(),
                         flow_type,
                     })
             }),
-            result: callable.result.clone(),
-            role: callable.role,
-            effect: callable.effect,
-            body: callable.body,
-            result_expression: callable.result_expression,
-            contextual_operation: callable.contextual_operation,
+            result,
+            role: callable.role(),
+            effect: callable.effect(),
+            body: callable.body(),
+            result_expression: callable.result_expression(),
+            contextual_operation: callable.contextual_operation(),
             semantic_root: None,
         });
     }
@@ -2373,7 +2399,7 @@ fn completed_context_formal_flow_types(
             let target_formal = lookup
                 .calls
                 .callable(call.callable())
-                .and_then(|callable| callable.context_formal);
+                .and_then(|callable| callable.context_formal_id());
             if target_formal.is_some_and(|formal| whole_value_requirements.contains(&formal)) {
                 changed |= whole_value_requirements.insert(caller_formal);
             }
@@ -2449,7 +2475,7 @@ fn semantic_call_inventory(
         let mut entries = Vec::with_capacity(call.entry_count());
         for entry in call_catalog.entries(call) {
             let parameter = entry.parameter();
-            let formal = parameter.decl_id;
+            let formal = parameter.declaration();
             entries.push(match entry {
                 CallEntryRef::Input {
                     value,
@@ -2463,19 +2489,19 @@ fn semantic_call_inventory(
                         .ok_or(ExpansionError::MissingExpression(value))?;
                     SemanticCallEntry::Input {
                         formal,
-                        ordinal: parameter.ordinal,
-                        name: parameter.name.clone(),
+                        ordinal: parameter.ordinal(),
+                        name: parameter.name().to_owned(),
                         checked_value: value,
                         value_flow_type,
                         from_pipe,
                         evaluation_scope,
-                        requirement: parameter.requirement.clone(),
+                        requirement: parameter.requirement().to_owned(),
                     }
                 }
                 CallEntryRef::FreshOut { output, scope, .. } => SemanticCallEntry::FreshOut {
                     formal,
-                    ordinal: parameter.ordinal,
-                    name: parameter.name.clone(),
+                    ordinal: parameter.ordinal(),
+                    name: parameter.name().to_owned(),
                     output,
                     scope: semantic_scope_ids.get(&scope).copied().ok_or_else(|| {
                         ExpansionError::InvalidLocalBindings(format!(
@@ -2491,8 +2517,8 @@ fn semantic_call_inventory(
                     ..
                 } => SemanticCallEntry::ForwardOut {
                     formal,
-                    ordinal: parameter.ordinal,
-                    name: parameter.name.clone(),
+                    ordinal: parameter.ordinal(),
+                    name: parameter.name().to_owned(),
                     target,
                     target_name: target_name.to_owned(),
                 },
@@ -2530,16 +2556,16 @@ fn semantic_call_inventory(
             callable: semantic_callable,
             owner_callable,
             function: call.function().to_owned(),
-            intrinsic: callable.intrinsic,
-            external_identity: callable.external_identity,
+            intrinsic: callable.intrinsic(),
+            external_identity: callable.external_identity(),
             entries,
             contexts,
             context_binding: call.context_binding(),
             contextual_substitutions: type_facts.contextual_substitutions,
             type_substitutions: type_facts.type_substitutions,
             result: type_facts.result,
-            role: callable.role,
-            effect: callable.effect,
+            role: callable.role(),
+            effect: callable.effect(),
             span: call.span(),
             occurrence_segment: crate::out_net::checked_call_occurrence_segment(
                 call_catalog,
@@ -2566,74 +2592,87 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
     calls: &crate::call_view::CallCatalog<'_>,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
-    if execution.callables.len() != program.callables.len() {
+    if execution.callables.len() != calls.callable_count() {
         return Err(format!(
             "semantic callable inventory contains {} rows for {} checked callables",
             execution.callables.len(),
-            program.callables.len(),
+            calls.callable_count(),
         ));
     }
     for (index, (semantic, checked)) in execution
         .callables
         .iter()
-        .zip(&program.callables)
+        .zip(calls.callables())
         .enumerate()
     {
+        let result_matches = match checked.result() {
+            crate::call_view::CallFlowRef::Rich(flow) => semantic.result == *flow,
+            crate::call_view::CallFlowRef::Packed(flow) => semantic.result.mode == flow.mode(),
+        };
         if semantic.id != SemanticCallableId(index)
-            || semantic.checked_callable != checked.decl_id
-            || semantic.kind != checked.kind
-            || semantic.name != checked.name
-            || semantic.external_identity != checked.external_identity
-            || semantic.context_formal != checked.context_formal
-            || semantic.result != checked.result
-            || semantic.role != checked.role
-            || semantic.effect != checked.effect
-            || semantic.body != checked.body
-            || semantic.result_expression != checked.result_expression
-            || semantic.contextual_operation != checked.contextual_operation
+            || semantic.checked_callable != checked.declaration()
+            || semantic.kind != checked.kind()
+            || semantic.name != checked.name()
+            || semantic.external_identity != checked.external_identity()
+            || semantic.context_formal != checked.context_formal_id()
+            || !result_matches
+            || semantic.role != checked.role()
+            || semantic.effect != checked.effect()
+            || semantic.body != checked.body()
+            || semantic.result_expression != checked.result_expression()
+            || semantic.contextual_operation != checked.contextual_operation()
         {
             return Err(format!(
                 "semantic callable row {index} differs from checked callable {}",
-                checked.decl_id.0,
+                checked.declaration().0,
             ));
         }
         let scope_matches = execution
             .scopes
             .get(semantic.scope.as_usize())
             .is_some_and(|scope| {
-                scope.id == semantic.scope && scope.checked_scope == checked.scope_id
+                scope.id == semantic.scope && scope.checked_scope == checked.scope()
             });
         if !scope_matches {
             return Err(format!(
                 "semantic callable {} does not map checked scope {} exactly",
-                semantic.id, checked.scope_id.0,
+                semantic.id,
+                checked.scope().0,
             ));
         }
-        if semantic.parameters.len() != checked.parameters.len() {
+        if semantic.parameters.len() != checked.parameter_count() {
             return Err(format!(
                 "semantic callable {} contains {} parameters for {} checked parameters",
                 semantic.id,
                 semantic.parameters.len(),
-                checked.parameters.len(),
+                checked.parameter_count(),
             ));
         }
         for (ordinal, (semantic_parameter, checked_parameter)) in semantic
             .parameters
             .iter()
-            .zip(&checked.parameters)
+            .zip(checked.parameters())
             .enumerate()
         {
+            let flow_matches = match checked_parameter.flow() {
+                crate::call_view::CallFlowRef::Rich(flow) => semantic_parameter.flow_type == *flow,
+                crate::call_view::CallFlowRef::Packed(flow) => {
+                    semantic_parameter.flow_type.mode == flow.mode()
+                }
+            };
             if semantic_parameter.id != semantic_parameter_id(semantic.id, ordinal)
-                || semantic_parameter.formal != checked_parameter.decl_id
-                || semantic_parameter.ordinal != checked_parameter.ordinal
+                || semantic_parameter.formal != checked_parameter.declaration()
+                || semantic_parameter.ordinal != checked_parameter.ordinal()
                 || semantic_parameter.ordinal != ordinal
-                || semantic_parameter.name != checked_parameter.name
-                || semantic_parameter.kind != checked_parameter.kind
-                || semantic_parameter.flow_type != checked_parameter.flow_type
-                || semantic_parameter.requirement != checked_parameter.requirement
-                || semantic_parameter.evaluation_scope != checked_parameter.evaluation_scope
-                || semantic_parameter.start != checked_parameter.start
-                || semantic_parameter.end != checked_parameter.end
+                || semantic_parameter.name != checked_parameter.name()
+                || semantic_parameter.kind != checked_parameter.kind()
+                || !flow_matches
+                || !checked_parameter
+                    .requirement()
+                    .matches_checked(&semantic_parameter.requirement)
+                || semantic_parameter.evaluation_scope != checked_parameter.evaluation_scope()
+                || semantic_parameter.start != checked_parameter.start()
+                || semantic_parameter.end != checked_parameter.end()
             {
                 return Err(format!(
                     "semantic callable {} parameter {ordinal} differs from its checked parameter",
@@ -2641,21 +2680,27 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
                 ));
             }
         }
-        if semantic.contexts.len() != checked.contexts.len() {
+        if semantic.contexts.len() != checked.context_count() {
             return Err(format!(
                 "semantic callable {} contains {} contexts for {} checked contexts",
                 semantic.id,
                 semantic.contexts.len(),
-                checked.contexts.len(),
+                checked.context_count(),
             ));
         }
         for (ordinal, (semantic_context, checked_context)) in
-            semantic.contexts.iter().zip(&checked.contexts).enumerate()
+            semantic.contexts.iter().zip(checked.contexts()).enumerate()
         {
-            if semantic_context.name != checked_context.name
-                || semantic_context.kind != checked_context.kind
-                || semantic_context.provider != checked_context.provider
-                || semantic_context.flow_type != checked_context.flow_type
+            let flow_matches = match checked_context.flow() {
+                crate::call_view::CallFlowRef::Rich(flow) => semantic_context.flow_type == *flow,
+                crate::call_view::CallFlowRef::Packed(flow) => {
+                    semantic_context.flow_type.mode == flow.mode()
+                }
+            };
+            if semantic_context.name != checked_context.name()
+                || semantic_context.kind != checked_context.kind()
+                || semantic_context.provider != checked_context.provider()
+                || !flow_matches
             {
                 return Err(format!(
                     "semantic callable {} context {ordinal} differs from its checked context",
@@ -2663,10 +2708,14 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
                 ));
             }
         }
-        match (checked.context_formal, semantic.context_parameter.as_ref()) {
+        match (
+            checked.context_formal_id(),
+            semantic.context_parameter.as_ref(),
+        ) {
             (None, None) => {}
             (Some(formal), Some(parameter))
-                if parameter.id == semantic_parameter_id(semantic.id, checked.parameters.len())
+                if parameter.id
+                    == semantic_parameter_id(semantic.id, checked.parameter_count())
                     && parameter.formal == formal
                     && parameter.name == "PASSED" => {}
             _ => {
@@ -2720,12 +2769,12 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
             || semantic.callable != SemanticCallableId(callable_index)
             || semantic.owner_callable != owner_callable
             || semantic.function != checked.function()
-            || semantic.intrinsic != callable.intrinsic
-            || semantic.external_identity != callable.external_identity
+            || semantic.intrinsic != callable.intrinsic()
+            || semantic.external_identity != callable.external_identity()
             || semantic.context_binding != checked.context_binding()
             || semantic.result.mode != checked.result().mode()
-            || semantic.role != callable.role
-            || semantic.effect != callable.effect
+            || semantic.role != callable.role()
+            || semantic.effect != callable.effect()
             || semantic.span != checked.span()
             || semantic
                 .occurrence_segment
@@ -2778,14 +2827,14 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
                         .get(value.0 as usize)
                         .filter(|expression| expression.id == value)
                         .map(|expression| &expression.flow_type);
-                    *formal == parameter.decl_id
-                        && *semantic_ordinal == parameter.ordinal
-                        && name == &parameter.name
+                    *formal == parameter.declaration()
+                        && *semantic_ordinal == parameter.ordinal()
+                        && name == parameter.name()
                         && *checked_value == value
                         && checked_flow == Some(value_flow_type)
                         && *from_pipe == checked_pipe
                         && *evaluation_scope == checked_scope
-                        && requirement == &parameter.requirement
+                        && parameter.requirement().matches_checked(requirement)
                 }
                 (
                     SemanticCallEntry::FreshOut {
@@ -2801,9 +2850,9 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
                         ..
                     },
                 ) => {
-                    *formal == parameter.decl_id
-                        && *semantic_ordinal == parameter.ordinal
-                        && name == &parameter.name
+                    *formal == parameter.declaration()
+                        && *semantic_ordinal == parameter.ordinal()
+                        && name == parameter.name()
                         && *output == checked_output
                         && execution
                             .scopes
@@ -2827,9 +2876,9 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
                         ..
                     },
                 ) => {
-                    *formal == parameter.decl_id
-                        && *semantic_ordinal == parameter.ordinal
-                        && name == &parameter.name
+                    *formal == parameter.declaration()
+                        && *semantic_ordinal == parameter.ordinal()
+                        && name == parameter.name()
                         && *target == checked_target
                         && target_name == checked_target_name
                 }
@@ -2967,10 +3016,14 @@ fn validate_checked_callable_and_call_inventory_reconstruction(
         .enumerate()
         .map(|(index, scope)| (scope.id, SemanticScopeId(index)))
         .collect::<BTreeMap<_, _>>();
-    let (expected_callables, callable_ids) =
-        semantic_callable_inventory(program, &semantic_scope_ids, &completed_context_formals)
-            .map_err(|error| error.to_string())?;
     let mut call_types = crate::call_view::CallTypeCatalog::new(calls)?;
+    let (expected_callables, callable_ids) = semantic_callable_inventory(
+        calls,
+        &mut call_types,
+        &semantic_scope_ids,
+        &completed_context_formals,
+    )
+    .map_err(|error| error.to_string())?;
     let (expected_calls, _) = semantic_call_inventory(
         program,
         calls,
@@ -3060,7 +3113,8 @@ pub(crate) fn derive_semantic_execution_graph(
         })
         .collect::<Result<Vec<_>, ExpansionError>>()?;
     let (mut callables, callable_ids) = semantic_callable_inventory(
-        program,
+        call_catalog,
+        &mut call_types,
         &semantic_scope_ids,
         &builder_indexes.completed_context_formals,
     )?;
@@ -8296,9 +8350,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 };
                 let parameter = entry.parameter();
                 arguments.push(SemanticCallArgument {
-                    formal: parameter.decl_id,
-                    ordinal: parameter.ordinal,
-                    name: parameter.name.clone(),
+                    formal: parameter.declaration(),
+                    ordinal: parameter.ordinal(),
+                    name: parameter.name().to_owned(),
                     checked_value: value,
                     value: self.expand_in_frame(value, scoped.frame, scoped.value_frame)?,
                     from_pipe,
@@ -9706,10 +9760,11 @@ mod tests {
                 &program,
                 producer_roots,
                 &retained,
-                |calls, call, _, entry, substitutions| {
+                |calls, call_types, call, _, entry, substitutions| {
                     crate::provisional_out_port_contract(
                         &program,
                         calls,
+                        call_types,
                         call,
                         entry,
                         substitutions,

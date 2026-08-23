@@ -94,6 +94,7 @@ pub(crate) struct PackedDeclarationPresentation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PackedStatementParameter {
+    pub(crate) declaration: crate::KernelDeclarationId,
     pub(crate) name: SymbolId,
     pub(crate) kind: KernelParameterKind,
     pub(crate) ordinal: u32,
@@ -621,10 +622,66 @@ impl PackedDefinitionFactsStoreBuilder {
         for statement in &facts.statements {
             let kind = match &statement.kind {
                 KernelStatementKind::Function { name, parameters } => {
-                    let parameters = append_span(
+                    let mut parameter_declarations =
+                        facts.declarations.iter().filter(|declaration| {
+                            matches!(
+                                declaration.origin,
+                                crate::KernelDeclarationOrigin::Parameter {
+                                    statement: owner_statement,
+                                    ..
+                                } if owner_statement == statement.id
+                            )
+                        });
+                    let packed_parameters = append_span(
                         &mut self.statement_parameters,
-                        parameters.iter().map(|parameter| {
+                        parameters.iter().enumerate().map(|(index, parameter)| {
+                            let ordinal = u32::try_from(index).map_err(|_| {
+                                KernelOwnerBuildError::new(
+                                    "statement parameter count exceeds u32",
+                                )
+                            })?;
+                            if parameter.ordinal != ordinal {
+                                return Err(KernelOwnerBuildError::new(format!(
+                                    "function statement {} parameter index {index} has noncanonical ordinal {}",
+                                    statement.id.0, parameter.ordinal,
+                                )));
+                            }
+                            let declaration = parameter_declarations.next().ok_or_else(|| {
+                                KernelOwnerBuildError::new(format!(
+                                    "function statement {} parameter ordinal {ordinal} has no declaration",
+                                    statement.id.0,
+                                ))
+                            })?;
+                            if declaration.origin
+                                != (crate::KernelDeclarationOrigin::Parameter {
+                                    statement: statement.id,
+                                    ordinal,
+                                })
+                            {
+                                return Err(KernelOwnerBuildError::new(format!(
+                                    "function statement {} parameter ordinal {ordinal} has a noncanonical declaration",
+                                    statement.id.0
+                                )));
+                            }
+                            let expected_kind = match parameter.kind {
+                                crate::KernelParameterKind::Value => {
+                                    crate::KernelDeclarationKind::ValueParameter
+                                }
+                                crate::KernelParameterKind::Out => {
+                                    crate::KernelDeclarationKind::OutParameter
+                                }
+                            };
+                            if declaration.kind != expected_kind
+                                || declaration.name != parameter.name
+                            {
+                                return Err(KernelOwnerBuildError::new(format!(
+                                    "function statement {} parameter ordinal {ordinal} differs from declaration {}",
+                                    statement.id.0,
+                                    declaration.id.0,
+                                )));
+                            }
                             Ok(PackedStatementParameter {
+                                declaration: declaration.id,
                                 name: lookup_symbol(
                                     text,
                                     &parameter.name,
@@ -638,9 +695,15 @@ impl PackedDefinitionFactsStoreBuilder {
                         }),
                         "statement parameter",
                     )?;
+                    if let Some(declaration) = parameter_declarations.next() {
+                        return Err(KernelOwnerBuildError::new(format!(
+                            "function statement {} has unexpected parameter declaration {}",
+                            statement.id.0, declaration.id.0,
+                        )));
+                    }
                     PackedStatementKind::Function {
                         name: lookup_symbol(text, name, owner, "function statement")?,
-                        parameters,
+                        parameters: packed_parameters,
                     }
                 }
                 KernelStatementKind::Field { name } => PackedStatementKind::Field {

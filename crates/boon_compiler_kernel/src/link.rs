@@ -20,10 +20,10 @@ use boon_checked::{
     CheckedDeclaration, CheckedDeclarationKind, CheckedDefinitionExecutionNodeV1,
     CheckedDefinitionExecutionTemplateV1, CheckedDefinitionSelectorV1, CheckedEffectSummary,
     CheckedEvaluationScope, CheckedExprId, CheckedExpression, CheckedExpressionKind,
-    CheckedImageKernelPublicationV1, CheckedImageRowDomainV2, CheckedList, CheckedListId,
-    CheckedMatchPattern, CheckedParameter, CheckedParameterDefault, CheckedParameterKind,
-    CheckedParameterRequirement, CheckedPassedAccess, CheckedPatternBinding, CheckedProgram,
-    CheckedProgramFields, CheckedRecordField, CheckedResourceBinding,
+    CheckedExternalDeclarationIdentityV1, CheckedImageKernelPublicationV1, CheckedImageRowDomainV2,
+    CheckedList, CheckedListId, CheckedMatchPattern, CheckedParameter, CheckedParameterDefault,
+    CheckedParameterKind, CheckedParameterRequirement, CheckedPassedAccess, CheckedPatternBinding,
+    CheckedProgram, CheckedProgramFields, CheckedRecordField, CheckedResourceBinding,
     CheckedResourceProjectionRequirement, CheckedRuntimeFlowTermProjectionV1, CheckedScope,
     CheckedScopeKind, CheckedSemanticPath, CheckedShardCallableKindV2, CheckedShardOwnerKeyV2,
     CheckedShardProjectionKeyV2, CheckedShardRegionV2, CheckedSource, CheckedSourceId,
@@ -700,6 +700,7 @@ struct KernelSemanticDefinitionSpanRelocationV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct KernelSemanticAbiRelocationV1 {
     callable: DeclId,
+    parameters: KernelCheckedRowRange,
     type_variables: KernelCheckedRowRange,
 }
 
@@ -740,6 +741,12 @@ pub struct KernelSemanticInputConstructionV1 {
     /// no checked declaration relocation but remain available as packed type
     /// authorities in `definition_code`.
     abi_relocations: Box<[Option<KernelSemanticAbiRelocationV1>]>,
+    /// User and referenced ABI schemes in the exact checked-callable order.
+    ///
+    /// Declaration IDs are sparse and start after the reserved zero sentinel,
+    /// so this one flat locator column replaces every downstream
+    /// `Vec<Option<callable-index>>` sidecar without indexing by `DeclId`.
+    callable_schemes: Box<[crate::KernelCallableSchemeId]>,
     /// Owners with execution templates, ordered by final callable ID.
     definition_execution_owners: Box<[KernelOwnerId]>,
     call_result_paths: Box<[KernelSemanticCallResultPathLocatorV1]>,
@@ -1102,6 +1109,68 @@ pub struct KernelPackedFlowRef<'a> {
 pub struct KernelCallableSchemeRef<'a> {
     input: &'a KernelSemanticInputV1,
     target: crate::KernelCallableSchemeId,
+}
+
+pub struct KernelCallableSchemeIter<'a> {
+    input: &'a KernelSemanticInputV1,
+    schemes: std::slice::Iter<'a, crate::KernelCallableSchemeId>,
+}
+
+/// Borrowed parameter row qualified by its callable scheme and packed type
+/// namespace. Text and types remain in the immutable kernel authorities.
+#[derive(Clone, Copy)]
+pub struct KernelSemanticCallableParameterRef<'a> {
+    callable: KernelCallableSchemeRef<'a>,
+    ordinal: u32,
+    declaration: DeclId,
+}
+
+pub struct KernelSemanticCallableParameterIter<'a> {
+    callable: KernelCallableSchemeRef<'a>,
+    next: u32,
+    len: u32,
+}
+
+/// Borrowed ABI call-context row. User callables currently have no such rows;
+/// PASSED is represented independently by a context formal.
+#[derive(Clone, Copy)]
+pub struct KernelSemanticCallableContextRef<'a> {
+    callable: KernelCallableSchemeRef<'a>,
+    ordinal: u32,
+}
+
+pub struct KernelSemanticCallableContextIter<'a> {
+    callable: KernelCallableSchemeRef<'a>,
+    next: u32,
+    len: u32,
+}
+
+/// One user-callable PASSED scheme. Its flow is a borrowed packed formal, not
+/// a reconstructed `CheckedContextScheme` with nested `Vec<String>` paths.
+#[derive(Clone, Copy)]
+pub struct KernelSemanticContextFormalRef<'a> {
+    callable: KernelCallableSchemeRef<'a>,
+    id: ContextFormalId,
+    ordinal: u32,
+}
+
+/// Required/optional parameter policy with borrowed interned/default text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelSemanticParameterRequirementRef<'a> {
+    Required,
+    CallableProfile(&'a str),
+    Tag(&'a str),
+    ExactInteger(i64),
+    Text(&'a str),
+}
+
+/// Global declaration lookup spanning definition-owned rows and the synthetic
+/// declaration rows of referenced ABI callables and their parameters.
+#[derive(Clone, Copy)]
+pub enum KernelSemanticResolvedDeclarationRef<'a> {
+    Definition(KernelSemanticDeclarationRef<'a>),
+    AbiCallable(KernelCallableSchemeRef<'a>),
+    AbiParameter(KernelSemanticCallableParameterRef<'a>),
 }
 
 /// Target-bound generic parameter token. Its ordinal is meaningful only in
@@ -3275,6 +3344,29 @@ impl KernelSemanticInputConstructionV1 {
             .and_then(Option::as_ref)
     }
 
+    fn callable_declaration(&self, target: crate::KernelCallableSchemeId) -> Option<DeclId> {
+        match target {
+            crate::KernelCallableSchemeId::User(owner) => {
+                let relocation = self.definition_relocation(owner)?;
+                (relocation.owner_callable == Some(relocation.callable))
+                    .then_some(relocation.callable)
+            }
+            crate::KernelCallableSchemeId::Abi(callable) => self
+                .abi_relocation(callable)
+                .map(|relocation| relocation.callable),
+        }
+    }
+
+    fn callable_index(&self, declaration: DeclId) -> Option<usize> {
+        self.callable_schemes
+            .binary_search_by_key(&declaration.0, |target| {
+                self.callable_declaration(*target)
+                    .expect("sealed callable locator has a declaration")
+                    .0
+            })
+            .ok()
+    }
+
     fn relocate_expression(&self, expression: crate::PackedExpressionRef) -> Option<CheckedExprId> {
         let range = self.definition_relocation(expression.owner())?.expressions;
         range
@@ -3815,6 +3907,7 @@ impl KernelSemanticInputConstructionV1 {
         }
         let mut definition_relocations = Vec::with_capacity(layout.definitions.len());
         let mut definition_execution_owners = Vec::new();
+        let mut callable_schemes = Vec::with_capacity(layout.totals.callables as usize);
         for definition in &layout.definitions {
             let definition_view = snapshot.definition(definition.owner).ok_or_else(|| {
                 KernelCheckedLinkError::new(format!(
@@ -3900,6 +3993,187 @@ impl KernelSemanticInputConstructionV1 {
                 })
                 .filter(|root| matches!(root.kind, crate::PackedStatementKind::Function { .. }))
                 .map(|_| definition.public_declaration);
+            if owner_callable.is_none()
+                && definition_view.linkage().context_formal_ordinal.is_some()
+            {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel non-callable definition {} owns a context formal",
+                    definition.owner.0,
+                )));
+            }
+            if let Some(callable) = owner_callable {
+                if callable != definition.public_declaration {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel semantic definition {} callable declaration differs from its public declaration",
+                        definition.owner.0,
+                    )));
+                }
+                let root = definition_view
+                    .linkage()
+                    .root_statement
+                    .expect("callable classification requires a root statement");
+                let root = definition_view
+                    .runtime_facts()
+                    .statements()
+                    .get(root.0 as usize)
+                    .expect("validated callable root statement exists");
+                let crate::PackedStatementKind::Function {
+                    name: function_name,
+                    ..
+                } = root.kind
+                else {
+                    unreachable!("callable classification requires a function root")
+                };
+                let KernelDeclarationReference::Local(public_declaration) = definition_view
+                    .linkage()
+                    .public_declaration
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel callable definition {} has no public declaration",
+                            definition.owner.0,
+                        ))
+                    })?
+                else {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel callable definition {} delegates its public declaration",
+                        definition.owner.0,
+                    )));
+                };
+                if layout.declaration(
+                    definition.owner,
+                    KernelDeclarationReference::Local(public_declaration),
+                )? != callable
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel callable definition {} public declaration does not relocate to {}",
+                        definition.owner.0, callable.0,
+                    )));
+                }
+                let public_row = facts
+                    .declarations()
+                    .get(public_declaration.0 as usize)
+                    .filter(|row| {
+                        row.id == public_declaration
+                            && row.kind == crate::KernelDeclarationKind::Function
+                    })
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel callable definition {} has no exact function declaration {}",
+                            definition.owner.0, public_declaration.0,
+                        ))
+                    })?;
+                if public_row.name != function_name {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel callable definition {} declaration name differs from its function header",
+                        definition.owner.0,
+                    )));
+                }
+                let declaration_body_scope = declaration_presentation(facts, public_declaration)?
+                    .body_scope
+                    .ok_or_else(|| {
+                        KernelCheckedLinkError::new(format!(
+                            "kernel callable definition {} has no declaration body scope",
+                            definition.owner.0,
+                        ))
+                    })?;
+                if statement_presentation(facts, root.id)?.body_scope
+                    != Some(declaration_body_scope)
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel callable definition {} function declaration and statement disagree on body scope",
+                        definition.owner.0,
+                    )));
+                }
+                let parameters = definition_view
+                    .runtime_facts()
+                    .statement_parameters(root)
+                    .expect("function root owns a parameter span");
+                for ordinal in 0..parameters.len() {
+                    let ordinal = u32::try_from(ordinal).map_err(|_| {
+                        KernelCheckedLinkError::new("kernel callable parameter count exceeds u32")
+                    })?;
+                    let parameter = parameters
+                        .get(ordinal as usize)
+                        .filter(|parameter| parameter.ordinal == ordinal)
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel semantic callable {} does not have parameter ordinal {ordinal} in canonical order",
+                                callable.0,
+                            ))
+                        })?;
+                    let expected_kind = match parameter.kind {
+                        crate::KernelParameterKind::Value => {
+                            crate::KernelDeclarationKind::ValueParameter
+                        }
+                        crate::KernelParameterKind::Out => {
+                            crate::KernelDeclarationKind::OutParameter
+                        }
+                    };
+                    facts
+                        .declarations()
+                        .get(parameter.declaration.0 as usize)
+                        .filter(|declaration| {
+                            declaration.id == parameter.declaration
+                                && declaration.origin
+                                    == crate::KernelDeclarationOrigin::Parameter {
+                                        statement: root.id,
+                                        ordinal,
+                                    }
+                                && declaration.kind == expected_kind
+                                && declaration.name == parameter.name
+                        })
+                        .ok_or_else(|| {
+                            KernelCheckedLinkError::new(format!(
+                                "kernel semantic callable {} parameter ordinal {ordinal} has no exact declaration",
+                                callable.0,
+                            ))
+                        })?;
+                    if let crate::KernelParameterEvaluationScope::Output { parameter_ordinal } =
+                        parameter.evaluation_scope
+                    {
+                        let output = parameters
+                            .get(parameter_ordinal as usize)
+                            .filter(|output| {
+                                output.ordinal == parameter_ordinal
+                                    && output.kind == crate::KernelParameterKind::Out
+                            })
+                            .ok_or_else(|| {
+                                KernelCheckedLinkError::new(format!(
+                                    "kernel semantic callable {} parameter ordinal {ordinal} targets missing or non-OUT parameter {parameter_ordinal}",
+                                    callable.0,
+                                ))
+                            })?;
+                        if facts
+                            .declarations()
+                            .get(output.declaration.0 as usize)
+                            .is_none_or(|candidate| {
+                                candidate.id != output.declaration
+                                    || candidate.kind != crate::KernelDeclarationKind::OutParameter
+                            })
+                        {
+                            return Err(KernelCheckedLinkError::new(format!(
+                                "kernel semantic callable {} output parameter {parameter_ordinal} has no exact OUT declaration",
+                                callable.0,
+                            )));
+                        }
+                    }
+                }
+                let context_count =
+                    usize::from(definition_view.linkage().context_formal_ordinal.is_some());
+                if code.formals().len() != parameters.len().saturating_add(context_count)
+                    || definition_view
+                        .linkage()
+                        .context_formal_ordinal
+                        .is_some_and(|ordinal| ordinal as usize != parameters.len())
+                {
+                    return Err(KernelCheckedLinkError::new(format!(
+                        "kernel semantic callable {} parameter/context rows disagree with its {} packed formals",
+                        callable.0,
+                        code.formals().len(),
+                    )));
+                }
+                callable_schemes.push(crate::KernelCallableSchemeId::User(definition.owner));
+            }
             let mut authority_root_scope = None;
             for provider in snapshot.definition_refs() {
                 let provider_layout = layout.definition(provider.owner())?;
@@ -4049,8 +4323,40 @@ impl KernelSemanticInputConstructionV1 {
             }
             *slot = Some(KernelSemanticAbiRelocationV1 {
                 callable: callable.declaration,
+                parameters: callable.parameters,
                 type_variables: callable.type_variables,
             });
+            callable_schemes.push(crate::KernelCallableSchemeId::Abi(callable.callable));
+        }
+        if callable_schemes.len() != layout.totals.callables as usize {
+            return Err(KernelCheckedLinkError::new(format!(
+                "kernel semantic callable locator has {} rows for a {}-row layout",
+                callable_schemes.len(),
+                layout.totals.callables,
+            )));
+        }
+        let callable_declaration = |target: crate::KernelCallableSchemeId| match target {
+            crate::KernelCallableSchemeId::User(owner) => definition_relocations
+                .get(owner.0 as usize)
+                .map(|relocation| relocation.callable),
+            crate::KernelCallableSchemeId::Abi(callable) => abi_relocations
+                .get(callable.0 as usize)
+                .and_then(Option::as_ref)
+                .map(|relocation| relocation.callable),
+        };
+        for pair in callable_schemes.windows(2) {
+            let left = callable_declaration(pair[0]).ok_or_else(|| {
+                KernelCheckedLinkError::new("kernel semantic callable locator has no declaration")
+            })?;
+            let right = callable_declaration(pair[1]).ok_or_else(|| {
+                KernelCheckedLinkError::new("kernel semantic callable locator has no declaration")
+            })?;
+            if left >= right {
+                return Err(KernelCheckedLinkError::new(format!(
+                    "kernel semantic callable declarations are not strictly ordered: {} then {}",
+                    left.0, right.0,
+                )));
+            }
         }
         let mut previous_call = None;
         let mut next_symbol = 0u32;
@@ -4141,6 +4447,7 @@ impl KernelSemanticInputConstructionV1 {
             ]
             .into_boxed_slice(),
             abi_relocations: abi_relocations.into_boxed_slice(),
+            callable_schemes: callable_schemes.into_boxed_slice(),
             definition_execution_owners: definition_execution_owners.into_boxed_slice(),
             call_result_paths,
             call_result_path_symbols,
@@ -4580,9 +4887,27 @@ impl KernelSemanticInputConstructionV1 {
                     owner.0,
                 ))
             })?;
-            if code.call_count() != 0 && relocation.start_line == 0 {
+            let definition = crate::KernelDefinitionRef::from_authorities(
+                &self.program,
+                &self.definition_code,
+                owner,
+            )
+            .ok_or_else(|| {
+                KernelCheckedLinkError::new(format!(
+                    "kernel semantic span relocation has no definition authority {}",
+                    owner.0,
+                ))
+            })?;
+            let owns_callable = definition
+                .linkage()
+                .root_statement
+                .and_then(|root| code.runtime_facts().statements().get(root.0 as usize))
+                .is_some_and(|root| {
+                    matches!(root.kind, crate::PackedStatementKind::Function { .. })
+                });
+            if (code.call_count() != 0 || owns_callable) && relocation.start_line == 0 {
                 return Err(KernelCheckedLinkError::new(format!(
-                    "kernel semantic definition {} has calls but no installed source-span relocation",
+                    "kernel semantic definition {} has source-bearing semantic rows but no installed source-span relocation",
                     owner.0,
                 )));
             }
@@ -4678,6 +5003,76 @@ impl KernelSemanticInputV1 {
 
     pub fn entity_counts(&self) -> KernelSemanticEntityCountsV1 {
         self.construction.entity_counts()
+    }
+
+    /// Iterate callable schemes in the exact dense order used by semantic
+    /// callable IDs. The iterator borrows one flat locator slab and allocates
+    /// nothing.
+    pub fn callables(&self) -> KernelCallableSchemeIter<'_> {
+        KernelCallableSchemeIter {
+            input: self,
+            schemes: self.construction.callable_schemes.iter(),
+        }
+    }
+
+    pub fn callable_count(&self) -> usize {
+        self.construction.callable_schemes.len()
+    }
+
+    pub fn callable_at(&self, index: usize) -> Option<KernelCallableSchemeRef<'_>> {
+        Some(self.callable_scheme_ref(*self.construction.callable_schemes.get(index)?))
+    }
+
+    pub fn callable(&self, declaration: DeclId) -> Option<KernelCallableSchemeRef<'_>> {
+        self.callable_at(self.callable_index(declaration)?)
+    }
+
+    pub fn callable_index(&self, declaration: DeclId) -> Option<usize> {
+        self.construction.callable_index(declaration)
+    }
+
+    /// Resolve a final checked declaration without allocating a rich row.
+    pub fn declaration(
+        &self,
+        declaration: DeclId,
+    ) -> Option<KernelSemanticResolvedDeclarationRef<'_>> {
+        if declaration.0 == 0 {
+            return None;
+        }
+        if let Some((owner, ordinal)) = self.construction.local_declaration(declaration) {
+            return self
+                .definition_rows(owner)?
+                .declaration(ordinal as usize)
+                .map(KernelSemanticResolvedDeclarationRef::Definition);
+        }
+
+        // All ABI declarations follow the definition-owned declaration ranges.
+        // The last callable declaration not after this ID is therefore the only
+        // ABI scheme that can own it or its contiguous parameter range.
+        let end = self
+            .construction
+            .callable_schemes
+            .partition_point(|target| {
+                self.construction
+                    .callable_declaration(*target)
+                    .is_some_and(|candidate| candidate <= declaration)
+            });
+        let target = *self
+            .construction
+            .callable_schemes
+            .get(end.checked_sub(1)?)?;
+        let crate::KernelCallableSchemeId::Abi(abi) = target else {
+            return None;
+        };
+        let callable = self.callable_scheme_ref(target);
+        let relocation = self.construction.abi_relocation(abi)?;
+        if declaration == relocation.callable {
+            return Some(KernelSemanticResolvedDeclarationRef::AbiCallable(callable));
+        }
+        let local = declaration.0.checked_sub(relocation.parameters.start)?;
+        (local < relocation.parameters.len).then_some(
+            KernelSemanticResolvedDeclarationRef::AbiParameter(callable.parameter(local as usize)?),
+        )
     }
 
     /// Resolve one final checked scope directly into its definition-local
@@ -5281,6 +5676,71 @@ impl<'a> KernelPackedTypeRef<'a> {
     fn with_term(self, term: crate::TypeTermId) -> Self {
         Self { term, ..self }
     }
+
+    /// Test whether this packed term contains one target-qualified callable
+    /// parameter. The walk follows the immutable hash-consed DAG directly and
+    /// allocates neither a rich recursive `Type` nor a visited collection.
+    pub fn contains_parameter(self, parameter: KernelCallableTypeParameterRef<'a>) -> bool {
+        if !std::ptr::eq(self.input, parameter.scheme.input)
+            || self.scope != parameter.scheme.type_scope()
+        {
+            return false;
+        }
+        let variable = parameter.source_variable();
+        fn contains(
+            arena: &crate::TypeTermArena,
+            term: crate::TypeTermId,
+            variable: crate::TypeVariableId,
+        ) -> bool {
+            match arena.term(term) {
+                crate::TypeTerm::Variable(candidate) => candidate == variable,
+                crate::TypeTerm::VariantSet(variants) => {
+                    variants.iter().any(|variant| match variant {
+                        crate::VariantTerm::Tag(_) => false,
+                        crate::VariantTerm::Tagged { fields, .. } => {
+                            contains(arena, *fields, variable)
+                        }
+                    })
+                }
+                crate::TypeTerm::Object { fields, .. } => fields
+                    .canonical_iter()
+                    .any(|field| contains(arena, field.ty, variable)),
+                crate::TypeTerm::List(item) | crate::TypeTerm::Set(item) => {
+                    contains(arena, item, variable)
+                }
+                crate::TypeTerm::Function { args, result, .. } => {
+                    args.iter()
+                        .copied()
+                        .any(|arg| contains(arena, arg, variable))
+                        || contains(arena, result, variable)
+                }
+                crate::TypeTerm::Union(members) => members
+                    .iter()
+                    .copied()
+                    .any(|member| contains(arena, member, variable)),
+                crate::TypeTerm::Map { key, value } => {
+                    contains(arena, key, variable) || contains(arena, value, variable)
+                }
+                crate::TypeTerm::Text
+                | crate::TypeTerm::Number
+                | crate::TypeTerm::Bytes(_)
+                | crate::TypeTerm::Absent
+                | crate::TypeTerm::OpenObjectPlaceholder
+                | crate::TypeTerm::RenderContract
+                | crate::TypeTerm::UnresolvedShape(_)
+                | crate::TypeTerm::Unknown
+                | crate::TypeTerm::Bits(_) => false,
+            }
+        }
+
+        let arena = self
+            .input
+            .construction
+            .definition_code
+            .type_store()
+            .as_arena();
+        contains(arena, self.term, variable)
+    }
 }
 
 impl KernelSemanticTypeMaterializer<'_> {
@@ -5471,9 +5931,72 @@ impl<'a> KernelPackedFlowRef<'a> {
     }
 }
 
+impl<'a> Iterator for KernelCallableSchemeIter<'a> {
+    type Item = KernelCallableSchemeRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.schemes
+            .next()
+            .copied()
+            .map(|target| self.input.callable_scheme_ref(target))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.schemes.size_hint()
+    }
+}
+
+impl ExactSizeIterator for KernelCallableSchemeIter<'_> {}
+
 impl<'a> KernelCallableSchemeRef<'a> {
     pub const fn identity(self) -> crate::KernelCallableSchemeId {
         self.target
+    }
+
+    fn user_definition(self) -> Option<KernelSemanticDefinitionRowsRef<'a>> {
+        let crate::KernelCallableSchemeId::User(owner) = self.target else {
+            return None;
+        };
+        self.input.definition_rows(owner)
+    }
+
+    fn abi_scheme(self) -> Option<crate::definition_code::PackedAbiCallableSchemeRef<'a>> {
+        let crate::KernelCallableSchemeId::Abi(callable) = self.target else {
+            return None;
+        };
+        self.input
+            .construction
+            .definition_code
+            .abi_callable_scheme(callable)
+    }
+
+    fn user_root_statement(
+        self,
+    ) -> Option<(
+        KernelSemanticDefinitionRowsRef<'a>,
+        crate::KernelStatementId,
+    )> {
+        let definition = self.user_definition()?;
+        let root = definition.definition().linkage().root_statement?;
+        let row = definition
+            .definition()
+            .runtime_facts()
+            .statements()
+            .get(root.0 as usize)?;
+        matches!(row.kind, crate::PackedStatementKind::Function { .. })
+            .then_some((definition, root))
+    }
+
+    fn user_parameter_rows(self) -> Option<&'a [crate::PackedStatementParameter]> {
+        let (definition, root) = self.user_root_statement()?;
+        let facts = definition.definition().runtime_facts();
+        facts.statement_parameters(facts.statements().get(root.0 as usize)?)
+    }
+
+    pub fn index(self) -> usize {
+        self.input
+            .callable_index(self.declaration())
+            .expect("sealed callable scheme remains in its ordered locator slab")
     }
 
     pub fn declaration(self) -> DeclId {
@@ -5495,7 +6018,288 @@ impl<'a> KernelCallableSchemeRef<'a> {
         }
     }
 
-    fn scope(self) -> KernelPackedTypeScope {
+    pub fn scope(self) -> LexicalScopeId {
+        match self.target {
+            crate::KernelCallableSchemeId::User(_) => self
+                .user_definition()
+                .expect("sealed user callable definition exists")
+                .authority_root_scope(),
+            crate::KernelCallableSchemeId::Abi(_) => LexicalScopeId(0),
+        }
+    }
+
+    pub fn kind(self) -> CheckedCallableKind {
+        match self.target {
+            crate::KernelCallableSchemeId::User(_) => CheckedCallableKind::User,
+            crate::KernelCallableSchemeId::Abi(_) => match self
+                .abi_scheme()
+                .expect("sealed ABI callable scheme exists")
+                .kind()
+            {
+                crate::KernelCallableKind::User => {
+                    unreachable!("immutable ABI cannot contain a user callable")
+                }
+                crate::KernelCallableKind::Builtin => CheckedCallableKind::Builtin,
+                crate::KernelCallableKind::External => CheckedCallableKind::External,
+            },
+        }
+    }
+
+    pub fn name(self) -> &'a str {
+        match self.target {
+            crate::KernelCallableSchemeId::User(_) => {
+                let (definition, root) = self
+                    .user_root_statement()
+                    .expect("sealed user callable has a function root");
+                let row = definition
+                    .definition()
+                    .runtime_facts()
+                    .statements()
+                    .get(root.0 as usize)
+                    .expect("sealed callable root statement exists");
+                let crate::PackedStatementKind::Function { name, .. } = row.kind else {
+                    unreachable!("validated user callable root is a function")
+                };
+                definition.symbol(name)
+            }
+            crate::KernelCallableSchemeId::Abi(_) => self
+                .abi_scheme()
+                .expect("sealed ABI callable scheme exists")
+                .name(),
+        }
+    }
+
+    pub fn intrinsic(self) -> Option<boon_checked::CheckedIntrinsicV1> {
+        self.abi_scheme().and_then(|scheme| scheme.intrinsic())
+    }
+
+    pub fn external_identity(self) -> Option<CheckedExternalDeclarationIdentityV1> {
+        self.abi_scheme()
+            .and_then(|scheme| scheme.external_identity())
+    }
+
+    pub fn parameter_count(self) -> usize {
+        match self.target {
+            crate::KernelCallableSchemeId::User(_) => self
+                .user_parameter_rows()
+                .expect("sealed user callable has parameters")
+                .len(),
+            crate::KernelCallableSchemeId::Abi(_) => self
+                .abi_scheme()
+                .expect("sealed ABI callable scheme exists")
+                .parameters()
+                .len(),
+        }
+    }
+
+    pub fn parameters(self) -> KernelSemanticCallableParameterIter<'a> {
+        KernelSemanticCallableParameterIter {
+            callable: self,
+            next: 0,
+            len: u32::try_from(self.parameter_count())
+                .expect("sealed callable parameter count fits u32"),
+        }
+    }
+
+    pub fn parameter(self, ordinal: usize) -> Option<KernelSemanticCallableParameterRef<'a>> {
+        let ordinal = u32::try_from(ordinal).ok()?;
+        if ordinal as usize >= self.parameter_count() {
+            return None;
+        }
+        let declaration = match self.target {
+            crate::KernelCallableSchemeId::User(owner) => {
+                let parameter = self.user_parameter_rows()?.get(ordinal as usize)?;
+                if parameter.ordinal != ordinal {
+                    return None;
+                }
+                self.input.construction.relocate_declaration(
+                    owner,
+                    KernelDeclarationReference::Local(parameter.declaration),
+                )?
+            }
+            crate::KernelCallableSchemeId::Abi(callable) => DeclId(
+                self.input
+                    .construction
+                    .abi_relocation(callable)?
+                    .parameters
+                    .resolve(ordinal, "semantic ABI parameter")
+                    .ok()?,
+            ),
+        };
+        Some(KernelSemanticCallableParameterRef {
+            callable: self,
+            ordinal,
+            declaration,
+        })
+    }
+
+    pub fn context_count(self) -> usize {
+        self.abi_scheme()
+            .map_or(0, |scheme| scheme.contexts().len())
+    }
+
+    pub fn contexts(self) -> KernelSemanticCallableContextIter<'a> {
+        KernelSemanticCallableContextIter {
+            callable: self,
+            next: 0,
+            len: u32::try_from(self.context_count())
+                .expect("sealed callable context count fits u32"),
+        }
+    }
+
+    pub fn context(self, ordinal: usize) -> Option<KernelSemanticCallableContextRef<'a>> {
+        (ordinal < self.context_count()).then_some(KernelSemanticCallableContextRef {
+            callable: self,
+            ordinal: u32::try_from(ordinal).ok()?,
+        })
+    }
+
+    pub fn context_formal(self) -> Option<KernelSemanticContextFormalRef<'a>> {
+        let definition = self.user_definition()?;
+        let relocation = definition.relocation();
+        Some(KernelSemanticContextFormalRef {
+            callable: self,
+            id: relocation.context_formal?,
+            ordinal: relocation.context_formal_ordinal?,
+        })
+    }
+
+    pub fn requires_pass(self) -> bool {
+        self.context_formal().is_some()
+    }
+
+    pub fn role(self) -> ProgramRole {
+        self.abi_scheme()
+            .map_or(self.input.role(), |scheme| scheme.role())
+    }
+
+    pub fn effect(self) -> CheckedEffectSummary {
+        match self.target {
+            crate::KernelCallableSchemeId::User(_) => {
+                let effect = self
+                    .user_definition()
+                    .expect("sealed user callable definition exists")
+                    .definition()
+                    .code()
+                    .effect_summary();
+                CheckedEffectSummary {
+                    reads_state: effect.reads_state,
+                    writes_state: effect.writes_state,
+                    emits_source: effect.emits_source,
+                    invokes_host: effect.invokes_host,
+                }
+            }
+            crate::KernelCallableSchemeId::Abi(_) => self
+                .abi_scheme()
+                .expect("sealed ABI callable scheme exists")
+                .effect(),
+        }
+    }
+
+    pub fn body(self) -> Option<CheckedStatementId> {
+        self.user_definition()
+            .map(|definition| definition.root_statement())
+    }
+
+    pub fn result_expression(self) -> Option<CheckedExprId> {
+        self.user_definition()
+            .map(|definition| definition.result_expression())
+    }
+
+    pub fn contextual_operation(self) -> Option<CheckedContextualOperation> {
+        let operation = self.abi_scheme()?.contextual_operation()?;
+        let parameter = |ordinal: u32| {
+            self.parameter(ordinal as usize)
+                .map(|row| row.declaration())
+        };
+        Some(match operation {
+            crate::KernelAbiContextualOperation::Map { list, row, body } => {
+                CheckedContextualOperation::Map {
+                    list: parameter(list)?,
+                    row: parameter(row)?,
+                    body: parameter(body)?,
+                }
+            }
+            crate::KernelAbiContextualOperation::Filter {
+                list,
+                row,
+                predicate,
+            } => CheckedContextualOperation::Filter {
+                list: parameter(list)?,
+                row: parameter(row)?,
+                predicate: parameter(predicate)?,
+            },
+            crate::KernelAbiContextualOperation::Retain {
+                list,
+                row,
+                predicate,
+            } => CheckedContextualOperation::Retain {
+                list: parameter(list)?,
+                row: parameter(row)?,
+                predicate: parameter(predicate)?,
+            },
+            crate::KernelAbiContextualOperation::Remove {
+                list,
+                row,
+                predicate,
+            } => CheckedContextualOperation::Remove {
+                list: parameter(list)?,
+                row: parameter(row)?,
+                predicate: parameter(predicate)?,
+            },
+            crate::KernelAbiContextualOperation::Every {
+                list,
+                row,
+                predicate,
+            } => CheckedContextualOperation::Every {
+                list: parameter(list)?,
+                row: parameter(row)?,
+                predicate: parameter(predicate)?,
+            },
+            crate::KernelAbiContextualOperation::Any {
+                list,
+                row,
+                predicate,
+            } => CheckedContextualOperation::Any {
+                list: parameter(list)?,
+                row: parameter(row)?,
+                predicate: parameter(predicate)?,
+            },
+            crate::KernelAbiContextualOperation::Find {
+                list,
+                row,
+                predicate,
+            } => CheckedContextualOperation::Find {
+                list: parameter(list)?,
+                row: parameter(row)?,
+                predicate: parameter(predicate)?,
+            },
+            crate::KernelAbiContextualOperation::SortBy {
+                list,
+                row,
+                key,
+                direction,
+            } => CheckedContextualOperation::SortBy {
+                list: parameter(list)?,
+                row: parameter(row)?,
+                key: parameter(key)?,
+                direction: parameter(direction)?,
+            },
+            crate::KernelAbiContextualOperation::ThenBy {
+                list,
+                row,
+                key,
+                direction,
+            } => CheckedContextualOperation::ThenBy {
+                list: parameter(list)?,
+                row: parameter(row)?,
+                key: parameter(key)?,
+                direction: parameter(direction)?,
+            },
+        })
+    }
+
+    fn type_scope(self) -> KernelPackedTypeScope {
         match self.target {
             crate::KernelCallableSchemeId::User(owner) => KernelPackedTypeScope::Definition(owner),
             crate::KernelCallableSchemeId::Abi(callable) => KernelPackedTypeScope::Abi(callable),
@@ -5505,7 +6309,7 @@ impl<'a> KernelCallableSchemeRef<'a> {
     fn flow(self, flow: crate::PackedFlow) -> KernelPackedFlowRef<'a> {
         KernelPackedFlowRef {
             mode: flow.mode,
-            ty: self.input.packed_type_ref(self.scope(), flow.term),
+            ty: self.input.packed_type_ref(self.type_scope(), flow.term),
         }
     }
 
@@ -5605,6 +6409,341 @@ impl<'a> KernelCallableSchemeRef<'a> {
     }
 }
 
+impl<'a> Iterator for KernelSemanticCallableParameterIter<'a> {
+    type Item = KernelSemanticCallableParameterRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.len {
+            return None;
+        }
+        let ordinal = self.next;
+        self.next += 1;
+        self.callable.parameter(ordinal as usize)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len.saturating_sub(self.next) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for KernelSemanticCallableParameterIter<'_> {}
+
+impl<'a> KernelSemanticCallableParameterRef<'a> {
+    fn user_row(self) -> Option<&'a crate::PackedStatementParameter> {
+        self.callable
+            .user_parameter_rows()?
+            .get(self.ordinal as usize)
+            .filter(|row| row.ordinal == self.ordinal)
+    }
+
+    fn abi_row(self) -> Option<&'a crate::definition_code::PackedAbiParameter> {
+        self.callable
+            .abi_scheme()?
+            .parameters()
+            .get(self.ordinal as usize)
+            .filter(|row| row.ordinal == self.ordinal)
+    }
+
+    pub const fn callable(self) -> KernelCallableSchemeRef<'a> {
+        self.callable
+    }
+
+    pub const fn ordinal(self) -> usize {
+        self.ordinal as usize
+    }
+
+    pub const fn declaration(self) -> DeclId {
+        self.declaration
+    }
+
+    pub fn name(self) -> &'a str {
+        match self.callable.target {
+            crate::KernelCallableSchemeId::User(_) => {
+                let row = self
+                    .user_row()
+                    .expect("sealed user callable parameter row exists");
+                self.callable
+                    .user_definition()
+                    .expect("sealed user callable definition exists")
+                    .symbol(row.name)
+            }
+            crate::KernelCallableSchemeId::Abi(_) => {
+                let row = self
+                    .abi_row()
+                    .expect("sealed ABI callable parameter row exists");
+                self.callable
+                    .abi_scheme()
+                    .expect("sealed ABI callable scheme exists")
+                    .symbol(row.name)
+                    .expect("sealed ABI parameter name belongs to its text authority")
+            }
+        }
+    }
+
+    pub fn kind(self) -> CheckedParameterKind {
+        match self.callable.target {
+            crate::KernelCallableSchemeId::User(_) => match self
+                .user_row()
+                .expect("sealed user callable parameter row exists")
+                .kind
+            {
+                crate::KernelParameterKind::Value => CheckedParameterKind::Value,
+                crate::KernelParameterKind::Out => CheckedParameterKind::Out,
+            },
+            crate::KernelCallableSchemeId::Abi(_) => {
+                self.abi_row()
+                    .expect("sealed ABI callable parameter row exists")
+                    .kind
+            }
+        }
+    }
+
+    pub fn flow(self) -> KernelPackedFlowRef<'a> {
+        self.callable
+            .formal(self.ordinal as usize)
+            .expect("sealed callable parameter has a packed formal flow")
+    }
+
+    pub fn requirement(self) -> KernelSemanticParameterRequirementRef<'a> {
+        let Some(row) = self.abi_row() else {
+            return KernelSemanticParameterRequirementRef::Required;
+        };
+        let scheme = self
+            .callable
+            .abi_scheme()
+            .expect("ABI parameter always has its scheme");
+        match row.requirement {
+            crate::PackedAbiParameterRequirement::Required => {
+                KernelSemanticParameterRequirementRef::Required
+            }
+            crate::PackedAbiParameterRequirement::CallableProfile(symbol) => {
+                KernelSemanticParameterRequirementRef::CallableProfile(
+                    scheme
+                        .symbol(symbol)
+                        .expect("sealed ABI profile belongs to its text authority"),
+                )
+            }
+            crate::PackedAbiParameterRequirement::Tag(symbol) => {
+                KernelSemanticParameterRequirementRef::Tag(
+                    scheme
+                        .symbol(symbol)
+                        .expect("sealed ABI tag belongs to its text authority"),
+                )
+            }
+            crate::PackedAbiParameterRequirement::ExactInteger(value) => {
+                KernelSemanticParameterRequirementRef::ExactInteger(value)
+            }
+            crate::PackedAbiParameterRequirement::Text(span) => {
+                KernelSemanticParameterRequirementRef::Text(
+                    scheme
+                        .default_text(span)
+                        .expect("sealed ABI default-text span is valid UTF-8"),
+                )
+            }
+        }
+    }
+
+    pub fn evaluation_scope(self) -> CheckedEvaluationScope {
+        let scope = match self.callable.target {
+            crate::KernelCallableSchemeId::User(_) => {
+                self.user_row()
+                    .expect("sealed user callable parameter row exists")
+                    .evaluation_scope
+            }
+            crate::KernelCallableSchemeId::Abi(_) => {
+                self.abi_row()
+                    .expect("sealed ABI callable parameter row exists")
+                    .evaluation_scope
+            }
+        };
+        match scope {
+            crate::KernelParameterEvaluationScope::Parent => CheckedEvaluationScope::Parent,
+            crate::KernelParameterEvaluationScope::Output { parameter_ordinal } => {
+                let output = self
+                    .callable
+                    .parameter(parameter_ordinal as usize)
+                    .expect("sealed callable evaluation scope targets a parameter");
+                assert_eq!(
+                    output.kind(),
+                    CheckedParameterKind::Out,
+                    "sealed callable evaluation scope targets an OUT parameter",
+                );
+                CheckedEvaluationScope::Output {
+                    formal: output.declaration(),
+                }
+            }
+        }
+    }
+
+    pub fn span(self) -> CheckedSpan {
+        match self.callable.target {
+            crate::KernelCallableSchemeId::User(_) => self
+                .callable
+                .input
+                .declaration(self.declaration)
+                .and_then(KernelSemanticResolvedDeclarationRef::span)
+                .expect("sealed user callable parameter span is rebased"),
+            crate::KernelCallableSchemeId::Abi(_) => CheckedSpan::default(),
+        }
+    }
+
+    pub fn start(self) -> usize {
+        self.span().start
+    }
+
+    pub fn end(self) -> usize {
+        self.span().end
+    }
+}
+
+impl KernelSemanticParameterRequirementRef<'_> {
+    pub const fn is_required(self) -> bool {
+        matches!(self, Self::Required)
+    }
+
+    pub const fn is_optional(self) -> bool {
+        !self.is_required()
+    }
+}
+
+impl<'a> Iterator for KernelSemanticCallableContextIter<'a> {
+    type Item = KernelSemanticCallableContextRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next >= self.len {
+            return None;
+        }
+        let ordinal = self.next;
+        self.next += 1;
+        Some(KernelSemanticCallableContextRef {
+            callable: self.callable,
+            ordinal,
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len.saturating_sub(self.next) as usize;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for KernelSemanticCallableContextIter<'_> {}
+
+impl<'a> KernelSemanticCallableContextRef<'a> {
+    fn row(self) -> &'a crate::definition_code::PackedAbiContext {
+        self.callable
+            .abi_scheme()
+            .expect("callable contexts belong to ABI schemes")
+            .contexts()
+            .get(self.ordinal as usize)
+            .expect("sealed ABI context ordinal is valid")
+    }
+
+    pub fn name(self) -> &'a str {
+        let row = self.row();
+        self.callable
+            .abi_scheme()
+            .expect("callable contexts belong to ABI schemes")
+            .symbol(row.name)
+            .expect("sealed ABI context name belongs to its text authority")
+    }
+
+    pub fn kind(self) -> boon_checked::CheckedCallContextKind {
+        self.row().kind
+    }
+
+    pub fn provider(self) -> DeclId {
+        self.callable
+            .parameter(self.row().provider_parameter_ordinal as usize)
+            .expect("sealed ABI context provider parameter exists")
+            .declaration()
+    }
+
+    pub fn flow(self) -> KernelPackedFlowRef<'a> {
+        self.callable.flow(self.row().flow)
+    }
+}
+
+impl<'a> KernelSemanticContextFormalRef<'a> {
+    pub const fn id(self) -> ContextFormalId {
+        self.id
+    }
+
+    pub fn callable(self) -> DeclId {
+        self.callable.declaration()
+    }
+
+    pub fn flow(self) -> KernelPackedFlowRef<'a> {
+        self.callable
+            .formal(self.ordinal as usize)
+            .expect("sealed PASSED context formal has a packed flow")
+    }
+}
+
+impl<'a> KernelSemanticResolvedDeclarationRef<'a> {
+    pub fn id(self) -> DeclId {
+        match self {
+            Self::Definition(row) => row.id(),
+            Self::AbiCallable(row) => row.declaration(),
+            Self::AbiParameter(row) => row.declaration(),
+        }
+    }
+
+    pub fn scope(self) -> LexicalScopeId {
+        match self {
+            Self::Definition(row) => row.scope(),
+            Self::AbiCallable(_) | Self::AbiParameter(_) => LexicalScopeId(0),
+        }
+    }
+
+    pub fn name(self) -> &'a str {
+        match self {
+            Self::Definition(row) => row.name(),
+            Self::AbiCallable(row) => row.name(),
+            Self::AbiParameter(row) => row.name(),
+        }
+    }
+
+    pub fn kind(self) -> CheckedDeclarationKind {
+        match self {
+            Self::Definition(row) => row.kind(),
+            Self::AbiCallable(row) => match row.kind() {
+                CheckedCallableKind::Builtin => CheckedDeclarationKind::Builtin,
+                CheckedCallableKind::External => CheckedDeclarationKind::External,
+                CheckedCallableKind::User => {
+                    unreachable!("definition-owned user declarations use the definition variant")
+                }
+            },
+            Self::AbiParameter(row) => match row.kind() {
+                CheckedParameterKind::Value => CheckedDeclarationKind::ValueParameter,
+                CheckedParameterKind::Out => CheckedDeclarationKind::OutParameter,
+            },
+        }
+    }
+
+    pub fn value(self) -> Option<CheckedExprId> {
+        match self {
+            Self::Definition(row) => row.value(),
+            Self::AbiCallable(_) | Self::AbiParameter(_) => None,
+        }
+    }
+
+    pub fn body_scope(self) -> Option<LexicalScopeId> {
+        match self {
+            Self::Definition(row) => row.body_scope(),
+            Self::AbiCallable(_) | Self::AbiParameter(_) => None,
+        }
+    }
+
+    pub fn span(self) -> Option<CheckedSpan> {
+        match self {
+            Self::Definition(row) => row.span(),
+            Self::AbiCallable(_) | Self::AbiParameter(_) => Some(CheckedSpan::default()),
+        }
+    }
+}
+
 impl<'a> KernelCallableTypeParameterRef<'a> {
     pub const fn scheme(self) -> KernelCallableSchemeRef<'a> {
         self.scheme
@@ -5612,6 +6751,31 @@ impl<'a> KernelCallableTypeParameterRef<'a> {
 
     pub const fn ordinal(self) -> crate::KernelTypeParameterId {
         self.ordinal
+    }
+
+    fn source_variable(self) -> crate::TypeVariableId {
+        match self.scheme.target {
+            crate::KernelCallableSchemeId::User(owner) => {
+                self.scheme
+                    .input
+                    .construction
+                    .definition_code
+                    .definition(owner)
+                    .expect("sealed callable parameter owner exists")
+                    .callable_type_parameters()[self.ordinal.0 as usize]
+                    .source
+            }
+            crate::KernelCallableSchemeId::Abi(callable) => {
+                self.scheme
+                    .input
+                    .construction
+                    .definition_code
+                    .abi_callable_scheme(callable)
+                    .expect("sealed ABI callable parameter scheme exists")
+                    .type_parameters()[self.ordinal.0 as usize]
+                    .source
+            }
+        }
     }
 
     /// Alpha coordinate inside this callable's own linked type-variable

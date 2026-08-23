@@ -116,7 +116,7 @@ impl VerifiedSemanticIntentV1 {
             if owner_callable.is_none()
                 && statement.declaration().is_some_and(|declaration| {
                     calls.declaration(declaration).is_some_and(|declaration| {
-                        matches!(declaration.name.as_str(), "document" | "scene")
+                        matches!(declaration.name(), "document" | "scene")
                     })
                 })
             {
@@ -194,7 +194,7 @@ impl VerifiedSemanticIntentV1 {
         for call in calls.calls() {
             if calls
                 .callable(call.callable())
-                .is_some_and(|callable| callable.kind == CheckedCallableKind::External)
+                .is_some_and(|callable| callable.kind() == CheckedCallableKind::External)
             {
                 roots.push(VerifiedIntentRootV1 {
                     kind: VerifiedIntentRootKindV1::ExternalCall,
@@ -212,7 +212,7 @@ impl VerifiedSemanticIntentV1 {
                     producer.callable.0
                 )
             })?;
-            let expression = callable.result_expression.ok_or_else(|| {
+            let expression = callable.result_expression().ok_or_else(|| {
                 format!(
                     "verified producer intent callable {} has no result expression",
                     producer.callable.0
@@ -223,7 +223,7 @@ impl VerifiedSemanticIntentV1 {
                 expression,
                 owner_callable: Some(producer.callable),
                 declaration: Some(producer.result_declaration),
-                statement: callable.body,
+                statement: callable.body(),
             });
         }
 
@@ -320,7 +320,7 @@ fn packed_output_root_statements<'a>(
             && statement.declaration().is_some_and(|declaration| {
                 calls
                     .declaration(declaration)
-                    .is_some_and(|declaration| declaration.name == "outputs")
+                    .is_some_and(|declaration| declaration.name() == "outputs")
             })
     });
     let Some(container) = container else {
@@ -352,7 +352,7 @@ fn packed_output_root_statements<'a>(
         let duplicate = roots.iter().copied().any(|root: StatementRef<'a>| {
             root.declaration()
                 .and_then(|declaration| calls.declaration(declaration))
-                .is_some_and(|previous| previous.name == declaration.name)
+                .is_some_and(|previous| previous.name() == declaration.name())
         });
         if duplicate {
             continue;

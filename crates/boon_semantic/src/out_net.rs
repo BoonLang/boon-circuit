@@ -795,7 +795,7 @@ impl OutNet<()> {
         Self::build_with(
             program,
             producer_roots,
-            |_, _, _, _, _| (),
+            |_, _, _, _, _, _| (),
             |_, kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
         )
     }
@@ -815,6 +815,7 @@ impl<Contract> OutNet<Contract> {
     where
         MakeContract: FnMut(
             &CallCatalog<'program>,
+            &CallTypeCatalog,
             CallRef<'program>,
             usize,
             CallEntryRef<'program>,
@@ -849,6 +850,7 @@ impl<Contract> OutNet<Contract> {
     where
         MakeContract: FnMut(
             &CallCatalog<'program>,
+            &CallTypeCatalog,
             CallRef<'program>,
             usize,
             CallEntryRef<'program>,
@@ -897,6 +899,7 @@ impl<Contract> OutNet<Contract> {
     where
         MakeContract: FnMut(
             &CallCatalog<'program>,
+            &CallTypeCatalog,
             CallRef<'program>,
             usize,
             CallEntryRef<'program>,
@@ -936,6 +939,7 @@ impl<Contract> OutNet<Contract> {
     where
         MakeContract: FnMut(
             &CallCatalog<'program>,
+            &CallTypeCatalog,
             CallRef<'program>,
             usize,
             CallEntryRef<'program>,
@@ -986,6 +990,7 @@ impl<Contract> OutNet<Contract> {
     where
         MakeContract: FnMut(
             &CallCatalog<'program>,
+            &CallTypeCatalog,
             CallRef<'program>,
             usize,
             CallEntryRef<'program>,
@@ -1229,6 +1234,7 @@ impl<'catalog, 'program, Contract, MakeContract, IsProducer>
 where
     MakeContract: FnMut(
         &CallCatalog<'program>,
+        &CallTypeCatalog,
         CallRef<'program>,
         usize,
         CallEntryRef<'program>,
@@ -1307,8 +1313,8 @@ where
             if !template.has_expected_schema()
                 || template.nodes().last().map(|node| node.expression()) != Some(template.result())
                 || calls.callable(callable).is_none_or(|callable| {
-                    callable.kind != CheckedCallableKind::User
-                        || callable.result_expression != Some(template.result())
+                    callable.kind() != CheckedCallableKind::User
+                        || callable.result_expression() != Some(template.result())
                 })
             {
                 diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
@@ -1375,12 +1381,14 @@ where
                 }
             }
         }
-        for callable in program.callables.iter().filter(|callable| {
-            callable.kind == CheckedCallableKind::User && callable.result_expression.is_some()
+        for callable in calls.callables().filter(|callable| {
+            callable.kind() == CheckedCallableKind::User && callable.result_expression().is_some()
         }) {
-            if definition_execution_template(program, kernel_input, callable.decl_id).is_none() {
+            if definition_execution_template(program, kernel_input, callable.declaration())
+                .is_none()
+            {
                 diagnostics.push(OutNetDiagnostic::InvalidDefinitionTemplate {
-                    callable: callable.decl_id,
+                    callable: callable.declaration(),
                     reason: "missing user definition template".to_owned(),
                 });
             }
@@ -1442,7 +1450,10 @@ where
         let Some(signature) = self.calls.callable(spec.callable) else {
             return;
         };
-        let Some(result_expression) = signature.result_expression else {
+        let Some(result_expression) = signature.result_expression() else {
+            return;
+        };
+        let Some(signature_types) = self.call_types.callable(self.calls, spec.callable) else {
             return;
         };
         let call = OutCallInstanceId(self.call_instances.len());
@@ -1475,17 +1486,17 @@ where
             local_type_substitutions: Vec::new(),
             resolved_type_substitutions: Vec::new(),
             type_substitution_count: 0,
-            result: signature.result.clone(),
+            result: signature_types.result.clone(),
             result_is_exact_occurrence: false,
             owner: None,
         });
         self.producer_identity_by_call.insert(call, spec.identity);
         self.producer_roots.push(ProducerRoot { spec, call });
         self.instantiate_frame(
-            Some(signature.decl_id),
+            Some(signature.declaration()),
             Some(call),
             BTreeMap::new(),
-            &mut vec![signature.decl_id],
+            &mut vec![signature.declaration()],
         );
     }
 
@@ -1497,9 +1508,8 @@ where
         let conservative = owner_callable.is_some_and(|owner| {
             self.resource_owning_callables.contains(&owner)
                 || self.calls.callable(owner).is_some_and(|callable| {
-                    callable.effect.writes_state
-                        || callable.effect.emits_source
-                        || callable.effect.invokes_host
+                    let effect = callable.effect();
+                    effect.writes_state || effect.emits_source || effect.invokes_host
                 })
         });
         let all_call_count = match owner_callable {
@@ -1530,7 +1540,7 @@ where
             |owner| {
                 self.calls
                     .callable(owner)
-                    .and_then(|callable| callable.result_expression)
+                    .and_then(|callable| callable.result_expression())
                     .into_iter()
                     .collect()
             },
@@ -1583,15 +1593,15 @@ where
             match &expression.kind {
                 CheckedExpressionKind::Read { target, .. } => {
                     if let Some(declaration) = self.calls.declaration(*target)
-                        && declaration.kind == CheckedDeclarationKind::Field
+                        && declaration.kind() == CheckedDeclarationKind::Field
                         && self
                             .function_owner_by_scope
-                            .get(declaration.scope_id.0 as usize)
+                            .get(declaration.scope().0 as usize)
                             .copied()
                             .flatten()
                             == owner_callable
                     {
-                        pending.extend(declaration.value);
+                        pending.extend(declaration.value());
                     }
                 }
                 CheckedExpressionKind::Call { call } => {
@@ -1742,17 +1752,17 @@ where
         let Some(callable) = self.calls.callable(call.callable()) else {
             return true;
         };
-        match callable.kind {
+        match callable.kind() {
             CheckedCallableKind::User => {
-                !self.retained_definitions.contains(&callable.decl_id)
+                !self.retained_definitions.contains(&callable.declaration())
                     || self
                         .retained_overlay_definitions
-                        .contains(&callable.decl_id)
+                        .contains(&callable.declaration())
             }
             CheckedCallableKind::Builtin | CheckedCallableKind::External => {
-                callable.effect != boon_checked::CheckedEffectSummary::default()
-                    || !callable.contexts.is_empty()
-                    || callable.context_formal.is_some()
+                callable.effect() != boon_checked::CheckedEffectSummary::default()
+                    || callable.context_count() != 0
+                    || callable.context_formal_id().is_some()
             }
         }
     }
@@ -1766,7 +1776,7 @@ where
         let mut pending = self
             .calls
             .callable(callable)
-            .and_then(|signature| signature.result_expression)
+            .and_then(|signature| signature.result_expression())
             .into_iter()
             .collect::<Vec<_>>();
         let mut visited = BTreeSet::new();
@@ -1818,7 +1828,7 @@ where
                     pending.extend(
                         self.calls
                             .declaration(*target)
-                            .and_then(|declaration| declaration.value),
+                            .and_then(|declaration| declaration.value()),
                     );
                 }
                 CheckedExpressionKind::Draining { input }
@@ -1931,7 +1941,7 @@ where
             CheckedExpressionKind::Read { target, .. } => {
                 self.calls.declaration(*target).is_some_and(|declaration| {
                     matches!(
-                        declaration.kind,
+                        declaration.kind(),
                         CheckedDeclarationKind::FreshOut | CheckedDeclarationKind::OutParameter
                     )
                 })
@@ -1988,14 +1998,14 @@ where
                     );
                 }
                 if let Some(declaration) = self.calls.declaration(*target)
-                    && declaration.kind == CheckedDeclarationKind::Field
+                    && declaration.kind() == CheckedDeclarationKind::Field
                     && self
                         .function_owner_by_scope
-                        .get(declaration.scope_id.0 as usize)
+                        .get(declaration.scope().0 as usize)
                         .copied()
                         .flatten()
                         .is_some()
-                    && let Some(value) = declaration.value
+                    && let Some(value) = declaration.value()
                 {
                     return self.static_checked_selector_value(value, frame, fields, visited);
                 }
@@ -2107,7 +2117,7 @@ where
                 parent.and_then(|parent| self.call_instances[parent.as_usize()].passed);
             let passed = match checked_call.context_binding() {
                 CheckedContextBinding::Explicit { value, .. } => signature.and_then(|signature| {
-                    signature.context_formal.map(|formal| PassedBinding {
+                    signature.context_formal_id().map(|formal| PassedBinding {
                         formal,
                         value: ScopedCheckedExpr {
                             expression: value,
@@ -2120,7 +2130,7 @@ where
                 }),
                 CheckedContextBinding::Inherited { .. } => {
                     let passed = signature
-                        .and_then(|signature| signature.context_formal)
+                        .and_then(|signature| signature.context_formal_id())
                         .zip(inherited_passed)
                         .map(|(formal, inherited)| PassedBinding {
                             formal,
@@ -2186,7 +2196,11 @@ where
                 .map_or(0, |parent| parent.type_substitution_count)
                 .saturating_add(local_type_substitutions.len());
             let result_scheme = signature
-                .map(|signature| &signature.result)
+                .and_then(|signature| {
+                    call_types
+                        .callable(calls, signature.declaration())
+                        .map(|facts| &facts.result)
+                })
                 .unwrap_or(checked_call_result);
             let local_result =
                 apply_checked_type_substitutions_once(&result_scheme.ty, local_type_substitutions);
@@ -2240,10 +2254,10 @@ where
                     })
                 })
                 .filter(|(owner, parent, _, parent_is_exact)| {
-                    owner.result_expression == Some(checked_call.expression())
+                    owner.result_expression() == Some(checked_call.expression())
                         || (*parent_is_exact
                             && self.call_is_callable_result_output(
-                                owner.decl_id,
+                                owner.declaration(),
                                 checked_call.expression(),
                                 Some(*parent),
                             ))
@@ -2292,7 +2306,7 @@ where
                 owner: None,
             });
 
-            let kind = signature.map(|signature| signature.kind);
+            let kind = signature.map(|signature| signature.kind());
             if kind.is_none() {
                 self.diagnostics.push(OutNetDiagnostic::MissingCallable {
                     call: instance,
@@ -2309,8 +2323,8 @@ where
                         output,
                         scope,
                     } => (
-                        parameter.decl_id,
-                        parameter.name.clone(),
+                        parameter.declaration(),
+                        parameter.name().to_owned(),
                         OutPortBinding::Fresh {
                             output,
                             scope_id: scope,
@@ -2319,13 +2333,14 @@ where
                     CallEntryRef::ForwardOut {
                         parameter, target, ..
                     } => (
-                        parameter.decl_id,
-                        parameter.name.clone(),
+                        parameter.declaration(),
+                        parameter.name().to_owned(),
                         OutPortBinding::Forward { target },
                     ),
                 };
                 let contract = (self.make_contract)(
                     calls,
+                    call_types,
                     checked_call,
                     entry_ordinal,
                     entry,
@@ -2407,7 +2422,7 @@ where
                         .find(|port_id| self.ports[port_id.as_usize()].formal == formal),
                     };
                     Some(OutInputBinding {
-                        formal: parameter.decl_id,
+                        formal: parameter.declaration(),
                         value: OutInputValue::Checked(ScopedCheckedExpr {
                             expression: value,
                             frame: parent,
@@ -3032,10 +3047,10 @@ fn resource_owning_callables(
                 .get(call)
                 .and_then(|call| calls.callable(call.callable()))
                 .is_some_and(|callable| {
-                    callable.kind != CheckedCallableKind::User
-                        && (callable.effect.writes_state
-                            || callable.effect.emits_source
-                            || callable.effect.invokes_host)
+                    callable.kind() != CheckedCallableKind::User && {
+                        let effect = callable.effect();
+                        effect.writes_state || effect.emits_source || effect.invokes_host
+                    }
                 }),
             _ => false,
         };
@@ -3088,21 +3103,21 @@ fn retained_overlay_definitions(
             || calls
                 .entries(call)
                 .any(|entry| !matches!(entry, CallEntryRef::Input { .. }))
-            || match target.kind {
-                CheckedCallableKind::User => !retained.contains(&target.decl_id),
+            || match target.kind() {
+                CheckedCallableKind::User => !retained.contains(&target.declaration()),
                 CheckedCallableKind::Builtin | CheckedCallableKind::External => {
-                    target.effect != boon_checked::CheckedEffectSummary::default()
-                        || !target.contexts.is_empty()
-                        || target.context_formal.is_some()
+                    target.effect() != boon_checked::CheckedEffectSummary::default()
+                        || target.context_count() != 0
+                        || target.context_formal_id().is_some()
                 }
             };
         if direct_overlay {
             required.insert(owner);
-        } else if target.kind == CheckedCallableKind::User {
+        } else if target.kind() == CheckedCallableKind::User {
             retained_dependencies
                 .entry(owner)
                 .or_default()
-                .insert(target.decl_id);
+                .insert(target.declaration());
         }
     }
 
@@ -3132,7 +3147,11 @@ fn alias_cycle_diagnostics(calls: &CallCatalog<'_>) -> Vec<OutNetDiagnostic> {
             calls.entries(call).filter_map(move |entry| match entry {
                 CallEntryRef::ForwardOut {
                     parameter, target, ..
-                } => Some((target, parameter.decl_id, OutCallProvenance::from(call))),
+                } => Some((
+                    target,
+                    parameter.declaration(),
+                    OutCallProvenance::from(call),
+                )),
                 _ => None,
             })
         })
@@ -3252,7 +3271,7 @@ mod tests {
             program,
             Vec::new(),
             &retained,
-            |_, _, _, _, _| (),
+            |_, _, _, _, _, _| (),
             |_, kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
         )
     }

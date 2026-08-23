@@ -5,21 +5,34 @@
 //! neither representation is copied into another checked-call DTO here.
 
 use boon_checked::{
-    CheckedCall, CheckedCallContext, CheckedCallEntry, CheckedCallId, CheckedCallableSignature,
-    CheckedContextBinding, CheckedContextTypeSubstitution, CheckedDeclaration,
-    CheckedEvaluationScope, CheckedExprId, CheckedParameter, CheckedParameterKind,
-    CheckedProgramFields, CheckedSpan, ContextFormalId, DeclId, FlowMode, FlowType, LexicalScopeId,
-    Type, TypeVar, Variant,
+    CheckedCall, CheckedCallContext, CheckedCallContextKind, CheckedCallEntry, CheckedCallId,
+    CheckedCallableKind, CheckedCallableSignature, CheckedContextBinding,
+    CheckedContextTypeSubstitution, CheckedContextualOperation, CheckedDeclaration,
+    CheckedDeclarationKind, CheckedEffectSummary, CheckedEvaluationScope, CheckedExprId,
+    CheckedExternalDeclarationIdentityV1, CheckedIntrinsicV1, CheckedParameter,
+    CheckedParameterDefault, CheckedParameterKind, CheckedParameterRequirement,
+    CheckedProgramFields, CheckedSpan, CheckedStatementId, ContextFormalId, DeclId, FlowMode,
+    FlowType, LexicalScopeId, ProgramRole, Type, TypeVar,
 };
 use boon_compiler_kernel::{
-    KernelPackedFlowRef, KernelPackedTypeRef, KernelSemanticCallContextRef,
-    KernelSemanticCallEntryRef, KernelSemanticCallRef, KernelSemanticInputV1,
+    KernelCallableSchemeRef, KernelPackedFlowRef, KernelPackedTypeRef,
+    KernelSemanticCallContextRef, KernelSemanticCallEntryRef, KernelSemanticCallRef,
+    KernelSemanticCallableContextIter, KernelSemanticCallableContextRef,
+    KernelSemanticCallableParameterIter, KernelSemanticCallableParameterRef, KernelSemanticInputV1,
+    KernelSemanticParameterRequirementRef, KernelSemanticResolvedDeclarationRef,
     KernelSemanticTypeMaterializer,
 };
 
-#[derive(Clone, Copy)]
-enum CallSource<'a> {
-    Rich(&'a [CheckedCall]),
+#[cfg(any(test, feature = "test-packed-call-oracle"))]
+use boon_compiler_kernel::KernelSemanticContextFormalRef;
+
+enum CallCatalogSource<'a> {
+    Rich {
+        program: &'a CheckedProgramFields,
+        call_by_id: Box<[Option<usize>]>,
+        callable_by_declaration: Box<[Option<usize>]>,
+        declaration_by_id: Box<[Option<usize>]>,
+    },
     Packed(&'a KernelSemanticInputV1),
 }
 
@@ -32,21 +45,68 @@ pub(crate) enum CallRef<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum CallEntryRef<'a> {
     Input {
-        parameter: &'a CheckedParameter,
+        parameter: CallableParameterRef<'a>,
         value: CheckedExprId,
         from_pipe: bool,
         evaluation_scope: CheckedEvaluationScope,
     },
     FreshOut {
-        parameter: &'a CheckedParameter,
+        parameter: CallableParameterRef<'a>,
         output: DeclId,
         scope: LexicalScopeId,
     },
     ForwardOut {
-        parameter: &'a CheckedParameter,
+        parameter: CallableParameterRef<'a>,
         target: DeclId,
         target_name: &'a str,
     },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CallableRef<'a> {
+    Rich(&'a CheckedCallableSignature),
+    Packed(KernelCallableSchemeRef<'a>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CallableParameterRef<'a> {
+    Rich(&'a CheckedParameter),
+    Packed(KernelSemanticCallableParameterRef<'a>),
+}
+
+pub(crate) enum CallableParameterIter<'a> {
+    Rich(std::slice::Iter<'a, CheckedParameter>),
+    Packed(KernelSemanticCallableParameterIter<'a>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum CallableContextRef<'a> {
+    Rich(&'a boon_checked::CheckedCallableContext),
+    Packed(KernelSemanticCallableContextRef<'a>),
+}
+
+pub(crate) enum CallableContextIter<'a> {
+    Rich(std::slice::Iter<'a, boon_checked::CheckedCallableContext>),
+    Packed(KernelSemanticCallableContextIter<'a>),
+}
+
+#[derive(Clone, Copy)]
+#[cfg(any(test, feature = "test-packed-call-oracle"))]
+pub(crate) enum ContextFormalRef<'a> {
+    Rich(&'a boon_checked::CheckedContextFormal),
+    Packed(KernelSemanticContextFormalRef<'a>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum DeclarationRef<'a> {
+    Rich(&'a CheckedDeclaration),
+    Packed(KernelSemanticResolvedDeclarationRef<'a>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ParameterRequirementRef<'a> {
+    Rich(&'a CheckedParameterRequirement),
+    Packed(KernelSemanticParameterRequirementRef<'a>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -95,6 +155,12 @@ pub(crate) struct CallTypeFacts {
     pub(crate) contextual_substitutions: Vec<CheckedContextTypeSubstitution>,
 }
 
+pub(crate) struct CallableTypeFacts {
+    pub(crate) result: FlowType,
+    pub(crate) parameters: Box<[FlowType]>,
+    pub(crate) contexts: Box<[FlowType]>,
+}
+
 /// The single rich-type ownership bridge for one semantic elaboration.
 ///
 /// Packed topology remains borrowed. Only values that the current durable
@@ -102,19 +168,21 @@ pub(crate) struct CallTypeFacts {
 /// `SemanticCall` rows after OUT/contextual construction has borrowed them.
 pub(crate) struct CallTypeCatalog {
     rows: Vec<Option<CallTypeFacts>>,
+    callables: Vec<Option<CallableTypeFacts>>,
     remaining: usize,
+    remaining_callables: usize,
 }
 
 pub(crate) struct CallCatalog<'a> {
-    program: &'a CheckedProgramFields,
-    source: CallSource<'a>,
-    rich_call_by_id: Box<[Option<usize>]>,
-    callable_by_declaration: Box<[Option<usize>]>,
-    declaration_by_id: Box<[Option<usize>]>,
-    context_formal_by_id: Box<[Option<usize>]>,
+    source: CallCatalogSource<'a>,
 }
 
 pub(crate) struct CallIter<'catalog, 'program> {
+    catalog: &'catalog CallCatalog<'program>,
+    next: usize,
+}
+
+pub(crate) struct CallableIter<'catalog, 'program> {
     catalog: &'catalog CallCatalog<'program>,
     next: usize,
 }
@@ -137,7 +205,7 @@ enum CallContextSubstitutionSource<'a> {
     Packed {
         call: KernelSemanticCallRef<'a>,
         formal: ContextFormalId,
-        scheme: &'a Type,
+        scheme: KernelPackedTypeRef<'a>,
     },
     Empty,
 }
@@ -148,54 +216,39 @@ pub(crate) struct CallContextSubstitutionIter<'a> {
 }
 
 impl<'a> CallCatalog<'a> {
-    pub(crate) fn new(
-        program: &'a CheckedProgramFields,
-        kernel_input: Option<&'a KernelSemanticInputV1>,
-    ) -> Result<Self, String> {
-        let source = kernel_input.map_or(CallSource::Rich(&program.calls), CallSource::Packed);
+    pub(crate) fn rich(program: &'a CheckedProgramFields) -> Result<Self, String> {
         let catalog = Self {
-            program,
-            source,
-            rich_call_by_id: dense_index(
-                &program.calls,
-                |call| call.id.0 as usize,
-                "checked call",
-            )?,
-            callable_by_declaration: dense_index(
-                &program.callables,
-                |callable| callable.decl_id.0 as usize,
-                "callable declaration",
-            )?,
-            declaration_by_id: dense_index(
-                &program.declarations,
-                |declaration| declaration.id.0 as usize,
-                "declaration",
-            )?,
-            context_formal_by_id: dense_index(
-                &program.context_formals,
-                |formal| formal.id.0 as usize,
-                "context formal",
-            )?,
+            source: CallCatalogSource::Rich {
+                program,
+                call_by_id: dense_index(&program.calls, |call| call.id.0 as usize, "checked call")?,
+                callable_by_declaration: dense_index(
+                    &program.callables,
+                    |callable| callable.decl_id.0 as usize,
+                    "callable declaration",
+                )?,
+                declaration_by_id: dense_index(
+                    &program.declarations,
+                    |declaration| declaration.id.0 as usize,
+                    "declaration",
+                )?,
+            },
         };
         catalog.validate()?;
-        #[cfg(debug_assertions)]
-        if let CallSource::Packed(input) = catalog.source
-            && !program.calls.is_empty()
-        {
-            catalog.validate_rich_parity(input)?;
-        }
         Ok(catalog)
     }
 
-    #[cfg(test)]
-    pub(crate) fn rich(program: &'a CheckedProgramFields) -> Result<Self, String> {
-        Self::new(program, None)
+    pub(crate) fn packed(input: &'a KernelSemanticInputV1) -> Result<Self, String> {
+        let catalog = Self {
+            source: CallCatalogSource::Packed(input),
+        };
+        catalog.validate()?;
+        Ok(catalog)
     }
 
     pub(crate) fn len(&self) -> usize {
-        match self.source {
-            CallSource::Rich(calls) => calls.len(),
-            CallSource::Packed(input) => input.call_count(),
+        match &self.source {
+            CallCatalogSource::Rich { program, .. } => program.calls.len(),
+            CallCatalogSource::Packed(input) => input.call_count(),
         }
     }
 
@@ -207,48 +260,93 @@ impl<'a> CallCatalog<'a> {
     }
 
     pub(crate) fn type_materializer(&self) -> CallTypeMaterializer<'a> {
-        match self.source {
-            CallSource::Rich(_) => CallTypeMaterializer::Rich,
-            CallSource::Packed(input) => {
+        match &self.source {
+            CallCatalogSource::Rich { .. } => CallTypeMaterializer::Rich,
+            CallCatalogSource::Packed(input) => {
                 CallTypeMaterializer::Packed(input.compatibility_type_materializer())
             }
         }
     }
 
     pub(crate) fn get(&self, id: CheckedCallId) -> Option<CallRef<'a>> {
-        match self.source {
-            CallSource::Rich(calls) => self
-                .rich_call_by_id
+        match &self.source {
+            CallCatalogSource::Rich {
+                program,
+                call_by_id,
+                ..
+            } => call_by_id
                 .get(id.0 as usize)
                 .copied()
                 .flatten()
-                .and_then(|index| calls.get(index))
+                .and_then(|index| program.calls.get(index))
                 .filter(|call| call.id == id)
                 .map(CallRef::Rich),
-            CallSource::Packed(input) => input.call(id).map(CallRef::Packed),
+            CallCatalogSource::Packed(input) => input.call(id).map(CallRef::Packed),
         }
     }
 
-    pub(crate) fn callable(&self, id: DeclId) -> Option<&'a CheckedCallableSignature> {
-        self.callable_index(id)
-            .and_then(|index| self.program.callables.get(index))
-            .filter(|callable| callable.decl_id == id)
+    pub(crate) fn callable(&self, id: DeclId) -> Option<CallableRef<'a>> {
+        match &self.source {
+            CallCatalogSource::Rich { program, .. } => self
+                .callable_index(id)
+                .and_then(|index| program.callables.get(index))
+                .filter(|callable| callable.decl_id == id)
+                .map(CallableRef::Rich),
+            CallCatalogSource::Packed(input) => input.callable(id).map(CallableRef::Packed),
+        }
+    }
+
+    pub(crate) fn callable_count(&self) -> usize {
+        match &self.source {
+            CallCatalogSource::Rich { program, .. } => program.callables.len(),
+            CallCatalogSource::Packed(input) => input.callable_count(),
+        }
+    }
+
+    pub(crate) fn callables(&self) -> CallableIter<'_, 'a> {
+        CallableIter {
+            catalog: self,
+            next: 0,
+        }
+    }
+
+    pub(crate) fn callable_at(&self, index: usize) -> Option<CallableRef<'a>> {
+        match &self.source {
+            CallCatalogSource::Rich { program, .. } => {
+                program.callables.get(index).map(CallableRef::Rich)
+            }
+            CallCatalogSource::Packed(input) => input.callable_at(index).map(CallableRef::Packed),
+        }
     }
 
     pub(crate) fn callable_index(&self, id: DeclId) -> Option<usize> {
-        self.callable_by_declaration
-            .get(id.0 as usize)
-            .copied()
-            .flatten()
+        match &self.source {
+            CallCatalogSource::Rich {
+                callable_by_declaration,
+                ..
+            } => callable_by_declaration
+                .get(id.0 as usize)
+                .copied()
+                .flatten(),
+            CallCatalogSource::Packed(input) => input.callable_index(id),
+        }
     }
 
-    pub(crate) fn declaration(&self, id: DeclId) -> Option<&'a CheckedDeclaration> {
-        self.declaration_by_id
-            .get(id.0 as usize)
-            .copied()
-            .flatten()
-            .and_then(|index| self.program.declarations.get(index))
-            .filter(|declaration| declaration.id == id)
+    pub(crate) fn declaration(&self, id: DeclId) -> Option<DeclarationRef<'a>> {
+        match &self.source {
+            CallCatalogSource::Rich {
+                program,
+                declaration_by_id,
+                ..
+            } => declaration_by_id
+                .get(id.0 as usize)
+                .copied()
+                .flatten()
+                .and_then(|index| program.declarations.get(index))
+                .filter(|declaration| declaration.id == id)
+                .map(DeclarationRef::Rich),
+            CallCatalogSource::Packed(input) => input.declaration(id).map(DeclarationRef::Packed),
+        }
     }
 
     pub(crate) fn entries(&self, call: CallRef<'a>) -> CallEntryIter<'_, 'a> {
@@ -275,32 +373,25 @@ impl<'a> CallCatalog<'a> {
             CallRef::Rich(call) => {
                 CallContextSubstitutionSource::Rich(&call.contextual_substitutions)
             }
-            CallRef::Packed(call) => self
-                .callable(call.callable())
-                .and_then(|callable| callable.context_formal)
-                .and_then(|formal| {
-                    self.context_formal_by_id
-                        .get(formal.0 as usize)
-                        .copied()
-                        .flatten()
-                        .and_then(|index| self.program.context_formals.get(index))
-                        .filter(|definition| {
-                            definition.id == formal && definition.callable == call.callable()
-                        })
-                        .map(|definition| CallContextSubstitutionSource::Packed {
-                            call,
-                            formal,
-                            scheme: &definition.scheme.flow_type.ty,
-                        })
-                })
-                .unwrap_or(CallContextSubstitutionSource::Empty),
+            CallRef::Packed(call) => match &self.source {
+                CallCatalogSource::Packed(input) => input
+                    .callable(call.callable())
+                    .and_then(KernelCallableSchemeRef::context_formal)
+                    .map(|formal| CallContextSubstitutionSource::Packed {
+                        call,
+                        formal: formal.id(),
+                        scheme: formal.flow().ty(),
+                    })
+                    .unwrap_or(CallContextSubstitutionSource::Empty),
+                CallCatalogSource::Rich { .. } => CallContextSubstitutionSource::Empty,
+            },
         };
         CallContextSubstitutionIter { source, next: 0 }
     }
 
     fn validate(&self) -> Result<(), String> {
         for (index, call) in self.calls().enumerate() {
-            if matches!(self.source, CallSource::Packed(_)) {
+            if matches!(&self.source, CallCatalogSource::Packed(_)) {
                 let expected = CheckedCallId(
                     u32::try_from(index)
                         .map_err(|_| "packed checked call count exceeds u32".to_owned())?,
@@ -313,12 +404,7 @@ impl<'a> CallCatalog<'a> {
                 }
             }
             let expression = call.expression();
-            if self
-                .program
-                .expressions
-                .get(expression.0 as usize)
-                .is_none_or(|candidate| candidate.id != expression)
-            {
+            if !self.has_expression(expression) {
                 return Err(format!(
                     "checked call {} references missing expression {}",
                     call.id().0,
@@ -348,11 +434,7 @@ impl<'a> CallCatalog<'a> {
                 self.context_at(call, ordinal)?;
             }
             if let CheckedContextBinding::Explicit { value, .. } = call.context_binding()
-                && self
-                    .program
-                    .expressions
-                    .get(value.0 as usize)
-                    .is_none_or(|candidate| candidate.id != value)
+                && !self.has_expression(value)
             {
                 return Err(format!(
                     "checked call {} PASS binding references missing expression {}",
@@ -362,6 +444,26 @@ impl<'a> CallCatalog<'a> {
             }
         }
         Ok(())
+    }
+
+    fn has_expression(&self, expression: CheckedExprId) -> bool {
+        match &self.source {
+            CallCatalogSource::Rich { program, .. } => program
+                .expressions
+                .get(expression.0 as usize)
+                .is_some_and(|candidate| candidate.id == expression),
+            CallCatalogSource::Packed(input) => input.expression(expression).is_some(),
+        }
+    }
+
+    fn has_scope(&self, scope: LexicalScopeId) -> bool {
+        match &self.source {
+            CallCatalogSource::Rich { program, .. } => program
+                .scopes
+                .get(scope.0 as usize)
+                .is_some_and(|candidate| candidate.id == scope),
+            CallCatalogSource::Packed(input) => input.scope(scope).is_some(),
+        }
     }
 
     fn entry_at(&self, call: CallRef<'a>, ordinal: usize) -> Result<CallEntryRef<'a>, String> {
@@ -380,9 +482,8 @@ impl<'a> CallCatalog<'a> {
                     .ok_or_else(|| format!("checked call {} has no entry {ordinal}", call.id.0))?;
                 let formal = rich_entry_formal(entry);
                 let parameter = callable
-                    .parameters
-                    .iter()
-                    .find(|parameter| parameter.decl_id == formal)
+                    .parameters()
+                    .find(|parameter| parameter.declaration() == formal)
                     .ok_or_else(|| {
                         format!(
                             "checked call {} entry {ordinal} references missing formal {}",
@@ -396,17 +497,17 @@ impl<'a> CallCatalog<'a> {
                     format!("packed checked call {} has no entry {ordinal}", call.id().0)
                 })?;
                 let parameter_ordinal = packed_entry_parameter_ordinal(entry) as usize;
-                let parameter = callable.parameters.get(parameter_ordinal).ok_or_else(|| {
+                let parameter = callable.parameter(parameter_ordinal).ok_or_else(|| {
                     format!(
                         "packed checked call {} entry {ordinal} references missing parameter ordinal {parameter_ordinal}",
                         call.id().0,
                     )
                 })?;
-                if parameter.ordinal != parameter_ordinal {
+                if parameter.ordinal() != parameter_ordinal {
                     return Err(format!(
                         "packed checked call {} entry {ordinal} resolves parameter ordinal {parameter_ordinal} to stale ordinal {}",
                         call.id().0,
-                        parameter.ordinal,
+                        parameter.ordinal(),
                     ));
                 }
                 self.project_packed_entry(call.id(), ordinal, entry, parameter)
@@ -419,7 +520,7 @@ impl<'a> CallCatalog<'a> {
         call: CheckedCallId,
         ordinal: usize,
         entry: &'a CheckedCallEntry,
-        parameter: &'a CheckedParameter,
+        parameter: CallableParameterRef<'a>,
     ) -> Result<CallEntryRef<'a>, String> {
         match entry {
             CheckedCallEntry::Input {
@@ -430,7 +531,7 @@ impl<'a> CallCatalog<'a> {
                 ..
             } => {
                 validate_parameter(call, ordinal, parameter, name, CheckedParameterKind::Value)?;
-                if parameter.evaluation_scope != *evaluation_scope {
+                if parameter.evaluation_scope() != *evaluation_scope {
                     return Err(format!(
                         "checked call {} input {ordinal} has stale evaluation scope",
                         call.0,
@@ -476,7 +577,7 @@ impl<'a> CallCatalog<'a> {
                         call.0, target.0,
                     )
                 })?;
-                if declaration.name != *target_name {
+                if declaration.name() != target_name {
                     return Err(format!(
                         "checked call {} ForwardOut {ordinal} has stale target name `{target_name}`",
                         call.0,
@@ -496,7 +597,7 @@ impl<'a> CallCatalog<'a> {
         call: CheckedCallId,
         ordinal: usize,
         entry: KernelSemanticCallEntryRef,
-        parameter: &'a CheckedParameter,
+        parameter: CallableParameterRef<'a>,
     ) -> Result<CallEntryRef<'a>, String> {
         match entry {
             KernelSemanticCallEntryRef::Input {
@@ -506,14 +607,14 @@ impl<'a> CallCatalog<'a> {
                     call,
                     ordinal,
                     parameter,
-                    &parameter.name,
+                    parameter.name(),
                     CheckedParameterKind::Value,
                 )?;
                 Ok(CallEntryRef::Input {
                     parameter,
                     value,
                     from_pipe,
-                    evaluation_scope: parameter.evaluation_scope,
+                    evaluation_scope: parameter.evaluation_scope(),
                 })
             }
             KernelSemanticCallEntryRef::FreshOut { output, scope, .. } => {
@@ -521,7 +622,7 @@ impl<'a> CallCatalog<'a> {
                     call,
                     ordinal,
                     parameter,
-                    &parameter.name,
+                    parameter.name(),
                     CheckedParameterKind::Out,
                 )?;
                 self.declaration(output).ok_or_else(|| {
@@ -542,7 +643,7 @@ impl<'a> CallCatalog<'a> {
                     call,
                     ordinal,
                     parameter,
-                    &parameter.name,
+                    parameter.name(),
                     CheckedParameterKind::Out,
                 )?;
                 let declaration = self.declaration(target).ok_or_else(|| {
@@ -554,7 +655,7 @@ impl<'a> CallCatalog<'a> {
                 Ok(CallEntryRef::ForwardOut {
                     parameter,
                     target,
-                    target_name: &declaration.name,
+                    target_name: declaration.name(),
                 })
             }
         }
@@ -586,7 +687,7 @@ impl<'a> CallCatalog<'a> {
                     })?
             }
         };
-        if context.signature >= callable.contexts.len() {
+        if context.signature >= callable.context_count() {
             return Err(format!(
                 "checked call {} context {ordinal} references missing signature context {}",
                 call.id().0,
@@ -605,30 +706,226 @@ impl<'a> CallCatalog<'a> {
     }
 
     fn require_scope(&self, call: CheckedCallId, scope: LexicalScopeId) -> Result<(), String> {
-        self.program
-            .scopes
-            .get(scope.0 as usize)
-            .filter(|candidate| candidate.id == scope)
-            .map(|_| ())
-            .ok_or_else(|| {
-                format!(
-                    "checked call {} references missing scope {}",
-                    call.0, scope.0,
-                )
-            })
+        self.has_scope(scope).then_some(()).ok_or_else(|| {
+            format!(
+                "checked call {} references missing scope {}",
+                call.0, scope.0,
+            )
+        })
     }
 
-    #[cfg(debug_assertions)]
-    fn validate_rich_parity(&self, input: &KernelSemanticInputV1) -> Result<(), String> {
-        if self.program.calls.len() != input.call_count() {
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
+    pub(crate) fn has_complete_rich_parity_input(&self, program: &CheckedProgramFields) -> bool {
+        let CallCatalogSource::Packed(input) = &self.source else {
+            return false;
+        };
+        let counts = input.entity_counts();
+        program.calls.len() == input.call_count()
+            && program.callables.len() == input.callable_count()
+            && program.declarations.len() == counts.declarations
+            && program.context_formals.len() == counts.context_formals
+    }
+
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
+    pub(crate) fn validate_rich_parity(
+        &self,
+        program: &'a CheckedProgramFields,
+    ) -> Result<(), String> {
+        let CallCatalogSource::Packed(input) = &self.source else {
+            return Err("packed call parity requires a packed catalog".to_owned());
+        };
+        let rich_catalog = Self::rich(program)?;
+        let counts = input.entity_counts();
+        if program.callables.len() != input.callable_count()
+            || program.callables.len() != counts.callables
+        {
+            return Err(format!(
+                "rich checked callable count {} differs from packed counts {}/{}",
+                program.callables.len(),
+                input.callable_count(),
+                counts.callables,
+            ));
+        }
+        if program.declarations.len() != counts.declarations {
+            return Err(format!(
+                "rich checked declaration count {} differs from packed count {}",
+                program.declarations.len(),
+                counts.declarations,
+            ));
+        }
+        if program.context_formals.len() != counts.context_formals {
+            return Err(format!(
+                "rich checked context-formal count {} differs from packed count {}",
+                program.context_formals.len(),
+                counts.context_formals,
+            ));
+        }
+        if self.declaration(DeclId(0)).is_some() {
+            return Err("packed declaration zero must remain the absent sentinel".to_owned());
+        }
+        let mut materializer = input.compatibility_type_materializer();
+        let mut packed_context_formal_count = 0usize;
+        for (index, expected) in program.callables.iter().enumerate() {
+            let actual = input.callable_at(index).ok_or_else(|| {
+                format!("packed callable authority omits rich callable index {index}")
+            })?;
+            if actual.index() != index
+                || input.callable(expected.decl_id).map(|row| row.identity())
+                    != Some(actual.identity())
+                || input.callable_index(expected.decl_id) != Some(index)
+                || actual.declaration() != expected.decl_id
+                || actual.scope() != expected.scope_id
+                || actual.kind() != expected.kind
+                || actual.name() != expected.name
+                || actual.intrinsic() != expected.intrinsic
+                || actual.external_identity() != expected.external_identity
+                || actual.parameter_count() != expected.parameters.len()
+                || actual.context_count() != expected.contexts.len()
+                || actual.role() != expected.role
+                || actual.effect() != expected.effect
+                || actual.body() != expected.body
+                || actual.result_expression() != expected.result_expression
+                || actual.contextual_operation() != expected.contextual_operation
+            {
+                return Err(format!(
+                    "rich checked callable {} differs from packed scalar topology",
+                    expected.decl_id.0,
+                ));
+            }
+            if materializer
+                .materialize_flow(actual.result())
+                .map_err(|error| error.to_string())?
+                != expected.result
+            {
+                return Err(format!(
+                    "rich checked callable {} result differs from packed authority",
+                    expected.decl_id.0,
+                ));
+            }
+            for (ordinal, (expected_parameter, actual_parameter)) in expected
+                .parameters
+                .iter()
+                .zip(actual.parameters())
+                .enumerate()
+            {
+                if actual_parameter.declaration() != expected_parameter.decl_id
+                    || actual_parameter.ordinal() != ordinal
+                    || actual_parameter.ordinal() != expected_parameter.ordinal
+                    || actual_parameter.name() != expected_parameter.name
+                    || actual_parameter.kind() != expected_parameter.kind
+                    || !ParameterRequirementRef::Packed(actual_parameter.requirement())
+                        .matches_checked(&expected_parameter.requirement)
+                    || actual_parameter.evaluation_scope() != expected_parameter.evaluation_scope
+                    || actual_parameter.start() != expected_parameter.start
+                    || actual_parameter.end() != expected_parameter.end
+                    || materializer
+                        .materialize_flow(actual_parameter.flow())
+                        .map_err(|error| error.to_string())?
+                        != expected_parameter.flow_type
+                {
+                    return Err(format!(
+                        "rich checked callable {} parameter {ordinal} differs from packed authority",
+                        expected.decl_id.0,
+                    ));
+                }
+            }
+            for (ordinal, (expected_context, actual_context)) in
+                expected.contexts.iter().zip(actual.contexts()).enumerate()
+            {
+                if actual_context.name() != expected_context.name
+                    || actual_context.kind() != expected_context.kind
+                    || actual_context.provider() != expected_context.provider
+                    || materializer
+                        .materialize_flow(actual_context.flow())
+                        .map_err(|error| error.to_string())?
+                        != expected_context.flow_type
+                {
+                    return Err(format!(
+                        "rich checked callable {} context {ordinal} differs from packed authority",
+                        expected.decl_id.0,
+                    ));
+                }
+            }
+            match (expected.context_formal, actual.context_formal()) {
+                (None, None) => {}
+                (Some(expected_id), Some(actual_formal)) => {
+                    packed_context_formal_count += 1;
+                    let expected_formal = program
+                        .context_formals
+                        .iter()
+                        .find(|formal| formal.id == expected_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "rich checked callable {} references missing context formal {}",
+                                expected.decl_id.0, expected_id.0,
+                            )
+                        })?;
+                    let expected_formal = ContextFormalRef::Rich(expected_formal);
+                    let actual_formal = ContextFormalRef::Packed(actual_formal);
+                    let CallFlowRef::Rich(expected_flow) = expected_formal.flow() else {
+                        unreachable!("rich context formal exposes a rich flow")
+                    };
+                    if actual_formal.id() != expected_formal.id()
+                        || actual_formal.callable() != expected_formal.callable()
+                        || materializer
+                            .materialize_flow(match actual_formal.flow() {
+                                CallFlowRef::Packed(flow) => flow,
+                                CallFlowRef::Rich(_) => {
+                                    unreachable!("packed callable exposes a packed context formal")
+                                }
+                            })
+                            .map_err(|error| error.to_string())?
+                            != *expected_flow
+                    {
+                        return Err(format!(
+                            "rich checked callable {} context formal differs from packed authority",
+                            expected.decl_id.0,
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "rich checked callable {} context-formal presence differs from packed authority",
+                        expected.decl_id.0,
+                    ));
+                }
+            }
+        }
+        if packed_context_formal_count != counts.context_formals {
+            return Err(format!(
+                "packed callable catalog exposes {packed_context_formal_count} context formals for {} sealed rows",
+                counts.context_formals,
+            ));
+        }
+        for expected in &program.declarations {
+            let actual = self.declaration(expected.id).ok_or_else(|| {
+                format!(
+                    "packed declaration authority omits rich declaration {}",
+                    expected.id.0,
+                )
+            })?;
+            if actual.id() != expected.id
+                || actual.scope() != expected.scope_id
+                || actual.name() != expected.name
+                || actual.kind() != expected.kind
+                || actual.value() != expected.value
+                || actual.body_scope() != expected.body_scope
+                || actual.span() != Some(expected.span)
+            {
+                return Err(format!(
+                    "rich checked declaration {} differs from packed topology",
+                    expected.id.0,
+                ));
+            }
+        }
+        if program.calls.len() != input.call_count() {
             return Err(format!(
                 "rich checked call count {} differs from packed count {}",
-                self.program.calls.len(),
+                program.calls.len(),
                 input.call_count(),
             ));
         }
-        let mut materializer = input.compatibility_type_materializer();
-        for rich in &self.program.calls {
+        for rich in &program.calls {
             let packed = input.call(rich.id).ok_or_else(|| {
                 format!(
                     "packed call authority omits rich checked call {}",
@@ -651,7 +948,7 @@ impl<'a> CallCatalog<'a> {
             let callable = self.callable(rich.callable).ok_or_else(|| {
                 format!("rich checked call {} has no target signature", rich.id.0)
             })?;
-            if callable.intrinsic != rich.intrinsic || callable.role != rich.role {
+            if callable.intrinsic() != rich.intrinsic || callable.role() != rich.role {
                 return Err(format!(
                     "rich checked call {} differs from its target signature",
                     rich.id.0,
@@ -666,7 +963,7 @@ impl<'a> CallCatalog<'a> {
                 ));
             }
             for ordinal in 0..rich.entries.len() {
-                let rich_entry = self.entry_at(CallRef::Rich(rich), ordinal)?;
+                let rich_entry = rich_catalog.entry_at(CallRef::Rich(rich), ordinal)?;
                 let packed_entry = self.entry_at(CallRef::Packed(packed), ordinal)?;
                 if !same_entry(rich_entry, packed_entry) {
                     return Err(format!(
@@ -676,7 +973,7 @@ impl<'a> CallCatalog<'a> {
                 }
             }
             for ordinal in 0..rich.contexts.len() {
-                if self.context_at(CallRef::Rich(rich), ordinal)?
+                if rich_catalog.context_at(CallRef::Rich(rich), ordinal)?
                     != self.context_at(CallRef::Packed(packed), ordinal)?
                 {
                     return Err(format!(
@@ -759,9 +1056,11 @@ impl<'program> Iterator for CallIter<'_, 'program> {
         if self.next >= self.catalog.len() {
             return None;
         }
-        let call = match self.catalog.source {
-            CallSource::Rich(calls) => calls.get(self.next).map(CallRef::Rich),
-            CallSource::Packed(input) => {
+        let call = match &self.catalog.source {
+            CallCatalogSource::Rich { program, .. } => {
+                program.calls.get(self.next).map(CallRef::Rich)
+            }
+            CallCatalogSource::Packed(input) => {
                 let id = CheckedCallId(
                     u32::try_from(self.next)
                         .expect("sealed packed call iterator index remains within u32"),
@@ -784,6 +1083,23 @@ impl<'program> Iterator for CallIter<'_, 'program> {
 }
 
 impl ExactSizeIterator for CallIter<'_, '_> {}
+
+impl<'program> Iterator for CallableIter<'_, 'program> {
+    type Item = CallableRef<'program>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let callable = self.catalog.callable_at(self.next)?;
+        self.next += 1;
+        Some(callable)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.catalog.callable_count().saturating_sub(self.next);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for CallableIter<'_, '_> {}
 
 impl<'program> Iterator for CallEntryIter<'_, 'program> {
     type Item = CallEntryRef<'program>;
@@ -858,7 +1174,7 @@ impl<'a> Iterator for CallContextSubstitutionIter<'a> {
                     self.next += 1;
                     let row = substitutions.substitution(ordinal)?;
                     let variable = row.parameter().linked_variable();
-                    if type_contains_variable(scheme, variable) {
+                    if scheme.contains_parameter(row.parameter()) {
                         return Some(CallContextSubstitutionRef {
                             formal,
                             variable,
@@ -982,8 +1298,428 @@ impl<'a> CallRef<'a> {
     }
 }
 
+impl<'a> CallableRef<'a> {
+    pub(crate) fn declaration(self) -> DeclId {
+        match self {
+            Self::Rich(row) => row.decl_id,
+            Self::Packed(row) => row.declaration(),
+        }
+    }
+
+    pub(crate) fn scope(self) -> LexicalScopeId {
+        match self {
+            Self::Rich(row) => row.scope_id,
+            Self::Packed(row) => row.scope(),
+        }
+    }
+
+    pub(crate) fn kind(self) -> CheckedCallableKind {
+        match self {
+            Self::Rich(row) => row.kind,
+            Self::Packed(row) => row.kind(),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'a str {
+        match self {
+            Self::Rich(row) => &row.name,
+            Self::Packed(row) => row.name(),
+        }
+    }
+
+    pub(crate) fn intrinsic(self) -> Option<CheckedIntrinsicV1> {
+        match self {
+            Self::Rich(row) => row.intrinsic,
+            Self::Packed(row) => row.intrinsic(),
+        }
+    }
+
+    pub(crate) fn external_identity(self) -> Option<CheckedExternalDeclarationIdentityV1> {
+        match self {
+            Self::Rich(row) => row.external_identity,
+            Self::Packed(row) => row.external_identity(),
+        }
+    }
+
+    pub(crate) fn parameter_count(self) -> usize {
+        match self {
+            Self::Rich(row) => row.parameters.len(),
+            Self::Packed(row) => row.parameter_count(),
+        }
+    }
+
+    pub(crate) fn parameters(self) -> CallableParameterIter<'a> {
+        match self {
+            Self::Rich(row) => CallableParameterIter::Rich(row.parameters.iter()),
+            Self::Packed(row) => CallableParameterIter::Packed(row.parameters()),
+        }
+    }
+
+    pub(crate) fn parameter(self, ordinal: usize) -> Option<CallableParameterRef<'a>> {
+        match self {
+            Self::Rich(row) => row
+                .parameters
+                .iter()
+                .find(|parameter| parameter.ordinal == ordinal)
+                .map(CallableParameterRef::Rich),
+            Self::Packed(row) => row.parameter(ordinal).map(CallableParameterRef::Packed),
+        }
+    }
+
+    pub(crate) fn context_count(self) -> usize {
+        match self {
+            Self::Rich(row) => row.contexts.len(),
+            Self::Packed(row) => row.context_count(),
+        }
+    }
+
+    pub(crate) fn contexts(self) -> CallableContextIter<'a> {
+        match self {
+            Self::Rich(row) => CallableContextIter::Rich(row.contexts.iter()),
+            Self::Packed(row) => CallableContextIter::Packed(row.contexts()),
+        }
+    }
+
+    pub(crate) fn context_formal_id(self) -> Option<ContextFormalId> {
+        match self {
+            Self::Rich(row) => row.context_formal,
+            Self::Packed(row) => row.context_formal().map(|formal| formal.id()),
+        }
+    }
+
+    pub(crate) fn result(self) -> CallFlowRef<'a> {
+        match self {
+            Self::Rich(row) => CallFlowRef::Rich(&row.result),
+            Self::Packed(row) => CallFlowRef::Packed(row.result()),
+        }
+    }
+
+    pub(crate) fn role(self) -> ProgramRole {
+        match self {
+            Self::Rich(row) => row.role,
+            Self::Packed(row) => row.role(),
+        }
+    }
+
+    pub(crate) fn effect(self) -> CheckedEffectSummary {
+        match self {
+            Self::Rich(row) => row.effect,
+            Self::Packed(row) => row.effect(),
+        }
+    }
+
+    pub(crate) fn body(self) -> Option<CheckedStatementId> {
+        match self {
+            Self::Rich(row) => row.body,
+            Self::Packed(row) => row.body(),
+        }
+    }
+
+    pub(crate) fn result_expression(self) -> Option<CheckedExprId> {
+        match self {
+            Self::Rich(row) => row.result_expression,
+            Self::Packed(row) => row.result_expression(),
+        }
+    }
+
+    pub(crate) fn contextual_operation(self) -> Option<CheckedContextualOperation> {
+        match self {
+            Self::Rich(row) => row.contextual_operation,
+            Self::Packed(row) => row.contextual_operation(),
+        }
+    }
+
+    pub(crate) fn requires_pass(self) -> bool {
+        self.context_formal_id().is_some()
+    }
+}
+
+impl<'a> Iterator for CallableParameterIter<'a> {
+    type Item = CallableParameterRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Rich(rows) => rows.next().map(CallableParameterRef::Rich),
+            Self::Packed(rows) => rows.next().map(CallableParameterRef::Packed),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Rich(rows) => rows.size_hint(),
+            Self::Packed(rows) => rows.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for CallableParameterIter<'_> {}
+
+impl<'a> CallableParameterRef<'a> {
+    pub(crate) fn declaration(self) -> DeclId {
+        match self {
+            Self::Rich(row) => row.decl_id,
+            Self::Packed(row) => row.declaration(),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'a str {
+        match self {
+            Self::Rich(row) => &row.name,
+            Self::Packed(row) => row.name(),
+        }
+    }
+
+    pub(crate) fn kind(self) -> CheckedParameterKind {
+        match self {
+            Self::Rich(row) => row.kind,
+            Self::Packed(row) => row.kind(),
+        }
+    }
+
+    pub(crate) fn ordinal(self) -> usize {
+        match self {
+            Self::Rich(row) => row.ordinal,
+            Self::Packed(row) => row.ordinal(),
+        }
+    }
+
+    pub(crate) fn flow(self) -> CallFlowRef<'a> {
+        match self {
+            Self::Rich(row) => CallFlowRef::Rich(&row.flow_type),
+            Self::Packed(row) => CallFlowRef::Packed(row.flow()),
+        }
+    }
+
+    pub(crate) fn requirement(self) -> ParameterRequirementRef<'a> {
+        match self {
+            Self::Rich(row) => ParameterRequirementRef::Rich(&row.requirement),
+            Self::Packed(row) => ParameterRequirementRef::Packed(row.requirement()),
+        }
+    }
+
+    pub(crate) fn evaluation_scope(self) -> CheckedEvaluationScope {
+        match self {
+            Self::Rich(row) => row.evaluation_scope,
+            Self::Packed(row) => row.evaluation_scope(),
+        }
+    }
+
+    pub(crate) fn start(self) -> usize {
+        match self {
+            Self::Rich(row) => row.start,
+            Self::Packed(row) => row.start(),
+        }
+    }
+
+    pub(crate) fn end(self) -> usize {
+        match self {
+            Self::Rich(row) => row.end,
+            Self::Packed(row) => row.end(),
+        }
+    }
+}
+
+impl<'a> Iterator for CallableContextIter<'a> {
+    type Item = CallableContextRef<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Rich(rows) => rows.next().map(CallableContextRef::Rich),
+            Self::Packed(rows) => rows.next().map(CallableContextRef::Packed),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::Rich(rows) => rows.size_hint(),
+            Self::Packed(rows) => rows.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for CallableContextIter<'_> {}
+
+impl<'a> CallableContextRef<'a> {
+    pub(crate) fn name(self) -> &'a str {
+        match self {
+            Self::Rich(row) => &row.name,
+            Self::Packed(row) => row.name(),
+        }
+    }
+
+    pub(crate) fn kind(self) -> CheckedCallContextKind {
+        match self {
+            Self::Rich(row) => row.kind,
+            Self::Packed(row) => row.kind(),
+        }
+    }
+
+    pub(crate) fn provider(self) -> DeclId {
+        match self {
+            Self::Rich(row) => row.provider,
+            Self::Packed(row) => row.provider(),
+        }
+    }
+
+    pub(crate) fn flow(self) -> CallFlowRef<'a> {
+        match self {
+            Self::Rich(row) => CallFlowRef::Rich(&row.flow_type),
+            Self::Packed(row) => CallFlowRef::Packed(row.flow()),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-packed-call-oracle"))]
+impl<'a> ContextFormalRef<'a> {
+    pub(crate) fn id(self) -> ContextFormalId {
+        match self {
+            Self::Rich(row) => row.id,
+            Self::Packed(row) => row.id(),
+        }
+    }
+
+    pub(crate) fn callable(self) -> DeclId {
+        match self {
+            Self::Rich(row) => row.callable,
+            Self::Packed(row) => row.callable(),
+        }
+    }
+
+    pub(crate) fn flow(self) -> CallFlowRef<'a> {
+        match self {
+            Self::Rich(row) => CallFlowRef::Rich(&row.scheme.flow_type),
+            Self::Packed(row) => CallFlowRef::Packed(row.flow()),
+        }
+    }
+}
+
+impl<'a> DeclarationRef<'a> {
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
+    pub(crate) fn id(self) -> DeclId {
+        match self {
+            Self::Rich(row) => row.id,
+            Self::Packed(row) => row.id(),
+        }
+    }
+
+    pub(crate) fn scope(self) -> LexicalScopeId {
+        match self {
+            Self::Rich(row) => row.scope_id,
+            Self::Packed(row) => row.scope(),
+        }
+    }
+
+    pub(crate) fn name(self) -> &'a str {
+        match self {
+            Self::Rich(row) => &row.name,
+            Self::Packed(row) => row.name(),
+        }
+    }
+
+    pub(crate) fn kind(self) -> CheckedDeclarationKind {
+        match self {
+            Self::Rich(row) => row.kind,
+            Self::Packed(row) => row.kind(),
+        }
+    }
+
+    pub(crate) fn value(self) -> Option<CheckedExprId> {
+        match self {
+            Self::Rich(row) => row.value,
+            Self::Packed(row) => row.value(),
+        }
+    }
+
+    pub(crate) fn body_scope(self) -> Option<LexicalScopeId> {
+        match self {
+            Self::Rich(row) => row.body_scope,
+            Self::Packed(row) => row.body_scope(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-packed-call-oracle"))]
+    pub(crate) fn span(self) -> Option<CheckedSpan> {
+        match self {
+            Self::Rich(row) => Some(row.span),
+            Self::Packed(row) => row.span(),
+        }
+    }
+}
+
+impl ParameterRequirementRef<'_> {
+    pub(crate) fn to_owned(self) -> CheckedParameterRequirement {
+        match self {
+            Self::Rich(row) => row.clone(),
+            Self::Packed(KernelSemanticParameterRequirementRef::Required) => {
+                CheckedParameterRequirement::Required
+            }
+            Self::Packed(KernelSemanticParameterRequirementRef::CallableProfile(profile)) => {
+                CheckedParameterRequirement::Optional {
+                    default: CheckedParameterDefault::CallableProfile {
+                        profile: profile.to_owned(),
+                    },
+                }
+            }
+            Self::Packed(KernelSemanticParameterRequirementRef::Tag(name)) => {
+                CheckedParameterRequirement::Optional {
+                    default: CheckedParameterDefault::Tag {
+                        name: name.to_owned(),
+                    },
+                }
+            }
+            Self::Packed(KernelSemanticParameterRequirementRef::ExactInteger(value)) => {
+                CheckedParameterRequirement::Optional {
+                    default: CheckedParameterDefault::ExactInteger { value },
+                }
+            }
+            Self::Packed(KernelSemanticParameterRequirementRef::Text(value)) => {
+                CheckedParameterRequirement::Optional {
+                    default: CheckedParameterDefault::Text {
+                        value: value.to_owned(),
+                    },
+                }
+            }
+        }
+    }
+
+    pub(crate) fn matches_checked(self, expected: &CheckedParameterRequirement) -> bool {
+        match (self, expected) {
+            (Self::Rich(actual), expected) => actual == expected,
+            (
+                Self::Packed(KernelSemanticParameterRequirementRef::Required),
+                CheckedParameterRequirement::Required,
+            ) => true,
+            (
+                Self::Packed(KernelSemanticParameterRequirementRef::CallableProfile(actual)),
+                CheckedParameterRequirement::Optional {
+                    default: CheckedParameterDefault::CallableProfile { profile },
+                },
+            ) => actual == profile,
+            (
+                Self::Packed(KernelSemanticParameterRequirementRef::Tag(actual)),
+                CheckedParameterRequirement::Optional {
+                    default: CheckedParameterDefault::Tag { name },
+                },
+            ) => actual == name,
+            (
+                Self::Packed(KernelSemanticParameterRequirementRef::ExactInteger(actual)),
+                CheckedParameterRequirement::Optional {
+                    default: CheckedParameterDefault::ExactInteger { value },
+                },
+            ) => actual == *value,
+            (
+                Self::Packed(KernelSemanticParameterRequirementRef::Text(actual)),
+                CheckedParameterRequirement::Optional {
+                    default: CheckedParameterDefault::Text { value },
+                },
+            ) => actual == value,
+            _ => false,
+        }
+    }
+}
+
 impl<'a> CallEntryRef<'a> {
-    pub(crate) fn parameter(self) -> &'a CheckedParameter {
+    pub(crate) fn parameter(self) -> CallableParameterRef<'a> {
         match self {
             Self::Input { parameter, .. }
             | Self::FreshOut { parameter, .. }
@@ -992,7 +1728,7 @@ impl<'a> CallEntryRef<'a> {
     }
 
     pub(crate) fn formal(self) -> DeclId {
-        self.parameter().decl_id
+        self.parameter().declaration()
     }
 
     pub(crate) fn input(self) -> Option<(CheckedExprId, bool, CheckedEvaluationScope)> {
@@ -1059,6 +1795,24 @@ impl CallTypeMaterializer<'_> {
 impl CallTypeCatalog {
     pub(crate) fn new(calls: &CallCatalog<'_>) -> Result<Self, String> {
         let mut materializer = calls.type_materializer();
+        let mut callable_types = Vec::with_capacity(calls.callable_count());
+        for callable in calls.callables() {
+            let parameters = callable
+                .parameters()
+                .map(|parameter| materializer.materialize_flow(parameter.flow()))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice();
+            let contexts = callable
+                .contexts()
+                .map(|context| materializer.materialize_flow(context.flow()))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice();
+            callable_types.push(CallableTypeFacts {
+                result: materializer.materialize_flow(callable.result())?,
+                parameters,
+                contexts,
+            });
+        }
         let mut rows = Vec::new();
         for call in calls.calls() {
             let index = call.id().0 as usize;
@@ -1113,6 +1867,8 @@ impl CallTypeCatalog {
         }
         Ok(Self {
             rows,
+            remaining_callables: callable_types.len(),
+            callables: callable_types.into_iter().map(Some).collect(),
             remaining: calls.len(),
         })
     }
@@ -1129,13 +1885,47 @@ impl CallTypeCatalog {
         facts
     }
 
+    pub(crate) fn callable(
+        &self,
+        calls: &CallCatalog<'_>,
+        callable: DeclId,
+    ) -> Option<&CallableTypeFacts> {
+        self.callables
+            .get(calls.callable_index(callable)?)?
+            .as_ref()
+    }
+
+    pub(crate) fn parameter(
+        &self,
+        calls: &CallCatalog<'_>,
+        callable: DeclId,
+        ordinal: usize,
+    ) -> Option<&FlowType> {
+        self.callable(calls, callable)?.parameters.get(ordinal)
+    }
+
+    pub(crate) fn take_callable(
+        &mut self,
+        calls: &CallCatalog<'_>,
+        callable: DeclId,
+    ) -> Option<CallableTypeFacts> {
+        let facts = self
+            .callables
+            .get_mut(calls.callable_index(callable)?)?
+            .take();
+        if facts.is_some() {
+            self.remaining_callables -= 1;
+        }
+        facts
+    }
+
     pub(crate) fn finish(self) -> Result<(), String> {
-        if self.remaining == 0 {
+        if self.remaining == 0 && self.remaining_callables == 0 {
             Ok(())
         } else {
             Err(format!(
-                "semantic call construction left {} type-fact rows unconsumed",
-                self.remaining,
+                "semantic construction left {} call and {} callable type-fact rows unconsumed",
+                self.remaining, self.remaining_callables,
             ))
         }
     }
@@ -1168,14 +1958,16 @@ fn dense_index<T>(
 fn validate_parameter(
     call: CheckedCallId,
     entry: usize,
-    parameter: &CheckedParameter,
+    parameter: CallableParameterRef<'_>,
     name: &str,
     kind: CheckedParameterKind,
 ) -> Result<(), String> {
-    if parameter.name != name || parameter.kind != kind {
+    if parameter.name() != name || parameter.kind() != kind {
         return Err(format!(
             "checked call {} entry {entry} differs from formal {} `{}`",
-            call.0, parameter.decl_id.0, parameter.name,
+            call.0,
+            parameter.declaration().0,
+            parameter.name(),
         ));
     }
     Ok(())
@@ -1219,7 +2011,7 @@ fn packed_context_ref(context: KernelSemanticCallContextRef) -> CallContextRef {
     }
 }
 
-#[cfg(debug_assertions)]
+#[cfg(any(test, feature = "test-packed-call-oracle"))]
 fn same_entry(left: CallEntryRef<'_>, right: CallEntryRef<'_>) -> bool {
     match (left, right) {
         (
@@ -1236,8 +2028,8 @@ fn same_entry(left: CallEntryRef<'_>, right: CallEntryRef<'_>) -> bool {
                 evaluation_scope: right_scope,
             },
         ) => {
-            left_parameter.decl_id == right_parameter.decl_id
-                && left_parameter.name == right_parameter.name
+            left_parameter.declaration() == right_parameter.declaration()
+                && left_parameter.name() == right_parameter.name()
                 && left_value == right_value
                 && left_pipe == right_pipe
                 && left_scope == right_scope
@@ -1254,8 +2046,8 @@ fn same_entry(left: CallEntryRef<'_>, right: CallEntryRef<'_>) -> bool {
                 scope: right_scope,
             },
         ) => {
-            left_parameter.decl_id == right_parameter.decl_id
-                && left_parameter.name == right_parameter.name
+            left_parameter.declaration() == right_parameter.declaration()
+                && left_parameter.name() == right_parameter.name()
                 && left_output == right_output
                 && left_scope == right_scope
         }
@@ -1271,49 +2063,12 @@ fn same_entry(left: CallEntryRef<'_>, right: CallEntryRef<'_>) -> bool {
                 target_name: right_name,
             },
         ) => {
-            left_parameter.decl_id == right_parameter.decl_id
-                && left_parameter.name == right_parameter.name
+            left_parameter.declaration() == right_parameter.declaration()
+                && left_parameter.name() == right_parameter.name()
                 && left_target == right_target
                 && left_name == right_name
         }
         _ => false,
-    }
-}
-
-fn type_contains_variable(ty: &Type, variable: TypeVar) -> bool {
-    match ty {
-        Type::Var(candidate) => *candidate == variable,
-        Type::List(item) | Type::Set(item) => type_contains_variable(item, variable),
-        Type::Map { key, value } => {
-            type_contains_variable(key, variable) || type_contains_variable(value, variable)
-        }
-        Type::Union(members) => members
-            .iter()
-            .any(|member| type_contains_variable(member, variable)),
-        Type::Function { args, result } => {
-            args.iter()
-                .any(|argument| type_contains_variable(argument, variable))
-                || type_contains_variable(&result.ty, variable)
-        }
-        Type::Object(shape) => shape
-            .fields
-            .values()
-            .any(|field| type_contains_variable(field, variable)),
-        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
-            Variant::Tag(_) => false,
-            Variant::Tagged { fields, .. } => fields
-                .fields
-                .values()
-                .any(|field| type_contains_variable(field, variable)),
-        }),
-        Type::Text
-        | Type::Number
-        | Type::Bytes(_)
-        | Type::Bits { .. }
-        | Type::Absent
-        | Type::RenderContract
-        | Type::UnresolvedShape { .. }
-        | Type::Unknown => false,
     }
 }
 

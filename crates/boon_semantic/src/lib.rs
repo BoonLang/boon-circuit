@@ -1023,9 +1023,17 @@ impl SemanticProgram {
                 "semantic source bundle digest does not match its checked oracle",
             ));
         }
-        let calls =
-            call_view::CallCatalog::new(&self.checked_program, self.kernel_input.as_deref())
-                .map_err(SemanticError::new)?;
+        let calls = if let Some(input) = self.kernel_input.as_deref() {
+            let calls = call_view::CallCatalog::packed(input).map_err(SemanticError::new)?;
+            if calls.has_complete_rich_parity_input(&self.checked_program) {
+                calls
+                    .validate_rich_parity(&self.checked_program)
+                    .map_err(SemanticError::new)?;
+            }
+            calls
+        } else {
+            call_view::CallCatalog::rich(&self.checked_program).map_err(SemanticError::new)?
+        };
         validate_contextual_bindings(&self.checked_program, &calls)?;
         contextual_expansion::validate_checked_callable_and_call_inventory(
             &self.checked_program,
@@ -2858,8 +2866,18 @@ fn elaborate_with_representation(
             checked_program.resource_projection_requirements.len(),
         )));
     }
-    let calls = call_view::CallCatalog::new(&checked_program, kernel_input_ref)
-        .map_err(SemanticError::new)?;
+    let calls = if let Some(input) = kernel_input_ref {
+        let calls = call_view::CallCatalog::packed(input).map_err(SemanticError::new)?;
+        #[cfg(any(test, feature = "test-packed-call-oracle"))]
+        if calls.has_complete_rich_parity_input(&checked_program) {
+            calls
+                .validate_rich_parity(&checked_program)
+                .map_err(SemanticError::new)?;
+        }
+        calls
+    } else {
+        call_view::CallCatalog::rich(&checked_program).map_err(SemanticError::new)?
+    };
     let call_types = call_view::CallTypeCatalog::new(&calls).map_err(SemanticError::new)?;
     let source_bundle_digest_v1 = checked_program.source_bundle_digest_v1;
     let role = checked_program.role;
@@ -2963,8 +2981,15 @@ fn elaborate_with_representation(
             kernel_input_ref,
             producer_roots,
             &verified_intent,
-            |calls, call, _, entry, substitutions| {
-                provisional_out_port_contract(&checked_program, calls, call, entry, substitutions)
+            |calls, call_types, call, _, entry, substitutions| {
+                provisional_out_port_contract(
+                    &checked_program,
+                    calls,
+                    call_types,
+                    call,
+                    entry,
+                    substitutions,
+                )
             },
             |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
@@ -3289,6 +3314,7 @@ fn elaborate_with_representation(
 fn provisional_out_port_contract(
     program: &CheckedProgramFields,
     calls: &call_view::CallCatalog<'_>,
+    call_types: &call_view::CallTypeCatalog,
     call: call_view::CallRef<'_>,
     entry: call_view::CallEntryRef<'_>,
     type_substitutions: &[boon_checked::CheckedTypeSubstitution],
@@ -3302,9 +3328,18 @@ fn provisional_out_port_contract(
         ))
     })?;
     let parameter = entry.parameter();
+    let parameter_flow = call_types
+        .parameter(calls, call.callable(), parameter.ordinal())
+        .ok_or_else(|| {
+            SemanticError::new(format!(
+                "checked call {} OUT formal {} has no materialized callable parameter flow",
+                call.id().0,
+                formal.0,
+            ))
+        })?;
     let flow_type = boon_checked::FlowType {
-        mode: parameter.flow_type.mode,
-        ty: apply_out_type_frame(&parameter.flow_type.ty, type_substitutions),
+        mode: parameter_flow.mode,
+        ty: apply_out_type_frame(&parameter_flow.ty, type_substitutions),
     };
     let lexical_scope = program
         .expressions
@@ -3329,7 +3364,7 @@ fn provisional_out_port_contract(
                     target.0
                 ))
             })?;
-            declaration.body_scope.ok_or_else(|| {
+            declaration.body_scope().ok_or_else(|| {
                 SemanticError::new(format!(
                     "checked call {} forwards OUT formal {} to declaration {} without an output scope",
                     call.id().0, formal.0, target.0
@@ -3343,7 +3378,7 @@ fn provisional_out_port_contract(
         shape_digest: [0; 32],
         lexical_scope,
         output_scope,
-        role: callable.role,
+        role: callable.role(),
         generation_identity: None,
         correlation_identity: None,
         presence: OutPresenceCompatibilityV1::from_mode(flow_type.mode),
@@ -3605,7 +3640,7 @@ fn resolve_out_contracts(
             Some(checked_call) => calls
                 .get(checked_call)
                 .and_then(|call| calls.callable(call.callable()))
-                .map(|callable| callable.role)
+                .map(|callable| callable.role())
                 .ok_or_else(|| {
                     SemanticError::new(format!(
                         "OUT call instance {call_id} references missing checked call {}",
@@ -3730,7 +3765,7 @@ fn concrete_checked_expression_type(
                                     call.owner_callable(),
                                     scoped.frame,
                                 ) && call.expression() == scoped.expression
-                                    && callable.kind == boon_checked::CheckedCallableKind::User
+                                    && callable.kind() == boon_checked::CheckedCallableKind::User
                                     && calls.entries(call).all(|entry| entry.input().is_some())
                                     && call.context_count() == 0
                                     && matches!(
@@ -3738,10 +3773,10 @@ fn concrete_checked_expression_type(
                                         boon_checked::CheckedContextBinding::None
                                     )
                                     && calls.contextual_substitutions(call).next().is_none()
-                                    && callable.contexts.is_empty()
-                                    && callable.context_formal.is_none()
-                                    && callable.contextual_operation.is_none()
-                                    && callable.effect
+                                    && callable.context_count() == 0
+                                    && callable.context_formal_id().is_none()
+                                    && callable.contextual_operation().is_none()
+                                    && callable.effect()
                                         == boon_checked::CheckedEffectSummary::default()
                             });
                         let occurrence = if instance_less_is_pure {
@@ -6450,8 +6485,15 @@ result: identity(value: [element: 1])
         let graph = out_net::OutNet::<OutPortContractV1>::try_build_with(
             &checked,
             producer_roots,
-            |calls, call, _, entry, substitutions| {
-                provisional_out_port_contract(&checked, calls, call, entry, substitutions)
+            |calls, call_types, call, _, entry, substitutions| {
+                provisional_out_port_contract(
+                    &checked,
+                    calls,
+                    call_types,
+                    call,
+                    entry,
+                    substitutions,
+                )
             },
             |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
@@ -6509,8 +6551,15 @@ result: identity(value: 1)
         let mut graph = out_net::OutNet::<OutPortContractV1>::try_build_with(
             &checked,
             producer_roots,
-            |calls, call, _, entry, substitutions| {
-                provisional_out_port_contract(&checked, calls, call, entry, substitutions)
+            |calls, call_types, call, _, entry, substitutions| {
+                provisional_out_port_contract(
+                    &checked,
+                    calls,
+                    call_types,
+                    call,
+                    entry,
+                    substitutions,
+                )
             },
             |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
@@ -6605,8 +6654,15 @@ result:
         let graph = out_net::OutNet::<OutPortContractV1>::try_build_with(
             &fields,
             producer_roots,
-            |calls, call, _, entry, substitutions| {
-                provisional_out_port_contract(&fields, calls, call, entry, substitutions)
+            |calls, call_types, call, _, entry, substitutions| {
+                provisional_out_port_contract(
+                    &fields,
+                    calls,
+                    call_types,
+                    call,
+                    entry,
+                    substitutions,
+                )
             },
             |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
@@ -6775,8 +6831,15 @@ result:
             None,
             producer_roots,
             &intent,
-            |calls, call, _, entry, substitutions| {
-                provisional_out_port_contract(&fields, calls, call, entry, substitutions)
+            |calls, call_types, call, _, entry, substitutions| {
+                provisional_out_port_contract(
+                    &fields,
+                    calls,
+                    call_types,
+                    call,
+                    entry,
+                    substitutions,
+                )
             },
             |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
@@ -8061,8 +8124,15 @@ FUNCTION selectable_row(row) {
         let out_net = out_net::OutNet::<OutPortContractV1>::try_build_with(
             &checked,
             producer_roots,
-            |calls, call, _, entry, substitutions| {
-                provisional_out_port_contract(&checked, calls, call, entry, substitutions)
+            |calls, call_types, call, _, entry, substitutions| {
+                provisional_out_port_contract(
+                    &checked,
+                    calls,
+                    call_types,
+                    call,
+                    entry,
+                    substitutions,
+                )
             },
             |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
@@ -8131,8 +8201,15 @@ store: [
         let out_net = out_net::OutNet::<OutPortContractV1>::try_build_with(
             &checked,
             producer_roots,
-            |calls, call, _, entry, substitutions| {
-                provisional_out_port_contract(&checked, calls, call, entry, substitutions)
+            |calls, call_types, call, _, entry, substitutions| {
+                provisional_out_port_contract(
+                    &checked,
+                    calls,
+                    call_types,
+                    call,
+                    entry,
+                    substitutions,
+                )
             },
             |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
@@ -8655,8 +8732,15 @@ result: mapped(value: 0)
             &checked,
             producer_roots,
             &retained,
-            |calls, call, _, entry, substitutions| {
-                provisional_out_port_contract(&checked, calls, call, entry, substitutions)
+            |calls, call_types, call, _, entry, substitutions| {
+                provisional_out_port_contract(
+                    &checked,
+                    calls,
+                    call_types,
+                    call,
+                    entry,
+                    substitutions,
+                )
             },
             |_, kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )

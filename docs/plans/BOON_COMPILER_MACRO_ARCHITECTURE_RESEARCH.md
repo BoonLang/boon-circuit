@@ -1,6 +1,17 @@
 # Boon Compiler Macro-Architecture Research
 
-Status: selected architecture refinement, reconciled through unit-native
+Status, 2026-09-06: historical research. Its former execution order is
+superseded by
+[the active compiler plan](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md).
+[The current audit](BOON_COMPILER_REASSESSMENT_2026_09_06.md) distinguishes
+already-landed packed/module sharing from remaining repeated evaluation,
+reconstruction and revision work. Dated "current"/"next" instructions below
+are not an active goal. One logical authority does not require whole-project
+physical storage, and warm work need not wait for unproven cold stretch targets.
+
+## Historical Research Contract
+
+Historical status: selected architecture refinement, reconciled through unit-native
 checkpoint `a48f488`; subordinate to
 `BOON_COMPILER_PERFORMANCE_PLAN.md` and additive to
 `BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`.

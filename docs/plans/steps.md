@@ -1,7 +1,19 @@
 # Boon Implementation Order
 
-`GOAL_PROMPT.md` is the complete execution contract. This file fixes sequencing
-only; linked plans remain authoritative for their own semantics and acceptance.
+Status, 2026-09-06: historical unified-portfolio sequence, not the current
+compiler goal. The active compiler sequence is
+[Definition-Owned Work and Responsive Revisions](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md),
+and [the next goal](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md) selects
+K0+K1 only. `GOAL_PROMPT.md` is now an index, not the retired unified objective.
+Do not execute the old resumption points below, defer warm responsiveness until
+all cold stretch hypotheses pass, or expand into later language/native/console/
+product work without a newly selected scope. Linked semantic plans retain their
+own meaning and acceptance, including the still-missing authored WHERE feature.
+
+## Historical Portfolio Sequencing
+
+The following text preserves the old combined sequencing and checkpoints for
+reference. Its "active", "current" and "next" instructions are historical.
 
 Before advancing past any numbered step, assign at least one fresh-context,
 read-only adversarial subagent to map that step and every completed linked-plan

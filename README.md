@@ -37,7 +37,8 @@ a verified Boon-designed RV32I system plus an interpreter-first standalone
 - [BoonConsole implementation plan](docs/plans/BOON_CONSOLE_IMPLEMENTATION_PLAN.md)
 - [Native GPU pipeline contract](docs/architecture/NATIVE_GPU_PIPELINE.md)
 - [Manual testing runbook](docs/plans/MANUAL_TESTING_RUNBOOK.md)
-- [`/goal` prompt](docs/plans/GOAL_PROMPT.md)
+- [Active compiler architecture plan](docs/plans/BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md)
+- [Next compiler `/goal` prompt](docs/plans/BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md)
 
 ## Non-Goals For The First Pass
 

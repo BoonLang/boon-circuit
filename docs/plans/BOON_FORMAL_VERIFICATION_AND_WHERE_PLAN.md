@@ -8,6 +8,59 @@ teaching portfolio, rollout, and acceptance criteria. It does not claim that
 the current parser, typechecker, compiler, runtime, editor, or playground
 already accepts or verifies `WHERE`.
 
+## Implementation Status — 2026-09-06
+
+Authored WHERE is still missing from the production language path audited at
+`37a576b6`. `boon_syntax` marks it Planned/Reject; the parser rejects the keyword;
+`boon_verify::verify_explicit_contracts` documents the absent accepted syntax
+and constructs the bootstrap verification result without source-generated
+contract/condition/obligation rows. Nonempty manifest unit-test fixtures are
+not an authored-source proof engine. Retain fail-closed rejection until a real
+supported feature slice is ready.
+
+The recorded NovyWave `contract_verify_ms` of roughly 0.050 ms is the present
+empty-obligation/dependency-binding bootstrap cost. It is NOT WHERE discharge
+performance and does not establish a budget for future function, HOLD, list or
+migration proofs. Earlier compiler research saying "WHERE is sub-millisecond"
+must be read as this correction, not a completed feature claim.
+
+[The compiler reassessment](BOON_COMPILER_REASSESSMENT_2026_09_06.md) preserves
+source anchors and evidence; [the active compiler plan](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md)
+tracks this explicitly as F1. Its next K0+K1 goal does not implement this entire
+formal plan. A later selected F1 goal must check the language-foundation and
+typed-list prerequisites below, then implement the relevant formal phases.
+The missing feature must not disappear from the backlog merely because the
+bootstrap artifact spine exists. No previous phase is marked complete here.
+
+The first source-to-proof vertical slice must cover both authored forms,
+complete parsing/recovery, checked contract ownership, lexical/PASSED
+substitution, real required-obligation discovery, nonempty completeness-checked
+manifests, supported pure/function proof discharge, source-bound diagnostics,
+proof erasure and the mandatory opaque verified-artifact boundary. It must test
+successful proofs, violated caller/result contracts, unknown/unsupported cases,
+missing/extra/tampered evidence and deterministic results. Failure or pending
+proof cannot publish an executable image or silently become a runtime assertion.
+HOLD, lists and migrations remain explicit subsequent phases; a pure slice is
+not V1 completion.
+
+Performance/tooling acceptance must report separately:
+
+- feature/assurance scope: unavailable bootstrap versus supported authored proof;
+- declared contracts, instantiated requirements, required obligations, discharged
+  obligations and failed/unknown/resource-limit outcomes;
+- obligation discovery and proof-context construction time/work;
+- actual discharge time/work and evidence/completeness checking;
+- cold proof versus exact-currentness/reused proof, with nonzero-obligation
+  representative fixtures and invalid-input cases;
+- final packed image audit, compiler artifact readiness, runtime installation
+  and presented preview as distinct endpoints.
+
+A benchmark with zero source obligations cannot close a source-WHERE timing
+gate. General proof complexity is not bounded by the current NovyWave timer;
+resource limits must produce explicit fail-closed outcomes, not weakened proof.
+
+## Semantic Authority
+
 This plan is the source of truth for implementing the feature. Once the
 implementation is accepted, the normative language semantics must also be
 integrated into `docs/architecture/LANGUAGE_SEMANTICS.md`; that document must

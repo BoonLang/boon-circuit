@@ -1,32 +1,35 @@
-# Boon Cold-First Compiler Performance Plan
+# Boon Compiler Performance and Evidence Contract
 
-Date: 2026-08-02
+Created: 2026-08-02. Authority reconciliation: 2026-09-06.
 
-Last architecture reconciliation: 2026-08-04
+Status: normative measurement, semantic-preservation and full-program
+acceptance contract. The single active implementation order and bug/feature
+register are in
+[the compiler architecture plan](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md).
+[The K0+K1 prompt](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md) selects the
+next bounded goal; this entire program is not implicitly that goal's scope.
 
-Status: authoritative blocking implementation contract for compiler latency,
-memory, invalidation, cancellation, and compiler-service ownership.
+[budgets/compiler.toml](../../budgets/compiler.toml) is the sole executable
+budget, sample-protocol and oracle authority. This document defines meanings,
+not a second editable budget table. The previous prose's NovyWave 384 MiB RSS
+limit differs from the manifest's 512 MiB; 384 MiB remains an unimplemented
+tighter target, not a claim that a gate was changed here. The 128 MiB and
+tens-of-milliseconds proposals remain stretch hypotheses. No executable budget
+or compiler configuration changed in this documentation reconciliation.
 
-Under the combined order in [`steps.md`](steps.md), this plan is implemented
-before the remaining native-recovery exit and before later language, formal,
-packed-runtime, console, product, or game work. Documentation reconciliation is
-the first slice; passing the cold compiler gates is the first implementation
-exit.
+The dated baseline, architecture journal and implementation-order sections
+below preserve historical design, regressions and checkpoint evidence. Their
+"current", "resume", Phase/M-number and execution-order instructions are NOT
+active. Consult them for the selected owner's lessons, not to restart completed
+work or expand a bounded goal. `steps.md`, the old refactor/research plans and
+retired unified prompt do not override K0--K5. Current evidence and corrections
+are in [the 2026-09-06 audit](BOON_COMPILER_REASSESSMENT_2026_09_06.md).
 
-[`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md)
-is the current high-leverage execution map derived from the live
-post-`c870358` audit. Its post-`d177af9` definition-artifact decision is detailed
-in
-[`BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`](BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md);
-the post-`e510726` unit-native/fact-store/compositional-seal refinement is
-detailed in
-[`BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`](BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md).
-The 2026-08-21 allocation, warm-session, Linux allocator/toolchain, and
-tens-of-milliseconds evidence is consolidated in
-[`BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md`](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md).
-This plan remains authoritative for every budget and exit; the refactor plan
-and its tens-of-milliseconds refinement fix the current order and deletion
-criteria for reaching them.
+The Purpose, Non-Negotiable Outcome, Performance Contract, harness/protocol,
+independent full-program closure and Clear End Condition sections remain
+normative with these scope distinctions. Language/formal/native plans retain
+their semantic authority. The active architecture plan owns mechanisms and
+ordering; this contract owns evidence and full-program acceptance meaning.
 
 ## Purpose And Authority
 
@@ -58,9 +61,9 @@ It does not own or weaken:
 
 The owning language, formal, packed, persistence, native, and console plans
 remain authoritative for those concerns. Where an older plan describes a
-compiler representation or execution order that conflicts with the budgets
-here, this plan owns the performance mechanism while preserving that plan's
-semantics and acceptance meaning.
+compiler representation or execution order that conflicts with the active
+architecture plan, the newer cut sequence owns the mechanism while preserving
+this evidence contract and the semantic owner's acceptance meaning.
 
 ## Non-Negotiable Outcome
 
@@ -76,21 +79,21 @@ or compiler daemon state may be reused by either cold mode. Incremental state
 and content-addressed artifacts are a second optimization layer; they cannot
 be used to satisfy a cold gate.
 
-A `/goal` run does not reach a performance stopping point by reconciling
-documentation, adding counters, extracting a crate, producing a directional
-sample, committing a checkpoint, or passing a focused correctness test. Those
-are implementation steps. While any required report is missing or red, the
-next action is the highest-impact measured compiler change or the smallest
-harness change that makes that blocker measurable. After an authorized phase
-checkpoint, continue directly with the next failing gate. Do not wait for a
-second `/goal resume` instruction and do not enter a later plan.
+A full performance-completion claim requires the Clear End Condition, not
+documentation, counters, one sample or an intermediate commit. A separately
+scoped goal may finish its reviewed architectural decision/cut while inherited
+whole-program gates remain red. It must list those failures and cannot claim
+this program is complete. Continue only within the selected goal's authorized
+cuts, then hand off; do not automatically enter another plan.
 
-The default and measured compiler is single-threaded. Parallel compilation is
-permitted only after the single-threaded cold targets pass and only when it
-improves a separately measured workload without increasing interactive
-contention or making correctness depend on scheduling.
+The normative measured compiler remains single-threaded. Warm revision work
+and optional bounded parallel experiments need not wait for speculative cold
+stretch targets. Parallel experiments require deterministic dependency
+ownership, aggregated worker evidence and a separate product label. They cannot
+satisfy or weaken single-threaded cold gates; full completion still requires
+those gates to pass with every worker pool disabled.
 
-## Current Baseline
+## Historical Baselines — Not Current Resumption Instructions
 
 The current post-reboot debug-profile checkpoint is historical diagnostic
 evidence, not an accepted performance ceiling:
@@ -158,15 +161,12 @@ The complete current resumption evidence and sequence are recorded below.
 
 ### Cold Budgets
 
-Each cold mode must pass the following single-threaded p95 limits with compiler
-caches disabled. Every scored sample must remain below the listed peak-RSS
-limit:
-
-| Fixture | Complete checked diagnostics p95 | Verified runnable `MachinePlan` p95 | Peak RSS |
-| --- | ---: | ---: | ---: |
-| Counter | 10 ms | 50 ms | 32 MiB |
-| Physical TodoMVC | 75 ms | 300 ms | 128 MiB |
-| NovyWave | 250 ms | 1,000 ms | 384 MiB |
+Each cold mode must pass the single-threaded p95 and per-sample peak-RSS limits
+in `budgets/compiler.toml` for Counter, physical TodoMVC and NovyWave, with
+compiler caches disabled. Read that manifest rather than copying a second
+numeric table here. A proposed harder policy is recorded separately; changing
+a manifest gate requires an explicit reviewed change, never automatic rebasing
+to the candidate being measured.
 
 "Complete checked diagnostics" parses and checks the entire requested source
 snapshot and returns every diagnostic required by the typechecking contract. It
@@ -178,18 +178,13 @@ semantic artifact cannot satisfy this budget.
 
 ### Warm Interaction Budgets
 
-Against an already opened project:
-
-- an edit's complete affected checked diagnostics finish within 16.7 ms p95,
-  25 ms p99, and 33.4 ms maximum;
-- a valid constant-dependency-cone edit reaches a replacement verified preview
-  within 100 ms p95 and 200 ms maximum;
-- lookup of an already loaded verified bundle completes within 1 ms;
-- an example switch is acknowledged within 16.7 ms and reaches the final
-  presented native frame within 100 ms p95 and 200 ms maximum;
-- a generation superseded by a newer edit or switch stops consuming compiler
-  work within 8 ms;
-- no superseded diagnostic, proof, plan, or preview generation is published.
+Against an already opened project, apply the manifest's `[warm]` p95/p99/max
+limits to complete affected diagnostics, verified preview, loaded-bundle
+lookup, switch acknowledgement/presentation and in-flight cancellation.
+No superseded diagnostic, proof, plan or preview generation may publish.
+Include valid/incomplete/erroneous edits, diagnostics-to-preview promotion,
+public/private/unrelated changes and revision retirement. A pre-canceled
+request is not evidence of bounded in-flight cancellation.
 
 Compiler completion and native presentation are separate measurements. The
 native pipeline remains responsible for proving the final presented frame; it
@@ -200,8 +195,11 @@ readback-proved presentation.
 
 Checked-in synthetic fixtures independently scale call depth, call-site count,
 contextual call sites, static branch count, source-unit count, and dependency-
-cone size. After fixed setup overhead, doubling one controlled dimension may
-increase the owning phase's counted work and allocation by at most 2.2 times.
+cone size. After fixed setup overhead, doubling one controlled dimension must
+respect the manifest's `maximum_doubling_ratio` for owning work and allocation.
+Extend the suite for invocation fanout, summary-node evaluation, compatible
+stateful code variants and exact invalidation. Final artifact cardinalities
+cannot substitute for operations actually evaluated.
 
 Ordinary callable bodies are stored once. A pruned static branch creates no
 semantic dependency, proof obligation, or backend node. A constant-cone edit
@@ -250,33 +248,24 @@ Do not collapse edge kinds merely to reduce graph count. Callable lexical
 scope, public-interface inference, result transfer, output flow, and authority
 share graph/SCC machinery, while each typed edge fact has one authority and
 each compact view contains only dependencies that can affect that semantic
-result. Acyclic components execute once; fixed-point inference is restricted
-to actual cycles.
+result. Re-evaluation must be justified by a changed semantic input/dependency,
+including late provider epochs; an acyclic label does not permit stale reuse.
+Fixed-point inference and widening retain the language's explicit cycle rules.
 
-The optimization order is mandatory:
+The active architecture plan supplies the only cut order. Preserve exact
+parity/currentness oracles, remove repeated transfer evaluation, publish one
+definition fact owner, migrate its consumers, delete superseded production
+reconstruction and remeasure. This is not a requirement to finish every
+cross-phase allocation cleanup before fixing invocation amplification or warm
+revision ownership. Useful derived indexes are permitted; duplicate semantic
+producers are not.
 
-1. establish exact parity/currentness oracles and close the active correctness
-   blocker;
-2. compile result transfers once into the SCC component artifact and remove
-   recursive source-shaped reinterpretation across nested call frames;
-3. publish the owner artifact core and make diagnostics a shallow owner/global-
-   reducer/source-unit projection, deleting whole-project semantic replay;
-4. fuse redundant interface input validation/module construction into the
-   component transaction and migrate checked/verified consumers to the same
-   facts;
-5. delete every superseded scan, index, rich retained owner, and second
-   semantic implementation, then remeasure;
-6. only after the normative single-threaded cold gates pass, evaluate bounded
-   deterministic scheduling across graph-proven independent SCCs and owner
-   bodies.
+Local container/hash tuning and extra threads cannot replace an uncompleted
+owning cut. Bounded configuration/parallel experiments follow the active plan's
+explicit conditions and separate labels. They cannot establish normative cold
+acceptance; full completion must pass with caches and worker pools disabled.
 
-Hashing/container tuning, unsafe, caches, crate splitting, and broad
-parallelism do not precede those ownership deletions unless a fresh profile
-proves that one is the largest remaining owner. Parallelism is optional and
-cannot establish a phase exit; disabling every worker pool must leave all
-single-threaded cold gates green.
-
-## Compiler Architecture
+## Historical Compiler Architecture and Checkpoint Journal
 
 ### Source And Checked Database
 
@@ -1622,7 +1611,9 @@ never mixed into cold results.
 
 ## Optimization Loop And Harness Ladder
 
-Repeat this loop until the plan's Clear End Condition passes:
+Use this loop within the authorized cut. Full-program completion requires the
+Clear End Condition; a bounded checkpoint has the explicitly different outcome
+defined by its selected goal:
 
 1. Measure the same revision and producer. Record source digest, binary hash,
    intent, fixture, total/phase time, RSS, work counters, diagnostics digest,
@@ -1637,8 +1628,8 @@ Repeat this loop until the plan's Clear End Condition passes:
 4. Run the smallest unit/integration tests that cover the changed owner plus a
    deterministic malformed-source or negative-proof oracle where applicable.
    A broad workspace suite is a milestone check, not an edit-loop command.
-5. Invoke the already-built producer directly for Counter and NovyWave, and
-   add physical TodoMVC when the changed owner affects its path. Compare
+5. Invoke the already-built producer directly for Counter, NovyWave and
+   physical TodoMVC, plus relevant invalid/stateful holdouts. Compare
    diagnostics and artifact hashes as well as time, RSS, and work.
 6. Keep the change only when it preserves semantics and either materially
    reduces the targeted work/time/RSS or establishes a required measured
@@ -1648,23 +1639,28 @@ Repeat this loop until the plan's Clear End Condition passes:
    subagent the phase contract, live revision, exact diff/checkpoint range, and
    report paths. It must try to disprove completion and return an evidence-
    backed pass/fail checklist. Close every finding before the exit claim.
-8. If a coherent checkpoint is authorized, commit its exact scope, then begin
-   the next failing gate in the same goal run.
+8. If a coherent checkpoint is authorized, commit its exact scope, then
+   continue only to the next cut explicitly included in that goal. Otherwise
+   stop with evidence and a proposed next goal. Never push without approval.
 
 Use three harness levels so verification cost stays proportional to confidence:
 
 - **Edit loop:** one direct debug or existing release sample per relevant
   intent/fixture, plus focused correctness tests. It is directional only and
   never produces acceptance evidence.
-- **Milestone preflight:** build the current release `boon_cli` once with
-  `cargo build --locked --release --jobs 2 -p boon_cli --bin boon_cli`, then run
-  the xtask collectors with a small explicitly non-acceptance sample count.
-  Fix failures before spending time on 30-sample reports.
+- **Milestone preflight:** build the current release product/evidence pair
+  once using the command below, then run the xtask collectors with a small
+  explicitly non-acceptance sample count. Fix correctness, identity and new
+  regressions before 30-sample comparisons; inherited absolute failures remain
+  visible and prevent full-program acceptance.
 - **Acceptance:** from one clean unchanged revision and current producer, run
   the manifest protocol of three setup plus 30 scored observations for all
   fixtures and both cold modes, followed by the complete interaction/scaling
   collector and `--check-existing` validation. Do this only for a candidate
-  that passed preflight.
+  that passed preflight. A bounded K1 decision may use that full sample count
+  under a separate report path while inherited absolute limits remain red;
+  it is comparison evidence, not full-program acceptance. Correctness,
+  identity and previously passing gates must not regress.
 
 The concrete collector sequence is:
 
@@ -1673,14 +1669,14 @@ The concrete collector sequence is:
 cargo build --locked --jobs 2 -p xtask
 
 # One release producer build for the coherent candidate.
-cargo build --locked --release --jobs 2 -p boon_cli --bin boon_cli
+cargo build --locked --release --jobs 2 -p boon_cli --bin boon_cli --bin boon_cli_evidence
 
-# Fast cold preflight during Phases 1-3.
+# Fast cold preflight for the selected ownership cut.
 target/debug/xtask verify-compiler-performance \
   --report target/reports/compiler-performance/preflight-cold.json \
   --setup-samples 1 --scored-samples 5
 
-# Add the interaction preflight when Phase 4 session/cancellation work exists.
+# Add interaction preflight for K3 session/cancellation work.
 target/debug/xtask verify-compiler-interactions \
   --report target/reports/compiler-performance/preflight-interactions.json \
   --setup-samples 1 --scored-samples 5
@@ -1691,12 +1687,12 @@ target/debug/xtask verify-compiler-interactions
 target/debug/xtask verify-compiler-performance --check-existing
 target/debug/xtask verify-compiler-interactions --check-existing
 
-# Phase 6 adds this manifest-backed closure after the three reviews exist.
-target/debug/xtask verify-compiler-performance-closure --check-existing
+# Planned final closure, NOT registered at the 2026-09-06 audit:
+# target/debug/xtask verify-compiler-performance-closure --check-existing
 ```
 
-Run each Cargo or collector command sequentially. During cold Phases 1-3, the
-interaction collector's explicit missing session/native evidence remains red
+Run each Cargo or collector command sequentially. During a cold ownership cut,
+the interaction collector's explicit missing session/native evidence remains red
 and does not block work on the cold owner; do not repeatedly run it before its
 implementation phase. A failing relevant preflight report is useful blocker
 evidence and must not overwrite the default acceptance report. The one-sample
@@ -1709,7 +1705,7 @@ does not block work; deterministic phase timers, work/allocation counters, and
 targeted trace modes must be sufficient to choose an owner. External profilers
 are corroborating evidence when available, not an excuse to stop.
 
-## Implementation Order
+## Historical Implementation Order — Superseded by K0--K5
 
 ### Phase 0: Documentation And Measurement Contract
 
@@ -2433,9 +2429,10 @@ compiler and downstream reports stale, so rerun them before repeating review.
   process-local compiler state with scored samples.
 - Record three unscored setup runs followed by 30 sequential scored runs for
   each cold mode and fixture. Do not flush the OS page cache.
-- Report Linux process peak RSS in KiB, sampled immediately after the checked
-  result or runnable `MachinePlan` exists and before plan-validation, pretty-
-  serialization, hashing, or report allocation can raise the high-water mark.
+- Report Linux process peak RSS in KiB through the consumed compiler artifact,
+  including every verifier, seal and digest needed to publish it. Separate
+  later unrequested export/report work, but do not exclude validation or hashing
+  consumed by the requested endpoint. State and preserve the measurement scope.
 - Report p50, p95, p99 where meaningful, maximum, peak RSS, phase work,
   allocations, cache status, cancellation latency, source digest, compiler
   revision, worktree fingerprint, binary hash, and artifact hash.
@@ -2456,11 +2453,16 @@ compiler and downstream reports stale, so rerun them before repeating review.
 - Add invalidation tests proving unrelated units, callables, semantic
   components, obligations, and backend regions are not recomputed.
 - Add cancellation races at parse, constraint, semantic, manifest, proof, and
-  lowering boundaries. A canceled generation publishes nothing.
+  lowering boundaries and inside long work batches. Measure live stop latency;
+  a canceled generation publishes nothing.
 - Compare fresh-process and empty-database results byte-for-byte and compare
   incremental results against a clean full compile of the same revision.
 
 ## Independent Adversarial Closure
+
+This section closes the full compiler-performance program, not every local
+K1 decision. The final aggregate/sidecar contract is still implementation work
+at K5; absence must be reported, not treated as a passing command.
 
 Performance completion requires three fresh-context, read-only subagent reviews
 with disjoint charters. Give each reviewer the current contracts, live `HEAD`,
@@ -2517,8 +2519,9 @@ code, test, counter, or report support.
 
 ## Clear End Condition
 
-This plan is complete only when all of the following are true on one unchanged
-revision:
+The full compiler-performance program is complete only when all of the
+following are true on one unchanged revision. Bounded goal completion is a
+different claim and retains the list of outstanding program failures:
 
 - both cache-disabled cold modes pass every time, RSS, determinism, and scaling
   gate for Counter, physical TodoMVC, and NovyWave;
@@ -2554,5 +2557,8 @@ revision:
 Passing only a smoke test, increasing a timeout, warming a cache, running more
 compilers concurrently, publishing partial diagnostics, skipping proof work,
 or preserving the old path behind a fallback does not satisfy this plan.
-Neither does ending a `/goal` run after an intermediate commit while any item
-above is missing or failing.
+An intermediate reviewed goal/checkpoint may finish its explicitly scoped
+outcome; it must not describe this full-program condition as passed while any
+item above is missing or failing. Authored WHERE feature completion additionally
+requires real source obligations and the formal plan's acceptance: today's
+empty-obligation bootstrap timer is not that evidence.

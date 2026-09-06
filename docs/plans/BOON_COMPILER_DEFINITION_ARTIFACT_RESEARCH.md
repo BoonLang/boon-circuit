@@ -1,8 +1,18 @@
 # Boon Definition Artifact And Thin-Link Architecture Research
 
+Status, 2026-09-06: historical design evidence, not an execution sequence.
+[The active compiler plan](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md)
+retains definition-owned facts and thin linking while separating reusable
+type transfers/code from occurrence state and permitting immutable local chunks.
+[The current audit](BOON_COMPILER_REASSESSMENT_2026_09_06.md) corrects stale
+representation and measurement claims. Dated "current" and "next" instructions
+below do not override its K0--K5 cuts or scoped goal outcomes.
+
+## Historical Research Contract
+
 Date: 2026-08-03
 
-Status: selected architecture direction, reconciled through unit-native
+Historical status: selected architecture direction, reconciled through unit-native
 checkpoint `a48f488`; subordinate
 to [`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md) and
 the sequencing in

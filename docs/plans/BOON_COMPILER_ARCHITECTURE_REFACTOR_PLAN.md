@@ -1,8 +1,21 @@
 # Boon Compiler Architecture Refactor Plan
 
+Execution status, 2026-09-06: historical architecture/checkpoint journal.
+[Definition-Owned Work and Responsive Revisions](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md)
+is the single active cut sequence; use its
+[K0+K1 goal](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md) and
+[current evidence](BOON_COMPILER_REASSESSMENT_2026_09_06.md).
+All dated "active", "current", "next", "resume" and M-number instructions
+below describe their historical checkpoint, not present authorization. They
+must not force all packed-allocation work to finish before eliminating
+invocation evaluation or downstream reconstruction. Landed work is preserved;
+read the historical sections only for a selected owner's design and pitfalls.
+
+## Historical Contract and Evidence
+
 Date: 2026-08-03
 
-Status: active high-leverage execution map, reconciled through the first
+Historical status: high-leverage execution map, reconciled through the first
 shared document plan-code/function-frame slice and deterministic checked-image
 definition publication cut on 2026-08-17, unit-native checkpoint `a48f488`,
 and the post-M1 identity/evaluator/fact-store/

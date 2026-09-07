@@ -1,0 +1,3488 @@
+{
+  "format_version": 1,
+  "kind": "K0 debug attribution; not timing acceptance or a legal memoization key",
+  "producer": {
+    "product_kind": "linux-mimalloc-product",
+    "binary_path": "/home/martinkavik/repos/boon-circuit/target/debug/boon_cli",
+    "binary_sha256": "3597d65e700ae70e6b487056b33ca64a639c0ae0182b24aadd853a7f95269b71",
+    "build_source_head": "ab670feca7e715728f95d95b66593652313b3575",
+    "build_source_workspace_sha256": "348e7f45f9469980ca248e5beb22a1f9b5c4b095cba86114535339d831da6775",
+    "build_source_dirty": true,
+    "build_input_scope": "workspace-cargo-toolchain-and-crates-excluding-xtask-plus-mimalloc-v1",
+    "rustc_release": "1.97.1",
+    "rustc_commit": "8bab26f4f68e0e26f0bb7960be334d5b520ea452",
+    "rustc_commit_date": "2026-07-14",
+    "llvm_version": "22.1.6",
+    "target_triple": "x86_64-unknown-linux-gnu",
+    "target_cpu": "generic",
+    "cargo_profile": "debug",
+    "profile_options": "opt-level=0;lto=unknown;codegen-units=unknown;debug-assertions=unknown;overflow-checks=unknown",
+    "rustflags": "",
+    "allocator": {
+      "id": "microsoft-mimalloc",
+      "version": "3.5.0",
+      "upstream_tag": "v3.5.0",
+      "upstream_commit": "18b08671c9302247bfb682286e6bf3cc1773f801",
+      "source_sha256": "a8f17aaca70683b44a9669f29624d6ab6d650d4f169a73d23262a475c1aabe1e",
+      "static_archive_sha256": "073bfa6797b0a916e56b363aa7206822f50fa1a8735bd056727aaf77fe501812",
+      "linkage": "static-rust-global-allocator-no-libc-override",
+      "build_options": "release;MI_STATIC_LIB=1;MI_BUILD_RELEASE=1;MI_OVERRIDE=0;MI_SECURE=0;MI_GUARDED=0;MI_TRACK=off;MI_OPT_ARCH=0;MI_OPT_SIMD=0"
+    },
+    "allocation_instrumentation": "none",
+    "allocation_counter_scope": "none",
+    "ld_preload": null,
+    "mimalloc_environment": [],
+    "transparent_hugepage_enabled": "always [madvise] never",
+    "transparent_hugepage_defrag": "always defer defer+madvise [madvise] never"
+  },
+  "notes": [
+    "Compiler transfer algorithm unchanged from ab670fec; debug-only tracing is introduced with this evidence.",
+    "TypeTermIds below are scoped to the quiescent tracing run. Epoch binding IDs are scoped to the separate epoch tracing run. Neither is a stable cross-run identity.",
+    "Tuple equality is resolved input type plus flow-mode equality, not permission to share mutable call state, requirements, dependencies or captures.",
+    "Root mutation observations are not a complete dependency-event audit; the selected roots include explicit dynamic dependency lists and representative late binding replacements.",
+    "The 1871 requested variable IDs all produced quiescent rows. Core work remained 282393 operations and 620555 activations with identical diagnostics fingerprints across attribution runs."
+  ],
+  "commands": {
+    "inputs": "BOON_KERNEL_TRACE_OWNERS=80,91,103,115,127 target/debug/boon_cli compiler-sample examples/todo_mvc_physical/RUN.bn --intent diagnostics --mode fresh-process",
+    "quiescent": "Set BOON_KERNEL_TRACE_VARIABLES to the emitted kernel-trace-variables value and repeat the same sample without BOON_KERNEL_TRACE_OWNERS.",
+    "epochs": "BOON_KERNEL_TRACE_EPOCHS=1 BOON_KERNEL_TRACE_VARIABLES=4556,4559,4562,4565,4591,4688,4805,4899,6436,6439,6442,6445,6471,6568,6685,6779,9899,9925,39566,39592 target/debug/boon_cli compiler-sample examples/todo_mvc_physical/RUN.bn --intent diagnostics --mode fresh-process"
+  },
+  "definitions": [
+    {
+      "owner": 80,
+      "source": "examples/todo_mvc_physical/Theme/Classic.bn",
+      "function": "font",
+      "first_summary_rejection": {
+        "expression": 137,
+        "kind": "PatternRead",
+        "projection": "ButtonIcon.checked"
+      },
+      "dominant_variant": {
+        "static_variants": [
+          null,
+          null
+        ],
+        "initial_state_surface": true
+      },
+      "distinct_invocations": 175,
+      "quiescent_type_mode_tuples": 21,
+      "invocations_with_open_provider": 155,
+      "invocations_containing_type_variables": 3,
+      "tuples": [
+        {
+          "count": 32,
+          "representative": [
+            {
+              "variable": 9925,
+              "mode": 9666,
+              "flow": "Continuous",
+              "root": 10011,
+              "term": 43799,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 9899,
+              "mode": 9645,
+              "flow": "Continuous",
+              "root": 9916,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(9896), TypeVariableId(9931)]"
+            }
+          ]
+        },
+        {
+          "count": 29,
+          "representative": [
+            {
+              "variable": 39592,
+              "mode": 36133,
+              "flow": "Continuous",
+              "root": 39678,
+              "term": 43794,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 39566,
+              "mode": 36112,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 18,
+          "representative": [
+            {
+              "variable": 6924,
+              "mode": 6300,
+              "flow": "Continuous",
+              "root": 7010,
+              "term": 43703,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 6898,
+              "mode": 6279,
+              "flow": "Continuous",
+              "root": 6915,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(6895), TypeVariableId(6930)]"
+            }
+          ]
+        },
+        {
+          "count": 18,
+          "representative": [
+            {
+              "variable": 7526,
+              "mode": 7006,
+              "flow": "Continuous",
+              "root": 7612,
+              "term": 43791,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 7500,
+              "mode": 6985,
+              "flow": "Continuous",
+              "root": 7517,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(7497), TypeVariableId(7532)]"
+            }
+          ]
+        },
+        {
+          "count": 15,
+          "representative": [
+            {
+              "variable": 9026,
+              "mode": 8610,
+              "flow": "Continuous",
+              "root": 9112,
+              "term": 41093,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 9000,
+              "mode": 8589,
+              "flow": "Continuous",
+              "root": 9017,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(8997), TypeVariableId(9032)]"
+            }
+          ]
+        },
+        {
+          "count": 14,
+          "representative": [
+            {
+              "variable": 40486,
+              "mode": 37186,
+              "flow": "Continuous",
+              "root": 40572,
+              "term": 43795,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 40460,
+              "mode": 37165,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 9,
+          "representative": [
+            {
+              "variable": 7824,
+              "mode": 7357,
+              "flow": "Continuous",
+              "root": 7910,
+              "term": 43792,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 7798,
+              "mode": 7336,
+              "flow": "Continuous",
+              "root": 7517,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(7497), TypeVariableId(7532)]"
+            }
+          ]
+        },
+        {
+          "count": 9,
+          "representative": [
+            {
+              "variable": 8574,
+              "mode": 8159,
+              "flow": "Continuous",
+              "root": 8660,
+              "term": 43793,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 8548,
+              "mode": 8138,
+              "flow": "Continuous",
+              "root": 8565,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(8545), TypeVariableId(8580)]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 52058,
+              "mode": 47702,
+              "flow": "Continuous",
+              "root": 52144,
+              "term": 244476,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 52032,
+              "mode": 47681,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 5,
+          "representative": [
+            {
+              "variable": 27572,
+              "mode": 25625,
+              "flow": "Continuous",
+              "root": 27600,
+              "term": 43799,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 27546,
+              "mode": 25604,
+              "flow": "Continuous",
+              "root": 27563,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 4,
+          "representative": [
+            {
+              "variable": 15804,
+              "mode": 14774,
+              "flow": "Continuous",
+              "root": 15832,
+              "term": 43794,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 15778,
+              "mode": 14753,
+              "flow": "Continuous",
+              "root": 15795,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 16698,
+              "mode": 15827,
+              "flow": "Continuous",
+              "root": 16726,
+              "term": 43795,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 16672,
+              "mode": 15806,
+              "flow": "Continuous",
+              "root": 16689,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 20827,
+              "mode": 19439,
+              "flow": "Continuous",
+              "root": 20855,
+              "term": 43791,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 20801,
+              "mode": 19418,
+              "flow": "Continuous",
+              "root": 20818,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 25937,
+              "mode": 23974,
+              "flow": "Continuous",
+              "root": 25965,
+              "term": 41093,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 25911,
+              "mode": 23953,
+              "flow": "Continuous",
+              "root": 25928,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 26235,
+              "mode": 24325,
+              "flow": "Continuous",
+              "root": 26263,
+              "term": 43703,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 26209,
+              "mode": 24304,
+              "flow": "Continuous",
+              "root": 26226,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 9622,
+              "mode": 9312,
+              "flow": "Continuous",
+              "root": 9708,
+              "term": 1008,
+              "authoritative": true,
+              "dependencies": "[TypeVariableId(395)]"
+            },
+            {
+              "variable": 9596,
+              "mode": 9291,
+              "flow": "Continuous",
+              "root": 9613,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(9593), TypeVariableId(9628)]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 21125,
+              "mode": 19790,
+              "flow": "Continuous",
+              "root": 21153,
+              "term": 43792,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 21099,
+              "mode": 19769,
+              "flow": "Continuous",
+              "root": 21116,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 23069,
+              "mode": 21556,
+              "flow": "Continuous",
+              "root": 23097,
+              "term": 43793,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 23043,
+              "mode": 21535,
+              "flow": "Continuous",
+              "root": 23060,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 28192,
+              "mode": 26343,
+              "flow": "Continuous",
+              "root": 28220,
+              "term": 244476,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 28166,
+              "mode": 26322,
+              "flow": "Continuous",
+              "root": 28183,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 185163,
+              "mode": 168166,
+              "flow": "Continuous",
+              "root": 185191,
+              "term": 208721,
+              "authoritative": true,
+              "dependencies": "[TypeVariableId(4203)]"
+            },
+            {
+              "variable": 185137,
+              "mode": 168145,
+              "flow": "Continuous",
+              "root": 185154,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(185134), TypeVariableId(185169)]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 186800,
+              "mode": 169503,
+              "flow": "Continuous",
+              "root": 187123,
+              "term": 243034,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(187953), TypeVariableId(187960)]"
+            },
+            {
+              "variable": 4320,
+              "mode": 4145,
+              "flow": "Continuous",
+              "root": 186819,
+              "term": 258841,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4317), TypeVariableId(187246)]"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "owner": 91,
+      "source": "examples/todo_mvc_physical/Theme/Glassmorphism.bn",
+      "function": "material",
+      "first_summary_rejection": {
+        "expression": 161,
+        "kind": "PatternRead",
+        "projection": "InteractiveRecessed.focus"
+      },
+      "dominant_variant": {
+        "static_variants": [
+          null,
+          null
+        ],
+        "initial_state_surface": true
+      },
+      "distinct_invocations": 179,
+      "quiescent_type_mode_tuples": 26,
+      "invocations_with_open_provider": 154,
+      "invocations_containing_type_variables": 1,
+      "tuples": [
+        {
+          "count": 41,
+          "representative": [
+            {
+              "variable": 6568,
+              "mode": 6003,
+              "flow": "Continuous",
+              "root": 6500,
+              "term": 241830,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 6439,
+              "mode": 5899,
+              "flow": "Continuous",
+              "root": 6411,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(6409), TypeVariableId(6416)]"
+            }
+          ]
+        },
+        {
+          "count": 21,
+          "representative": [
+            {
+              "variable": 4688,
+              "mode": 4427,
+              "flow": "Continuous",
+              "root": 4620,
+              "term": 40980,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 4559,
+              "mode": 4323,
+              "flow": "Continuous",
+              "root": 5001,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4999), TypeVariableId(5006)]"
+            }
+          ]
+        },
+        {
+          "count": 18,
+          "representative": [
+            {
+              "variable": 48881,
+              "mode": 44580,
+              "flow": "Continuous",
+              "root": 48813,
+              "term": 41091,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 48752,
+              "mode": 44476,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 15,
+          "representative": [
+            {
+              "variable": 5628,
+              "mode": 5215,
+              "flow": "Continuous",
+              "root": 5560,
+              "term": 41093,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 5499,
+              "mode": 5111,
+              "flow": "Continuous",
+              "root": 5941,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(5939), TypeVariableId(5946)]"
+            }
+          ]
+        },
+        {
+          "count": 9,
+          "representative": [
+            {
+              "variable": 5158,
+              "mode": 4821,
+              "flow": "Continuous",
+              "root": 5090,
+              "term": 40988,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 5029,
+              "mode": 4717,
+              "flow": "Continuous",
+              "root": 5001,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4999), TypeVariableId(5006)]"
+            }
+          ]
+        },
+        {
+          "count": 9,
+          "representative": [
+            {
+              "variable": 44280,
+              "mode": 40479,
+              "flow": "Continuous",
+              "root": 44212,
+              "term": 41095,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 44151,
+              "mode": 40375,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 18375,
+              "mode": 17342,
+              "flow": "Continuous",
+              "root": 18415,
+              "term": 241830,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 18246,
+              "mode": 17238,
+              "flow": "Continuous",
+              "root": 18257,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 43246,
+              "mode": 39634,
+              "flow": "Continuous",
+              "root": 43178,
+              "term": 243933,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 43117,
+              "mode": 39530,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 43716,
+              "mode": 40028,
+              "flow": "Continuous",
+              "root": 43648,
+              "term": 41092,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 43587,
+              "mode": 39924,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 7,
+          "representative": [
+            {
+              "variable": 35254,
+              "mode": 32634,
+              "flow": "Continuous",
+              "root": 35186,
+              "term": 41081,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 35125,
+              "mode": 32530,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 6,
+          "representative": [
+            {
+              "variable": 41374,
+              "mode": 38104,
+              "flow": "Continuous",
+              "root": 41306,
+              "term": 41083,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 41245,
+              "mode": 38000,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 5,
+          "representative": [
+            {
+              "variable": 37778,
+              "mode": 34676,
+              "flow": "Continuous",
+              "root": 37710,
+              "term": 41082,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 37649,
+              "mode": 34572,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 5,
+          "representative": [
+            {
+              "variable": 38248,
+              "mode": 35070,
+              "flow": "Continuous",
+              "root": 38180,
+              "term": 41084,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 38119,
+              "mode": 34966,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 3,
+          "representative": [
+            {
+              "variable": 12648,
+              "mode": 12247,
+              "flow": "Continuous",
+              "root": 12688,
+              "term": 40980,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 12519,
+              "mode": 12143,
+              "flow": "Continuous",
+              "root": 12530,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 3,
+          "representative": [
+            {
+              "variable": 25033,
+              "mode": 23221,
+              "flow": "Continuous",
+              "root": 25073,
+              "term": 41091,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 24904,
+              "mode": 23117,
+              "flow": "Continuous",
+              "root": 24915,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 11502,
+              "mode": 11275,
+              "flow": "Continuous",
+              "root": 11542,
+              "term": 41081,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 11373,
+              "mode": 11171,
+              "flow": "Continuous",
+              "root": 11384,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 25580,
+              "mode": 23670,
+              "flow": "Continuous",
+              "root": 25620,
+              "term": 41093,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 25451,
+              "mode": 23566,
+              "flow": "Continuous",
+              "root": 25462,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 14008,
+              "mode": 13317,
+              "flow": "Continuous",
+              "root": 14048,
+              "term": 41082,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 13879,
+              "mode": 13213,
+              "flow": "Continuous",
+              "root": 13890,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 14472,
+              "mode": 13711,
+              "flow": "Continuous",
+              "root": 14512,
+              "term": 41084,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 14343,
+              "mode": 13607,
+              "flow": "Continuous",
+              "root": 14354,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 17586,
+              "mode": 16745,
+              "flow": "Continuous",
+              "root": 17626,
+              "term": 41083,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 17457,
+              "mode": 16641,
+              "flow": "Continuous",
+              "root": 17468,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 19434,
+              "mode": 18275,
+              "flow": "Continuous",
+              "root": 19474,
+              "term": 243933,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 19305,
+              "mode": 18171,
+              "flow": "Continuous",
+              "root": 19316,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 19898,
+              "mode": 18669,
+              "flow": "Continuous",
+              "root": 19938,
+              "term": 41092,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 19769,
+              "mode": 18565,
+              "flow": "Continuous",
+              "root": 19780,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 20456,
+              "mode": 19120,
+              "flow": "Continuous",
+              "root": 20388,
+              "term": 41095,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 20327,
+              "mode": 19016,
+              "flow": "Continuous",
+              "root": 20338,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 22713,
+              "mode": 21254,
+              "flow": "Continuous",
+              "root": 22753,
+              "term": 40988,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 22584,
+              "mode": 21150,
+              "flow": "Continuous",
+              "root": 22595,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 184364,
+              "mode": 167487,
+              "flow": "Continuous",
+              "root": 184296,
+              "term": 207710,
+              "authoritative": true,
+              "dependencies": "[TypeVariableId(184076)]"
+            },
+            {
+              "variable": 184235,
+              "mode": 167383,
+              "flow": "Continuous",
+              "root": 184103,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(184101), TypeVariableId(184108)]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 187260,
+              "mode": 169921,
+              "flow": "Continuous",
+              "root": 187050,
+              "term": 221929,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(187877), TypeVariableId(187915)]"
+            },
+            {
+              "variable": 4328,
+              "mode": 4153,
+              "flow": "Continuous",
+              "root": 186819,
+              "term": 258841,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4317), TypeVariableId(187246)]"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "owner": 103,
+      "source": "examples/todo_mvc_physical/Theme/Neobrutalism.bn",
+      "function": "material",
+      "first_summary_rejection": {
+        "expression": 114,
+        "kind": "PatternRead",
+        "projection": "InteractiveRecessed.focus"
+      },
+      "dominant_variant": {
+        "static_variants": [
+          null,
+          null
+        ],
+        "initial_state_surface": true
+      },
+      "distinct_invocations": 179,
+      "quiescent_type_mode_tuples": 26,
+      "invocations_with_open_provider": 154,
+      "invocations_containing_type_variables": 1,
+      "tuples": [
+        {
+          "count": 41,
+          "representative": [
+            {
+              "variable": 6685,
+              "mode": 6103,
+              "flow": "Continuous",
+              "root": 6500,
+              "term": 241830,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 6442,
+              "mode": 5903,
+              "flow": "Continuous",
+              "root": 6411,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(6409), TypeVariableId(6416)]"
+            }
+          ]
+        },
+        {
+          "count": 21,
+          "representative": [
+            {
+              "variable": 4805,
+              "mode": 4527,
+              "flow": "Continuous",
+              "root": 4620,
+              "term": 40980,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 4562,
+              "mode": 4327,
+              "flow": "Continuous",
+              "root": 5001,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4999), TypeVariableId(5006)]"
+            }
+          ]
+        },
+        {
+          "count": 18,
+          "representative": [
+            {
+              "variable": 48998,
+              "mode": 44680,
+              "flow": "Continuous",
+              "root": 48813,
+              "term": 41091,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 48755,
+              "mode": 44480,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 15,
+          "representative": [
+            {
+              "variable": 5745,
+              "mode": 5315,
+              "flow": "Continuous",
+              "root": 5560,
+              "term": 41093,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 5502,
+              "mode": 5115,
+              "flow": "Continuous",
+              "root": 5941,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(5939), TypeVariableId(5946)]"
+            }
+          ]
+        },
+        {
+          "count": 9,
+          "representative": [
+            {
+              "variable": 5275,
+              "mode": 4921,
+              "flow": "Continuous",
+              "root": 5090,
+              "term": 40988,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 5032,
+              "mode": 4721,
+              "flow": "Continuous",
+              "root": 5001,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4999), TypeVariableId(5006)]"
+            }
+          ]
+        },
+        {
+          "count": 9,
+          "representative": [
+            {
+              "variable": 44397,
+              "mode": 40579,
+              "flow": "Continuous",
+              "root": 44212,
+              "term": 41095,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 44154,
+              "mode": 40379,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 18492,
+              "mode": 17442,
+              "flow": "Continuous",
+              "root": 18524,
+              "term": 241830,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 18249,
+              "mode": 17242,
+              "flow": "Continuous",
+              "root": 18257,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 43363,
+              "mode": 39734,
+              "flow": "Continuous",
+              "root": 43178,
+              "term": 243933,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 43120,
+              "mode": 39534,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 43833,
+              "mode": 40128,
+              "flow": "Continuous",
+              "root": 43648,
+              "term": 41092,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 43590,
+              "mode": 39928,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 7,
+          "representative": [
+            {
+              "variable": 35371,
+              "mode": 32734,
+              "flow": "Continuous",
+              "root": 35186,
+              "term": 41081,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 35128,
+              "mode": 32534,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 6,
+          "representative": [
+            {
+              "variable": 41491,
+              "mode": 38204,
+              "flow": "Continuous",
+              "root": 41306,
+              "term": 41083,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 41248,
+              "mode": 38004,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 5,
+          "representative": [
+            {
+              "variable": 37895,
+              "mode": 34776,
+              "flow": "Continuous",
+              "root": 37710,
+              "term": 41082,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 37652,
+              "mode": 34576,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 5,
+          "representative": [
+            {
+              "variable": 38365,
+              "mode": 35170,
+              "flow": "Continuous",
+              "root": 38180,
+              "term": 41084,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 38122,
+              "mode": 34970,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 3,
+          "representative": [
+            {
+              "variable": 12765,
+              "mode": 12347,
+              "flow": "Continuous",
+              "root": 12797,
+              "term": 40980,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 12522,
+              "mode": 12147,
+              "flow": "Continuous",
+              "root": 12530,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 3,
+          "representative": [
+            {
+              "variable": 25150,
+              "mode": 23321,
+              "flow": "Continuous",
+              "root": 25182,
+              "term": 41091,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 24907,
+              "mode": 23121,
+              "flow": "Continuous",
+              "root": 24915,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 11619,
+              "mode": 11375,
+              "flow": "Continuous",
+              "root": 11651,
+              "term": 41081,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 11376,
+              "mode": 11175,
+              "flow": "Continuous",
+              "root": 11384,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 25697,
+              "mode": 23770,
+              "flow": "Continuous",
+              "root": 25729,
+              "term": 41093,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 25454,
+              "mode": 23570,
+              "flow": "Continuous",
+              "root": 25462,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 14125,
+              "mode": 13417,
+              "flow": "Continuous",
+              "root": 14157,
+              "term": 41082,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 13882,
+              "mode": 13217,
+              "flow": "Continuous",
+              "root": 13890,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 14589,
+              "mode": 13811,
+              "flow": "Continuous",
+              "root": 14621,
+              "term": 41084,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 14346,
+              "mode": 13611,
+              "flow": "Continuous",
+              "root": 14354,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 17703,
+              "mode": 16845,
+              "flow": "Continuous",
+              "root": 17735,
+              "term": 41083,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 17460,
+              "mode": 16645,
+              "flow": "Continuous",
+              "root": 17468,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 19551,
+              "mode": 18375,
+              "flow": "Continuous",
+              "root": 19583,
+              "term": 243933,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 19308,
+              "mode": 18175,
+              "flow": "Continuous",
+              "root": 19316,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 20015,
+              "mode": 18769,
+              "flow": "Continuous",
+              "root": 20047,
+              "term": 41092,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 19772,
+              "mode": 18569,
+              "flow": "Continuous",
+              "root": 19780,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 20573,
+              "mode": 19220,
+              "flow": "Continuous",
+              "root": 20388,
+              "term": 41095,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 20330,
+              "mode": 19020,
+              "flow": "Continuous",
+              "root": 20338,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 22830,
+              "mode": 21354,
+              "flow": "Continuous",
+              "root": 22862,
+              "term": 40988,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 22587,
+              "mode": 21154,
+              "flow": "Continuous",
+              "root": 22595,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 184481,
+              "mode": 167587,
+              "flow": "Continuous",
+              "root": 184296,
+              "term": 207710,
+              "authoritative": true,
+              "dependencies": "[TypeVariableId(184076)]"
+            },
+            {
+              "variable": 184238,
+              "mode": 167387,
+              "flow": "Continuous",
+              "root": 184103,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(184101), TypeVariableId(184108)]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 187542,
+              "mode": 170188,
+              "flow": "Continuous",
+              "root": 187050,
+              "term": 221929,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(187877), TypeVariableId(187915)]"
+            },
+            {
+              "variable": 4332,
+              "mode": 4157,
+              "flow": "Continuous",
+              "root": 186819,
+              "term": 258841,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4317), TypeVariableId(187246)]"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "owner": 115,
+      "source": "examples/todo_mvc_physical/Theme/Neumorphism.bn",
+      "function": "material",
+      "first_summary_rejection": {
+        "expression": 171,
+        "kind": "PatternRead",
+        "projection": "InteractiveRecessed.focus"
+      },
+      "dominant_variant": {
+        "static_variants": [
+          null,
+          null
+        ],
+        "initial_state_surface": true
+      },
+      "distinct_invocations": 179,
+      "quiescent_type_mode_tuples": 26,
+      "invocations_with_open_provider": 154,
+      "invocations_containing_type_variables": 1,
+      "tuples": [
+        {
+          "count": 41,
+          "representative": [
+            {
+              "variable": 6779,
+              "mode": 6187,
+              "flow": "Continuous",
+              "root": 6500,
+              "term": 241830,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 6445,
+              "mode": 5907,
+              "flow": "Continuous",
+              "root": 6411,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(6409), TypeVariableId(6416)]"
+            }
+          ]
+        },
+        {
+          "count": 21,
+          "representative": [
+            {
+              "variable": 4899,
+              "mode": 4611,
+              "flow": "Continuous",
+              "root": 4620,
+              "term": 40980,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 4565,
+              "mode": 4331,
+              "flow": "Continuous",
+              "root": 5001,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4999), TypeVariableId(5006)]"
+            }
+          ]
+        },
+        {
+          "count": 18,
+          "representative": [
+            {
+              "variable": 49092,
+              "mode": 44764,
+              "flow": "Continuous",
+              "root": 48813,
+              "term": 41091,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 48758,
+              "mode": 44484,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 15,
+          "representative": [
+            {
+              "variable": 5839,
+              "mode": 5399,
+              "flow": "Continuous",
+              "root": 5560,
+              "term": 41093,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 5505,
+              "mode": 5119,
+              "flow": "Continuous",
+              "root": 5941,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(5939), TypeVariableId(5946)]"
+            }
+          ]
+        },
+        {
+          "count": 9,
+          "representative": [
+            {
+              "variable": 5369,
+              "mode": 5005,
+              "flow": "Continuous",
+              "root": 5090,
+              "term": 40988,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 5035,
+              "mode": 4725,
+              "flow": "Continuous",
+              "root": 5001,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4999), TypeVariableId(5006)]"
+            }
+          ]
+        },
+        {
+          "count": 9,
+          "representative": [
+            {
+              "variable": 44491,
+              "mode": 40663,
+              "flow": "Continuous",
+              "root": 44212,
+              "term": 41095,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 44157,
+              "mode": 40383,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 18586,
+              "mode": 17526,
+              "flow": "Continuous",
+              "root": 18622,
+              "term": 241830,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 18252,
+              "mode": 17246,
+              "flow": "Continuous",
+              "root": 18257,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 43457,
+              "mode": 39818,
+              "flow": "Continuous",
+              "root": 43178,
+              "term": 243933,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 43123,
+              "mode": 39538,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 43927,
+              "mode": 40212,
+              "flow": "Continuous",
+              "root": 43648,
+              "term": 41092,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 43593,
+              "mode": 39932,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 7,
+          "representative": [
+            {
+              "variable": 35465,
+              "mode": 32818,
+              "flow": "Continuous",
+              "root": 35186,
+              "term": 41081,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 35131,
+              "mode": 32538,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 6,
+          "representative": [
+            {
+              "variable": 41585,
+              "mode": 38288,
+              "flow": "Continuous",
+              "root": 41306,
+              "term": 41083,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 41251,
+              "mode": 38008,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 5,
+          "representative": [
+            {
+              "variable": 37989,
+              "mode": 34860,
+              "flow": "Continuous",
+              "root": 37710,
+              "term": 41082,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 37655,
+              "mode": 34580,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 5,
+          "representative": [
+            {
+              "variable": 38459,
+              "mode": 35254,
+              "flow": "Continuous",
+              "root": 38180,
+              "term": 41084,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 38125,
+              "mode": 34974,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 3,
+          "representative": [
+            {
+              "variable": 12859,
+              "mode": 12431,
+              "flow": "Continuous",
+              "root": 12895,
+              "term": 40980,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 12525,
+              "mode": 12151,
+              "flow": "Continuous",
+              "root": 12530,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 3,
+          "representative": [
+            {
+              "variable": 25244,
+              "mode": 23405,
+              "flow": "Continuous",
+              "root": 25280,
+              "term": 41091,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 24910,
+              "mode": 23125,
+              "flow": "Continuous",
+              "root": 24915,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 11713,
+              "mode": 11459,
+              "flow": "Continuous",
+              "root": 11749,
+              "term": 41081,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 11379,
+              "mode": 11179,
+              "flow": "Continuous",
+              "root": 11384,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 25791,
+              "mode": 23854,
+              "flow": "Continuous",
+              "root": 25827,
+              "term": 41093,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 25457,
+              "mode": 23574,
+              "flow": "Continuous",
+              "root": 25462,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 14219,
+              "mode": 13501,
+              "flow": "Continuous",
+              "root": 14255,
+              "term": 41082,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 13885,
+              "mode": 13221,
+              "flow": "Continuous",
+              "root": 13890,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 14683,
+              "mode": 13895,
+              "flow": "Continuous",
+              "root": 14719,
+              "term": 41084,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 14349,
+              "mode": 13615,
+              "flow": "Continuous",
+              "root": 14354,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 17797,
+              "mode": 16929,
+              "flow": "Continuous",
+              "root": 17833,
+              "term": 41083,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 17463,
+              "mode": 16649,
+              "flow": "Continuous",
+              "root": 17468,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 19645,
+              "mode": 18459,
+              "flow": "Continuous",
+              "root": 19681,
+              "term": 243933,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 19311,
+              "mode": 18179,
+              "flow": "Continuous",
+              "root": 19316,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 20109,
+              "mode": 18853,
+              "flow": "Continuous",
+              "root": 20145,
+              "term": 41092,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 19775,
+              "mode": 18573,
+              "flow": "Continuous",
+              "root": 19780,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 20667,
+              "mode": 19304,
+              "flow": "Continuous",
+              "root": 20388,
+              "term": 41095,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 20333,
+              "mode": 19024,
+              "flow": "Continuous",
+              "root": 20338,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 22924,
+              "mode": 21438,
+              "flow": "Continuous",
+              "root": 22960,
+              "term": 40988,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 22590,
+              "mode": 21158,
+              "flow": "Continuous",
+              "root": 22595,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 184575,
+              "mode": 167671,
+              "flow": "Continuous",
+              "root": 184296,
+              "term": 207710,
+              "authoritative": true,
+              "dependencies": "[TypeVariableId(184076)]"
+            },
+            {
+              "variable": 184241,
+              "mode": 167391,
+              "flow": "Continuous",
+              "root": 184103,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(184101), TypeVariableId(184108)]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 187801,
+              "mode": 170439,
+              "flow": "Continuous",
+              "root": 187050,
+              "term": 221929,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(187877), TypeVariableId(187915)]"
+            },
+            {
+              "variable": 4336,
+              "mode": 4161,
+              "flow": "Continuous",
+              "root": 186819,
+              "term": 258841,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4317), TypeVariableId(187246)]"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "owner": 127,
+      "source": "examples/todo_mvc_physical/Theme/Professional.bn",
+      "function": "material",
+      "first_summary_rejection": {
+        "expression": 104,
+        "kind": "PatternRead",
+        "projection": "Interactive.hovered"
+      },
+      "dominant_variant": {
+        "static_variants": [
+          null,
+          null
+        ],
+        "initial_state_surface": true
+      },
+      "distinct_invocations": 179,
+      "quiescent_type_mode_tuples": 26,
+      "invocations_with_open_provider": 154,
+      "invocations_containing_type_variables": 1,
+      "tuples": [
+        {
+          "count": 41,
+          "representative": [
+            {
+              "variable": 6471,
+              "mode": 5917,
+              "flow": "Continuous",
+              "root": 6500,
+              "term": 241830,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 6436,
+              "mode": 5895,
+              "flow": "Continuous",
+              "root": 6411,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(6409), TypeVariableId(6416)]"
+            }
+          ]
+        },
+        {
+          "count": 21,
+          "representative": [
+            {
+              "variable": 4591,
+              "mode": 4341,
+              "flow": "Continuous",
+              "root": 4620,
+              "term": 40980,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 4556,
+              "mode": 4319,
+              "flow": "Continuous",
+              "root": 5001,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4999), TypeVariableId(5006)]"
+            }
+          ]
+        },
+        {
+          "count": 18,
+          "representative": [
+            {
+              "variable": 48784,
+              "mode": 44494,
+              "flow": "Continuous",
+              "root": 48813,
+              "term": 41091,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 48749,
+              "mode": 44472,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 15,
+          "representative": [
+            {
+              "variable": 5531,
+              "mode": 5129,
+              "flow": "Continuous",
+              "root": 5560,
+              "term": 41093,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 5496,
+              "mode": 5107,
+              "flow": "Continuous",
+              "root": 5941,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(5939), TypeVariableId(5946)]"
+            }
+          ]
+        },
+        {
+          "count": 9,
+          "representative": [
+            {
+              "variable": 5061,
+              "mode": 4735,
+              "flow": "Continuous",
+              "root": 5090,
+              "term": 40988,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 5026,
+              "mode": 4713,
+              "flow": "Continuous",
+              "root": 5001,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4999), TypeVariableId(5006)]"
+            }
+          ]
+        },
+        {
+          "count": 9,
+          "representative": [
+            {
+              "variable": 44183,
+              "mode": 40393,
+              "flow": "Continuous",
+              "root": 44212,
+              "term": 41095,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 44148,
+              "mode": 40371,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 18278,
+              "mode": 17256,
+              "flow": "Continuous",
+              "root": 18307,
+              "term": 241830,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 18243,
+              "mode": 17234,
+              "flow": "Continuous",
+              "root": 18257,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 43149,
+              "mode": 39548,
+              "flow": "Continuous",
+              "root": 43178,
+              "term": 243933,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 43114,
+              "mode": 39526,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 8,
+          "representative": [
+            {
+              "variable": 43619,
+              "mode": 39942,
+              "flow": "Continuous",
+              "root": 43648,
+              "term": 41092,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 43584,
+              "mode": 39920,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 7,
+          "representative": [
+            {
+              "variable": 35157,
+              "mode": 32548,
+              "flow": "Continuous",
+              "root": 35186,
+              "term": 41081,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 35122,
+              "mode": 32526,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 6,
+          "representative": [
+            {
+              "variable": 41277,
+              "mode": 38018,
+              "flow": "Continuous",
+              "root": 41306,
+              "term": 41083,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 41242,
+              "mode": 37996,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 5,
+          "representative": [
+            {
+              "variable": 37681,
+              "mode": 34590,
+              "flow": "Continuous",
+              "root": 37710,
+              "term": 41082,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 37646,
+              "mode": 34568,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 5,
+          "representative": [
+            {
+              "variable": 38151,
+              "mode": 34984,
+              "flow": "Continuous",
+              "root": 38180,
+              "term": 41084,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 38116,
+              "mode": 34962,
+              "flow": "Continuous",
+              "root": 42488,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+            }
+          ]
+        },
+        {
+          "count": 3,
+          "representative": [
+            {
+              "variable": 12551,
+              "mode": 12161,
+              "flow": "Continuous",
+              "root": 12580,
+              "term": 40980,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 12516,
+              "mode": 12139,
+              "flow": "Continuous",
+              "root": 12530,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 3,
+          "representative": [
+            {
+              "variable": 24936,
+              "mode": 23135,
+              "flow": "Continuous",
+              "root": 24965,
+              "term": 41091,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 24901,
+              "mode": 23113,
+              "flow": "Continuous",
+              "root": 24915,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 11405,
+              "mode": 11189,
+              "flow": "Continuous",
+              "root": 11434,
+              "term": 41081,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 11370,
+              "mode": 11167,
+              "flow": "Continuous",
+              "root": 11384,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 2,
+          "representative": [
+            {
+              "variable": 25483,
+              "mode": 23584,
+              "flow": "Continuous",
+              "root": 25512,
+              "term": 41093,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 25448,
+              "mode": 23562,
+              "flow": "Continuous",
+              "root": 25462,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 13911,
+              "mode": 13231,
+              "flow": "Continuous",
+              "root": 13940,
+              "term": 41082,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 13876,
+              "mode": 13209,
+              "flow": "Continuous",
+              "root": 13890,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 14375,
+              "mode": 13625,
+              "flow": "Continuous",
+              "root": 14404,
+              "term": 41084,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 14340,
+              "mode": 13603,
+              "flow": "Continuous",
+              "root": 14354,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 17489,
+              "mode": 16659,
+              "flow": "Continuous",
+              "root": 17518,
+              "term": 41083,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 17454,
+              "mode": 16637,
+              "flow": "Continuous",
+              "root": 17468,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 19337,
+              "mode": 18189,
+              "flow": "Continuous",
+              "root": 19366,
+              "term": 243933,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 19302,
+              "mode": 18167,
+              "flow": "Continuous",
+              "root": 19316,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 19801,
+              "mode": 18583,
+              "flow": "Continuous",
+              "root": 19830,
+              "term": 41092,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 19766,
+              "mode": 18561,
+              "flow": "Continuous",
+              "root": 19780,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 20359,
+              "mode": 19034,
+              "flow": "Continuous",
+              "root": 20388,
+              "term": 41095,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 20324,
+              "mode": 19012,
+              "flow": "Continuous",
+              "root": 20338,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 22616,
+              "mode": 21168,
+              "flow": "Continuous",
+              "root": 22645,
+              "term": 40988,
+              "authoritative": true,
+              "dependencies": "[]"
+            },
+            {
+              "variable": 22581,
+              "mode": 21146,
+              "flow": "Continuous",
+              "root": 22595,
+              "term": 255514,
+              "authoritative": true,
+              "dependencies": "[]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 184267,
+              "mode": 167401,
+              "flow": "Continuous",
+              "root": 184296,
+              "term": 207710,
+              "authoritative": true,
+              "dependencies": "[TypeVariableId(184076)]"
+            },
+            {
+              "variable": 184232,
+              "mode": 167379,
+              "flow": "Continuous",
+              "root": 184103,
+              "term": 258842,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(184101), TypeVariableId(184108)]"
+            }
+          ]
+        },
+        {
+          "count": 1,
+          "representative": [
+            {
+              "variable": 186995,
+              "mode": 169668,
+              "flow": "Continuous",
+              "root": 187050,
+              "term": 221929,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(187877), TypeVariableId(187915)]"
+            },
+            {
+              "variable": 4324,
+              "mode": 4149,
+              "flow": "Continuous",
+              "root": 186819,
+              "term": 258841,
+              "authoritative": false,
+              "dependencies": "[TypeVariableId(4317), TypeVariableId(187246)]"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "quiescent_types": {
+    "1008": "Var(TypeVar(395))",
+    "40980": "VariantSet(SharedVariantSet([Tag(\"SurfaceElevated\")]))",
+    "40988": "VariantSet(SharedVariantSet([Tag(\"Danger\")]))",
+    "41081": "VariantSet(SharedVariantSet([Tag(\"Background\")]))",
+    "41082": "VariantSet(SharedVariantSet([Tag(\"Surface\")]))",
+    "41083": "VariantSet(SharedVariantSet([Tag(\"SurfaceVariant\")]))",
+    "41084": "VariantSet(SharedVariantSet([Tag(\"PanelFrame\")]))",
+    "41091": "VariantSet(SharedVariantSet([Tag(\"Primary\")]))",
+    "41092": "VariantSet(SharedVariantSet([Tag(\"PrimarySubtle\")]))",
+    "41093": "VariantSet(SharedVariantSet([Tag(\"FilterSelected\")]))",
+    "41095": "VariantSet(SharedVariantSet([Tag(\"CheckboxGlyph\")]))",
+    "43703": "VariantSet(SharedVariantSet([Tag(\"BodySecondary\")]))",
+    "43791": "VariantSet(SharedVariantSet([Tag(\"Body\")]))",
+    "43792": "VariantSet(SharedVariantSet([Tag(\"BodyDisabled\")]))",
+    "43793": "VariantSet(SharedVariantSet([Tag(\"BodyDanger\")]))",
+    "43794": "VariantSet(SharedVariantSet([Tag(\"Input\")]))",
+    "43795": "VariantSet(SharedVariantSet([Tag(\"Placeholder\")]))",
+    "43799": "VariantSet(SharedVariantSet([Tag(\"Small\")]))",
+    "207710": "Var(TypeVar(184076))",
+    "208721": "Var(TypeVar(4203))",
+    "221929": "VariantSet(SharedVariantSet([Tag(\"Background\"), Tag(\"CheckboxGlyph\"), Tag(\"Danger\"), Tag(\"FilterSelected\"), Tag(\"HeroTitle\"), Tag(\"PanelFrame\"), Tag(\"Primary\"), Tag(\"PrimarySubtle\"), Tag(\"Surface\"), Tag(\"SurfaceElevated\"), Tag(\"SurfaceVariant\"), Tagged { tag: \"Interactive\", fields: SharedObjectShape(ObjectShape { fields: {\"hovered\": VariantSet(SharedVariantSet([Tag(\"False\"), Tag(\"True\")]))}, field_order: [\"hovered\"], open: true }) }, Tagged { tag: \"InteractiveRecessed\", fields: SharedObjectShape(ObjectShape { fields: {\"focus\": VariantSet(SharedVariantSet([Tag(\"False\"), Tag(\"True\")]))}, field_order: [\"focus\"], open: true }) }]))",
+    "241830": "VariantSet(SharedVariantSet([Tagged { tag: \"Interactive\", fields: SharedObjectShape(ObjectShape { fields: {\"hovered\": VariantSet(SharedVariantSet([Tag(\"False\"), Tag(\"True\")]))}, field_order: [\"hovered\"], open: false }) }]))",
+    "243034": "VariantSet(SharedVariantSet([Tag(\"Body\"), Tag(\"BodyDanger\"), Tag(\"BodyDisabled\"), Tag(\"BodySecondary\"), Tag(\"FilterSelected\"), Tag(\"Hero\"), Tag(\"Input\"), Tag(\"Placeholder\"), Tag(\"Small\"), Tagged { tag: \"ButtonIcon\", fields: SharedObjectShape(ObjectShape { fields: {\"checked\": VariantSet(SharedVariantSet([Tag(\"False\"), Tag(\"True\")]))}, field_order: [\"checked\"], open: true }) }, Tagged { tag: \"SmallLink\", fields: SharedObjectShape(ObjectShape { fields: {\"hovered\": Var(TypeVar(187694))}, field_order: [\"hovered\"], open: true }) }]))",
+    "243933": "VariantSet(SharedVariantSet([Tagged { tag: \"InteractiveRecessed\", fields: SharedObjectShape(ObjectShape { fields: {\"focus\": VariantSet(SharedVariantSet([Tag(\"True\")]))}, field_order: [\"focus\"], open: false }) }]))",
+    "244476": "VariantSet(SharedVariantSet([Tagged { tag: \"SmallLink\", fields: SharedObjectShape(ObjectShape { fields: {\"hovered\": VariantSet(SharedVariantSet([Tag(\"False\"), Tag(\"True\")]))}, field_order: [\"hovered\"], open: false }) }]))",
+    "255514": "Object(SharedObjectShape(ObjectShape { fields: {\"mode\": VariantSet(SharedVariantSet([Tag(\"Dark\"), Tag(\"Light\")])), \"name\": VariantSet(SharedVariantSet([Tag(\"Classic\"), Tag(\"Glassmorphism\"), Tag(\"Neobrutalism\"), Tag(\"Neumorphism\"), Tag(\"Professional\")]))}, field_order: [\"name\", \"mode\"], open: false }))",
+    "258841": "Object(SharedObjectShape(ObjectShape { fields: {\"mode\": VariantSet(SharedVariantSet([Tag(\"Dark\"), Tag(\"Light\")])), \"name\": VariantSet(SharedVariantSet([Tag(\"Classic\"), Tag(\"Glassmorphism\"), Tag(\"Neobrutalism\"), Tag(\"Neumorphism\"), Tag(\"Professional\")]))}, field_order: [\"mode\", \"name\"], open: true }))",
+    "258842": "Object(SharedObjectShape(ObjectShape { fields: {\"mode\": VariantSet(SharedVariantSet([Tag(\"Dark\"), Tag(\"Light\")])), \"name\": VariantSet(SharedVariantSet([Tag(\"Classic\"), Tag(\"Glassmorphism\"), Tag(\"Neobrutalism\"), Tag(\"Neumorphism\"), Tag(\"Professional\")]))}, field_order: [\"name\", \"mode\"], open: true }))"
+  },
+  "epoch_observations": {
+    "selected_variables": [
+      4556,
+      4559,
+      4562,
+      4565,
+      4591,
+      4688,
+      4805,
+      4899,
+      6436,
+      6439,
+      6442,
+      6445,
+      6471,
+      6568,
+      6685,
+      6779,
+      9899,
+      9925,
+      39566,
+      39592
+    ],
+    "events": 597,
+    "roots": [
+      {
+        "root": 4620,
+        "events": 14,
+        "distinct_bindings": [
+          "Some(TypeTermId(211677))",
+          "Some(TypeTermId(211686))",
+          "Some(TypeTermId(211695))",
+          "Some(TypeTermId(211704))",
+          "Some(TypeTermId(40980))"
+        ],
+        "first": {
+          "mutation": 19379,
+          "operation": "None",
+          "variable": 4620,
+          "root": 4620,
+          "binding": "Some(TypeTermId(211677))",
+          "dependencies": "[TypeVariableId(4674), TypeVariableId(4675)]"
+        },
+        "last": {
+          "mutation": 402468,
+          "operation": "Some(OperationId(185))",
+          "variable": 4620,
+          "root": 4620,
+          "binding": "Some(TypeTermId(40980))",
+          "dependencies": "[]"
+        }
+      },
+      {
+        "root": 4728,
+        "events": 2,
+        "distinct_bindings": [
+          "Some(TypeTermId(211686))"
+        ],
+        "first": {
+          "mutation": 19513,
+          "operation": "None",
+          "variable": 4728,
+          "root": 4728,
+          "binding": "Some(TypeTermId(211686))",
+          "dependencies": "[TypeVariableId(4789), TypeVariableId(4790)]"
+        },
+        "last": {
+          "mutation": 19514,
+          "operation": "None",
+          "variable": 4688,
+          "root": 4728,
+          "binding": "Some(TypeTermId(211686))",
+          "dependencies": "[TypeVariableId(4789), TypeVariableId(4790)]"
+        }
+      },
+      {
+        "root": 4837,
+        "events": 2,
+        "distinct_bindings": [
+          "Some(TypeTermId(211695))"
+        ],
+        "first": {
+          "mutation": 19614,
+          "operation": "None",
+          "variable": 4837,
+          "root": 4837,
+          "binding": "Some(TypeTermId(211695))",
+          "dependencies": "[TypeVariableId(4887), TypeVariableId(4888)]"
+        },
+        "last": {
+          "mutation": 19615,
+          "operation": "None",
+          "variable": 4805,
+          "root": 4837,
+          "binding": "Some(TypeTermId(211695))",
+          "dependencies": "[TypeVariableId(4887), TypeVariableId(4888)]"
+        }
+      },
+      {
+        "root": 4935,
+        "events": 2,
+        "distinct_bindings": [
+          "Some(TypeTermId(211704))"
+        ],
+        "first": {
+          "mutation": 19727,
+          "operation": "None",
+          "variable": 4935,
+          "root": 4935,
+          "binding": "Some(TypeTermId(211704))",
+          "dependencies": "[TypeVariableId(4987), TypeVariableId(4988)]"
+        },
+        "last": {
+          "mutation": 19728,
+          "operation": "None",
+          "variable": 4899,
+          "root": 4935,
+          "binding": "Some(TypeTermId(211704))",
+          "dependencies": "[TypeVariableId(4987), TypeVariableId(4988)]"
+        }
+      },
+      {
+        "root": 5001,
+        "events": 60,
+        "distinct_bindings": [
+          "Some(TypeTermId(211305))"
+        ],
+        "first": {
+          "mutation": 19249,
+          "operation": "None",
+          "variable": 5001,
+          "root": 5001,
+          "binding": "Some(TypeTermId(211305))",
+          "dependencies": "[TypeVariableId(4999), TypeVariableId(5006)]"
+        },
+        "last": {
+          "mutation": 303811,
+          "operation": "Some(OperationId(298))",
+          "variable": 5468,
+          "root": 5001,
+          "binding": "Some(TypeTermId(211305))",
+          "dependencies": "[TypeVariableId(4999), TypeVariableId(5006)]"
+        }
+      },
+      {
+        "root": 6411,
+        "events": 28,
+        "distinct_bindings": [
+          "Some(TypeTermId(211309))"
+        ],
+        "first": {
+          "mutation": 21318,
+          "operation": "None",
+          "variable": 6411,
+          "root": 6411,
+          "binding": "Some(TypeTermId(211309))",
+          "dependencies": "[TypeVariableId(6409), TypeVariableId(6416)]"
+        },
+        "last": {
+          "mutation": 303926,
+          "operation": "Some(OperationId(477))",
+          "variable": 6878,
+          "root": 6411,
+          "binding": "Some(TypeTermId(211309))",
+          "dependencies": "[TypeVariableId(6409), TypeVariableId(6416)]"
+        }
+      },
+      {
+        "root": 6500,
+        "events": 14,
+        "distinct_bindings": [
+          "Some(TypeTermId(211823))",
+          "Some(TypeTermId(211832))",
+          "Some(TypeTermId(211841))",
+          "Some(TypeTermId(211850))",
+          "Some(TypeTermId(241830))"
+        ],
+        "first": {
+          "mutation": 21448,
+          "operation": "None",
+          "variable": 6500,
+          "root": 6500,
+          "binding": "Some(TypeTermId(211823))",
+          "dependencies": "[TypeVariableId(6554), TypeVariableId(6555)]"
+        },
+        "last": {
+          "mutation": 402494,
+          "operation": "Some(OperationId(423))",
+          "variable": 6500,
+          "root": 6500,
+          "binding": "Some(TypeTermId(241830))",
+          "dependencies": "[]"
+        }
+      },
+      {
+        "root": 6608,
+        "events": 2,
+        "distinct_bindings": [
+          "Some(TypeTermId(211832))"
+        ],
+        "first": {
+          "mutation": 21581,
+          "operation": "None",
+          "variable": 6608,
+          "root": 6608,
+          "binding": "Some(TypeTermId(211832))",
+          "dependencies": "[TypeVariableId(6669), TypeVariableId(6670)]"
+        },
+        "last": {
+          "mutation": 21582,
+          "operation": "None",
+          "variable": 6568,
+          "root": 6608,
+          "binding": "Some(TypeTermId(211832))",
+          "dependencies": "[TypeVariableId(6669), TypeVariableId(6670)]"
+        }
+      },
+      {
+        "root": 6717,
+        "events": 2,
+        "distinct_bindings": [
+          "Some(TypeTermId(211841))"
+        ],
+        "first": {
+          "mutation": 21682,
+          "operation": "None",
+          "variable": 6717,
+          "root": 6717,
+          "binding": "Some(TypeTermId(211841))",
+          "dependencies": "[TypeVariableId(6767), TypeVariableId(6768)]"
+        },
+        "last": {
+          "mutation": 21683,
+          "operation": "None",
+          "variable": 6685,
+          "root": 6717,
+          "binding": "Some(TypeTermId(211841))",
+          "dependencies": "[TypeVariableId(6767), TypeVariableId(6768)]"
+        }
+      },
+      {
+        "root": 6815,
+        "events": 2,
+        "distinct_bindings": [
+          "Some(TypeTermId(211850))"
+        ],
+        "first": {
+          "mutation": 21795,
+          "operation": "None",
+          "variable": 6815,
+          "root": 6815,
+          "binding": "Some(TypeTermId(211850))",
+          "dependencies": "[TypeVariableId(6867), TypeVariableId(6868)]"
+        },
+        "last": {
+          "mutation": 21796,
+          "operation": "None",
+          "variable": 6779,
+          "root": 6815,
+          "binding": "Some(TypeTermId(211850))",
+          "dependencies": "[TypeVariableId(6867), TypeVariableId(6868)]"
+        }
+      },
+      {
+        "root": 9916,
+        "events": 94,
+        "distinct_bindings": [
+          "Some(TypeTermId(46572))",
+          "Some(TypeTermId(212008))",
+          "Some(TypeTermId(212021))"
+        ],
+        "first": {
+          "mutation": 24367,
+          "operation": "None",
+          "variable": 9916,
+          "root": 9916,
+          "binding": "Some(TypeTermId(46572))",
+          "dependencies": "[TypeVariableId(9917)]"
+        },
+        "last": {
+          "mutation": 25071,
+          "operation": "None",
+          "variable": 10742,
+          "root": 9916,
+          "binding": "Some(TypeTermId(212021))",
+          "dependencies": "[TypeVariableId(9896), TypeVariableId(9931)]"
+        }
+      },
+      {
+        "root": 9953,
+        "events": 4,
+        "distinct_bindings": [
+          "Some(TypeTermId(212007))"
+        ],
+        "first": {
+          "mutation": 24457,
+          "operation": "None",
+          "variable": 9953,
+          "root": 9953,
+          "binding": "Some(TypeTermId(212007))",
+          "dependencies": "[TypeVariableId(9995), TypeVariableId(9996)]"
+        },
+        "last": {
+          "mutation": 304354,
+          "operation": "Some(OperationId(1073))",
+          "variable": 10147,
+          "root": 9953,
+          "binding": "Some(TypeTermId(212007))",
+          "dependencies": "[TypeVariableId(9995), TypeVariableId(9996)]"
+        }
+      },
+      {
+        "root": 10011,
+        "events": 13,
+        "distinct_bindings": [
+          "Some(TypeTermId(212011))",
+          "Some(TypeTermId(212007))",
+          "Some(TypeTermId(212014))",
+          "Some(TypeTermId(212017))",
+          "Some(TypeTermId(212020))",
+          "Some(TypeTermId(43799))"
+        ],
+        "first": {
+          "mutation": 304357,
+          "operation": "Some(OperationId(1081))",
+          "variable": 10011,
+          "root": 10011,
+          "binding": "Some(TypeTermId(212011))",
+          "dependencies": "[TypeVariableId(10043), TypeVariableId(10044)]"
+        },
+        "last": {
+          "mutation": 402568,
+          "operation": "Some(OperationId(1073))",
+          "variable": 10011,
+          "root": 10011,
+          "binding": "Some(TypeTermId(43799))",
+          "dependencies": "[]"
+        }
+      },
+      {
+        "root": 39620,
+        "events": 4,
+        "distinct_bindings": [
+          "Some(TypeTermId(213703))"
+        ],
+        "first": {
+          "mutation": 54023,
+          "operation": "None",
+          "variable": 39620,
+          "root": 39620,
+          "binding": "Some(TypeTermId(213703))",
+          "dependencies": "[TypeVariableId(39662), TypeVariableId(39663)]"
+        },
+        "last": {
+          "mutation": 309807,
+          "operation": "Some(OperationId(7064))",
+          "variable": 39814,
+          "root": 39620,
+          "binding": "Some(TypeTermId(213703))",
+          "dependencies": "[TypeVariableId(39662), TypeVariableId(39663)]"
+        }
+      },
+      {
+        "root": 39678,
+        "events": 14,
+        "distinct_bindings": [
+          "Some(TypeTermId(213706))",
+          "Some(TypeTermId(213703))",
+          "Some(TypeTermId(213709))",
+          "Some(TypeTermId(213712))",
+          "Some(TypeTermId(213715))",
+          "Some(TypeTermId(73938))",
+          "Some(TypeTermId(43794))"
+        ],
+        "first": {
+          "mutation": 309810,
+          "operation": "Some(OperationId(7072))",
+          "variable": 39678,
+          "root": 39678,
+          "binding": "Some(TypeTermId(213706))",
+          "dependencies": "[TypeVariableId(39710), TypeVariableId(39711)]"
+        },
+        "last": {
+          "mutation": 413145,
+          "operation": "Some(OperationId(7072))",
+          "variable": 39678,
+          "root": 39678,
+          "binding": "Some(TypeTermId(43794))",
+          "dependencies": "[]"
+        }
+      },
+      {
+        "root": 42488,
+        "events": 339,
+        "distinct_bindings": [
+          "Some(TypeTermId(211324))"
+        ],
+        "first": {
+          "mutation": 53933,
+          "operation": "None",
+          "variable": 42488,
+          "root": 42488,
+          "binding": "Some(TypeTermId(211324))",
+          "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+        },
+        "last": {
+          "mutation": 312014,
+          "operation": "Some(OperationId(10893))",
+          "variable": 58705,
+          "root": 42488,
+          "binding": "Some(TypeTermId(211324))",
+          "dependencies": "[TypeVariableId(42486), TypeVariableId(42493)]"
+        }
+      }
+    ]
+  }
+}

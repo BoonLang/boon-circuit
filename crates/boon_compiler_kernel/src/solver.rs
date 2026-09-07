@@ -269,6 +269,10 @@ fn validate_single_writers(program: &ComponentProgram) -> Result<(), KernelSolve
 
 struct ComponentSolver {
     program: SolverStateProgram,
+    #[cfg(debug_assertions)]
+    trace_variables: Box<[TypeVariableId]>,
+    #[cfg(debug_assertions)]
+    trace_epochs: bool,
     cells: Vec<VariableCell>,
     /// Occurrence provenance is deliberately separate from union-find type
     /// equality. Equality may constrain two types in both directions, while
@@ -511,6 +515,16 @@ impl ComponentSolver {
                 available_outputs: vec![false; outputs.len()],
                 outputs,
             },
+            #[cfg(debug_assertions)]
+            trace_epochs: std::env::var_os("BOON_KERNEL_TRACE_EPOCHS").is_some(),
+            #[cfg(debug_assertions)]
+            trace_variables: std::env::var("BOON_KERNEL_TRACE_VARIABLES")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(|value| value.parse::<u32>().ok())
+                .filter(|value| (*value as usize) < variable_count)
+                .map(TypeVariableId)
+                .collect(),
             cells,
             syntax_selected: vec![false; variable_count],
             syntax_selected_here: vec![false; variable_count],
@@ -669,6 +683,8 @@ impl ComponentSolver {
     }
 
     fn snapshot(&mut self) -> ComponentOutputSnapshot<'_> {
+        #[cfg(debug_assertions)]
+        self.trace_quiescent_inputs();
         let outputs = self.materialize_packed_outputs();
         self.update_term_work();
         self.finish_summary_definition_ranking();
@@ -676,6 +692,8 @@ impl ComponentSolver {
     }
 
     fn finish_unsealed(mut self) -> Result<UnsealedComponentArtifact, KernelSolveError> {
+        #[cfg(debug_assertions)]
+        self.trace_quiescent_inputs();
         let outputs = self.materialize_packed_outputs();
         self.update_term_work();
         self.finish_summary_definition_ranking();
@@ -3031,7 +3049,26 @@ impl ComponentSolver {
 
     fn touch(&mut self, variable: TypeVariableId) {
         self.work.mutations = self.work.mutations.saturating_add(1);
+        #[cfg(debug_assertions)]
+        if self.trace_epochs && !self.trace_variables.is_empty() {
+            let root = self.root_readonly(variable);
+            if self.trace_variables.iter().any(|traced| self.root_readonly(*traced) == root) {
+                eprintln!("kernel-input-epoch mutation={} operation={:?} variable={} root={} binding={:?} dependencies={:?}", self.work.mutations, self.active_operation, variable.0, root.0, self.cells[root.0 as usize].binding, self.binding_dependencies[root.0 as usize]);
+            }
+        }
         self.schedule_variable(variable);
+    }
+
+    #[cfg(debug_assertions)]
+    fn trace_quiescent_inputs(&mut self) {
+        for index in 0..self.trace_variables.len() {
+            let variable = self.trace_variables[index];
+            let root = self.root_readonly(variable);
+            let term = self.program.terms.variable(variable);
+            let resolved = self.resolve_term(term);
+            let ty = self.program.terms.export_checked_type(resolved);
+            eprintln!("kernel-input-quiescent variable={} root={} term={} authoritative={} dependencies={:?} type={ty:?}", variable.0, root.0, resolved.0, self.cells[root.0 as usize].authoritative_provider, self.binding_dependencies[root.0 as usize]);
+        }
     }
 
     fn set_syntax_selected(&mut self, variable: TypeVariableId, selected: bool) {

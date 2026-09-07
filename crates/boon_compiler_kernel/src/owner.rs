@@ -15197,6 +15197,8 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
             })
         })
         .collect::<Result<Vec<_>, KernelOwnerBuildError>>()?;
+    #[cfg(debug_assertions)]
+    trace_invocation_inputs(&invocations, &modes);
     let component = builder.finish();
     let mut frame_counts = HashMap::<*const ComponentProgram, u64>::new();
     for frame in component.residual_frames.iter() {
@@ -15354,6 +15356,46 @@ struct InvocationKey {
     actuals: Box<[(TypeVariableId, ModeVariableId)]>,
     static_variants: Box<[Option<StaticVariantSet>]>,
     initial_state_surface: bool,
+}
+
+/// Opt-in K0 attribution only. Debug observers are absent from release
+/// producers and must never be scored as performance evidence.
+#[cfg(debug_assertions)]
+fn trace_invocation_inputs(invocations: &HashMap<InvocationKey, OwnerInstance>, modes: &[FlowMode]) {
+    let owners = traced_summary_owners();
+    if owners.is_empty() {
+        return;
+    }
+    let mut keys = invocations
+        .keys()
+        .filter(|key| owners.contains(&key.target.0))
+        .collect::<Vec<_>>();
+    keys.sort_by(|left, right| {
+        left.target.cmp(&right.target)
+            .then(left.actuals.cmp(&right.actuals))
+            .then(left.initial_state_surface.cmp(&right.initial_state_surface))
+            .then_with(|| format!("{:?}", left.static_variants).cmp(&format!("{:?}", right.static_variants)))
+    });
+    let mut variables = BTreeSet::new();
+    for key in keys {
+        let flows = key.actuals.iter()
+            .map(|(variable, mode)| {
+                variables.insert(variable.0);
+                (*variable, *mode, modes[mode.0 as usize])
+            })
+            .collect::<Vec<_>>();
+        eprintln!("kernel-invocation-input owner={} actuals={flows:?} variants={:?} initial_state_surface={}", key.target.0, key.static_variants, key.initial_state_surface);
+    }
+    eprintln!("kernel-trace-variables={}", variables.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
+}
+
+#[cfg(debug_assertions)]
+fn traced_summary_owners() -> BTreeSet<u32> {
+    std::env::var("BOON_KERNEL_TRACE_OWNERS")
+        .unwrap_or_default()
+        .split(',')
+        .filter_map(|value| value.parse().ok())
+        .collect()
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -16811,6 +16853,7 @@ fn direct_result_summary_supported(
     owner_id: KernelOwnerId,
     expression: usize,
     active: &mut BTreeSet<(KernelOwnerId, usize)>,
+    trace: bool,
 ) -> bool {
     let Some(owner) = project.owner(owner_id) else {
         return false;
@@ -16823,7 +16866,7 @@ fn direct_result_summary_supported(
     }
     let child = |edge: &crate::PackedKernelOwnerInputEdge,
                  active: &mut BTreeSet<(KernelOwnerId, usize)>| {
-        direct_result_summary_supported(project, owner_id, edge.expression.0 as usize, active)
+        direct_result_summary_supported(project, owner_id, edge.expression.0 as usize, active, trace)
     };
     let inputs = node.inputs(owner);
     let supported = match &node.kind {
@@ -16888,7 +16931,7 @@ fn direct_result_summary_supported(
             matches!(providers.as_slice(), [provider] if {
                 let reference = provider.expression.0 as usize;
                 if reference < owner.node_count() {
-                    direct_result_summary_supported(project, owner_id, reference, active)
+                    direct_result_summary_supported(project, owner_id, reference, active, trace)
                 } else {
                     owner
                         .external_expressions()
@@ -16913,6 +16956,7 @@ fn direct_result_summary_supported(
                 *target,
                 target_owner.result().0 as usize,
                 active,
+                trace,
             )
         }
         PackedKernelOwnerNodeKind::RenderConstructor { .. } => inputs.iter().all(|edge| {
@@ -17005,6 +17049,12 @@ fn direct_result_summary_supported(
         _ => false,
     };
     active.remove(&(owner_id, expression));
+    #[cfg(debug_assertions)]
+    if trace && !supported {
+        // Predicates short-circuit in source edge order. The first emitted
+        // rejection is the leaf cause; later rows describe its result path.
+        eprintln!("kernel-summary-rejection owner={} expression={expression} kind={:?}", owner_id.0, node.kind);
+    }
     supported
 }
 
@@ -18976,6 +19026,8 @@ fn compile_direct_result_summaries(
     builder: &mut ComponentProgramBuilder,
     project: &PackedKernelProjectProgram,
 ) -> Vec<Option<Arc<CompiledDirectSummary>>> {
+    #[cfg(debug_assertions)]
+    let traced = traced_summary_owners();
     let targets = project
         .owners()
         .flat_map(|owner| owner.nodes().iter())
@@ -18990,11 +19042,19 @@ fn compile_direct_result_summaries(
             let Some(owner) = project.owner(*target) else {
                 return false;
             };
+            let trace = false;
+            #[cfg(debug_assertions)]
+            let trace = traced.contains(&target.0) || trace;
+            #[cfg(debug_assertions)]
+            if trace {
+                eprintln!("kernel-summary-candidate owner={}", target.0);
+            }
             direct_result_summary_supported(
                 project,
                 *target,
                 owner.result().0 as usize,
                 &mut BTreeSet::new(),
+                trace,
             )
         })
         .collect::<BTreeSet<_>>();

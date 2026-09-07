@@ -613,7 +613,7 @@ fn validate_lane(
             allocation_counter_scope: counter_scope,
             cargo_profile: "release",
             target_cpu: "generic",
-            profile_options: "opt-level=3;lto=off;codegen-units=16;debug-assertions=off;overflow-checks=off",
+            profile_options: "opt-level=3;lto=false;codegen-units=16;debug-assertions=off;overflow-checks=off",
             rustflags: "",
         },
     )

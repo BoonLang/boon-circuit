@@ -25,8 +25,10 @@ not competing resumption instructions.
   [the WHERE plan](BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md) owns proof meaning
   and feature rollout; this plan must neither weaken nor pretend to implement it.
 
-This update changes documentation only. K0--K5 and F1 below are not marked
-implemented by writing this plan. Do not resume an old attachment containing
+The 2026-09-06 plan update changed documentation only. K0--K5 and F1 below
+are not marked implemented by writing this plan. Live K0+K1 progress is recorded
+in the [2026-09-07 execution log](BOON_COMPILER_K0_K1_EXECUTION_2026_09_07.md).
+Do not resume an old attachment containing
 "implement M0--M6 completely" or the retired unified-product goal.
 
 ## Decision

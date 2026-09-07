@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod build_git;
+
 const MIMALLOC_UPSTREAM_COMMIT: &str = "18b08671c9302247bfb682286e6bf3cc1773f801";
 
 fn main() {
@@ -86,9 +88,10 @@ fn emit_toolchain_identity() {
 fn emit_profile_identity() {
     let rustflags = env::var("CARGO_ENCODED_RUSTFLAGS").unwrap_or_default();
     let target_cpu = target_cpu_from_rustflags(&rustflags).unwrap_or("generic");
+    let profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".to_owned());
     println!(
         "cargo:rustc-env=BOON_BUILD_PROFILE={}",
-        env::var("PROFILE").unwrap_or_else(|_| "unknown".to_owned())
+        profile
     );
     println!(
         "cargo:rustc-env=BOON_BUILD_OPT_LEVEL={}",
@@ -104,8 +107,16 @@ fn emit_profile_identity() {
     );
     println!("cargo:rustc-env=BOON_BUILD_TARGET_CPU={target_cpu}");
     println!("cargo:rustc-env=BOON_BUILD_RUSTFLAGS={rustflags}");
+    // This is the repository's frozen release measurement lane, not a general
+    // effective Cargo profile resolver. Do not attest release-only settings for
+    // occasional, explicitly unscored debug observations.
+    let settings = if profile == "release" {
+        "lto=false;codegen-units=16;debug-assertions=off;overflow-checks=off"
+    } else {
+        "lto=unknown;codegen-units=unknown;debug-assertions=unknown;overflow-checks=unknown"
+    };
     println!(
-        "cargo:rustc-env=BOON_BUILD_PROFILE_OPTIONS=opt-level={};lto=off;codegen-units=16;debug-assertions=off;overflow-checks=off",
+        "cargo:rustc-env=BOON_BUILD_PROFILE_OPTIONS=opt-level={};{settings}",
         env::var("OPT_LEVEL").unwrap_or_else(|_| "unknown".to_owned())
     );
 }
@@ -129,6 +140,11 @@ fn target_cpu_from_rustflags(flags: &str) -> Option<&str> {
 }
 
 fn emit_workspace_build_identity(workspace: &Path) {
+    // The v1 identity includes HEAD and staging state, not only source bytes.
+    // A commit must refresh provenance even when it changes documentation only.
+    for path in build_git::identity_watch_paths(workspace) {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
     let head = git_stdout(workspace, &["rev-parse", "HEAD"]);
     let head = String::from_utf8(head).expect("git HEAD UTF-8");
     let head = head.trim();

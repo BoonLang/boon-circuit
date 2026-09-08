@@ -163,6 +163,16 @@ pub struct KernelSummaryProjectionStep {
     pub consumer: TypeVariableId,
 }
 
+/// Occurrence-private requirement cells, connected only when their input is
+/// actually demanded. Merely compiling an untaken arm must not constrain the
+/// caller's formal interface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KernelSummaryRequirementPath {
+    pub provider: TypeVariableId,
+    pub root: TypeVariableId,
+    pub consumers: Box<[TypeVariableId]>,
+}
+
 /// One occurrence-local operand for immutable definition-summary bytecode.
 ///
 /// A projection stores preallocated private cells but no standalone graph
@@ -179,6 +189,7 @@ pub enum KernelSummaryCallInput {
         /// definition. Context reads deliberately preserve the caller value's
         /// provenance instead.
         parameter_derived: bool,
+        requirement: Option<KernelSummaryRequirementPath>,
     },
 }
 
@@ -625,6 +636,14 @@ pub(crate) enum ProgramOperationRef {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct ProgramConsumer {
     pub operation: OperationId,
+    pub role: ProgramConsumerRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum ProgramConsumerRole {
+    Ordinary,
+    SummaryRead,
+    SummaryOutputWatch,
 }
 
 #[derive(Clone, Debug)]
@@ -1199,10 +1218,23 @@ impl ComponentProgramBuilder {
         let mut consumers = vec![
             ProgramConsumer {
                 operation: OperationId(0),
+                role: ProgramConsumerRole::Ordinary,
             };
             dependency_count
         ];
+        let mut summary_reads = Vec::new();
         for operation in 0..work_items.len() {
+            summary_reads.clear();
+            let is_summary = if let ProgramOperationRef::Direct(direct) = work_items[operation]
+                && let KernelOperationRef::SummaryCall { inputs, .. } = self.operations.get(direct as usize)
+            {
+                collect_summary_input_variables(inputs, &self.terms, &mut summary_reads);
+                summary_reads.sort_unstable();
+                summary_reads.dedup();
+                true
+            } else {
+                false
+            };
             let operation_id =
                 OperationId(u32::try_from(operation).expect("kernel operation count exceeds u32"));
             let start = dependency_offsets[operation] as usize;
@@ -1211,6 +1243,15 @@ impl ComponentProgramBuilder {
                 let cursor = &mut consumer_cursors[dependency.0 as usize];
                 consumers[*cursor as usize] = ProgramConsumer {
                     operation: operation_id,
+                    role: if !is_summary {
+                        ProgramConsumerRole::Ordinary
+                    } else if summary_reads.binary_search(dependency).is_ok() {
+                        // Read wins when one variable is both an input and the
+                        // result. Later aliases retain their authored roles.
+                        ProgramConsumerRole::SummaryRead
+                    } else {
+                        ProgramConsumerRole::SummaryOutputWatch
+                    },
                 };
                 *cursor = cursor
                     .checked_add(1)
@@ -1650,14 +1691,23 @@ fn collect_operation_variables(
             ..
         } => {
             output.push(variable);
-            for input in inputs {
-                match input {
-                    KernelSummaryCallInput::Term(term) => {
-                        collect_term_variables(*term, terms, output);
-                    }
-                    KernelSummaryCallInput::Projection { provider, .. } => {
-                        output.push(*provider);
-                    }
+            collect_summary_input_variables(inputs, terms, output);
+        }
+    }
+}
+
+fn collect_summary_input_variables(
+    inputs: &[KernelSummaryCallInput],
+    terms: &TypeTermArena,
+    output: &mut Vec<TypeVariableId>,
+) {
+    for input in inputs {
+        match input {
+            KernelSummaryCallInput::Term(term) => collect_term_variables(*term, terms, output),
+            KernelSummaryCallInput::Projection { provider, requirement, .. } => {
+                output.push(*provider);
+                if let Some(requirement) = requirement {
+                    output.push(requirement.provider);
                 }
             }
         }
@@ -1743,9 +1793,31 @@ mod tests {
 
         let consumer = ProgramConsumer {
             operation: OperationId(0),
+            role: ProgramConsumerRole::Ordinary,
         };
         assert_eq!(program.consumers(input), &[consumer]);
         assert_eq!(program.consumers(output), &[consumer]);
+    }
+
+    #[test]
+    fn summary_input_role_wins_over_output_watch() {
+        let mut builder = ComponentProgramBuilder::new();
+        let input_and_output = builder.new_variable();
+        let input = builder.variable_term(input_and_output);
+        builder.add_summary_call(
+            input_and_output,
+            Arc::new(KernelSummaryProgram {
+                definition: 0,
+                nodes: vec![KernelSummaryNode::Input(0)].into_boxed_slice(),
+                result: KernelSummaryValueId(0),
+            }),
+            [KernelSummaryCallInput::Term(input)],
+        );
+        let program = builder.finish();
+        assert_eq!(program.consumers(input_and_output), &[ProgramConsumer {
+            operation: OperationId(0),
+            role: ProgramConsumerRole::SummaryRead,
+        }]);
     }
 
     #[test]
@@ -1776,6 +1848,7 @@ mod tests {
             program.consumers(input),
             &[ProgramConsumer {
                 operation: OperationId(0),
+                role: ProgramConsumerRole::Ordinary,
             }]
         );
         assert!(program.consumers(projection).is_empty());

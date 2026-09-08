@@ -19211,31 +19211,17 @@ fn emit_compiled_direct_summary(
                         });
                     }
                 }
-                if !builder.is_authoritative(actual.variable) || actual.requirement_backflow {
-                    // Summary inputs are detached projections so a concrete
-                    // call-site provider can never be specialized by the
-                    // callee. An open caller formal is different: the
-                    // callee's definition-local requirement must flow back to
-                    // that formal's private requirement surface. Recreate the
-                    // same root/path equation used by a full invocation frame
-                    // without allocating that frame.
-                    let consumer = steps
-                        .last()
-                        .expect("a summary projection always has one step")
-                        .consumer;
-                    let requirement_root = builder.new_contextual_hole();
-                    let requirement = requirement_projection(builder, requirement_root, fields);
-                    let consumer = builder.variable_term(consumer);
-                    let requirement = builder.variable_term(requirement);
-                    builder.add_unify(consumer, requirement);
-                    let actual = builder.variable_term(actual.requirement);
-                    let requirement_root = builder.variable_term(requirement_root);
-                    builder.add_unify(actual, requirement_root);
-                }
+                let requirement = (!builder.is_authoritative(actual.variable)
+                    || actual.requirement_backflow).then(|| crate::KernelSummaryRequirementPath {
+                        provider: actual.requirement,
+                        root: builder.new_contextual_hole(),
+                        consumers: (0..steps.len()).map(|_| builder.new_variable()).collect(),
+                    });
                 call_inputs.push(KernelSummaryCallInput::Projection {
                     provider: actual.variable,
                     steps: steps.into_boxed_slice(),
                     parameter_derived: *parameter_derived,
+                    requirement,
                 });
                 input_modes.push(projected_mode_variable(
                     mode_builder,

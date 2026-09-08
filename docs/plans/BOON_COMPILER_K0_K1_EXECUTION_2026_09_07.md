@@ -181,11 +181,68 @@ probe above isolates transfer semantics; it is not a fix or product workaround
 for inline function support. Preserve this missing-feature report for a parser
 tranche; do not claim that feature was implemented by K1.
 
+## K1 correctness prerequisite — 2026-09-08
+
+The clean K0 baseline is preserved at commit
+`2d7a5343c9d98e9eeabc5c0de0c3c5728f4fb7f2`, in the detached sibling worktree
+`/home/martinkavik/repos/boon-compiler-k0-2d7a5343`. Its product and evidence
+release binaries were built before the K1 changes and copied byte-for-byte to
+that worktree's `target/release`:
+
+- Product SHA-256: `178b6b58c641890f1028bbfbf612b1a3b5fd29df895f191ab0b536db43948ecf`.
+- Evidence SHA-256: `c547ddac0c80d0b4079953e972809525f2fbb96ab8289b61837a4a5abb6f329b`.
+- Embedded workspace-input SHA-256: `299f1b59bbc3b2a32ea4e7206664a23fad04653a2b738d6221486ad2b26ae13c`.
+- Embedded HEAD matches the baseline; dirty is false. Release settings remain
+  opt-level 3, LTO false, 16 codegen units, debug assertions and overflow checks
+  off. These binaries are not fresh candidates for the changed main worktree.
+
+The first implementation change makes ordinary summary requirement paths lazy:
+private cells are allocated per occurrence, but no requirement equation is
+connected until evaluation reads that input. Whole-value backflow is equality;
+field backflow uses the existing projection equation. This removes the eager
+standalone requirement equations, not the generic residual solver.
+
+The same reverse-consumer store now distinguishes ordinary dependencies,
+summary input reads and summary output watches. A changed input can requeue
+the active summary after its activation-local scratch becomes stale; its own
+output publication cannot trigger contextual-hole self-replay. Input wins
+when the same variable is both input and output. There is no second queue or
+result-type-equality cache.
+
+The formerly ignored ordinary-field regression is enabled and passes alongside
+the pattern regression. The first broader kernel run caught a whole-value
+backflow mistake (a directional read failed to export a callee requirement);
+the equality correction passes the existing regression. All 177 kernel unit
+tests pass, including new direct/nested late-backflow replay, output-only
+contextual-hole termination and same-input/output subscription-role tests.
+This is a correctness prerequisite, not accepted K1 performance evidence.
+
+Independent read-only review found no definite scheduling defect and requested
+two additional focused gates: a taken nested-field requirement and a late
+constraint on a distinct caller requirement provider while the actual stays
+authoritative. The four high-level transfer cases (untaken field, nested field,
+pattern and taken nested field) and all three staged-compilation tests pass.
+The separate-provider gate also passes: a late extra field on the caller's
+requirement root queues the summary again, the merged requirement retains both
+fields, and the concrete authoritative input and Number result remain unchanged.
+Its initial run failed only because the test used an undeclared frozen-pool
+symbol; the corrected test uses the existing `kind` symbol.
+
+The review also identified a retained validation limitation: private projection
+cells are not fully covered by directional-writer validation, and requirement
+path length is checked only when demanded. Existing value-path cells have a
+similar limitation; do not claim a complete private-cell validation boundary.
+The larger consumer row and extra per-summary dependency collection/sort need
+measurement alongside the deleted eager equality operations; no cost direction
+has been established yet.
+
 ## Next action and status
 
-Attribution and the generic regression probes have run. Freeze a clean K0
-source/binary pair before changing transfer semantics, then implement and
-test lazy requirement and pattern transfer. Count
-summary work as well as residual work; use the required alternating comparison
-and holdouts before claiming a speedup. Baseline preservation is still pending,
-K1 is not implemented, and inherited performance failures remain open.
+The focused lazy-requirement gates and conditional review requests are met.
+Next add typed formal-root pattern transfer with pattern-local mode identity preserved.
+Pattern transfer is not implemented yet. Count summary work as well as residual
+work; use the required alternating comparison and holdouts before claiming a
+speedup. The baseline collector still needs a correctly baseline-rooted xtask
+build: its workspace root is compiled in, so copying main's xtask is invalid.
+No fresh candidate release measurement or K1 acceptance run has occurred;
+inherited performance failures remain open.

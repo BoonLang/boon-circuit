@@ -4,7 +4,7 @@ use crate::{
     KernelCollectionProjectionKind, KernelOperationRef, KernelRecordEntry, KernelSelectArm,
     KernelSolveWork, KernelSummaryCallInput, KernelSummaryDefinitionWork, KernelSummaryNode,
     KernelSummaryProgram, KernelSummaryRecordEntry, OperationId, PackedKernelPattern,
-    PackedOperationTable, ProgramConsumer, ProgramOperationRef, PublishMode,
+    PackedOperationTable, ProgramConsumer, ProgramConsumerRole, ProgramOperationRef, PublishMode,
     ResidualOperationFrame, TypeTerm, TypeTermHead, TypeTermId, TypeVariableId,
     UnsealedComponentArtifact, VariantTerm, term::ScratchPool,
 };
@@ -1875,6 +1875,7 @@ impl ComponentSolver {
                 provider,
                 steps,
                 parameter_derived,
+                requirement,
             } => {
                 if steps.is_empty() {
                     return Err(KernelSolveError::new(format!(
@@ -1885,6 +1886,30 @@ impl ComponentSolver {
                 for step in steps {
                     self.project(provider, step.field, step.consumer);
                     provider = step.consumer;
+                }
+                if let Some(requirement) = requirement {
+                    if requirement.consumers.len() != steps.len() {
+                        return Err(KernelSolveError::new("summary requirement path length differs from its value path"));
+                    }
+                    let mut required = requirement.root;
+                    for (step, consumer) in steps.iter().zip(requirement.consumers.iter().copied()) {
+                        if step.field.is_some() {
+                            self.project(required, step.field, consumer);
+                        } else {
+                            // A whole-value requirement is equality, not a
+                            // directional read that waits for a provider.
+                            let root = self.program.terms.variable(required);
+                            let leaf = self.program.terms.variable(consumer);
+                            self.unify_terms(root, leaf);
+                        }
+                        required = consumer;
+                    }
+                    let value = self.program.terms.variable(provider);
+                    let required = self.program.terms.variable(required);
+                    self.unify_terms(value, required);
+                    let actual = self.program.terms.variable(requirement.provider);
+                    let root = self.program.terms.variable(requirement.root);
+                    self.unify_terms(actual, root);
                 }
                 let provider = self.program.terms.variable(provider);
                 Ok(SummaryValue {
@@ -3127,8 +3152,13 @@ impl ComponentSolver {
                 for consumer in self.program.consumers(dependency) {
                     let operation = consumer.operation;
                     let index = operation.0 as usize;
-                    if self.active_operation == Some(operation) && !self.self_replayable[index] {
-                        continue;
+                    if self.active_operation == Some(operation) {
+                        match consumer.role {
+                            ProgramConsumerRole::SummaryRead => {}
+                            ProgramConsumerRole::SummaryOutputWatch => continue,
+                            ProgramConsumerRole::Ordinary if !self.self_replayable[index] => continue,
+                            ProgramConsumerRole::Ordinary => {}
+                        }
                     }
                     if self.enabled[index] && self.replayable[index] && !self.queued[index] {
                         self.queued[index] = true;
@@ -3510,6 +3540,7 @@ mod tests {
                     }]
                     .into_boxed_slice(),
                     parameter_derived: true,
+                    requirement: None,
                 },
             ],
         );
@@ -3608,6 +3639,7 @@ mod tests {
                     }]
                     .into_boxed_slice(),
                     parameter_derived: true,
+                    requirement: None,
                 },
             ],
         );
@@ -3689,6 +3721,7 @@ mod tests {
                 }]
                 .into_boxed_slice(),
                 parameter_derived: true,
+                requirement: None,
             }],
         );
         let result_output = builder.add_output(output, FlowMode::Continuous);
@@ -3739,6 +3772,7 @@ mod tests {
                 }]
                 .into_boxed_slice(),
                 parameter_derived: true,
+                requirement: None,
             }],
         );
         let actual_output = builder.add_output(actual, FlowMode::Continuous);
@@ -3796,6 +3830,7 @@ mod tests {
                 }]
                 .into_boxed_slice(),
                 parameter_derived: true,
+                requirement: None,
             }],
         );
         let actual_output = builder.add_output(actual, FlowMode::Continuous);
@@ -3811,6 +3846,142 @@ mod tests {
             artifact.output_flow(result_output).unwrap().ty,
             Type::Number
         );
+    }
+
+    fn assert_summary_revisits_selector_after_lazy_backflow(nested: bool) {
+        use crate::{KernelSummaryRequirementPath, KernelSummarySelectArm, KernelSummaryValueId as V};
+        let mut builder = ComponentProgramBuilder::new();
+        let actual = builder.new_contextual_hole();
+        let output = builder.new_authoritative_provider();
+        let chosen = builder.terms_mut().variant_tag("True");
+        let pattern = tag_pattern(chosen.tag());
+        let chosen = builder.terms_mut().variant_set([chosen]);
+        let number = builder.terms().number();
+        let text = builder.terms().text();
+        // The selector is deliberately read before the constraint, and then
+        // reused from this activation's scratch. A genuine input notification
+        // must arrange a fresh activation, not reuse the stale union result.
+        let mut summary = Arc::new(KernelSummaryProgram {
+            definition: 0,
+            nodes: vec![
+                KernelSummaryNode::Input(0),
+                KernelSummaryNode::Term(number),
+                KernelSummaryNode::Term(text),
+                KernelSummaryNode::Select {
+                    selector: V(0),
+                    syntax_discriminating: true,
+                    arms: vec![
+                        KernelSummarySelectArm { pattern, output: V(1) },
+                        KernelSummarySelectArm { pattern: PackedKernelPattern::Wildcard, output: V(2) },
+                    ].into_boxed_slice(),
+                },
+                KernelSummaryNode::Constrain { value: V(0), expected: chosen },
+                KernelSummaryNode::Sequence { inputs: vec![V(3), V(4)].into_boxed_slice(), result: V(3) },
+            ].into_boxed_slice(),
+            result: V(5),
+        });
+        if nested {
+            summary = Arc::new(KernelSummaryProgram {
+                definition: 1,
+                nodes: vec![
+                    KernelSummaryNode::Input(0),
+                    KernelSummaryNode::Invoke { program: summary, inputs: vec![V(0)].into_boxed_slice() },
+                ].into_boxed_slice(),
+                result: V(1),
+            });
+        }
+        let consumer = builder.new_variable();
+        let requirement = KernelSummaryRequirementPath {
+            provider: actual,
+            root: builder.new_contextual_hole(),
+            consumers: vec![builder.new_variable()].into_boxed_slice(),
+        };
+        builder.add_summary_call(output, summary, [KernelSummaryCallInput::Projection {
+            provider: actual,
+            steps: vec![crate::KernelSummaryProjectionStep { field: None, consumer }].into_boxed_slice(),
+            parameter_derived: true,
+            requirement: Some(requirement),
+        }]);
+        let result = builder.add_output(output, FlowMode::Continuous);
+        let artifact = solve_component(builder.finish()).unwrap();
+        assert_eq!(artifact.output_flow(result).unwrap().ty, Type::Number);
+        assert!(artifact.output(result).unwrap().call_syntax_selected);
+        assert_eq!(artifact.work.summary_call_activations, 2);
+    }
+
+    #[test]
+    fn summary_revisits_selector_after_lazy_backflow() {
+        assert_summary_revisits_selector_after_lazy_backflow(false);
+    }
+
+    #[test]
+    fn nested_summary_revisits_selector_after_lazy_backflow() {
+        assert_summary_revisits_selector_after_lazy_backflow(true);
+    }
+
+    #[test]
+    fn separate_summary_requirement_requeues_without_changing_authoritative_actual() {
+        let mut builder = ComponentProgramBuilder::new();
+        let actual = builder.new_authoritative_provider();
+        let requirement_provider = builder.new_contextual_hole();
+        let output = builder.new_authoritative_provider();
+        let value = builder.terms_mut().intern_name("value");
+        let late = builder.terms_mut().intern_name("kind");
+        let number = builder.terms().number();
+        let text = builder.terms().text();
+        let concrete = builder.terms_mut().object([(value, number)], false);
+        let late_requirement = builder.terms_mut().object([(late, text)], true);
+        let input = KernelSummaryCallInput::Projection {
+            provider: actual,
+            steps: vec![crate::KernelSummaryProjectionStep {
+                field: Some(value),
+                consumer: builder.new_variable(),
+            }].into_boxed_slice(),
+            parameter_derived: true,
+            requirement: Some(crate::KernelSummaryRequirementPath {
+                provider: requirement_provider,
+                root: builder.new_contextual_hole(),
+                consumers: vec![builder.new_variable()].into_boxed_slice(),
+            }),
+        };
+        builder.add_summary_call(output, Arc::new(KernelSummaryProgram {
+            definition: 0,
+            nodes: vec![KernelSummaryNode::Input(0)].into_boxed_slice(),
+            result: crate::KernelSummaryValueId(0),
+        }), [input]);
+        let actual_term = builder.variable_term(actual);
+        let output_term = builder.variable_term(output);
+        let requirement_term = builder.variable_term(requirement_provider);
+        let (mut solver, execution) = ComponentSolver::new(builder.finish());
+        solver.replace_binding(actual, concrete, true);
+        solver.enable(&execution, &[true]).unwrap();
+        let activations = solver.work.summary_call_activations;
+        assert!(solver.pending.is_empty());
+
+        solver.unify_terms(requirement_term, late_requirement);
+        assert_eq!(solver.pending.front(), Some(&OperationId(0)));
+        solver.enable(&execution, &[true]).unwrap();
+        assert!(solver.work.summary_call_activations > activations);
+        assert_eq!(solver.resolve_term(actual_term), concrete);
+        assert_eq!(solver.resolve_term(output_term), number);
+        let required = solver.resolve_term(requirement_term);
+        let expected = solver.program.terms.object([(value, number), (late, text)], true);
+        assert_eq!(required, expected);
+    }
+
+    #[test]
+    fn summary_contextual_hole_output_does_not_self_requeue() {
+        let mut builder = ComponentProgramBuilder::new();
+        let output = builder.new_authoritative_provider();
+        let summary = Arc::new(KernelSummaryProgram {
+            definition: 0,
+            nodes: vec![KernelSummaryNode::ContextualHole].into_boxed_slice(),
+            result: crate::KernelSummaryValueId(0),
+        });
+        builder.add_summary_call(output, summary, std::iter::empty::<TypeTermId>());
+        builder.add_output(output, FlowMode::Continuous);
+        let artifact = solve_component(builder.finish()).unwrap();
+        assert_eq!(artifact.work.summary_call_activations, 1);
     }
 
     #[test]

@@ -246,3 +246,294 @@ speedup. The baseline collector still needs a correctly baseline-rooted xtask
 build: its workspace root is compiled in, so copying main's xtask is invalid.
 No fresh candidate release measurement or K1 acceptance run has occurred;
 inherited performance failures remain open.
+
+## Pattern-transfer WIP — 2026-09-09
+
+The lazy-requirement prerequisite was committed as `6dd95c4e`. The next cut is
+uncommitted and not performance-accepted. Typed `Whole`, `Field` and `Pattern`
+paths now reuse the existing `project` / `project_pattern` equations, with
+occurrence-private requirement cells. Pattern result modes stay fixed across
+path composition; a completion assertion and the emitter reject a pattern or
+requirement input escaping as an ordinary input-derived result mode. Computed
+pattern providers without a formal-root path remain residual equations.
+
+The first broader compiler run exposed two TodoMVC failures (96 tests passed,
+two failed, one was already ignored). Shared transfer omitted the closed WHEN
+domain equations used by residual lowering, so wrapper interfaces retained only
+payload-bearing alternatives and rejected valid bare tags. A five-case transfer
+suite now includes the small `Plain | Wrapped[value]` reproduction. Adding
+occurrence-private `PatternRequirement` inputs and impure `Unify` nodes made
+that reproduction pass; no mutable expected-type holes live in shared bytecode.
+Nested invocations receive distinct requirement operands. The domain sequence
+remains lazy under its enclosing arm; wildcard/binding domains stay open.
+
+Read-only review identified the next necessary split: resolved input values
+cannot substitute for writable requirement identities. `SummaryValue` now
+carries those separately, including authoritative callback data with a distinct
+caller requirement surface. Closed directional evidence is copied as a term,
+not by aliasing its authoritative cell. Unresolved nested directional evidence
+still needs explicit adversarial coverage; do not claim complete parity yet.
+
+The writable-domain change exposed a real non-monotone equation cycle in the
+existing syntax-discrimination test: a VariantSet domain and unqualified object
+field requirements erased and reinstalled each other. A full unit run exceeded
+60 seconds in that test; only its test process was terminated. A subsequent
+isolated 10-second diagnostic timeout confirmed non-convergence. Neither timeout
+was added to production or treated as a convergence rule. The fix qualifies
+descendant formal-field paths with the active tag arm: A requires a, B requires
+b, rather than exporting both fields unconditionally. The formerly looping test
+now passes immediately, and all 179 kernel unit tests pass.
+
+New solver gates cover late nested payloads, missing/wrong/disappearing tags and
+reappearance, plus concrete callback data changing alternatives while its
+separate callable domain retains both alternatives. The compiler-wide rerun,
+additional mode/currentness and nested-invocation coverage, fresh release
+measurements and final independent review remain outstanding. There is no new
+NovyWave timing or speedup claim for this WIP.
+
+The latest compiler-wide rerun rebuilt in 1m14s and reached the two TodoMVC
+tests, but both exceeded 60 seconds (the earlier complete failing run took
+25.18s total). At 1m37s the test process still used roughly two CPU cores and
+218,528 KiB RSS. A read-only debugger attach was denied by ptrace policy; no
+machine policy was changed. Only that test PID was terminated. This is an
+unresolved large-fixture stall, not a passing gate or a proven timing result.
+Next isolate one TodoMVC test and attribute active solver work before making
+another equation change. The 179-test kernel pass does not establish that this
+broader stall is fixed; do not commit the WIP as a verified production cut.
+
+The isolated 12-second TodoMVC trace reached 480,000 mutations across many
+operations, rather than one slowly executing operation. Sampling is debug-only:
+`BOON_KERNEL_TRACE_EPOCHS=1` with no selected roots reports every 10,000th
+mutation; explicit selected-root tracing keeps its existing behavior. The run
+ended by its diagnostic timeout, not by successful convergence.
+
+Two additional deterministic unit reproductions now pass after focused fixes:
+
+- A directional callback provider with no first value yet must not alias its
+  private read cell to its separate requirement channel. Authority is checked
+  on the input provider, not merely on the still-uninitialized read cell.
+- Same-tag requirement payloads must merge through solver-aware equality.
+  Immutable structural widening previously replaced their raw variable IDs
+  without equating their union-find identities. `merge_equal_terms` now merges
+  matching tagged payloads recursively using the existing variant scratch pool.
+  The regression asserts that replaying either contributor after the first
+  merge produces zero additional mutations.
+
+All 181 kernel tests pass. The isolated TodoMVC oracle is being rerun; this
+does not yet prove that the large-fixture stall is resolved. Review also calls
+for whole-selector forwarding through an arm and invalid/transiently mismatched
+closed evidence tests before accepting the new domain-transfer representation.
+
+### Ownership reassessment, not another equality special case
+
+The isolated TodoMVC oracle still exceeded 80 seconds after those fixes and
+was stopped. A second bounded trace reached 530,000 mutations. Selected root
+27968 / operation 6422 alternated complete font-record types: for example,
+`weight` changed between tag sets and open-empty Object, while `style` and
+authored field order also changed. This is real value/shape churn, not merely
+equal payloads retaining different raw IDs. Raw diagnostic traces and the
+bounded counterexample are preserved in
+[the non-convergence evidence](evidence/compiler-k1-nonconvergence-2026-09-09.json).
+
+A fresh-context read-only architecture audit found that this prototype mixes
+directional data evidence with permanent conditional requirements. The new
+`incompatible_directional_evidence_reaches_requirement_quiescence` test proves
+one generic replay cycle without hanging: unchanged closed Object data plus a
+tag-domain requirement produces 9 mutations after the first activation and 11
+after the second. Copying the data restores a field that the incompatible
+domain immediately erases. The new test is enabled and fails; the earlier
+181-test pass must not be cited as a current all-tests pass.
+
+The audit also identifies two representation gaps that another equality
+special case cannot solve: inactive arms cannot withdraw prior union-find
+effects, and whole-selector forwarding does not retain the active arm guard.
+These are not yet proven causes of every TodoMVC oscillation, but they are
+mandatory soundness obligations for K1.
+
+The next implementation decision within K1 is therefore:
+
+1. Retain definition-owned bytecode and occurrence-private cells; introduce no
+   second solver or result-type cache.
+2. Represent directional value evidence, writable requirement destination and
+   active-arm guard as separate facts. Whole forwarding keeps the original
+   tagged value, not just its payload.
+3. Give each conditional requirement contribution an exact occurrence/effect/
+   nested-invocation identity. Reevaluation replaces its contribution; an
+   inactive site contributes nothing.
+4. Aggregate current contributions in the existing component solver without
+   permanently unioning retractable contributor cells into the destination.
+   Unconditional inference equalities keep their existing role.
+5. Replace unconditional closed-data copying with explicitly owned replaceable
+   evidence or a compatibility obligation. Do not suppress input replay to hide
+   the cycle, widen all tag arms conjunctively, or relax diagnostics.
+6. Prove incompatible-input quiescence, late-arm withdrawal, A→B→A equivalence
+   to a fresh A solve, preservation of another occurrence's still-active
+   contribution, whole forwarding, and nested/HOLD identity isolation before
+   rerunning large-fixture acceptance.
+
+This rejects the current permanent-side-effect transfer prototype, not the
+K1 reuse hypothesis as a whole. The goal, comparison protocol and exit criteria
+are unchanged. The WIP remains uncommitted; performance acceptance, the final
+independent review and the complete K1 outcome are still outstanding.
+
+### Replaceable contribution table: initial implementation
+
+Added `solver/requirements.rs` as the private storage substrate for the ownership
+change. It retains dense occurrence/site identities and stages complete effect
+replacements before commit. Unvisited sites withdraw their facts without
+touching another occurrence. Failed evaluation retains the previously committed
+facts. Destination dirtiness is deduplicated; unchanged replay adds no dirty
+destination. Registration order is separate from branch visitation order.
+
+A bounded independent read-only review found no standalone table blocker, but
+identified mandatory integration obligations: nested transactions, mutable term
+dependencies, base-fact separation, alias ordering/invalidation, and preventing
+payload mutation before commit. The table now defines an owner as a top-level
+summary activation with distinct nested-effect sites under that same atomic
+replacement. Site registration seals before first evaluation. Exposed site
+ordinals support deterministic merging across aliased destination identities.
+
+Seven focused table tests pass, covering withdrawal, multiple contributors,
+A-to-B-to-A replacement, unchanged replay, staged/aborted evaluation, skipped
+nested calls, parent abort, and order independent of visitation/alias-member
+enumeration. These are storage-level tests, not proof of integrated solver
+behavior. Command: `cargo test -p boon_compiler_kernel --lib
+solver::requirements::tests --jobs 2`.
+
+The full kernel suite run after the first four table tests had 185 passes and
+the same one enabled failure: incompatible directional evidence still produces
+11 mutations instead of 9. The three later table tests were checked separately.
+The table is not yet connected to summary evaluation or union-find aggregation;
+there is no production behavior or timing improvement from this substrate yet.
+Next integrate separately retained unconditional base bindings and exact
+contribution dependencies, then switch summary effects to atomic replacement.
+Do not aggregate into the previous aggregate, permanently union retractable
+payloads, or use raw term-ID equality as proof that nested bindings are current.
+All work remains uncommitted pending a coherent passing cut; no push occurred.
+
+### Solver aggregation integration and retraction counterexamples
+
+The contribution store is now connected to the component solver's binding and
+dependency machinery, but summary evaluation has not yet been converted to
+publish through it. Managed destinations retain unconditional base facts
+separately. Equality, directional replacement and alias establishment preserve
+that separation; aggregation does not permanently union contributor payload
+variables. Original contribution terms remain dependency authorities even when
+their resolved types are closed or unchanged. Aliased destinations fold sites
+in registration order. New scratch storage is included in existing scratch
+work accounting.
+
+Four solver-level tests prove base restoration after withdrawal and late
+unconditional facts, mutable payload invalidation without contributor unions,
+alias-order-independent field order and withdrawal, and quiescent incompatible
+fact replay through the new aggregation path.
+
+Independent review identified two additional generic counterexamples, both
+reproduced as bounded enabled tests:
+
+- Two cyclic contributions retained Number after their external Number seed
+  was withdrawn. Recomputing against the previous effective bindings was not
+  enough. The solver now clears the affected reverse dependency cone's derived
+  bindings before re-deriving them from base facts and live contributions. This
+  test passes. The algorithm is component-local retraction, not revision
+  currentness or full-provider scanning; its work must be measured before any
+  performance acceptance.
+- An ordinary projection copies a retractable `{value: Number}` into its
+  consumer through permanent equality. After withdrawal, replay scaffolds that
+  consumer back into the provider's unconditional base. This test remains red.
+  Merely replacing the final aggregate cannot fix the projection's ownership.
+
+The full kernel run has 193 passes and two failures (195 tests, none ignored):
+the new projection counterexample and the original summary replay regression
+(11 mutations instead of 9). All 12 other contribution tests pass. No TodoMVC
+rerun or release measurement is justified yet, and no production checkpoint is
+claimed. Next replace summary requirement-path scaffold/equality replay with
+explicit destination/path/guard contributions and non-mutating value reads;
+preserve required backflow rather than suppressing it to pass the new test.
+Then route summary effect sites, including nested calls, through the activation
+transaction. Exact contribution/aggregation work counters and independent
+review of the integrated path remain required before the K1 decision.
+
+### Summary writes now use activation-owned contributions
+
+Summary calls now collect requirements by exact call occurrence and root input
+path. Nested summary evaluation shares that activation's collection; it does
+not independently commit child effects. Successful evaluation publishes the
+complete replacement; errors abort it. Closed value evidence and explicit
+constraints are folded into that replacement instead of repeatedly mutating a
+permanent requirement cell. The call table is solver-local and keyed by output
+variable identity, never by resolved result types or cross-revision cache keys.
+
+Requirement-bearing summary inputs use a non-mutating value read. Reverse path
+construction (whole, field, or pattern payload) happens when publishing the
+collected requirement, not while reading the value. The old private
+requirement-root/consumer fields are no longer used by this evaluator; their
+model/construction deletion is pending the coherent cut, not an accepted
+compatibility layer.
+
+The original `incompatible_directional_evidence_reaches_requirement_quiescence`
+regression now passes, including unchanged replay, through actual summary
+evaluation. The full kernel suite still has 193 passes and two failures, but
+the remaining failures are now:
+
+- The ordinary projection counterexample: non-summary projection/equality can
+  still reimport withdrawn evidence into a managed destination's permanent base.
+- `separate_summary_requirement_requeues_without_changing_authoritative_actual`:
+  requeue and value-isolation checks pass, but exact field order is wrong.
+  Actual and expected both contain `kind: Text` and `value: Number`; actual
+  order is `[kind, value]`, expected `[value, kind]`. Folding all base facts
+  before contributions reorders a late unconditional field ahead of the
+  earlier contribution. Preserve ordering authority separately from retained
+  type evidence; do not weaken the assertion or simply reverse every fold.
+
+No integrated whole-arm-forwarding, nested-effect identity, large-fixture,
+release, or final independent acceptance is claimed. Registration order across
+lazy call activation and the cost of occurrence/site storage also need review.
+Next fix the projection ownership boundary and deterministic field ordering,
+then run the compiler transfer/staged gates before another TodoMVC acceptance
+attempt. No commit or push; the goal remains open.
+
+### Requirement-ownership correctness milestone
+
+The two remaining focused failures are resolved without changing their
+assertions. Ordering receipts retain only surviving field order; all values,
+shape kinds and openness come from freshly derived facts. A new test proves
+that ordering cannot resurrect a removed field or an old field type, including
+inside a list. Alias joins discard representative-dependent ordering receipts
+and use stable contribution-site order.
+
+Whole/field/pattern projections from contribution-managed providers now own
+separate forward-value and backward-requirement sites. Backflow reads the
+consumer's independent base facts, not the value that this projection just
+forwarded. The regression additionally proves that a consumer loses a withdrawn
+Number and that a new independent Text constraint still flows back to the
+source. These equations settle through the existing operation queue.
+
+Deleted the obsolete private requirement root and per-step consumer allocation
+from summary construction. `KernelSummaryRequirementTarget` now holds only the
+destination; the already-owned value path determines reverse scaffolding.
+There are no remaining references to `KernelSummaryRequirementPath` or its
+removed private-cell fields in kernel source.
+
+Verified focused results after that deletion:
+
+- Kernel library: 196 passed, none failed or ignored.
+- Compiler transfer integration: 5 passed.
+- Compiler staged integration: 3 passed.
+- Fresh debug compiler unit binary: 98 passed, none failed, one pre-existing
+  ignored directional timing probe; 31.10 seconds with two test threads.
+- Isolated TodoMVC checked-publication/replay/verification oracle: passed in
+  21.25 seconds under a 30-second observation bound. This is debug correctness
+  test duration, **not** release compilation latency or a speedup claim.
+
+This is a local correctness checkpoint within K1, not the accepted K1 decision.
+Next: adversarial whole-forwarding and occurrence/currentness coverage, complete
+work counters for contributions/aggregation/cone invalidation, fresh release
+product/evidence measurements, and independent final review. Lazy registration
+ordering, cold memory/work cost, and the full comparison/oracle cohort remain
+unaccepted. The original budget/oracle gates and 3+30 A/B protocol are unchanged.
+
+After formatting the changed Rust files, a fresh `cargo test -p
+boon_compiler_kernel -p boon_compiler --lib --jobs 2 -- --test-threads 2` also
+passed: 98 compiler tests (one existing ignored probe) and 196 kernel tests.
+The compiler suite took 32.38 seconds; this remains debug test-suite duration.

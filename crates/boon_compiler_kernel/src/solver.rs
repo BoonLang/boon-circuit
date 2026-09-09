@@ -13,6 +13,8 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt::{self, Write as _};
 
+mod requirements;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelSolveError {
     message: String,
@@ -39,6 +41,9 @@ struct VariableCell {
     parent: TypeVariableId,
     rank: u8,
     binding: Option<TypeTermId>,
+    /// Present only for a retractable destination. Never capture the effective
+    /// aggregate as an unconditional equality fact.
+    requirement_base: Option<Option<TypeTermId>>,
     contextual_hole: bool,
     authoritative_provider: bool,
 }
@@ -60,6 +65,7 @@ impl SummaryScratch {
                 value_count,
                 SummaryValue {
                     term: placeholder,
+                    requirement: None,
                     parameter_derived: false,
                     syntax_selected: false,
                 },
@@ -73,6 +79,10 @@ impl SummaryScratch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct SummaryValue {
     term: TypeTermId,
+    /// Activation-local input slot, separate from the resolved value.
+    /// In particular, callback data may be authoritative while its callable
+    /// domain is still inferred through a distinct requirement surface.
+    requirement: Option<u32>,
     parameter_derived: bool,
     syntax_selected: bool,
 }
@@ -298,6 +308,18 @@ struct ComponentSolver {
     schedule_generation: u32,
     schedule_stack: Vec<TypeVariableId>,
     summary_scratch_pool: Vec<SummaryScratch>,
+    requirements: requirements::RequirementContributions,
+    summary_requirement_calls: std::collections::HashMap<
+        TypeVariableId,
+        (
+            requirements::RequirementOwnerId,
+            Box<[Option<requirements::RequirementSiteId>]>,
+        ),
+    >,
+    summary_requirement_values: Vec<Option<TypeTermId>>,
+    requirement_projections:
+        std::collections::HashMap<TypeVariableId, requirements::RequirementProjection>,
+    requirement_fact_scratch: ScratchPool<(requirements::RequirementSiteId, TypeTermId)>,
     summary_program_evaluations: Vec<u64>,
     summary_node_evaluations: Vec<u64>,
     resolve_cache_seen: Vec<u32>,
@@ -409,6 +431,7 @@ impl ComponentSolver {
                 ),
                 rank: 0,
                 binding: None,
+                requirement_base: None,
                 contextual_hole: spec.contextual_hole,
                 authoritative_provider: spec.authoritative_provider,
             })
@@ -544,6 +567,11 @@ impl ComponentSolver {
             schedule_generation: 0,
             schedule_stack: Vec::new(),
             summary_scratch_pool: Vec::new(),
+            requirements: requirements::RequirementContributions::default(),
+            summary_requirement_calls: std::collections::HashMap::new(),
+            summary_requirement_values: Vec::new(),
+            requirement_projections: std::collections::HashMap::new(),
+            requirement_fact_scratch: ScratchPool::default(),
             summary_program_evaluations: Vec::new(),
             summary_node_evaluations: Vec::new(),
             resolve_cache_seen: Vec::new(),
@@ -585,6 +613,7 @@ impl ComponentSolver {
             parent: variable,
             rank: 0,
             binding: None,
+            requirement_base: None,
             contextual_hole: true,
             authoritative_provider: false,
         });
@@ -645,7 +674,11 @@ impl ComponentSolver {
                 self.pending.push_back(operation);
             }
         }
-        while let Some(operation) = self.pending.pop_front() {
+        loop {
+            self.refresh_requirements();
+            let Some(operation) = self.pending.pop_front() else {
+                break;
+            };
             self.queued[operation.0 as usize] = false;
             self.activate(execution, operation)?;
         }
@@ -735,25 +768,29 @@ impl ComponentSolver {
             .misses()
             .saturating_add(self.record_field_scratch.misses())
             .saturating_add(self.variant_scratch.misses())
-            .saturating_add(self.variable_scratch.misses());
+            .saturating_add(self.variable_scratch.misses())
+            .saturating_add(self.requirement_fact_scratch.misses());
         let solver_scratch_reuses = self
             .term_id_scratch
             .reuses()
             .saturating_add(self.record_field_scratch.reuses())
             .saturating_add(self.variant_scratch.reuses())
-            .saturating_add(self.variable_scratch.reuses());
+            .saturating_add(self.variable_scratch.reuses())
+            .saturating_add(self.requirement_fact_scratch.reuses());
         let solver_scratch_max_depth = self
             .term_id_scratch
             .max_checked_out()
             .max(self.record_field_scratch.max_checked_out())
             .max(self.variant_scratch.max_checked_out())
-            .max(self.variable_scratch.max_checked_out());
+            .max(self.variable_scratch.max_checked_out())
+            .max(self.requirement_fact_scratch.max_checked_out());
         let solver_scratch_capacity = self
             .term_id_scratch
             .retained_capacity_bytes()
             .saturating_add(self.record_field_scratch.retained_capacity_bytes())
             .saturating_add(self.variant_scratch.retained_capacity_bytes())
-            .saturating_add(self.variable_scratch.retained_capacity_bytes());
+            .saturating_add(self.variable_scratch.retained_capacity_bytes())
+            .saturating_add(self.requirement_fact_scratch.retained_capacity_bytes());
         self.work.term_intern_requests = term_work.intern_requests;
         self.work.term_intern_hits = term_work.intern_hits;
         self.work.term_intern_requests_by_kind = term_work.intern_requests_by_kind;
@@ -1361,6 +1398,10 @@ impl ComponentSolver {
         let syntax_selected = self.variable_syntax_selected(provider);
         self.set_syntax_selected(consumer, syntax_selected);
         let provider = self.root(provider);
+        if self.cells[provider.0 as usize].requirement_base.is_some() {
+            self.project_requirement(provider, field, None, consumer);
+            return;
+        }
         let authoritative = self.cells[provider.0 as usize].authoritative_provider;
         let provider_term = self.program.terms.variable(provider);
         // Projection must retain nested variable identities. Recursively
@@ -1425,6 +1466,10 @@ impl ComponentSolver {
         let syntax_selected = self.variable_syntax_selected(provider);
         self.set_syntax_selected(consumer, syntax_selected);
         let provider = self.root(provider);
+        if self.cells[provider.0 as usize].requirement_base.is_some() {
+            self.project_requirement(provider, None, Some((pattern, fields)), consumer);
+            return;
+        }
         let authoritative = self.cells[provider.0 as usize].authoritative_provider;
         let provider_term = self.program.terms.variable(provider);
         let resolved = self.resolve_term_head(provider_term);
@@ -1796,7 +1841,10 @@ impl ComponentSolver {
         inputs: &[KernelSummaryCallInput],
     ) -> Result<(), KernelSolveError> {
         self.work.summary_call_activations = self.work.summary_call_activations.saturating_add(1);
-        let mut result = self.evaluate_summary_program(program, inputs)?;
+        self.begin_summary_requirements(output, inputs);
+        let result = self.evaluate_summary_program(program, inputs);
+        self.finish_summary_requirements(output, inputs, result.is_ok());
+        let mut result = result?;
         // A contextual hole is allowed to escape shared definition bytecode,
         // but it has no stable identity outside this call occurrence. Preserve
         // locally constrained holes and canonicalize only still-unbound holes
@@ -1864,6 +1912,7 @@ impl ComponentSolver {
         match input {
             KernelSummaryCallInput::Term(term) => Ok(SummaryValue {
                 term: self.resolve_term_head(*term),
+                requirement: None,
                 parameter_derived: false,
                 // A checked call row reports selection performed by the
                 // target's result construction. Caller-side provenance starts
@@ -1882,38 +1931,38 @@ impl ComponentSolver {
                         "kernel summary input {input_index} has an empty projection program"
                     )));
                 }
+                if requirement.is_some() {
+                    let term = self.read_summary_requirement_value(*provider, steps);
+                    let known = self.resolve_term(term);
+                    if !self.program.terms.has_variable(known) {
+                        self.accumulate_summary_requirement(input_index, known);
+                    }
+                    return Ok(SummaryValue {
+                        term,
+                        requirement: Some(input_index),
+                        parameter_derived: *parameter_derived,
+                        syntax_selected: false,
+                    });
+                }
                 let mut provider = *provider;
                 for step in steps {
-                    self.project(provider, step.field, step.consumer);
-                    provider = step.consumer;
-                }
-                if let Some(requirement) = requirement {
-                    if requirement.consumers.len() != steps.len() {
-                        return Err(KernelSolveError::new("summary requirement path length differs from its value path"));
-                    }
-                    let mut required = requirement.root;
-                    for (step, consumer) in steps.iter().zip(requirement.consumers.iter().copied()) {
-                        if step.field.is_some() {
-                            self.project(required, step.field, consumer);
-                        } else {
-                            // A whole-value requirement is equality, not a
-                            // directional read that waits for a provider.
-                            let root = self.program.terms.variable(required);
-                            let leaf = self.program.terms.variable(consumer);
-                            self.unify_terms(root, leaf);
+                    match &step.projection {
+                        crate::KernelSummaryProjection::Whole => {
+                            self.project(provider, None, step.consumer)
                         }
-                        required = consumer;
+                        crate::KernelSummaryProjection::Field(field) => {
+                            self.project(provider, Some(*field), step.consumer)
+                        }
+                        crate::KernelSummaryProjection::Pattern { pattern, fields } => {
+                            self.project_pattern(provider, *pattern, fields, step.consumer)
+                        }
                     }
-                    let value = self.program.terms.variable(provider);
-                    let required = self.program.terms.variable(required);
-                    self.unify_terms(value, required);
-                    let actual = self.program.terms.variable(requirement.provider);
-                    let root = self.program.terms.variable(requirement.root);
-                    self.unify_terms(actual, root);
+                    provider = step.consumer;
                 }
                 let provider = self.program.terms.variable(provider);
                 Ok(SummaryValue {
                     term: self.resolve_term_head(provider),
+                    requirement: None,
                     parameter_derived: *parameter_derived,
                     syntax_selected: false,
                 })
@@ -1956,11 +2005,13 @@ impl ComponentSolver {
             KernelSummaryNode::Input(input_index) => resolve_input(self, *input_index),
             KernelSummaryNode::Term(term) => Ok(SummaryValue {
                 term: *term,
+                requirement: None,
                 parameter_derived: false,
                 syntax_selected: false,
             }),
             KernelSummaryNode::ContextualHole => Ok(SummaryValue {
                 term: self.new_contextual_hole_term(),
+                requirement: None,
                 parameter_derived: false,
                 syntax_selected: false,
             }),
@@ -1983,7 +2034,27 @@ impl ComponentSolver {
                             });
                 }
                 provider.term = self.resolve_term_head(provider.term);
+                provider.requirement = None;
                 Ok(provider)
+            }
+            KernelSummaryNode::Unify { value, requirement } => {
+                let mut actual = self.evaluate_summary_value(
+                    program,
+                    resolve_input,
+                    *value,
+                    scratch,
+                    node_evaluations,
+                )?;
+                let expected = self.evaluate_summary_value(
+                    program,
+                    resolve_input,
+                    *requirement,
+                    scratch,
+                    node_evaluations,
+                )?;
+                self.constrain_summary_value(&mut actual, expected.term);
+                actual.term = self.resolve_term_head(actual.term);
+                Ok(actual)
             }
             KernelSummaryNode::Constrain { value, expected } => {
                 let mut actual = self.evaluate_summary_value(
@@ -1993,7 +2064,7 @@ impl ComponentSolver {
                     scratch,
                     node_evaluations,
                 )?;
-                self.unify_terms(actual.term, *expected);
+                self.constrain_summary_value(&mut actual, *expected);
                 actual.term = self.resolve_term_head(actual.term);
                 Ok(actual)
             }
@@ -2063,6 +2134,7 @@ impl ComponentSolver {
                     }
                     Ok(SummaryValue {
                         term: self.collection_type(*kind, &items, &values),
+                        requirement: None,
                         parameter_derived,
                         syntax_selected,
                     })
@@ -2131,6 +2203,7 @@ impl ComponentSolver {
                     }
                     return Ok(SummaryValue {
                         term: self.program.terms.absent(),
+                        requirement: None,
                         parameter_derived: selector.parameter_derived,
                         syntax_selected: *syntax_discriminating && selector.parameter_derived,
                     });
@@ -2158,6 +2231,7 @@ impl ComponentSolver {
                     }
                     Ok(SummaryValue {
                         term: self.join_select_candidates(&candidates),
+                        requirement: None,
                         parameter_derived,
                         syntax_selected,
                     })
@@ -2213,6 +2287,7 @@ impl ComponentSolver {
                     };
                     Ok(SummaryValue {
                         term,
+                        requirement: None,
                         parameter_derived,
                         syntax_selected,
                     })
@@ -2558,12 +2633,19 @@ impl ComponentSolver {
         if self.occurs(variable, incoming) {
             return;
         }
-        let current = self.cells[variable.0 as usize].binding;
+        let managed = self.cells[variable.0 as usize].requirement_base;
+        let current = managed.unwrap_or(self.cells[variable.0 as usize].binding);
         let merged = match current {
             None => incoming,
             Some(current) => self.merge_equal_terms(current, incoming),
         };
         if current == Some(merged) {
+            return;
+        }
+        if managed.is_some() {
+            self.cells[variable.0 as usize].requirement_base = Some(Some(merged));
+            self.requirements.mark_dirty(variable);
+            self.schedule_variable(variable);
             return;
         }
         self.replace_binding_dependencies(variable, merged);
@@ -2583,6 +2665,19 @@ impl ComponentSolver {
             return;
         };
         if self.occurs(variable, provider) {
+            return;
+        }
+        if let Some(base) = self.cells[variable.0 as usize].requirement_base {
+            let authority_changed =
+                authoritative && !self.cells[variable.0 as usize].authoritative_provider;
+            self.cells[variable.0 as usize].authoritative_provider |= authoritative;
+            if base != Some(provider) || authority_changed {
+                self.cells[variable.0 as usize].requirement_base = Some(Some(provider));
+                self.requirements.mark_dirty(variable);
+                if authority_changed {
+                    self.touch(variable);
+                }
+            }
             return;
         }
         let mut changed = self.cells[variable.0 as usize].binding != Some(provider);
@@ -2672,12 +2767,21 @@ impl ComponentSolver {
     }
 
     fn merge_equal_terms(&mut self, left: TypeTermId, right: TypeTermId) -> TypeTermId {
-        if let TypeTerm::Variable(variable) = self.program.terms.term(left) {
+        self.merge_type_evidence(left, right, true)
+    }
+
+    fn merge_type_evidence(
+        &mut self,
+        left: TypeTermId,
+        right: TypeTermId,
+        permanent: bool,
+    ) -> TypeTermId {
+        if permanent && let TypeTerm::Variable(variable) = self.program.terms.term(left) {
             self.bind_equal(variable, right);
             let root = self.root(variable);
             return self.program.terms.variable(root);
         }
-        if let TypeTerm::Variable(variable) = self.program.terms.term(right) {
+        if permanent && let TypeTerm::Variable(variable) = self.program.terms.term(right) {
             self.bind_equal(variable, left);
             let root = self.root(variable);
             return self.program.terms.variable(root);
@@ -2691,7 +2795,40 @@ impl ComponentSolver {
         let right_term = self.program.terms.term_head(right);
         match (left_term, right_term) {
             (TypeTermHead::Variable(_), _) | (_, TypeTermHead::Variable(_)) => {
-                unreachable!("term heads were resolved above")
+                assert!(!permanent, "term heads were resolved above");
+                self.program.terms.structural_widen(left, right)
+            }
+            (TypeTermHead::VariantSet(left), TypeTermHead::VariantSet(right)) => {
+                // Equality owns payload variable identities. Immutable type
+                // widening treats variables as placeholders and can alternate
+                // equivalent raw IDs on every contributor replay instead of
+                // equating them through this solver's union-find authority.
+                let mut variants = self.variant_scratch.take();
+                variants.extend_from_slice(self.program.terms.variant_terms(left));
+                for ordinal in 0..right.len() {
+                    let incoming = self.program.terms.variant_terms(right)[ordinal];
+                    let Some(index) = variants
+                        .iter()
+                        .position(|variant| variant.tag() == incoming.tag())
+                    else {
+                        variants.push(incoming);
+                        continue;
+                    };
+                    variants[index] = match (variants[index], incoming) {
+                        (
+                            VariantTerm::Tagged { tag, fields: left },
+                            VariantTerm::Tagged { fields: right, .. },
+                        ) => VariantTerm::Tagged {
+                            tag,
+                            fields: self.merge_type_evidence(left, right, permanent),
+                        },
+                        (VariantTerm::Tag(_), tagged @ VariantTerm::Tagged { .. }) => tagged,
+                        (existing, _) => existing,
+                    };
+                }
+                let merged = self.program.terms.variant_set(variants.iter().copied());
+                self.variant_scratch.recycle(variants);
+                merged
             }
             (
                 TypeTermHead::Object {
@@ -2726,7 +2863,8 @@ impl ComponentSolver {
                         .object_field_for_shape(right_shape, ordinal)
                         .expect("sealed right equality field exists");
                     if let Some(index) = fields.iter().position(|left| left.0 == right.name) {
-                        fields[index].1 = self.merge_equal_terms(fields[index].1, right.ty);
+                        fields[index].1 =
+                            self.merge_type_evidence(fields[index].1, right.ty, permanent);
                     } else {
                         fields.push((right.name, right.ty));
                     }
@@ -2739,11 +2877,11 @@ impl ComponentSolver {
                 result
             }
             (TypeTermHead::List(left), TypeTermHead::List(right)) => {
-                let item = self.merge_equal_terms(left, right);
+                let item = self.merge_type_evidence(left, right, permanent);
                 self.program.terms.list(item)
             }
             (TypeTermHead::Set(left), TypeTermHead::Set(right)) => {
-                let item = self.merge_equal_terms(left, right);
+                let item = self.merge_type_evidence(left, right, permanent);
                 self.program.terms.set(item)
             }
             (
@@ -2756,8 +2894,8 @@ impl ComponentSolver {
                     value: right_value,
                 },
             ) => {
-                let key = self.merge_equal_terms(left_key, right_key);
-                let value = self.merge_equal_terms(left_value, right_value);
+                let key = self.merge_type_evidence(left_key, right_key, permanent);
+                let value = self.merge_type_evidence(left_value, right_value, permanent);
                 self.program.terms.map(key, value)
             }
             (
@@ -2777,9 +2915,9 @@ impl ComponentSolver {
                 for ordinal in 0..left_args.len() {
                     let left = self.program.terms.term_ids(left_args)[ordinal];
                     let right = self.program.terms.term_ids(right_args)[ordinal];
-                    merged_args.push(self.merge_equal_terms(left, right));
+                    merged_args.push(self.merge_type_evidence(left, right, permanent));
                 }
-                let result = self.merge_equal_terms(left_result, right_result);
+                let result = self.merge_type_evidence(left_result, right_result, permanent);
                 let function =
                     self.program
                         .terms
@@ -2800,7 +2938,17 @@ impl ComponentSolver {
         if self.cells[left.0 as usize].rank < self.cells[right.0 as usize].rank {
             std::mem::swap(&mut left, &mut right);
         }
-        let right_binding = self.cells[right.0 as usize].binding.take();
+        let managed = self.cells[left.0 as usize].requirement_base.is_some()
+            || self.cells[right.0 as usize].requirement_base.is_some();
+        let right_binding = self.cells[right.0 as usize]
+            .requirement_base
+            .take()
+            .unwrap_or(self.cells[right.0 as usize].binding);
+        self.cells[right.0 as usize].binding = None;
+        if managed && self.cells[left.0 as usize].requirement_base.is_none() {
+            self.cells[left.0 as usize].requirement_base =
+                Some(self.cells[left.0 as usize].binding);
+        }
         // `right` is permanently retired below, so retaining this capacity in
         // its dependency row would strand one allocation until the component
         // is dropped. Ordinary rebinding keeps its live root's row capacity.
@@ -2822,6 +2970,13 @@ impl ComponentSolver {
         self.touch(right);
         if let Some(right_binding) = right_binding {
             self.bind_equal(left, right_binding);
+        }
+        if managed {
+            // Joining independent ordering authorities uses the stable site
+            // order, not whichever representative happened to win by rank.
+            self.requirements.set_order(left, None);
+            self.requirements.set_order(right, None);
+            self.requirements.mark_dirty(left);
         }
     }
 
@@ -3001,10 +3156,21 @@ impl ComponentSolver {
     }
 
     fn replace_binding_dependencies(&mut self, parent: TypeVariableId, binding: TypeTermId) {
+        self.replace_binding_dependencies_from(parent, &[binding]);
+    }
+
+    fn replace_binding_dependencies_from(
+        &mut self,
+        parent: TypeVariableId,
+        bindings: &[TypeTermId],
+    ) {
         let parent = self.root(parent);
         self.clear_binding_dependencies(parent);
-        self.collect_term_variables(binding);
-        let mut dependencies = std::mem::take(&mut self.term_variable_buffer);
+        let mut dependencies = self.variable_scratch.take();
+        for binding in bindings {
+            self.collect_term_variables(*binding);
+            dependencies.extend_from_slice(&self.term_variable_buffer);
+        }
         for dependency in dependencies.iter_mut() {
             *dependency = self.root(*dependency);
         }
@@ -3017,8 +3183,7 @@ impl ComponentSolver {
                 self.binding_dependencies[parent.0 as usize].push(dependency);
             }
         }
-        dependencies.clear();
-        self.term_variable_buffer = dependencies;
+        self.variable_scratch.recycle(dependencies);
     }
 
     fn collect_term_variables(&mut self, term: TypeTermId) {
@@ -3075,10 +3240,34 @@ impl ComponentSolver {
     fn touch(&mut self, variable: TypeVariableId) {
         self.work.mutations = self.work.mutations.saturating_add(1);
         #[cfg(debug_assertions)]
-        if self.trace_epochs && !self.trace_variables.is_empty() {
+        if self.trace_epochs {
             let root = self.root_readonly(variable);
-            if self.trace_variables.iter().any(|traced| self.root_readonly(*traced) == root) {
-                eprintln!("kernel-input-epoch mutation={} operation={:?} variable={} root={} binding={:?} dependencies={:?}", self.work.mutations, self.active_operation, variable.0, root.0, self.cells[root.0 as usize].binding, self.binding_dependencies[root.0 as usize]);
+            // With no selected roots, provide a bounded global progress
+            // sample for diagnosing non-quiescence in a large fixture.
+            if (self.trace_variables.is_empty() && self.work.mutations % 10_000 == 0)
+                || self
+                    .trace_variables
+                    .iter()
+                    .any(|traced| self.root_readonly(*traced) == root)
+            {
+                eprintln!(
+                    "kernel-input-epoch mutation={} operation={:?} variable={} root={} binding={:?} dependencies={:?}",
+                    self.work.mutations,
+                    self.active_operation,
+                    variable.0,
+                    root.0,
+                    self.cells[root.0 as usize].binding,
+                    self.binding_dependencies[root.0 as usize]
+                );
+                if !self.trace_variables.is_empty() {
+                    if let Some(term) = self.cells[root.0 as usize].binding {
+                        eprintln!(
+                            "kernel-input-binding root={} type={:?}",
+                            root.0,
+                            self.program.terms.export_checked_type(term)
+                        );
+                    }
+                }
             }
         }
         self.schedule_variable(variable);
@@ -3092,7 +3281,14 @@ impl ComponentSolver {
             let term = self.program.terms.variable(variable);
             let resolved = self.resolve_term(term);
             let ty = self.program.terms.export_checked_type(resolved);
-            eprintln!("kernel-input-quiescent variable={} root={} term={} authoritative={} dependencies={:?} type={ty:?}", variable.0, root.0, resolved.0, self.cells[root.0 as usize].authoritative_provider, self.binding_dependencies[root.0 as usize]);
+            eprintln!(
+                "kernel-input-quiescent variable={} root={} term={} authoritative={} dependencies={:?} type={ty:?}",
+                variable.0,
+                root.0,
+                resolved.0,
+                self.cells[root.0 as usize].authoritative_provider,
+                self.binding_dependencies[root.0 as usize]
+            );
         }
     }
 
@@ -3156,7 +3352,9 @@ impl ComponentSolver {
                         match consumer.role {
                             ProgramConsumerRole::SummaryRead => {}
                             ProgramConsumerRole::SummaryOutputWatch => continue,
-                            ProgramConsumerRole::Ordinary if !self.self_replayable[index] => continue,
+                            ProgramConsumerRole::Ordinary if !self.self_replayable[index] => {
+                                continue;
+                            }
                             ProgramConsumerRole::Ordinary => {}
                         }
                     }
@@ -3165,12 +3363,17 @@ impl ComponentSolver {
                         self.pending.push_back(operation);
                     }
                 }
-                self.schedule_stack.extend(
-                    self.binding_dependents[dependency.0 as usize]
-                        .iter()
-                        .rev()
-                        .copied(),
-                );
+                for ordinal in (0..self.binding_dependents[dependency.0 as usize].len()).rev() {
+                    let dependent = self.binding_dependents[dependency.0 as usize][ordinal];
+                    let dependent_root = self.root_readonly(dependent);
+                    if self.cells[dependent_root.0 as usize]
+                        .requirement_base
+                        .is_some()
+                    {
+                        self.requirements.mark_dirty(dependent_root);
+                    }
+                    self.schedule_stack.push(dependent);
+                }
             }
         }
     }
@@ -3535,7 +3738,7 @@ mod tests {
                 KernelSummaryCallInput::Projection {
                     provider: actual,
                     steps: vec![crate::KernelSummaryProjectionStep {
-                        field: Some(value),
+                        projection: crate::KernelSummaryProjection::Field(value),
                         consumer: projected,
                     }]
                     .into_boxed_slice(),
@@ -3634,7 +3837,7 @@ mod tests {
                 KernelSummaryCallInput::Projection {
                     provider: actual,
                     steps: vec![crate::KernelSummaryProjectionStep {
-                        field: Some(value),
+                        projection: crate::KernelSummaryProjection::Field(value),
                         consumer: projected,
                     }]
                     .into_boxed_slice(),
@@ -3716,7 +3919,7 @@ mod tests {
             [KernelSummaryCallInput::Projection {
                 provider: actual,
                 steps: vec![crate::KernelSummaryProjectionStep {
-                    field: Some(kind),
+                    projection: crate::KernelSummaryProjection::Field(kind),
                     consumer: projected,
                 }]
                 .into_boxed_slice(),
@@ -3767,7 +3970,7 @@ mod tests {
             [KernelSummaryCallInput::Projection {
                 provider: actual,
                 steps: vec![crate::KernelSummaryProjectionStep {
-                    field: Some(value),
+                    projection: crate::KernelSummaryProjection::Field(value),
                     consumer: projected,
                 }]
                 .into_boxed_slice(),
@@ -3825,7 +4028,7 @@ mod tests {
             [KernelSummaryCallInput::Projection {
                 provider: actual,
                 steps: vec![crate::KernelSummaryProjectionStep {
-                    field: Some(field),
+                    projection: crate::KernelSummaryProjection::Field(field),
                     consumer: projected,
                 }]
                 .into_boxed_slice(),
@@ -3849,7 +4052,9 @@ mod tests {
     }
 
     fn assert_summary_revisits_selector_after_lazy_backflow(nested: bool) {
-        use crate::{KernelSummaryRequirementPath, KernelSummarySelectArm, KernelSummaryValueId as V};
+        use crate::{
+            KernelSummaryRequirementTarget, KernelSummarySelectArm, KernelSummaryValueId as V,
+        };
         let mut builder = ComponentProgramBuilder::new();
         let actual = builder.new_contextual_hole();
         let output = builder.new_authoritative_provider();
@@ -3871,13 +4076,27 @@ mod tests {
                     selector: V(0),
                     syntax_discriminating: true,
                     arms: vec![
-                        KernelSummarySelectArm { pattern, output: V(1) },
-                        KernelSummarySelectArm { pattern: PackedKernelPattern::Wildcard, output: V(2) },
-                    ].into_boxed_slice(),
+                        KernelSummarySelectArm {
+                            pattern,
+                            output: V(1),
+                        },
+                        KernelSummarySelectArm {
+                            pattern: PackedKernelPattern::Wildcard,
+                            output: V(2),
+                        },
+                    ]
+                    .into_boxed_slice(),
                 },
-                KernelSummaryNode::Constrain { value: V(0), expected: chosen },
-                KernelSummaryNode::Sequence { inputs: vec![V(3), V(4)].into_boxed_slice(), result: V(3) },
-            ].into_boxed_slice(),
+                KernelSummaryNode::Constrain {
+                    value: V(0),
+                    expected: chosen,
+                },
+                KernelSummaryNode::Sequence {
+                    inputs: vec![V(3), V(4)].into_boxed_slice(),
+                    result: V(3),
+                },
+            ]
+            .into_boxed_slice(),
             result: V(5),
         });
         if nested {
@@ -3885,23 +4104,31 @@ mod tests {
                 definition: 1,
                 nodes: vec![
                     KernelSummaryNode::Input(0),
-                    KernelSummaryNode::Invoke { program: summary, inputs: vec![V(0)].into_boxed_slice() },
-                ].into_boxed_slice(),
+                    KernelSummaryNode::Invoke {
+                        program: summary,
+                        inputs: vec![V(0)].into_boxed_slice(),
+                    },
+                ]
+                .into_boxed_slice(),
                 result: V(1),
             });
         }
         let consumer = builder.new_variable();
-        let requirement = KernelSummaryRequirementPath {
-            provider: actual,
-            root: builder.new_contextual_hole(),
-            consumers: vec![builder.new_variable()].into_boxed_slice(),
-        };
-        builder.add_summary_call(output, summary, [KernelSummaryCallInput::Projection {
-            provider: actual,
-            steps: vec![crate::KernelSummaryProjectionStep { field: None, consumer }].into_boxed_slice(),
-            parameter_derived: true,
-            requirement: Some(requirement),
-        }]);
+        let requirement = KernelSummaryRequirementTarget { provider: actual };
+        builder.add_summary_call(
+            output,
+            summary,
+            [KernelSummaryCallInput::Projection {
+                provider: actual,
+                steps: vec![crate::KernelSummaryProjectionStep {
+                    projection: crate::KernelSummaryProjection::Whole,
+                    consumer,
+                }]
+                .into_boxed_slice(),
+                parameter_derived: true,
+                requirement: Some(requirement),
+            }],
+        );
         let result = builder.add_output(output, FlowMode::Continuous);
         let artifact = solve_component(builder.finish()).unwrap();
         assert_eq!(artifact.output_flow(result).unwrap().ty, Type::Number);
@@ -3934,21 +4161,24 @@ mod tests {
         let input = KernelSummaryCallInput::Projection {
             provider: actual,
             steps: vec![crate::KernelSummaryProjectionStep {
-                field: Some(value),
+                projection: crate::KernelSummaryProjection::Field(value),
                 consumer: builder.new_variable(),
-            }].into_boxed_slice(),
+            }]
+            .into_boxed_slice(),
             parameter_derived: true,
-            requirement: Some(crate::KernelSummaryRequirementPath {
+            requirement: Some(crate::KernelSummaryRequirementTarget {
                 provider: requirement_provider,
-                root: builder.new_contextual_hole(),
-                consumers: vec![builder.new_variable()].into_boxed_slice(),
             }),
         };
-        builder.add_summary_call(output, Arc::new(KernelSummaryProgram {
-            definition: 0,
-            nodes: vec![KernelSummaryNode::Input(0)].into_boxed_slice(),
-            result: crate::KernelSummaryValueId(0),
-        }), [input]);
+        builder.add_summary_call(
+            output,
+            Arc::new(KernelSummaryProgram {
+                definition: 0,
+                nodes: vec![KernelSummaryNode::Input(0)].into_boxed_slice(),
+                result: crate::KernelSummaryValueId(0),
+            }),
+            [input],
+        );
         let actual_term = builder.variable_term(actual);
         let output_term = builder.variable_term(output);
         let requirement_term = builder.variable_term(requirement_provider);
@@ -3965,8 +4195,201 @@ mod tests {
         assert_eq!(solver.resolve_term(actual_term), concrete);
         assert_eq!(solver.resolve_term(output_term), number);
         let required = solver.resolve_term(requirement_term);
-        let expected = solver.program.terms.object([(value, number), (late, text)], true);
-        assert_eq!(required, expected);
+        let expected = solver
+            .program
+            .terms
+            .object([(value, number), (late, text)], true);
+        assert_eq!(
+            required,
+            expected,
+            "actual={:?}; expected={:?}",
+            solver.program.terms.export_checked_type(required),
+            solver.program.terms.export_checked_type(expected)
+        );
+    }
+
+    #[test]
+    fn pattern_summary_tracks_late_nested_and_disappearing_payloads() {
+        let mut builder = ComponentProgramBuilder::new();
+        let actual = builder.new_authoritative_provider();
+        let output = builder.new_authoritative_provider();
+        let value = builder.terms_mut().intern_name("value");
+        let kind = builder.terms_mut().intern_name("kind");
+        let tag = builder.terms_mut().intern_name("Header");
+        let pattern = tag_pattern(tag);
+        let leaf = builder.new_authoritative_provider();
+        let leaf_term = builder.variable_term(leaf);
+        let nested = builder.terms_mut().object([(kind, leaf_term)], false);
+        let fields = builder.terms_mut().object([(value, nested)], false);
+        let present = builder
+            .terms_mut()
+            .variant_set([VariantTerm::Tagged { tag, fields }]);
+        let missing_fields = builder.terms_mut().object([], false);
+        let missing = builder.terms_mut().variant_set([VariantTerm::Tagged {
+            tag,
+            fields: missing_fields,
+        }]);
+        let other = builder.terms_mut().variant_tag("Empty");
+        let wrong_tag = builder.terms_mut().variant_set([other]);
+        let number = builder.terms().number();
+        let text = builder.terms().text();
+        let input = KernelSummaryCallInput::Projection {
+            provider: actual,
+            steps: vec![
+                crate::KernelSummaryProjectionStep {
+                    projection: crate::KernelSummaryProjection::Pattern {
+                        pattern,
+                        fields: vec![value].into_boxed_slice(),
+                    },
+                    consumer: builder.new_variable(),
+                },
+                crate::KernelSummaryProjectionStep {
+                    projection: crate::KernelSummaryProjection::Field(kind),
+                    consumer: builder.new_variable(),
+                },
+            ]
+            .into_boxed_slice(),
+            parameter_derived: true,
+            requirement: None,
+        };
+        builder.add_summary_call(
+            output,
+            Arc::new(KernelSummaryProgram {
+                definition: 0,
+                nodes: vec![KernelSummaryNode::Input(0)].into_boxed_slice(),
+                result: crate::KernelSummaryValueId(0),
+            }),
+            [input],
+        );
+        let output_term = builder.variable_term(output);
+        let (mut solver, execution) = ComponentSolver::new(builder.finish());
+        solver.enable(&execution, &[true]).unwrap();
+        solver.replace_binding(leaf, number, true);
+        solver.replace_binding(actual, present, true);
+        solver.enable(&execution, &[true]).unwrap();
+        assert_eq!(solver.resolve_term(output_term), number);
+        solver.replace_binding(leaf, text, true);
+        solver.enable(&execution, &[true]).unwrap();
+        assert_eq!(solver.resolve_term(output_term), text);
+        for absent in [missing, wrong_tag] {
+            solver.replace_binding(actual, absent, true);
+            solver.enable(&execution, &[true]).unwrap();
+            let result = solver.resolve_term(output_term);
+            assert!(matches!(
+                solver.program.terms.term(result),
+                TypeTerm::UnresolvedShape(_)
+            ));
+        }
+        solver.replace_binding(actual, present, true);
+        solver.enable(&execution, &[true]).unwrap();
+        assert_eq!(solver.resolve_term(output_term), text);
+    }
+
+    #[test]
+    fn closed_summary_domain_does_not_widen_directional_callback_data() {
+        assert_closed_summary_domain_does_not_widen_directional_callback_data(false);
+    }
+
+    #[test]
+    fn closed_summary_domain_waits_for_late_directional_callback_data() {
+        assert_closed_summary_domain_does_not_widen_directional_callback_data(true);
+    }
+
+    fn assert_closed_summary_domain_does_not_widen_directional_callback_data(late: bool) {
+        use crate::{
+            KernelSummaryRequirementTarget, KernelSummarySelectArm, KernelSummaryValueId as V,
+        };
+        let mut builder = ComponentProgramBuilder::new();
+        let actual = builder.new_authoritative_provider();
+        let required = builder.new_contextual_hole();
+        let output = builder.new_authoritative_provider();
+        let wrapped = builder.terms_mut().intern_name("Header");
+        let plain = builder.terms_mut().intern_name("Empty");
+        let value = builder.terms_mut().intern_name("value");
+        let number = builder.terms().number();
+        let text = builder.terms().text();
+        let payload = builder.terms_mut().object([(value, number)], true);
+        let tagged = VariantTerm::Tagged {
+            tag: wrapped,
+            fields: payload,
+        };
+        let concrete = builder.terms_mut().variant_set([tagged]);
+        let bare = builder.terms_mut().variant_set([VariantTerm::Tag(plain)]);
+        let domain = builder
+            .terms_mut()
+            .variant_set([VariantTerm::Tag(plain), tagged]);
+        let data_read = builder.new_variable();
+        let input = KernelSummaryCallInput::Projection {
+            provider: actual,
+            steps: vec![crate::KernelSummaryProjectionStep {
+                projection: crate::KernelSummaryProjection::Whole,
+                consumer: data_read,
+            }]
+            .into_boxed_slice(),
+            parameter_derived: true,
+            requirement: Some(KernelSummaryRequirementTarget { provider: required }),
+        };
+        builder.add_summary_call(
+            output,
+            Arc::new(KernelSummaryProgram {
+                definition: 0,
+                nodes: vec![
+                    KernelSummaryNode::Input(0),
+                    KernelSummaryNode::Input(1),
+                    KernelSummaryNode::Unify {
+                        value: V(0),
+                        requirement: V(1),
+                    },
+                    KernelSummaryNode::Term(number),
+                    KernelSummaryNode::Term(text),
+                    KernelSummaryNode::Select {
+                        selector: V(0),
+                        syntax_discriminating: true,
+                        arms: vec![
+                            KernelSummarySelectArm {
+                                pattern: tag_pattern(wrapped),
+                                output: V(3),
+                            },
+                            KernelSummarySelectArm {
+                                pattern: tag_pattern(plain),
+                                output: V(4),
+                            },
+                        ]
+                        .into_boxed_slice(),
+                    },
+                    KernelSummaryNode::Sequence {
+                        inputs: vec![V(2)].into_boxed_slice(),
+                        result: V(5),
+                    },
+                ]
+                .into_boxed_slice(),
+                result: V(6),
+            }),
+            [input, KernelSummaryCallInput::Term(domain)],
+        );
+        let actual_term = builder.variable_term(actual);
+        let required_term = builder.variable_term(required);
+        let output_term = builder.variable_term(output);
+        let (mut solver, execution) = ComponentSolver::new(builder.finish());
+        if late {
+            solver.enable(&execution, &[true]).unwrap();
+            assert_ne!(
+                solver.root_readonly(data_read),
+                solver.root_readonly(required),
+                "an authoritative provider's pending read must not alias its requirement channel"
+            );
+        }
+        solver.replace_binding(actual, concrete, true);
+        solver.enable(&execution, &[true]).unwrap();
+        assert_eq!(solver.resolve_term(actual_term), concrete);
+        assert_eq!(solver.resolve_term(required_term), domain);
+        assert_eq!(solver.resolve_term(output_term), number);
+        solver.replace_binding(actual, bare, true);
+        solver.enable(&execution, &[true]).unwrap();
+        assert_eq!(solver.resolve_term(actual_term), bare);
+        assert_eq!(solver.resolve_term(required_term), domain);
+        assert_eq!(solver.resolve_term(output_term), text);
+        assert!(solver.pending.is_empty());
     }
 
     #[test]
@@ -3982,6 +4405,97 @@ mod tests {
         builder.add_output(output, FlowMode::Continuous);
         let artifact = solve_component(builder.finish()).unwrap();
         assert_eq!(artifact.work.summary_call_activations, 1);
+    }
+
+    #[test]
+    fn tagged_requirement_contributors_keep_one_payload_identity() {
+        let mut builder = ComponentProgramBuilder::new();
+        let root = builder.new_contextual_hole();
+        let first = builder.new_contextual_hole();
+        let second = builder.new_contextual_hole();
+        let tag = builder.terms_mut().intern_name("Header");
+        let field = builder.terms_mut().intern_name("value");
+        let first_term = builder.variable_term(first);
+        let second_term = builder.variable_term(second);
+        let first_fields = builder.terms_mut().object([(field, first_term)], true);
+        let second_fields = builder.terms_mut().object([(field, second_term)], true);
+        let first_tag = builder.terms_mut().variant_set([VariantTerm::Tagged {
+            tag,
+            fields: first_fields,
+        }]);
+        let second_tag = builder.terms_mut().variant_set([VariantTerm::Tagged {
+            tag,
+            fields: second_fields,
+        }]);
+        let (mut solver, _) = ComponentSolver::new(builder.finish());
+        solver.bind_equal(root, first_tag);
+        solver.bind_equal(root, second_tag);
+        assert_eq!(
+            solver.root_readonly(first),
+            solver.root_readonly(second),
+            "same-tag requirement payloads must share the solver's equality identity"
+        );
+        let mutations = solver.work.mutations;
+        for contributor in [first_tag, second_tag, first_tag, second_tag] {
+            solver.bind_equal(root, contributor);
+        }
+        assert_eq!(
+            solver.work.mutations, mutations,
+            "replaying unchanged tagged contributors must not republish a different raw variable ID"
+        );
+    }
+
+    #[test]
+    fn incompatible_directional_evidence_reaches_requirement_quiescence() {
+        use crate::{KernelSummaryRequirementTarget, KernelSummaryValueId as V};
+        let mut builder = ComponentProgramBuilder::new();
+        let actual = builder.new_authoritative_provider();
+        let required = builder.new_contextual_hole();
+        let output = builder.new_authoritative_provider();
+        let field = builder.terms_mut().intern_name("value");
+        let number = builder.terms().number();
+        let concrete = builder.terms_mut().object([(field, number)], false);
+        let tag = builder.terms_mut().variant_tag("Header");
+        let domain = builder.terms_mut().variant_set([tag]);
+        let input = KernelSummaryCallInput::Projection {
+            provider: actual,
+            steps: vec![crate::KernelSummaryProjectionStep {
+                projection: crate::KernelSummaryProjection::Whole,
+                consumer: builder.new_variable(),
+            }]
+            .into_boxed_slice(),
+            parameter_derived: true,
+            requirement: Some(KernelSummaryRequirementTarget { provider: required }),
+        };
+        builder.add_summary_call(
+            output,
+            Arc::new(KernelSummaryProgram {
+                definition: 0,
+                nodes: vec![
+                    KernelSummaryNode::Input(0),
+                    KernelSummaryNode::Input(1),
+                    KernelSummaryNode::Unify {
+                        value: V(0),
+                        requirement: V(1),
+                    },
+                ]
+                .into_boxed_slice(),
+                result: V(2),
+            }),
+            [input, KernelSummaryCallInput::Term(domain)],
+        );
+        let (mut solver, execution) = ComponentSolver::new(builder.finish());
+        solver.replace_binding(actual, concrete, true);
+        solver.enabled[0] = true;
+        // Drive two activations explicitly: the assertion diagnoses repeated
+        // mutation without letting an invalid-input regression hang the suite.
+        solver.activate(&execution, OperationId(0)).unwrap();
+        let mutations = solver.work.mutations;
+        solver.activate(&execution, OperationId(0)).unwrap();
+        assert_eq!(
+            solver.work.mutations, mutations,
+            "unchanged incompatible data must not rebuild and erase a requirement every activation"
+        );
     }
 
     #[test]

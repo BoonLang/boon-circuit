@@ -15361,7 +15361,10 @@ struct InvocationKey {
 /// Opt-in K0 attribution only. Debug observers are absent from release
 /// producers and must never be scored as performance evidence.
 #[cfg(debug_assertions)]
-fn trace_invocation_inputs(invocations: &HashMap<InvocationKey, OwnerInstance>, modes: &[FlowMode]) {
+fn trace_invocation_inputs(
+    invocations: &HashMap<InvocationKey, OwnerInstance>,
+    modes: &[FlowMode],
+) {
     let owners = traced_summary_owners();
     if owners.is_empty() {
         return;
@@ -15371,22 +15374,37 @@ fn trace_invocation_inputs(invocations: &HashMap<InvocationKey, OwnerInstance>, 
         .filter(|key| owners.contains(&key.target.0))
         .collect::<Vec<_>>();
     keys.sort_by(|left, right| {
-        left.target.cmp(&right.target)
+        left.target
+            .cmp(&right.target)
             .then(left.actuals.cmp(&right.actuals))
             .then(left.initial_state_surface.cmp(&right.initial_state_surface))
-            .then_with(|| format!("{:?}", left.static_variants).cmp(&format!("{:?}", right.static_variants)))
+            .then_with(|| {
+                format!("{:?}", left.static_variants).cmp(&format!("{:?}", right.static_variants))
+            })
     });
     let mut variables = BTreeSet::new();
     for key in keys {
-        let flows = key.actuals.iter()
+        let flows = key
+            .actuals
+            .iter()
             .map(|(variable, mode)| {
                 variables.insert(variable.0);
                 (*variable, *mode, modes[mode.0 as usize])
             })
             .collect::<Vec<_>>();
-        eprintln!("kernel-invocation-input owner={} actuals={flows:?} variants={:?} initial_state_surface={}", key.target.0, key.static_variants, key.initial_state_surface);
+        eprintln!(
+            "kernel-invocation-input owner={} actuals={flows:?} variants={:?} initial_state_surface={}",
+            key.target.0, key.static_variants, key.initial_state_surface
+        );
     }
-    eprintln!("kernel-trace-variables={}", variables.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
+    eprintln!(
+        "kernel-trace-variables={}",
+        variables
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
 }
 
 #[cfg(debug_assertions)]
@@ -16866,7 +16884,13 @@ fn direct_result_summary_supported(
     }
     let child = |edge: &crate::PackedKernelOwnerInputEdge,
                  active: &mut BTreeSet<(KernelOwnerId, usize)>| {
-        direct_result_summary_supported(project, owner_id, edge.expression.0 as usize, active, trace)
+        direct_result_summary_supported(
+            project,
+            owner_id,
+            edge.expression.0 as usize,
+            active,
+            trace,
+        )
     };
     let inputs = node.inputs(owner);
     let supported = match &node.kind {
@@ -16923,7 +16947,8 @@ fn direct_result_summary_supported(
         }
         PackedKernelOwnerNodeKind::LexicalRead { .. }
         | PackedKernelOwnerNodeKind::ValueRead { .. }
-        | PackedKernelOwnerNodeKind::DerivedRead { .. } => {
+        | PackedKernelOwnerNodeKind::DerivedRead { .. }
+        | PackedKernelOwnerNodeKind::PatternRead { .. } => {
             let providers = inputs
                 .iter()
                 .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::ReadProvider))
@@ -16940,9 +16965,6 @@ fn direct_result_summary_supported(
                 }
             })
         }
-        // A pattern projection owns tag-sensitive formal shaping and cannot
-        // be represented by the generic field-projection summary bytecode.
-        PackedKernelOwnerNodeKind::PatternRead { .. } => false,
         PackedKernelOwnerNodeKind::UserCall { target, .. } => {
             let Some(target_owner) = project.owner(*target) else {
                 active.remove(&(owner_id, expression));
@@ -17053,7 +17075,10 @@ fn direct_result_summary_supported(
     if trace && !supported {
         // Predicates short-circuit in source edge order. The first emitted
         // rejection is the leaf cause; later rows describe its result path.
-        eprintln!("kernel-summary-rejection owner={} expression={expression} kind={:?}", owner_id.0, node.kind);
+        eprintln!(
+            "kernel-summary-rejection owner={} expression={expression} kind={:?}",
+            owner_id.0, node.kind
+        );
     }
     supported
 }
@@ -17087,9 +17112,13 @@ const SHARED_SUMMARY_MIN_NODES: usize = 128;
 
 #[derive(Clone, Debug)]
 enum DirectSummaryInput {
+    PatternRequirement {
+        owner: KernelOwnerId,
+        pattern: crate::PackedKernelPattern,
+    },
     FormalProjection {
         formal: u32,
-        fields: Box<[SymbolId]>,
+        fields: Box<[crate::KernelSummaryProjection]>,
         parameter_derived: bool,
     },
     External {
@@ -17140,7 +17169,16 @@ struct DirectSummaryPlanCompiler<'a> {
     summaries: &'a [Option<Arc<CompiledDirectSummary>>],
     nodes: Vec<KernelSummaryNode>,
     inputs: Vec<DirectSummaryInput>,
-    formal_projection_inputs: HashMap<(u32, Box<[SymbolId]>, bool), (u32, KernelSummaryValueId)>,
+    /// Active tag arms qualify descendant field requirements of their
+    /// formal-root selector. This preserves A -> a and B -> b rather than
+    /// exporting an unconditional object requirement alongside A | B.
+    pattern_contexts: Vec<(
+        u32,
+        Box<[crate::KernelSummaryProjection]>,
+        crate::PackedKernelPattern,
+    )>,
+    formal_projection_inputs:
+        HashMap<(u32, Box<[crate::KernelSummaryProjection]>, bool), (u32, KernelSummaryValueId)>,
 }
 
 impl DirectSummaryPlanCompiler<'_> {
@@ -17167,9 +17205,21 @@ impl DirectSummaryPlanCompiler<'_> {
     fn push_formal_projection(
         &mut self,
         formal: u32,
-        fields: Box<[SymbolId]>,
+        mut fields: Box<[crate::KernelSummaryProjection]>,
         parameter_derived: bool,
     ) -> PlannedSummaryValue {
+        for (selector_formal, prefix, pattern) in &self.pattern_contexts {
+            if *selector_formal == formal && fields.starts_with(prefix) {
+                if let Some(crate::KernelSummaryProjection::Field(field)) = fields.get(prefix.len())
+                {
+                    let field = *field;
+                    fields[prefix.len()] = crate::KernelSummaryProjection::Pattern {
+                        pattern: *pattern,
+                        fields: vec![field].into_boxed_slice(),
+                    };
+                }
+            }
+        }
         let key = (formal, fields.clone(), parameter_derived);
         if let Some((input, value)) = self.formal_projection_inputs.get(&key).copied() {
             return PlannedSummaryValue {
@@ -17214,12 +17264,20 @@ impl DirectSummaryPlanCompiler<'_> {
                 return None;
             };
             let mut projection = prefix.into_vec();
-            projection.extend(fields);
-            return Some(self.push_formal_projection(
+            projection.extend(
+                fields
+                    .into_iter()
+                    .map(crate::KernelSummaryProjection::Field),
+            );
+            let mut projected = self.push_formal_projection(
                 formal,
                 projection.into_boxed_slice(),
                 parameter_derived,
-            ));
+            );
+            if matches!(value.mode, DirectSummaryMode::Fixed { .. }) {
+                projected.mode = value.mode;
+            }
+            return Some(projected);
         }
         Some(PlannedSummaryValue {
             value: self.push_node(KernelSummaryNode::Projection {
@@ -17234,7 +17292,7 @@ impl DirectSummaryPlanCompiler<'_> {
     fn project_interned_formal_value(
         &mut self,
         value: PlannedSummaryValue,
-        fields: &[SymbolId],
+        fields: &[crate::KernelSummaryProjection],
     ) -> Option<PlannedSummaryValue> {
         if fields.is_empty() {
             return Some(value);
@@ -17250,7 +17308,12 @@ impl DirectSummaryPlanCompiler<'_> {
         };
         let mut projection = prefix.into_vec();
         projection.extend_from_slice(fields);
-        Some(self.push_formal_projection(formal, projection.into_boxed_slice(), parameter_derived))
+        let mut projected =
+            self.push_formal_projection(formal, projection.into_boxed_slice(), parameter_derived);
+        if matches!(value.mode, DirectSummaryMode::Fixed { .. }) {
+            projected.mode = value.mode;
+        }
+        Some(projected)
     }
 
     fn compile_shared_invoke(
@@ -17265,6 +17328,19 @@ impl DirectSummaryPlanCompiler<'_> {
         let mut modes = Vec::with_capacity(summary.inputs.len());
         for input in summary.inputs.iter() {
             let value = match input {
+                DirectSummaryInput::PatternRequirement { owner, pattern } => {
+                    let input = u32::try_from(self.inputs.len())
+                        .expect("kernel summary input count exceeds u32");
+                    self.inputs.push(DirectSummaryInput::PatternRequirement {
+                        owner: *owner,
+                        pattern: *pattern,
+                    });
+                    PlannedSummaryValue {
+                        value: self.push_node(KernelSummaryNode::Input(input)),
+                        mode: DirectSummaryMode::Input(input),
+                        formal_projection_input: None,
+                    }
+                }
                 DirectSummaryInput::FormalProjection {
                     formal,
                     fields,
@@ -17399,7 +17475,11 @@ impl DirectSummaryPlanCompiler<'_> {
                     let actual = actuals.get(*formal as usize)?;
                     match actual {
                         PlannedSummaryActual::Formal(formal) => {
-                            let fields = fields.iter().collect::<Vec<_>>().into_boxed_slice();
+                            let fields = fields
+                                .iter()
+                                .map(crate::KernelSummaryProjection::Field)
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice();
                             Some(self.push_formal_projection(*formal, fields, true))
                         }
                         PlannedSummaryActual::Value(value) => {
@@ -17412,7 +17492,11 @@ impl DirectSummaryPlanCompiler<'_> {
                     let actual = actuals.get(*formal as usize)?;
                     match actual {
                         PlannedSummaryActual::Formal(formal) => {
-                            let fields = fields.iter().collect::<Vec<_>>().into_boxed_slice();
+                            let fields = fields
+                                .iter()
+                                .map(crate::KernelSummaryProjection::Field)
+                                .collect::<Vec<_>>()
+                                .into_boxed_slice();
                             Some(self.push_formal_projection(*formal, fields, false))
                         }
                         PlannedSummaryActual::Value(value) => {
@@ -17642,7 +17726,31 @@ impl DirectSummaryPlanCompiler<'_> {
                     };
                     self.project_value(provider, fields, fixed_mode)
                 }
-                PackedKernelOwnerNodeKind::PatternRead { .. } => None,
+                PackedKernelOwnerNodeKind::PatternRead { pattern, fields } => {
+                    let [provider] = node_inputs else {
+                        return None;
+                    };
+                    if !matches!(provider.role, PackedKernelOwnerEdgeRole::ReadProvider) {
+                        return None;
+                    }
+                    let provider = self.compile_expression(
+                        owner_id,
+                        provider.expression.0 as usize,
+                        actuals,
+                        active,
+                    )?;
+                    // Computed providers retain their generic residual equation.
+                    // Only a formal-root path has reusable requirement backflow.
+                    let mut projected = self.project_interned_formal_value(
+                        provider,
+                        &[crate::KernelSummaryProjection::Pattern {
+                            pattern: *pattern,
+                            fields: owner.path(*fields)?.iter().collect(),
+                        }],
+                    )?;
+                    projected.mode = fixed_mode;
+                    Some(projected)
+                }
                 PackedKernelOwnerNodeKind::UserCall {
                     target,
                     inherited_formal,
@@ -17857,33 +17965,53 @@ impl DirectSummaryPlanCompiler<'_> {
                     })
                 }
                 PackedKernelOwnerNodeKind::When => {
-                    let mut selector = None;
+                    let selectors = node_inputs
+                        .iter()
+                        .filter(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenInput))
+                        .collect::<Vec<_>>();
+                    let [selector_edge] = selectors.as_slice() else {
+                        return None;
+                    };
+                    let selector = self.compile_expression(
+                        owner_id,
+                        selector_edge.expression.0 as usize,
+                        actuals,
+                        active,
+                    )?;
                     let mut arms = Vec::new();
                     for edge in node_inputs {
                         match edge.role {
-                            PackedKernelOwnerEdgeRole::WhenInput => {
-                                if selector.is_some() {
-                                    return None;
-                                }
-                                selector = Some(self.compile_expression(
-                                    owner_id,
-                                    edge.expression.0 as usize,
-                                    actuals,
-                                    active,
-                                )?);
-                            }
+                            PackedKernelOwnerEdgeRole::WhenInput => {}
                             PackedKernelOwnerEdgeRole::WhenArm => {
                                 let arm = owner.nodes().get(edge.expression.0 as usize)?;
                                 let PackedKernelOwnerNodeKind::MatchArm { pattern } = arm.kind
                                 else {
                                     return None;
                                 };
+                                let depth = self.pattern_contexts.len();
+                                if matches!(pattern, crate::PackedKernelPattern::Tag { .. }) {
+                                    if let Some(DirectSummaryInput::FormalProjection {
+                                        formal,
+                                        fields,
+                                        ..
+                                    }) = selector
+                                        .formal_projection_input
+                                        .and_then(|input| self.inputs.get(input as usize))
+                                    {
+                                        self.pattern_contexts.push((
+                                            *formal,
+                                            fields.clone(),
+                                            pattern,
+                                        ));
+                                    }
+                                }
                                 let output = self.compile_expression(
                                     owner_id,
                                     edge.expression.0 as usize,
                                     actuals,
                                     active,
                                 )?;
+                                self.pattern_contexts.truncate(depth);
                                 arms.push(KernelSummarySelectArm {
                                     pattern,
                                     output: output.value,
@@ -17892,13 +18020,45 @@ impl DirectSummaryPlanCompiler<'_> {
                             _ => return None,
                         }
                     }
-                    let selector = selector?;
+                    let mut requirements = Vec::new();
+                    if !arms.iter().any(|arm| {
+                        matches!(
+                            arm.pattern,
+                            crate::PackedKernelPattern::Wildcard
+                                | crate::PackedKernelPattern::Binding { .. }
+                        )
+                    }) {
+                        for arm in &arms {
+                            if matches!(arm.pattern, crate::PackedKernelPattern::Invalid) {
+                                continue;
+                            }
+                            let input = u32::try_from(self.inputs.len())
+                                .expect("kernel summary input count exceeds u32");
+                            self.inputs.push(DirectSummaryInput::PatternRequirement {
+                                owner: owner_id,
+                                pattern: arm.pattern,
+                            });
+                            let requirement = self.push_node(KernelSummaryNode::Input(input));
+                            requirements.push(self.push_node(KernelSummaryNode::Unify {
+                                value: selector.value,
+                                requirement,
+                            }));
+                        }
+                    }
+                    let selected = self.push_node(KernelSummaryNode::Select {
+                        selector: selector.value,
+                        syntax_discriminating: true,
+                        arms: arms.into_boxed_slice(),
+                    });
                     Some(PlannedSummaryValue {
-                        value: self.push_node(KernelSummaryNode::Select {
-                            selector: selector.value,
-                            syntax_discriminating: true,
-                            arms: arms.into_boxed_slice(),
-                        }),
+                        value: if requirements.is_empty() {
+                            selected
+                        } else {
+                            self.push_node(KernelSummaryNode::Sequence {
+                                inputs: requirements.into_boxed_slice(),
+                                result: selected,
+                            })
+                        },
                         mode: selector.mode,
                         formal_projection_input: None,
                     })
@@ -18105,6 +18265,7 @@ fn fold_constant_summary_nodes(
             KernelSummaryNode::Input(_)
             | KernelSummaryNode::ContextualHole
             | KernelSummaryNode::Constrain { .. }
+            | KernelSummaryNode::Unify { .. }
             | KernelSummaryNode::Invoke { .. } => None,
             KernelSummaryNode::Term(term) => {
                 (!builder.terms().has_variable(*term)).then_some(*term)
@@ -18326,6 +18487,21 @@ fn canonicalize_summary_node(
             );
             *provider = value;
             pure
+        }
+        KernelSummaryNode::Unify { value, requirement } => {
+            for operand in [value, requirement] {
+                *operand = canonicalize_summary_value(
+                    *operand,
+                    old_nodes,
+                    relocations,
+                    purities,
+                    active,
+                    interner,
+                    canonical,
+                )
+                .0;
+            }
+            false
         }
         KernelSummaryNode::Constrain { value, .. } => {
             *value = canonicalize_summary_value(
@@ -18563,6 +18739,7 @@ fn pure_summary_node_hash(node: &KernelSummaryNode) -> u64 {
         }
         KernelSummaryNode::ContextualHole
         | KernelSummaryNode::Constrain { .. }
+        | KernelSummaryNode::Unify { .. }
         | KernelSummaryNode::Sequence { .. }
         | KernelSummaryNode::Invoke { .. } => {
             unreachable!("effect-owning summary nodes are never hash-consed")
@@ -18608,6 +18785,9 @@ fn compact_summary_result(
             KernelSummaryNode::Term(_) | KernelSummaryNode::ContextualHole => {}
             KernelSummaryNode::Projection { provider, .. } => pending.push(*provider),
             KernelSummaryNode::Constrain { value, .. } => pending.push(*value),
+            KernelSummaryNode::Unify { value, requirement } => {
+                pending.extend([*value, *requirement])
+            }
             KernelSummaryNode::Sequence {
                 inputs: dependencies,
                 result,
@@ -18722,6 +18902,10 @@ fn relocate_summary_node(
         KernelSummaryNode::Term(_) | KernelSummaryNode::ContextualHole => {}
         KernelSummaryNode::Projection { provider, .. } => {
             *provider = relocated_summary_value(*provider, values);
+        }
+        KernelSummaryNode::Unify { value, requirement } => {
+            *value = relocated_summary_value(*value, values);
+            *requirement = relocated_summary_value(*requirement, values);
         }
         KernelSummaryNode::Constrain { value, .. } => {
             *value = relocated_summary_value(*value, values);
@@ -19078,6 +19262,7 @@ fn compile_direct_result_summaries(
             summaries: &summaries,
             nodes: Vec::new(),
             inputs: Vec::new(),
+            pattern_contexts: Vec::new(),
             formal_projection_inputs: HashMap::new(),
         };
         let Some(mut result) =
@@ -19089,6 +19274,15 @@ fn compile_direct_result_summaries(
         let (constant_folded_nodes, selector_fused_records) = compiler.fold_constant_nodes();
         let deduplicated_nodes = compiler.deduplicate_nodes(&mut result);
         let (pruned_nodes, pruned_inputs) = compiler.compact_result(&mut result);
+        if let DirectSummaryMode::Input(input) = result.mode {
+            debug_assert!(
+                matches!(compiler.inputs.get(input as usize),
+                    Some(DirectSummaryInput::FormalProjection { fields, .. })
+                        if fields.iter().all(|step| matches!(step, crate::KernelSummaryProjection::Field(_)))
+                ),
+                "pattern and requirement inputs cannot own a summary result mode"
+            );
+        }
         summaries[target.0 as usize] = Some(Arc::new(CompiledDirectSummary {
             program: Arc::new(KernelSummaryProgram {
                 definition: target.0,
@@ -19187,6 +19381,22 @@ fn emit_compiled_direct_summary(
     let mut input_modes = Vec::with_capacity(summary.inputs.len());
     for input in summary.inputs.iter() {
         match input {
+            DirectSummaryInput::PatternRequirement { owner, pattern } => {
+                let owner = context
+                    .project
+                    .and_then(|project| project.owner(*owner))
+                    .ok_or_else(|| {
+                        KernelOwnerBuildError::new("summary pattern requirement has no owner")
+                    })?;
+                let requirement =
+                    pattern_requirement_term(builder, owner, pattern).ok_or_else(|| {
+                        KernelOwnerBuildError::new(
+                            "summary pattern requirement has no closed domain",
+                        )
+                    })?;
+                call_inputs.push(KernelSummaryCallInput::Term(requirement));
+                input_modes.push(None);
+            }
             DirectSummaryInput::FormalProjection {
                 formal,
                 fields,
@@ -19200,22 +19410,21 @@ fn emit_compiled_direct_summary(
                 let mut steps = Vec::with_capacity(fields.len().max(1));
                 if fields.is_empty() {
                     steps.push(KernelSummaryProjectionStep {
-                        field: None,
+                        projection: crate::KernelSummaryProjection::Whole,
                         consumer: builder.new_variable(),
                     });
                 } else {
-                    for field in fields.iter().copied() {
+                    for projection in fields.iter().cloned() {
                         steps.push(KernelSummaryProjectionStep {
-                            field: Some(field),
+                            projection,
                             consumer: builder.new_variable(),
                         });
                     }
                 }
                 let requirement = (!builder.is_authoritative(actual.variable)
-                    || actual.requirement_backflow).then(|| crate::KernelSummaryRequirementPath {
+                    || actual.requirement_backflow)
+                    .then_some(crate::KernelSummaryRequirementTarget {
                         provider: actual.requirement,
-                        root: builder.new_contextual_hole(),
-                        consumers: (0..steps.len()).map(|_| builder.new_variable()).collect(),
                     });
                 call_inputs.push(KernelSummaryCallInput::Projection {
                     provider: actual.variable,
@@ -19223,14 +19432,25 @@ fn emit_compiled_direct_summary(
                     parameter_derived: *parameter_derived,
                     requirement,
                 });
-                input_modes.push(projected_mode_variable(
-                    mode_builder,
-                    context,
-                    source_node,
-                    &actual.mode_source,
-                    fields,
-                    &mut BTreeSet::new(),
-                )?);
+                let mode_fields = fields
+                    .iter()
+                    .map(|step| match step {
+                        crate::KernelSummaryProjection::Field(field) => Some(*field),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>();
+                input_modes.push(if let Some(fields) = mode_fields {
+                    Some(projected_mode_variable(
+                        mode_builder,
+                        context,
+                        source_node,
+                        &actual.mode_source,
+                        &fields,
+                        &mut BTreeSet::new(),
+                    )?)
+                } else {
+                    None
+                });
             }
             DirectSummaryInput::External { owner, expression } => {
                 let instance = context.principals.get(owner.0 as usize).ok_or_else(|| {
@@ -19248,7 +19468,7 @@ fn emit_compiled_direct_summary(
                 call_inputs.push(KernelSummaryCallInput::Term(
                     builder.variable_term(variable),
                 ));
-                input_modes.push(instance.expression_modes[*expression]);
+                input_modes.push(Some(instance.expression_modes[*expression]));
             }
         }
     }
@@ -19268,6 +19488,7 @@ fn emit_compiled_direct_summary(
         DirectSummaryMode::Input(input) => input_modes
             .get(input as usize)
             .copied()
+            .flatten()
             .ok_or_else(|| {
                 KernelOwnerBuildError::new(format!(
                     "compiled direct summary mode references missing input {input}"
@@ -27689,7 +27910,7 @@ mod tests {
                         matches!(
                             input,
                             KernelSummaryCallInput::Projection { steps, .. }
-                                if steps.iter().any(|step| step.field.is_some())
+                            if steps.iter().any(|step| matches!(step.projection, crate::KernelSummaryProjection::Field(_)))
                         )
                     }) =>
                 {

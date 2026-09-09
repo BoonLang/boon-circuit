@@ -46,9 +46,7 @@ result: wrapper(value: TEXT {{ unconstrained }})
 
 #[test]
 fn untaken_pattern_requirement_does_not_constrain_wrapper_formal() {
-    assert_untaken_requirement_is_not_exported(
-        "value |> WHEN { Wrapped[item] => item + 1 }",
-    );
+    assert_untaken_requirement_is_not_exported("value |> WHEN { Wrapped[item] => item + 1 }");
 }
 
 #[test]
@@ -70,17 +68,31 @@ FUNCTION choose(which, value) {
         Second => value.item.inner + 1
     }
 }
+
 FUNCTION wrapper(value) {
     choose(which: Second, value: value)
 }
 result: wrapper(value: [item: [inner: 2]])
 "#;
     let checked = check_editor_source(CompilerCheckRequest::source_text(
-        "taken-transfer-requirement.bn", source, ProgramRole::Server,
-    )).unwrap();
-    assert!(!checked.output.report.has_errors(), "{:?}", checked.output.report);
-    let wrapper = checked.output.report.function_type_table.entries.iter()
-        .find(|function| function.name == "wrapper").expect("wrapper interface");
+        "taken-transfer-requirement.bn",
+        source,
+        ProgramRole::Server,
+    ))
+    .unwrap();
+    assert!(
+        !checked.output.report.has_errors(),
+        "{:?}",
+        checked.output.report
+    );
+    let wrapper = checked
+        .output
+        .report
+        .function_type_table
+        .entries
+        .iter()
+        .find(|function| function.name == "wrapper")
+        .expect("wrapper interface");
     let Type::Object(root) = &wrapper.parameters[0].flow_type.ty else {
         panic!("taken requirement must constrain wrapper: {wrapper:?}")
     };
@@ -89,4 +101,49 @@ result: wrapper(value: [item: [inner: 2]])
     };
     assert_eq!(item.fields["inner"], Type::Number);
     assert_eq!(wrapper.result.ty, Type::Number);
+}
+
+#[test]
+fn shared_pattern_transfer_keeps_bare_alternatives_in_closed_domain() {
+    let source = r#"
+FUNCTION choose(which) {
+    which |> WHEN {
+        Plain => 0
+        Wrapped[value] => value + 1
+    }
+}
+FUNCTION wrapper(which) {
+    choose(which: which)
+}
+result: wrapper(which: Plain)
+"#;
+    let checked = check_editor_source(CompilerCheckRequest::source_text(
+        "closed-pattern-transfer-domain.bn",
+        source,
+        ProgramRole::Server,
+    ))
+    .unwrap();
+    assert!(
+        !checked.output.report.has_errors(),
+        "{:?}",
+        checked.output.report
+    );
+    let wrapper = checked
+        .output
+        .report
+        .function_type_table
+        .entries
+        .iter()
+        .find(|function| function.name == "wrapper")
+        .expect("wrapper interface");
+    let Type::VariantSet(domain) = &wrapper.parameters[0].flow_type.ty else {
+        panic!("closed domain must remain a variant set: {wrapper:?}")
+    };
+    assert!(
+        domain
+            .iter()
+            .any(|variant| matches!(variant, boon_checked::Variant::Tag(tag) if tag == "Plain"))
+    );
+    assert!(domain.iter().any(|variant| matches!(variant,
+        boon_checked::Variant::Tagged { tag, fields } if tag == "Wrapped" && fields.fields["value"] == Type::Number)));
 }

@@ -101,6 +101,13 @@ pub struct KernelSummaryProgram {
 pub enum KernelSummaryNode {
     Input(u32),
     Term(TypeTermId),
+    /// Equality against an occurrence-private requirement input. Unlike a
+    /// constant constraint, its payload holes must not belong to the shared
+    /// definition bytecode.
+    Unify {
+        value: KernelSummaryValueId,
+        requirement: KernelSummaryValueId,
+    },
     /// One occurrence-local contextual hole (`[]`). The evaluator allocates a
     /// fresh union-find variable for every summary invocation so an enclosing
     /// constraint can choose record, list, set, map, or bytes shape without
@@ -157,20 +164,30 @@ pub struct KernelSummarySelectArm {
     pub output: KernelSummaryValueId,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A formal-root transfer path retains pattern narrowing as an equation,
+/// rather than flattening a tag payload into ordinary object fields.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub enum KernelSummaryProjection {
+    Whole,
+    Field(SymbolId),
+    Pattern {
+        pattern: PackedKernelPattern,
+        fields: Box<[SymbolId]>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KernelSummaryProjectionStep {
-    pub field: Option<SymbolId>,
+    pub projection: KernelSummaryProjection,
     pub consumer: TypeVariableId,
 }
 
-/// Occurrence-private requirement cells, connected only when their input is
-/// actually demanded. Merely compiling an untaken arm must not constrain the
-/// caller's formal interface.
+/// Destination for activation-owned requirements. The value input's typed
+/// path defines reverse scaffolding; no duplicate private equation cells are
+/// constructed. An untaken input contributes nothing to this destination.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct KernelSummaryRequirementPath {
+pub struct KernelSummaryRequirementTarget {
     pub provider: TypeVariableId,
-    pub root: TypeVariableId,
-    pub consumers: Box<[TypeVariableId]>,
 }
 
 /// One occurrence-local operand for immutable definition-summary bytecode.
@@ -189,7 +206,7 @@ pub enum KernelSummaryCallInput {
         /// definition. Context reads deliberately preserve the caller value's
         /// provenance instead.
         parameter_derived: bool,
-        requirement: Option<KernelSummaryRequirementPath>,
+        requirement: Option<KernelSummaryRequirementTarget>,
     },
 }
 
@@ -1226,7 +1243,8 @@ impl ComponentProgramBuilder {
         for operation in 0..work_items.len() {
             summary_reads.clear();
             let is_summary = if let ProgramOperationRef::Direct(direct) = work_items[operation]
-                && let KernelOperationRef::SummaryCall { inputs, .. } = self.operations.get(direct as usize)
+                && let KernelOperationRef::SummaryCall { inputs, .. } =
+                    self.operations.get(direct as usize)
             {
                 collect_summary_input_variables(inputs, &self.terms, &mut summary_reads);
                 summary_reads.sort_unstable();
@@ -1704,7 +1722,11 @@ fn collect_summary_input_variables(
     for input in inputs {
         match input {
             KernelSummaryCallInput::Term(term) => collect_term_variables(*term, terms, output),
-            KernelSummaryCallInput::Projection { provider, requirement, .. } => {
+            KernelSummaryCallInput::Projection {
+                provider,
+                requirement,
+                ..
+            } => {
                 output.push(*provider);
                 if let Some(requirement) = requirement {
                     output.push(requirement.provider);
@@ -1814,10 +1836,13 @@ mod tests {
             [KernelSummaryCallInput::Term(input)],
         );
         let program = builder.finish();
-        assert_eq!(program.consumers(input_and_output), &[ProgramConsumer {
-            operation: OperationId(0),
-            role: ProgramConsumerRole::SummaryRead,
-        }]);
+        assert_eq!(
+            program.consumers(input_and_output),
+            &[ProgramConsumer {
+                operation: OperationId(0),
+                role: ProgramConsumerRole::SummaryRead,
+            }]
+        );
     }
 
     #[test]

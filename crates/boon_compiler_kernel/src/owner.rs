@@ -12353,6 +12353,7 @@ fn compile_owner_program_with_definition_facts_and_text(
         &formal_static_variants,
     )];
     let principal = &principals[0];
+    let tag_arm_guards = owner_tag_arm_guards(input);
     let context = OwnerCompileContext {
         initial_state_surface: false,
         text: &text,
@@ -12374,6 +12375,7 @@ fn compile_owner_program_with_definition_facts_and_text(
         syntax_selected_calls: None,
         direct_summaries: &[],
         packed_input_types: None,
+        tag_arm_guards: &tag_arm_guards,
     };
     let specialization = OwnerSpecialization {
         static_variants: principal.static_variants.clone(),
@@ -15066,6 +15068,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
             u32::try_from(owner_index).expect("kernel project owner count exceeds u32"),
         );
         let instance = &principals[owner_index];
+        let tag_arm_guards = owner_tag_arm_guards(owner);
         let context = OwnerCompileContext {
             initial_state_surface: false,
             text: &text,
@@ -15087,6 +15090,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
             syntax_selected_calls: None,
             direct_summaries: &direct_summaries,
             packed_input_types: None,
+            tag_arm_guards: &tag_arm_guards,
         };
         let mut stack = vec![owner_id];
         let specialization = OwnerSpecialization {
@@ -15345,6 +15349,13 @@ struct CallActual {
     /// directional and unchanged; only `requirement` accepts constraints from
     /// the callee definition.
     requirement_backflow: bool,
+    /// Whether a surrounding tag arm proves this whole argument value. A
+    /// guarded actual is the arm's tag, so the callee's requirement is checked
+    /// against that closed value and must not backflow into the caller's
+    /// formal. The arm-local read publishes the tag itself; the flag keeps the
+    /// requirement channel detached even when the occurrence variable is not
+    /// marked authoritative in the consuming builder.
+    guarded: bool,
     mode: ModeVariableId,
     mode_source: ModeSource,
     static_variants: Option<StaticVariantSet>,
@@ -15777,6 +15788,147 @@ struct OwnerCompileContext<'a> {
     /// therefore leaves this empty. The scoped import session prevents another
     /// module from advancing the reusable table while these IDs are live.
     packed_input_types: Option<PackedInputTypeProjection<'a>>,
+    /// Tag arms that lexically surround each owner expression. A whole read of
+    /// the guarded formal inside such an arm is the matched tag itself, not
+    /// the unguarded formal, so the callee's requirement cannot widen the
+    /// caller's domain.
+    tag_arm_guards: &'a BTreeMap<usize, Vec<FormalTagArmGuard>>,
+}
+
+/// One WHEN-arm tag guard surrounding a formal-root read.
+///
+/// The selector identity is retained so the guard only qualifies reads of the
+/// exact formal path it proves; the same formal read outside the arm keeps its
+/// unguarded authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FormalTagArmGuard {
+    formal: u32,
+    fields: boon_contract::PathId,
+    pattern: crate::PackedKernelPattern,
+}
+
+/// Map every owner expression to the tag-arm guards that lexically surround it.
+///
+/// Guards flow from a WHEN arm's match output through the local expression
+/// DAG. An expression reachable under two different patterns of the same
+/// selector retains both guards; consumers must treat that as unguarded until
+/// a conditional representation exists.
+fn owner_tag_arm_guards(
+    owner: PackedKernelOwnerProgramRef<'_>,
+) -> BTreeMap<usize, Vec<FormalTagArmGuard>> {
+    let mut guards: BTreeMap<usize, Vec<FormalTagArmGuard>> = BTreeMap::new();
+    let mut queue = VecDeque::new();
+    for index in 0..owner.node_count() {
+        queue.push_back(index);
+    }
+    while let Some(index) = queue.pop_front() {
+        let Some(node) = owner.nodes().get(index) else {
+            continue;
+        };
+        let selector = matches!(node.kind, PackedKernelOwnerNodeKind::When).then(|| {
+            node.inputs(owner)
+                .iter()
+                .find(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenInput))
+                .and_then(|edge| {
+                    let selector = owner.nodes().get(edge.expression.0 as usize)?;
+                    let PackedKernelOwnerNodeKind::FormalRead { formal, fields } = selector.kind
+                    else {
+                        return None;
+                    };
+                    Some((formal, fields))
+                })
+        });
+        let current = guards.get(&index).cloned().unwrap_or_default();
+        for edge in node.inputs(owner) {
+            let child = edge.expression.0 as usize;
+            if child >= owner.node_count() {
+                continue;
+            }
+            let mut additions = current.clone();
+            if let Some(Some((formal, fields))) = selector
+                && matches!(edge.role, PackedKernelOwnerEdgeRole::WhenArm)
+                && let Some(arm) = owner.nodes().get(child)
+                && let PackedKernelOwnerNodeKind::MatchArm { pattern } = arm.kind
+            {
+                additions.push(FormalTagArmGuard {
+                    formal,
+                    fields,
+                    pattern,
+                });
+            }
+            let entry = guards.entry(child).or_default();
+            let mut changed = false;
+            for guard in additions {
+                if !entry.contains(&guard) {
+                    entry.push(guard);
+                    changed = true;
+                }
+            }
+            if changed {
+                queue.push_back(child);
+            }
+        }
+    }
+    guards
+}
+
+/// Closed tag a surrounding WHEN arm proves for a whole formal read.
+///
+/// Only bare tag patterns produce a closed value here. A tagged payload arm
+/// keeps its payload connected to the caller's formal, so it retains the
+/// existing forwarding until a guarded whole-value projection exists.
+fn guarded_whole_read_tag(
+    context: &OwnerCompileContext<'_>,
+    expression: usize,
+) -> Option<SymbolId> {
+    let node = context.input.nodes().get(expression)?;
+    let PackedKernelOwnerNodeKind::FormalRead { formal, fields } = &node.kind else {
+        return None;
+    };
+    let mut matched: Option<SymbolId> = None;
+    for guard in context.tag_arm_guards.get(&expression)? {
+        if guard.formal != *formal || guard.fields != *fields {
+            continue;
+        }
+        let crate::PackedKernelPattern::Tag {
+            name,
+            fields: pattern_fields,
+        } = guard.pattern
+        else {
+            return None;
+        };
+        if pattern_fields != boon_contract::PathId::ROOT {
+            return None;
+        }
+        match matched {
+            None => matched = Some(name),
+            Some(previous) if previous == name => {}
+            Some(_) => return None,
+        }
+    }
+    matched
+}
+
+/// Closed tag proven for a call argument by a surrounding WHEN arm.
+///
+/// The call and the argument read must both sit inside the arm, so an
+/// expression shared with an unguarded occurrence keeps its forwarding.
+fn guarded_call_argument_tag(
+    context: &OwnerCompileContext<'_>,
+    call: usize,
+    argument: usize,
+) -> Option<SymbolId> {
+    if argument >= context.input.node_count() {
+        return None;
+    }
+    let read_guards = context.tag_arm_guards.get(&argument)?;
+    let call_guards = context.tag_arm_guards.get(&call);
+    for guard in read_guards {
+        if !call_guards.is_some_and(|guards| guards.contains(guard)) {
+            return None;
+        }
+    }
+    guarded_whole_read_tag(context, argument)
 }
 
 fn edge_static_variants(
@@ -16372,6 +16524,7 @@ fn compile_residual_type_module(
         .iter()
         .map(|_| builder.new_contextual_hole())
         .collect::<Vec<_>>();
+    let tag_arm_guards = owner_tag_arm_guards(owner);
     let context = OwnerCompileContext {
         initial_state_surface,
         text,
@@ -16395,6 +16548,7 @@ fn compile_residual_type_module(
         packed_input_types: packed_input_types
             .as_ref()
             .map(|imports| PackedInputTypeProjection { imports }),
+        tag_arm_guards: &tag_arm_guards,
     };
     let mut invocations = HashMap::new();
     let mut specializations = HashMap::new();
@@ -16791,6 +16945,7 @@ fn instantiate_owner(
     };
     let external_variables = principal_external_variables(owner, project, principals)?;
     stack.push(target);
+    let tag_arm_guards = owner_tag_arm_guards(owner);
     let result = (|| {
         let context = OwnerCompileContext {
             initial_state_surface,
@@ -16813,6 +16968,7 @@ fn instantiate_owner(
             syntax_selected_calls: Some(&specialization.syntax_selected_calls),
             direct_summaries,
             packed_input_types: None,
+            tag_arm_guards: &tag_arm_guards,
         };
         append_residual_type_frame(builder, &module, &instance, &external_variables)?;
         compile_work.residual_frames = compile_work.residual_frames.saturating_add(1);
@@ -16853,7 +17009,9 @@ fn instantiate_owner(
         // A closed or directionally derived actual is provider authority, not
         // a writable formal scaffold. Callee requirements remain useful for
         // open caller formals, but must never widen a concrete occurrence.
-        if builder.is_authoritative(actual.variable) && !actual.requirement_backflow {
+        if actual.guarded
+            || (builder.is_authoritative(actual.variable) && !actual.requirement_backflow)
+        {
             continue;
         }
         let actual = builder.variable_term(actual.requirement);
@@ -17244,6 +17402,40 @@ impl DirectSummaryPlanCompiler<'_> {
         }
     }
 
+    /// Closed tag an enclosing WHEN arm proves for a whole formal read.
+    ///
+    /// Only a selector at the formal root with a bare tag pattern yields a
+    /// closed value here. Deeper selector paths and payload patterns keep the
+    /// existing projection behavior until a guarded whole-value projection
+    /// exists.
+    fn whole_value_tag_guard(
+        &self,
+        formal: u32,
+        fields: PackedKernelPathRef<'_>,
+    ) -> Option<SymbolId> {
+        if !fields.is_empty() {
+            return None;
+        }
+        let mut matched = None;
+        for (selector_formal, prefix, pattern) in &self.pattern_contexts {
+            if *selector_formal != formal || !prefix.is_empty() {
+                continue;
+            }
+            let crate::PackedKernelPattern::Tag { name, fields } = pattern else {
+                continue;
+            };
+            if *fields != boon_contract::PathId::ROOT {
+                continue;
+            }
+            match matched {
+                None => matched = Some(*name),
+                Some(previous) if previous == *name => {}
+                Some(_) => return None,
+            }
+        }
+        matched
+    }
+
     fn project_value(
         &mut self,
         value: PlannedSummaryValue,
@@ -17472,6 +17664,15 @@ impl DirectSummaryPlanCompiler<'_> {
                 }
                 PackedKernelOwnerNodeKind::FormalRead { formal, fields } => {
                     let fields = owner.path(*fields)?;
+                    if let Some(name) = self.whole_value_tag_guard(*formal, fields) {
+                        // The enclosing arm proves the selector's tag, so the
+                        // whole read is that closed value. Forwarding the tag
+                        // keeps the callee's requirement from re-shaping the
+                        // caller's formal.
+                        let tag = VariantTerm::Tag(name);
+                        let term = self.builder.terms_mut().variant_set([tag]);
+                        return Some(term_value(self, term));
+                    }
                     let actual = actuals.get(*formal as usize)?;
                     match actual {
                         PlannedSummaryActual::Formal(formal) => {
@@ -19421,8 +19622,8 @@ fn emit_compiled_direct_summary(
                         });
                     }
                 }
-                let requirement = (!builder.is_authoritative(actual.variable)
-                    || actual.requirement_backflow)
+                let requirement = (!actual.guarded
+                    && (!builder.is_authoritative(actual.variable) || actual.requirement_backflow))
                     .then_some(crate::KernelSummaryRequirementTarget {
                         provider: actual.requirement,
                     });
@@ -19663,6 +19864,18 @@ fn compile_node(
                     "kernel owner node {index} formal read has explicit inputs"
                 )));
             }
+            if let Some(name) = guarded_whole_read_tag(context, index) {
+                // An enclosing tag arm proves this whole read is that tag.
+                // Publishing the closed snapshot keeps the read from aliasing
+                // the unguarded formal, so a callee requirement is checked
+                // against what the arm proves instead of widening the formal
+                // and this read is not exported as an unguarded requirement
+                // participant either.
+                let tag = VariantTerm::Tag(name);
+                let term = builder.terms_mut().variant_set([tag]);
+                builder.add_publish(output, [term], PublishMode::Replace);
+                return Ok(());
+            }
             let provider = context
                 .formals
                 .get(*formal as usize)
@@ -19894,6 +20107,9 @@ fn compile_node(
                     variable,
                     requirement,
                     requirement_backflow,
+                    guarded: matches!(edge.role, KernelOwnerEdgeRole::CallArgument { .. })
+                        && guarded_call_argument_tag(context, index, edge.expression.0 as usize)
+                            .is_some(),
                     mode: edge_mode_variable(context, index, edge)?,
                     mode_source: mode_source_for_edge(
                         context,
@@ -19959,6 +20175,7 @@ fn compile_node(
                         variable: actual,
                         requirement: actual_requirement,
                         requirement_backflow: false,
+                        guarded: false,
                         mode: actual_mode,
                         mode_source: actual_mode_source,
                         static_variants: context

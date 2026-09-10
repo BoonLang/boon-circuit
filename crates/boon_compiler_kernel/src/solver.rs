@@ -762,6 +762,7 @@ impl ComponentSolver {
     }
 
     fn update_term_work(&mut self) {
+        self.work.requirements = self.requirements.work;
         let term_work = self.program.terms.work();
         let solver_scratch_misses = self
             .term_id_scratch

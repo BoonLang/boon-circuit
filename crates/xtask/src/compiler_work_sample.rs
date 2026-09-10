@@ -240,7 +240,31 @@ pub(crate) struct FrozenTypeStoreLayoutSample {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct KernelRequirementWorkSample {
+    pub(crate) owners: u64,
+    pub(crate) sites: u64,
+    pub(crate) activations: u64,
+    pub(crate) begin_site_visits: u64,
+    pub(crate) staged_writes: u64,
+    pub(crate) commit_site_visits: u64,
+    pub(crate) changed_sites: u64,
+    pub(crate) withdrawn_sites: u64,
+    pub(crate) aggregate_evaluations: u64,
+    pub(crate) aggregate_fact_visits: u64,
+    pub(crate) invalidation_variable_visits: u64,
+    pub(crate) invalidation_edge_visits: u64,
+    pub(crate) order_term_visits: u64,
+    pub(crate) projection_evaluations: u64,
+    pub(crate) path_step_evaluations: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct KernelSolveWorkSample {
+    /// Older baseline producers predate contribution accounting. Absence is
+    /// distinct from a candidate reporting zero work.
+    #[serde(default)]
+    pub(crate) requirements: Option<KernelRequirementWorkSample>,
     pub(crate) variables: u64,
     pub(crate) scheduled_work_items: u64,
     pub(crate) operations: u64,
@@ -332,6 +356,29 @@ impl WorkSample {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requirement_accounting_distinguishes_missing_baseline_from_zero_work() {
+        let mut baseline = serde_json::to_value(KernelSolveWorkSample::default()).unwrap();
+        baseline.as_object_mut().unwrap().remove("requirements");
+        let parsed: KernelSolveWorkSample = serde_json::from_value(baseline.clone()).unwrap();
+        assert_eq!(parsed.requirements, None);
+        baseline["requirements"] =
+            serde_json::to_value(KernelRequirementWorkSample::default()).unwrap();
+        let parsed: KernelSolveWorkSample = serde_json::from_value(baseline.clone()).unwrap();
+        assert_eq!(
+            parsed.requirements,
+            Some(KernelRequirementWorkSample::default())
+        );
+        baseline["requirements"]
+            .as_object_mut()
+            .unwrap()
+            .remove("aggregate_fact_visits");
+        assert!(
+            serde_json::from_value::<KernelSolveWorkSample>(baseline).is_err(),
+            "a present accounting block must be complete"
+        );
+    }
 
     fn complete_kernel_work() -> WorkSample {
         WorkSample {

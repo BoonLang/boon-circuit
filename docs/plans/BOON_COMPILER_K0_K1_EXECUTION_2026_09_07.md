@@ -537,3 +537,80 @@ After formatting the changed Rust files, a fresh `cargo test -p
 boon_compiler_kernel -p boon_compiler --lib --jobs 2 -- --test-threads 2` also
 passed: 98 compiler tests (one existing ignored probe) and 196 kernel tests.
 The compiler suite took 32.38 seconds; this remains debug test-suite duration.
+
+### 2026-09-10: accounting and whole-selector holdout
+
+Added `KernelRequirementWork` and producer/collector projection for occurrence
+and site counts, begin/stage/commit visits, changed and withdrawn sites,
+aggregate/fact visits, invalidation variable/edge visits, ordering traversal,
+projection evaluation and forward/reverse path steps. Unchanged replay remains
+visible as work even when no facts change. The collector distinguishes an
+absent historical accounting block from an explicitly zero-valued block; a
+present block must contain every counter. No budget or semantic oracle changed.
+Focused checks: 15 contribution tests and four collector work-sample tests pass.
+`cargo check -p boon_cli --bins --jobs 2` also passes with the new report fields.
+
+The independent reviewer could not run because of the account usage limit;
+there is no new independent approval. Main-agent source inspection and an
+enabled compiler integration test confirmed the previously suspected whole
+selector gap. `inner` accepts First/InnerOnly; `wrapper` accepts First/Second
+and calls `inner(which: which)` only in its First arm. Current compilation
+exports First/InnerOnly/Second from wrapper and reports an incompatible argument
+at the guarded inner call. See
+[the bounded evidence](evidence/compiler-k1-whole-selector-2026-09-10.json).
+
+This is not fixed by activation-level withdrawal alone: all potential arms of
+an abstract selector can participate in an activation, so the active arm guard
+must qualify whole-value requirements and values. The current compiler only
+qualifies descendant Field paths, and its empty-path helpers return unchanged
+input identities. The source-level failure may also involve principal/residual
+publication; do not assume a summary-only edit is sufficient. Comparison with
+the preserved K0 behavior remains outstanding.
+
+The new regression is intentionally enabled and failing. K1 release acceptance
+waits for this guard obligation; the prior local correctness checkpoint was not
+final acceptance. Next carry whole-value arm guards explicitly through value
+forwarding and reverse requirements, verify the principal/call-publication
+boundary, then rerun the holdout and previous focused gates. Accounting and the
+new regression are uncommitted WIP, not a new accepted checkpoint.
+
+Follow-up comparison: the regression now asserts zero diagnostics from the
+test-only legacy checker before checking the candidate. A fresh run passes that
+assertion and fails the candidate no-errors assertion (exit 101). The preserved
+clean K0 release producer also rejects this source with one diagnostic; changing
+only the inner actual to the literal First produces zero diagnostics. This is
+an existing production-kernel parity gap, not evidence that K1 introduced it.
+The CLI comparison uses client role and exposes only the diagnostic count;
+the integration test uses server role. Exact K0 diagnostic bytes are not claimed.
+
+Source inspection confirms that principal `FormalRead` unconditionally unifies
+the read with the whole formal requirement, and `expression_requirement_variable`
+returns that unrestricted destination for call backflow. The existing adapter
+`attach_tag_match_mode_narrowings` handles only deeper ValueRead paths and stores
+no pattern. Existing PatternProjection returns a tag's payload, not its whole
+tagged value. None is an adequate whole-value guard without an explicit semantic
+extension. A bounded independent read-only review is examining the common
+guarded-access ownership seam; no final K1 approval or speedup is claimed.
+
+The independent read-only review confirmed the shared guarded-access seam and
+identified a necessary negative control: filtering backflow must not erase a
+callee mismatch. The initial tag-only negative control was invalid as a legacy
+oracle: that checker widened the inner formal to First | InnerOnly. Replacing
+the inner body with `which + 1` gives a genuine negative control. Legacy reports
+an error and the preserved K0 producer reports one diagnostic, but the candidate
+reports none and publishes an open empty Object for the wrapper formal. The
+enabled `whole_selector_guard_does_not_hide_an_incompatible_callee` regression
+now captures that false negative. This is a regression against K0, not merely
+the older false-positive gap; the exact introducing commit is not yet bisected.
+
+The positive test now also asserts the legacy wrapper's exact First | Second
+domain, rather than relying on empty diagnostics alone. Both positive legacy
+assertions pass before the candidate fails. The numeric negative's legacy error
+assertion likewise passes before candidate failure. The full current kernel
+library suite, including accounting, passes 197 tests; it does not cover these
+source-level failures. No guard implementation or accepted checkpoint has been
+landed. Next: retain one occurrence-scoped guard chain across principal and
+summary paths, keep actual evidence separate from callee requirements, and
+verify both error directions before release measurements. Tagged payload and
+lexical containment semantics need checked-row tests, not dependency-closure
+inference or payload-projection substitution.

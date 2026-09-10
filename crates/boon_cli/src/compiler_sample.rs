@@ -440,7 +440,27 @@ struct FrozenTypeStoreLayoutSample {
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
+struct KernelRequirementWorkSample {
+    owners: u64,
+    sites: u64,
+    activations: u64,
+    begin_site_visits: u64,
+    staged_writes: u64,
+    commit_site_visits: u64,
+    changed_sites: u64,
+    withdrawn_sites: u64,
+    aggregate_evaluations: u64,
+    aggregate_fact_visits: u64,
+    invalidation_variable_visits: u64,
+    invalidation_edge_visits: u64,
+    order_term_visits: u64,
+    projection_evaluations: u64,
+    path_step_evaluations: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 struct KernelSolveWorkSample {
+    requirements: KernelRequirementWorkSample,
     variables: u64,
     scheduled_work_items: u64,
     operations: u64,
@@ -633,6 +653,23 @@ macro_rules! kernel_solve_work_sample {
     ($work:expr) => {{
         let work = $work;
         KernelSolveWorkSample {
+            requirements: KernelRequirementWorkSample {
+                owners: work.requirements.owners,
+                sites: work.requirements.sites,
+                activations: work.requirements.activations,
+                begin_site_visits: work.requirements.begin_site_visits,
+                staged_writes: work.requirements.staged_writes,
+                commit_site_visits: work.requirements.commit_site_visits,
+                changed_sites: work.requirements.changed_sites,
+                withdrawn_sites: work.requirements.withdrawn_sites,
+                aggregate_evaluations: work.requirements.aggregate_evaluations,
+                aggregate_fact_visits: work.requirements.aggregate_fact_visits,
+                invalidation_variable_visits: work.requirements.invalidation_variable_visits,
+                invalidation_edge_visits: work.requirements.invalidation_edge_visits,
+                order_term_visits: work.requirements.order_term_visits,
+                projection_evaluations: work.requirements.projection_evaluations,
+                path_step_evaluations: work.requirements.path_step_evaluations,
+            },
             variables: work.variables,
             scheduled_work_items: work.scheduled_work_items,
             operations: work.operations,

@@ -1,0 +1,49 @@
+{
+  "status": "diagnostic-only; unresolved guard counterexample",
+  "checkpoint": "a4eda0d4",
+  "candidate": "checkpoint plus requirement accounting and enabled regression",
+  "date": "2026-09-10",
+  "command": "cargo test -p boon_compiler --test kernel_transfer whole_selector_forwarding --jobs 2",
+  "exit_code": 101,
+  "test": "whole_selector_forwarding_does_not_export_an_inactive_callee_alternative",
+  "source": "FUNCTION inner(which) {\n    which |> WHEN {\n        First => 1\n        InnerOnly => 2\n    }\n}\nFUNCTION wrapper(which) {\n    which |> WHEN {\n        First => inner(which: which)\n        Second => 0\n    }\n}\nresult: wrapper(which: First)\n",
+  "canonical_source_location": "crates/boon_compiler/tests/kernel_transfer.rs",
+  "expected": "The inner call is guarded by First. Its InnerOnly alternative must not widen the wrapper's First | Second domain or produce an incompatible-argument error for this valid call.",
+  "actual_wrapper_domain": ["First", "InnerOnly", "Second"],
+  "actual_diagnostic": "`FUNCTION inner` argument `which` has an incompatible type\nexpected: First | InnerOnly\nfound: First | InnerOnly | Second",
+  "source_attribution": "DirectSummaryCompiler::push_formal_projection only qualifies descendant Field steps; project_value and project_interned_formal_value return unchanged whole-value inputs for empty paths.",
+  "legacy_oracle": {
+    "entrypoint": "boon_typecheck::check_program after boon_parser::parse_source; test-only legacy-owner-oracle dependency",
+    "diagnostic_count": 0,
+    "wrapper_domain": ["First", "Second"],
+    "verification": "The enabled regression asserts both empty legacy diagnostics and the exact First | Second wrapper domain before running the candidate. Fresh execution passes those assertions and fails the candidate no-errors assertion. Acceptance alone is not used as proof of narrowing."
+  },
+  "preserved_k0_comparison": {
+    "binary_sha256": "178b6b58c641890f1028bbfbf612b1a3b5fd29df895f191ab0b536db43948ecf",
+    "build_source_head": "2d7a5343c9d98e9eeabc5c0de0c3c5728f4fb7f2",
+    "build_source_workspace_sha256": "299f1b59bbc3b2a32ea4e7206664a23fad04653a2b738d6221486ad2b26ae13c",
+    "build_source_dirty": false,
+    "program_role": "client",
+    "command": "target/release/boon_cli compiler-sample /tmp/boon-k1-whole-ZrAbQF/whole.bn --intent diagnostics --mode fresh-process --samples 1",
+    "exit_code": 1,
+    "stderr": "boon_cli: performance fixture produced 1 diagnostic(s)",
+    "control": {
+      "source_change": "Replace inner(which: which) with inner(which: First), leaving the rest of the source unchanged.",
+      "exit_code": 0,
+      "diagnostic_count": 0,
+      "purpose": "Diagnostic isolation only; not a production workaround or performance observation."
+    }
+  },
+  "negative_control": {
+    "test": "whole_selector_guard_does_not_hide_an_incompatible_callee",
+    "source": "\nFUNCTION inner(which) {\n    which + 1\n}\nFUNCTION wrapper(which) {\n    which |> WHEN {\n        First => inner(which: which)\n        Second => 0\n    }\n}\nresult: wrapper(which: First)\n",
+    "legacy_has_errors": true,
+    "candidate_diagnostic_count": 0,
+    "candidate_wrapper_parameter": "open empty Object",
+    "preserved_k0_diagnostic_count": 1,
+    "preserved_k0_exit_code": 1,
+    "status": "enabled failing regression; current candidate loses an error retained by both older checks",
+    "discarded_control": "An inner function matching only InnerOnly was not a valid legacy-negative oracle: the legacy checker widened its inferred formal to First | InnerOnly while narrowing the guarded actual to First. The numeric requirement provides the independent negative control instead."
+  },
+  "limitations": "K0 CLI reports diagnostic count, not diagnostic bytes, and runs client role while the integration regressions use server role. Exact cross-version diagnostic parity is not established here. Principal FormalRead and expression_requirement_variable also lack arm guards; a summary-only change is not a complete fix. The numeric false-negative has not yet been bisected to a specific K1 commit."
+}

@@ -12,7 +12,28 @@ pub struct KernelSummaryDefinitionWork {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KernelRequirementWork {
+    pub owners: u64,
+    pub sites: u64,
+    pub activations: u64,
+    pub begin_site_visits: u64,
+    pub staged_writes: u64,
+    pub commit_site_visits: u64,
+    pub changed_sites: u64,
+    pub withdrawn_sites: u64,
+    pub aggregate_evaluations: u64,
+    /// Raw base/contribution terms folded, including unchanged aggregates.
+    pub aggregate_fact_visits: u64,
+    pub invalidation_variable_visits: u64,
+    pub invalidation_edge_visits: u64,
+    pub order_term_visits: u64,
+    pub projection_evaluations: u64,
+    pub path_step_evaluations: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct KernelSolveWork {
+    pub requirements: KernelRequirementWork,
     pub variables: u64,
     /// Coarse scheduler entries. Fully acyclic residual definition frames
     /// contribute one entry regardless of their immutable instruction count.

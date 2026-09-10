@@ -104,6 +104,111 @@ result: wrapper(value: [item: [inner: 2]])
 }
 
 #[test]
+fn whole_selector_forwarding_does_not_export_an_inactive_callee_alternative() {
+    let source = r#"
+FUNCTION inner(which) {
+    which |> WHEN {
+        First => 1
+        InnerOnly => 2
+    }
+}
+FUNCTION wrapper(which) {
+    which |> WHEN {
+        First => inner(which: which)
+        Second => 0
+    }
+}
+result: wrapper(which: First)
+"#;
+    let legacy_source =
+        boon_parser::parse_source("whole-selector-transfer-guard.bn", source).unwrap();
+    let legacy = boon_typecheck::check_program(&legacy_source);
+    assert!(
+        legacy.report.diagnostics.is_empty(),
+        "legacy oracle: {:?}",
+        legacy.report.diagnostics
+    );
+    let legacy_wrapper = legacy
+        .report
+        .function_type_table
+        .entries
+        .iter()
+        .find(|function| function.name == "wrapper")
+        .expect("legacy wrapper interface");
+    let expected_domain = Type::VariantSet(
+        vec![
+            boon_checked::Variant::Tag("First".to_owned()),
+            boon_checked::Variant::Tag("Second".to_owned()),
+        ]
+        .into(),
+    );
+    assert_eq!(legacy_wrapper.parameters[0].flow_type.ty, expected_domain);
+    let checked = check_editor_source(CompilerCheckRequest::source_text(
+        "whole-selector-transfer-guard.bn",
+        source,
+        ProgramRole::Server,
+    ))
+    .unwrap();
+    assert!(
+        !checked.output.report.has_errors(),
+        "{:?}",
+        checked.output.report
+    );
+    let wrapper = checked
+        .output
+        .report
+        .function_type_table
+        .entries
+        .iter()
+        .find(|function| function.name == "wrapper")
+        .expect("wrapper interface");
+    let Type::VariantSet(domain) = &wrapper.parameters[0].flow_type.ty else {
+        panic!("wrapper must retain its own closed domain: {wrapper:?}");
+    };
+    assert!(!domain.iter().any(|variant| matches!(variant,
+        boon_checked::Variant::Tag(tag) | boon_checked::Variant::Tagged { tag, .. } if tag == "InnerOnly")),
+        "an inner alternative cannot escape an outer First-only invocation: {wrapper:?}");
+}
+
+#[test]
+fn whole_selector_guard_does_not_hide_an_incompatible_callee() {
+    let source = r#"
+FUNCTION inner(which) {
+    which + 1
+}
+FUNCTION wrapper(which) {
+    which |> WHEN {
+        First => inner(which: which)
+        Second => 0
+    }
+}
+result: wrapper(which: First)
+"#;
+    let parsed = boon_parser::parse_source("incompatible-whole-selector-guard.bn", source).unwrap();
+    let legacy = boon_typecheck::check_program(&parsed);
+    assert!(
+        legacy.report.has_errors(),
+        "legacy oracle must reject the guarded call"
+    );
+    let checked = check_editor_source(CompilerCheckRequest::source_text(
+        "incompatible-whole-selector-guard.bn",
+        source,
+        ProgramRole::Server,
+    ))
+    .unwrap();
+    assert!(
+        checked.output.report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.line == 7
+                && diagnostic
+                    .message
+                    .contains("`FUNCTION inner` argument `which` has an incompatible type")
+        }),
+        "filtering reverse requirements must not erase the incompatible guarded actual: {:?}",
+        checked.output.report
+    );
+}
+
+#[test]
 fn shared_pattern_transfer_keeps_bare_alternatives_in_closed_domain() {
     let source = r#"
 FUNCTION choose(which) {

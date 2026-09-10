@@ -57,6 +57,7 @@ struct Target {
 /// belongs to the consumer, which must include all members of an alias class.
 #[derive(Default)]
 pub(super) struct RequirementContributions {
+    pub(super) work: crate::KernelRequirementWork,
     owners: Vec<Owner>,
     sites: Vec<Site>,
     targets: Vec<Target>,
@@ -72,6 +73,7 @@ impl RequirementContributions {
         self.targets[target.0 as usize].order = order;
     }
     pub(super) fn owner(&mut self) -> RequirementOwnerId {
+        self.work.owners = self.work.owners.saturating_add(1);
         let id = RequirementOwnerId(
             self.owners
                 .len()
@@ -87,6 +89,7 @@ impl RequirementContributions {
         owner: RequirementOwnerId,
         target: TypeVariableId,
     ) -> RequirementSiteId {
+        self.work.sites = self.work.sites.saturating_add(1);
         assert!(
             !self.owners[owner.0 as usize].sealed,
             "register all nested effect sites before first evaluation"
@@ -120,6 +123,7 @@ impl RequirementContributions {
     }
 
     pub(super) fn begin(&mut self, owner: RequirementOwnerId) {
+        self.work.activations = self.work.activations.saturating_add(1);
         let owner = &mut self.owners[owner.0 as usize];
         assert!(
             !owner.evaluating,
@@ -128,6 +132,7 @@ impl RequirementContributions {
         owner.evaluating = true;
         owner.sealed = true;
         for site in &owner.sites {
+            self.work.begin_site_visits = self.work.begin_site_visits.saturating_add(1);
             self.sites[site.0 as usize].staged = None;
         }
     }
@@ -138,6 +143,7 @@ impl RequirementContributions {
         site: RequirementSiteId,
         value: TypeTermId,
     ) {
+        self.work.staged_writes = self.work.staged_writes.saturating_add(1);
         assert!(self.owners[owner.0 as usize].evaluating);
         let site = &mut self.sites[site.0 as usize];
         assert_eq!(
@@ -156,9 +162,14 @@ impl RequirementContributions {
         assert!(owner.evaluating);
         owner.evaluating = false;
         for id in &owner.sites {
+            self.work.commit_site_visits = self.work.commit_site_visits.saturating_add(1);
             let site = &mut self.sites[id.0 as usize];
             if site.value == site.staged {
                 continue;
+            }
+            self.work.changed_sites = self.work.changed_sites.saturating_add(1);
+            if site.staged.is_none() {
+                self.work.withdrawn_sites = self.work.withdrawn_sites.saturating_add(1);
             }
             site.value = site.staged;
             let target = &mut self.targets[site.target.0 as usize];
@@ -232,6 +243,11 @@ impl super::ComponentSolver {
         pattern: Option<(crate::PackedKernelPattern, &[boon_contract::SymbolId])>,
         consumer: TypeVariableId,
     ) {
+        self.requirements.work.projection_evaluations = self
+            .requirements
+            .work
+            .projection_evaluations
+            .saturating_add(1);
         self.refresh_requirements();
         let projection = if let Some(projection) = self.requirement_projections.get(&consumer) {
             *projection
@@ -340,6 +356,11 @@ impl super::ComponentSolver {
             };
             let mut valid = true;
             for step in steps.iter().rev() {
+                self.requirements.work.path_step_evaluations = self
+                    .requirements
+                    .work
+                    .path_step_evaluations
+                    .saturating_add(1);
                 term = match &step.projection {
                     crate::KernelSummaryProjection::Whole => term,
                     crate::KernelSummaryProjection::Field(field) => {
@@ -402,6 +423,11 @@ impl super::ComponentSolver {
     ) -> TypeTermId {
         let mut term = self.program.terms.variable(provider);
         for step in steps {
+            self.requirements.work.path_step_evaluations = self
+                .requirements
+                .work
+                .path_step_evaluations
+                .saturating_add(1);
             term = self.resolve_term_head(term);
             let open = matches!(
                 self.program.terms.term(term),
@@ -467,6 +493,11 @@ impl super::ComponentSolver {
             let Some(base) = self.cells[target.0 as usize].requirement_base else {
                 continue;
             };
+            self.requirements.work.aggregate_evaluations = self
+                .requirements
+                .work
+                .aggregate_evaluations
+                .saturating_add(1);
             let mut facts = self.requirement_fact_scratch.take();
             let mut member = Some(self.equivalence_head[target.0 as usize]);
             while let Some(variable) = member {
@@ -481,6 +512,11 @@ impl super::ComponentSolver {
             self.replace_binding_dependencies_from(target, &inputs);
             let mut aggregate = None;
             for term in inputs.iter().copied() {
+                self.requirements.work.aggregate_fact_visits = self
+                    .requirements
+                    .work
+                    .aggregate_fact_visits
+                    .saturating_add(1);
                 // Match the existing recursive-shape guard without equating
                 // any contributor variable to its destination.
                 if self.occurs(target, term) {
@@ -516,6 +552,8 @@ impl super::ComponentSolver {
         current: TypeTermId,
     ) -> TypeTermId {
         use crate::{TypeTermHead as H, VariantTerm};
+        self.requirements.work.order_term_visits =
+            self.requirements.work.order_term_visits.saturating_add(1);
         if previous == current {
             return current;
         }
@@ -657,6 +695,11 @@ impl super::ComponentSolver {
             &mut [],
         );
         while let Some(variable) = pending.pop() {
+            self.requirements.work.invalidation_variable_visits = self
+                .requirements
+                .work
+                .invalidation_variable_visits
+                .saturating_add(1);
             let root = self.root_readonly(variable);
             if self.schedule_seen[root.0 as usize] == self.schedule_generation {
                 continue;
@@ -668,6 +711,11 @@ impl super::ComponentSolver {
             let mut member = Some(self.equivalence_head[root.0 as usize]);
             while let Some(variable) = member {
                 pending.extend_from_slice(&self.binding_dependents[variable.0 as usize]);
+                self.requirements.work.invalidation_edge_visits = self
+                    .requirements
+                    .work
+                    .invalidation_edge_visits
+                    .saturating_add(self.binding_dependents[variable.0 as usize].len() as u64);
                 member = self.equivalence_next[variable.0 as usize];
             }
         }
@@ -954,6 +1002,34 @@ mod tests {
         let current = solver.program.terms.list(current);
         let expected = solver.program.terms.list(expected);
         assert_eq!(solver.retain_requirement_order(prior, current), expected);
+    }
+
+    #[test]
+    fn work_counts_replay_visits_even_when_no_facts_change() {
+        let mut store = RequirementContributions::default();
+        let owner = store.owner();
+        let site = store.site(owner, TypeVariableId(0));
+        for value in [Some(TypeTermId(1)), Some(TypeTermId(1)), None, None] {
+            store.begin(owner);
+            if let Some(value) = value {
+                store.stage(owner, site, value);
+            }
+            store.commit(owner);
+        }
+        assert_eq!(
+            store.work,
+            crate::KernelRequirementWork {
+                owners: 1,
+                sites: 1,
+                activations: 4,
+                begin_site_visits: 4,
+                staged_writes: 2,
+                commit_site_visits: 4,
+                changed_sites: 2,
+                withdrawn_sites: 1,
+                ..crate::KernelRequirementWork::default()
+            }
+        );
     }
 
     #[test]

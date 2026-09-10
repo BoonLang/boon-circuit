@@ -1937,6 +1937,19 @@ impl ComponentSolver {
                     let known = self.resolve_term(term);
                     if !self.program.terms.has_variable(known) {
                         self.accumulate_summary_requirement(input_index, known);
+                    } else if steps.iter().any(|step| {
+                        !matches!(step.projection, crate::KernelSummaryProjection::Whole)
+                    }) && let Some(leaf) = steps.last()
+                    {
+                        // Reading through a field or pattern path requires the
+                        // caller's actual to provide that path even while its
+                        // shape is still open. The leaf stays a hole and the
+                        // reverse projection wraps it in the path's scaffold.
+                        // Demanding the read is what carries the requirement,
+                        // so an untaken summary branch still contributes
+                        // nothing.
+                        let leaf = self.program.terms.variable(leaf.consumer);
+                        self.accumulate_summary_requirement(input_index, leaf);
                     }
                     return Ok(SummaryValue {
                         term,

@@ -252,3 +252,148 @@ result: wrapper(which: Plain)
     assert!(domain.iter().any(|variant| matches!(variant,
         boon_checked::Variant::Tagged { tag, fields } if tag == "Wrapped" && fields.fields["value"] == Type::Number)));
 }
+
+#[test]
+fn tagged_whole_selector_forwarding_keeps_the_tag_and_payload() {
+    let source = r#"
+FUNCTION inner(which) {
+    which.value + 1
+}
+FUNCTION wrapper(which) {
+    which |> WHEN {
+        Wrapped[value] => inner(which: which)
+        Other => 0
+    }
+}
+result: wrapper(which: Wrapped[value: 1])
+"#;
+    let legacy_source =
+        boon_parser::parse_source("tagged-whole-selector-transfer.bn", source).unwrap();
+    let legacy = boon_typecheck::check_program(&legacy_source);
+    assert!(
+        legacy.report.diagnostics.is_empty(),
+        "legacy oracle: {:?}",
+        legacy.report.diagnostics
+    );
+    let checked = check_editor_source(CompilerCheckRequest::source_text(
+        "tagged-whole-selector-transfer.bn",
+        source,
+        ProgramRole::Server,
+    ))
+    .unwrap();
+    assert!(
+        !checked.output.report.has_errors(),
+        "{:?}",
+        checked.output.report
+    );
+    let wrapper = checked
+        .output
+        .report
+        .function_type_table
+        .entries
+        .iter()
+        .find(|function| function.name == "wrapper")
+        .expect("wrapper interface");
+    let Type::VariantSet(domain) = &wrapper.parameters[0].flow_type.ty else {
+        panic!("wrapper must retain its own closed domain: {wrapper:?}")
+    };
+    assert!(
+        domain
+            .iter()
+            .any(|variant| matches!(variant, boon_checked::Variant::Tag(tag) if tag == "Other")),
+        "the bare alternative must survive whole-value forwarding: {wrapper:?}"
+    );
+    assert!(
+        domain.iter().any(|variant| matches!(variant,
+            boon_checked::Variant::Tagged { tag, fields }
+                if tag == "Wrapped" && fields.fields["value"] == Type::Number)),
+        "the guarded call must keep the tag and its payload requirement: {wrapper:?}"
+    );
+}
+
+#[test]
+fn tagged_whole_selector_forwarding_rejects_an_incompatible_payload() {
+    let source = r#"
+FUNCTION inner(which) {
+    which.value + 1
+}
+FUNCTION wrapper(which) {
+    which |> WHEN {
+        Wrapped[value] => inner(which: which)
+        Other => 0
+    }
+}
+result: wrapper(which: Wrapped[value: TEXT { x }])
+"#;
+    let parsed = boon_parser::parse_source("incompatible-tagged-selector.bn", source).unwrap();
+    let legacy = boon_typecheck::check_program(&parsed);
+    assert!(
+        legacy.report.has_errors(),
+        "legacy oracle must reject the tagged call"
+    );
+    let checked = check_editor_source(CompilerCheckRequest::source_text(
+        "incompatible-tagged-selector.bn",
+        source,
+        ProgramRole::Server,
+    ))
+    .unwrap();
+    let errors = checked
+        .output
+        .report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        errors.len(),
+        1,
+        "the incompatible tagged payload must stay rejected: {:?}",
+        checked.output.report
+    );
+    let message = &errors[0].message;
+    assert!(
+        message.contains("NUMBER") && message.contains("TEXT"),
+        "the rejection must name the incompatible payload types: {message}"
+    );
+    // The legacy oracle attributes this to the guarded inner call. The
+    // candidate transmits the payload requirement through the wrapper's public
+    // formal, so the same rejection is reported at the call whose concrete
+    // actual violates it. The rejection itself is the checked contract here.
+}
+
+#[test]
+fn nested_tagged_whole_selector_forwarding_rejects_an_incompatible_payload() {
+    let source = r#"
+FUNCTION inner(which) {
+    which.value + 1
+}
+FUNCTION middle(which) {
+    which |> WHEN {
+        Wrapped[value] => inner(which: which)
+        Other => 0
+    }
+}
+FUNCTION outer(which) {
+    middle(which: which)
+}
+result: outer(which: Wrapped[value: TEXT { x }])
+"#;
+    let parsed =
+        boon_parser::parse_source("nested-incompatible-tagged-selector.bn", source).unwrap();
+    let legacy = boon_typecheck::check_program(&parsed);
+    assert!(
+        legacy.report.has_errors(),
+        "legacy oracle must reject the nested tagged call"
+    );
+    let checked = check_editor_source(CompilerCheckRequest::source_text(
+        "nested-incompatible-tagged-selector.bn",
+        source,
+        ProgramRole::Server,
+    ))
+    .unwrap();
+    assert!(
+        checked.output.report.has_errors(),
+        "the nested tagged payload mismatch must stay rejected: {:?}",
+        checked.output.report
+    );
+}

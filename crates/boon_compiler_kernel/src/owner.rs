@@ -40,6 +40,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -12340,8 +12341,7 @@ fn compile_owner_program_with_definition_facts_and_text(
     let result = checked_expression_index(input.result(), input.node_count(), "owner result")?;
     let mut builder = ComponentProgramBuilder::with_terms(terms);
     let mut mode_builder = ModeProgramBuilder::default();
-    let mut packed_input_imports =
-        TypeTermImportScratch::with_source_limit(packed_input_term_count);
+    let mut residual_modules = ResidualModuleCache::new(packed_input_term_count);
     let formal_static_variants = vec![None; input.formal_count() as usize];
     let formal_dependent_expressions = [owner_expressions_depend_on_formals(input)];
     let formal_dependent_results = [formal_dependent_expressions[0][result]];
@@ -12353,7 +12353,7 @@ fn compile_owner_program_with_definition_facts_and_text(
         &formal_static_variants,
     )];
     let principal = &principals[0];
-    let tag_arm_guards = owner_tag_arm_guards(input);
+    let tag_arm_guards = residual_modules.tag_arm_guards(KernelOwnerId(0), input);
     let context = OwnerCompileContext {
         initial_state_surface: false,
         text: &text,
@@ -12375,7 +12375,7 @@ fn compile_owner_program_with_definition_facts_and_text(
         syntax_selected_calls: None,
         direct_summaries: &[],
         packed_input_types: None,
-        tag_arm_guards: &tag_arm_guards,
+        tag_arm_guards: tag_arm_guards.as_ref(),
     };
     let specialization = OwnerSpecialization {
         static_variants: principal.static_variants.clone(),
@@ -12390,7 +12390,7 @@ fn compile_owner_program_with_definition_facts_and_text(
     let module = compile_residual_type_module(
         &text,
         Some(builder.terms()),
-        &mut packed_input_imports,
+        &mut residual_modules,
         KernelOwnerId(0),
         input,
         None,
@@ -15068,7 +15068,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
             u32::try_from(owner_index).expect("kernel project owner count exceeds u32"),
         );
         let instance = &principals[owner_index];
-        let tag_arm_guards = owner_tag_arm_guards(owner);
+        let tag_arm_guards = residual_modules.tag_arm_guards(owner_id, owner);
         let context = OwnerCompileContext {
             initial_state_surface: false,
             text: &text,
@@ -15090,7 +15090,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
             syntax_selected_calls: None,
             direct_summaries: &direct_summaries,
             packed_input_types: None,
-            tag_arm_guards: &tag_arm_guards,
+            tag_arm_guards: tag_arm_guards.as_ref(),
         };
         let mut stack = vec![owner_id];
         let specialization = OwnerSpecialization {
@@ -15106,7 +15106,7 @@ pub(crate) fn compile_project_program_with_definition_facts_abi_text_and_terms(
         let module = compile_residual_type_module(
             &text,
             Some(builder.terms()),
-            &mut residual_modules.packed_type_imports,
+            &mut residual_modules,
             owner_id,
             owner,
             Some(input),
@@ -15456,6 +15456,9 @@ struct ResidualTypeModule {
 struct ResidualModuleCache {
     modules: HashMap<SpecializationKey, Arc<ResidualTypeModule>>,
     packed_type_imports: TypeTermImportScratch,
+    /// Owner expression tag-arm guards. The map depends only on the immutable
+    /// packed owner program, so every specialization of one owner reuses it.
+    tag_arm_guards: Vec<Option<Rc<BTreeMap<usize, Vec<FormalTagArmGuard>>>>>,
 }
 
 impl ResidualModuleCache {
@@ -15463,7 +15466,25 @@ impl ResidualModuleCache {
         Self {
             modules: HashMap::new(),
             packed_type_imports: TypeTermImportScratch::with_source_limit(packed_input_term_count),
+            tag_arm_guards: Vec::new(),
         }
+    }
+
+    fn tag_arm_guards(
+        &mut self,
+        owner: KernelOwnerId,
+        program: PackedKernelOwnerProgramRef<'_>,
+    ) -> Rc<BTreeMap<usize, Vec<FormalTagArmGuard>>> {
+        let index = owner.0 as usize;
+        if self.tag_arm_guards.len() <= index {
+            self.tag_arm_guards.resize_with(index + 1, || None);
+        }
+        if let Some(guards) = &self.tag_arm_guards[index] {
+            return Rc::clone(guards);
+        }
+        let guards = Rc::new(owner_tag_arm_guards(program));
+        self.tag_arm_guards[index] = Some(Rc::clone(&guards));
+        guards
     }
 }
 
@@ -15809,83 +15830,218 @@ struct FormalTagArmGuard {
 
 /// Map every owner expression to the tag-arm guards that lexically surround it.
 ///
-/// Guards flow from a WHEN arm's match output through the local expression
-/// DAG. An expression reachable under two different patterns of the same
-/// selector retains both guards; consumers must treat that as unguarded until
-/// a conditional representation exists.
+/// An expression belongs to an arm only when every path from the owner roots
+/// reaches it through that arm. The selector read is reachable from the WHEN
+/// itself, and a node shared by two arms is reachable through the other arm,
+/// so neither receives a guard even though the arm closure contains them.
 fn owner_tag_arm_guards(
     owner: PackedKernelOwnerProgramRef<'_>,
 ) -> BTreeMap<usize, Vec<FormalTagArmGuard>> {
-    let mut guards: BTreeMap<usize, Vec<FormalTagArmGuard>> = BTreeMap::new();
+    let node_count = owner.node_count();
+    // One guard per match output arm.
+    let mut arms: Vec<FormalTagArmGuard> = Vec::new();
+    let mut arm_of_match_output: Vec<Option<u32>> = vec![None; node_count];
+    for when in 0..node_count {
+        let Some(node) = owner.nodes().get(when) else {
+            continue;
+        };
+        if !matches!(node.kind, PackedKernelOwnerNodeKind::When) {
+            continue;
+        }
+        let Some((formal, fields)) = node
+            .inputs(owner)
+            .iter()
+            .find(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenInput))
+            .and_then(|edge| {
+                let selector = owner.nodes().get(edge.expression.0 as usize)?;
+                let PackedKernelOwnerNodeKind::FormalRead { formal, fields } = selector.kind else {
+                    return None;
+                };
+                Some((formal, fields))
+            })
+        else {
+            continue;
+        };
+        for edge in node.inputs(owner) {
+            if !matches!(edge.role, PackedKernelOwnerEdgeRole::WhenArm) {
+                continue;
+            }
+            let arm_index = edge.expression.0 as usize;
+            let Some(arm) = owner.nodes().get(arm_index) else {
+                continue;
+            };
+            let PackedKernelOwnerNodeKind::MatchArm { pattern } = arm.kind else {
+                continue;
+            };
+            let arm_id = u32::try_from(arms.len()).expect("kernel arm count exceeds u32");
+            if arm_of_match_output[arm_index].replace(arm_id).is_some() {
+                return BTreeMap::new();
+            }
+            arms.push(FormalTagArmGuard {
+                formal,
+                fields,
+                pattern,
+            });
+        }
+    }
+    if arms.is_empty() {
+        return BTreeMap::new();
+    }
+    // Flat incoming-edge index so the analysis allocates a fixed few buffers.
+    let mut incoming_counts = vec![0_u32; node_count];
+    for parent in 0..node_count {
+        let Some(node) = owner.nodes().get(parent) else {
+            continue;
+        };
+        for edge in node.inputs(owner) {
+            let child = edge.expression.0 as usize;
+            if child < node_count {
+                incoming_counts[child] = incoming_counts[child].saturating_add(1);
+            }
+        }
+    }
+    let mut incoming_offsets = vec![0_u32; node_count + 1];
+    for index in 0..node_count {
+        incoming_offsets[index + 1] =
+            incoming_offsets[index].saturating_add(incoming_counts[index]);
+    }
+    let mut incoming = vec![(0_u32, Option::<u32>::None); incoming_offsets[node_count] as usize];
+    let mut filled = vec![0_u32; node_count];
+    for parent in 0..node_count {
+        let Some(node) = owner.nodes().get(parent) else {
+            continue;
+        };
+        for edge in node.inputs(owner) {
+            let child = edge.expression.0 as usize;
+            if child >= node_count {
+                continue;
+            }
+            let arm = matches!(edge.role, PackedKernelOwnerEdgeRole::MatchOutput)
+                .then(|| arm_of_match_output[parent])
+                .flatten();
+            let slot = incoming_offsets[child] + filled[child];
+            incoming[slot as usize] = (parent as u32, arm);
+            filled[child] += 1;
+        }
+    }
+    // Reachability from the owner roots bounds which nodes can carry a guard.
+    let mut reachable = vec![false; node_count];
     let mut queue = VecDeque::new();
-    for index in 0..owner.node_count() {
-        queue.push_back(index);
+    for index in 0..node_count {
+        if incoming_counts[index] == 0 {
+            reachable[index] = true;
+            queue.push_back(index);
+        }
+    }
+    let result = owner.result().0 as usize;
+    if result < node_count && !reachable[result] {
+        reachable[result] = true;
+        queue.push_back(result);
     }
     while let Some(index) = queue.pop_front() {
         let Some(node) = owner.nodes().get(index) else {
             continue;
         };
-        let selector = matches!(node.kind, PackedKernelOwnerNodeKind::When).then(|| {
-            node.inputs(owner)
-                .iter()
-                .find(|edge| matches!(edge.role, PackedKernelOwnerEdgeRole::WhenInput))
-                .and_then(|edge| {
-                    let selector = owner.nodes().get(edge.expression.0 as usize)?;
-                    let PackedKernelOwnerNodeKind::FormalRead { formal, fields } = selector.kind
-                    else {
-                        return None;
-                    };
-                    Some((formal, fields))
-                })
-        });
-        let current = guards.get(&index).cloned().unwrap_or_default();
         for edge in node.inputs(owner) {
             let child = edge.expression.0 as usize;
-            if child >= owner.node_count() {
-                continue;
-            }
-            let mut additions = current.clone();
-            if let Some(Some((formal, fields))) = selector
-                && matches!(edge.role, PackedKernelOwnerEdgeRole::WhenArm)
-                && let Some(arm) = owner.nodes().get(child)
-                && let PackedKernelOwnerNodeKind::MatchArm { pattern } = arm.kind
-            {
-                additions.push(FormalTagArmGuard {
-                    formal,
-                    fields,
-                    pattern,
-                });
-            }
-            let entry = guards.entry(child).or_default();
-            let mut changed = false;
-            for guard in additions {
-                if !entry.contains(&guard) {
-                    entry.push(guard);
-                    changed = true;
-                }
-            }
-            if changed {
+            if child < node_count && !reachable[child] {
+                reachable[child] = true;
                 queue.push_back(child);
             }
+        }
+    }
+    // Every path to a node must pass through the arm body. Intersecting the
+    // incoming contributions computes that exactly, and a node reachable from
+    // an outer root or a sibling arm loses the guard at the join.
+    let words = arms.len().div_ceil(64);
+    let mut universe = vec![u64::MAX; words];
+    if let Some(last) = universe.last_mut() {
+        let remainder = arms.len() % 64;
+        if remainder != 0 {
+            *last = (1_u64 << remainder) - 1;
+        }
+    }
+    let mut dominators = vec![Vec::<u64>::new(); node_count];
+    for index in 0..node_count {
+        dominators[index] = if reachable[index] && incoming_counts[index] > 0 {
+            universe.clone()
+        } else {
+            Vec::new()
+        };
+    }
+    let mut scratch = vec![0_u64; words];
+    loop {
+        let mut changed = false;
+        for index in 0..node_count {
+            if !reachable[index] || incoming_counts[index] == 0 {
+                continue;
+            }
+            let start = incoming_offsets[index] as usize;
+            let end = incoming_offsets[index + 1] as usize;
+            for word in scratch.iter_mut() {
+                *word = u64::MAX;
+            }
+            for (parent, arm) in &incoming[start..end] {
+                let parent = dominators[*parent as usize].as_slice();
+                for (word, value) in scratch.iter_mut().enumerate() {
+                    let mut incoming = parent.get(word).copied().unwrap_or(0);
+                    if arm.is_some_and(|arm| (arm as usize) / 64 == word) {
+                        incoming |= 1_u64 << (arm.expect("checked arm") % 64);
+                    }
+                    *value &= incoming;
+                }
+            }
+            if dominators[index] != scratch {
+                dominators[index].clone_from(&scratch);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut guards: BTreeMap<usize, Vec<FormalTagArmGuard>> = BTreeMap::new();
+    for (index, dominators) in dominators.iter().enumerate() {
+        if dominators.is_empty() {
+            continue;
+        }
+        for (arm_id, arm) in arms.iter().enumerate() {
+            if dominators[arm_id / 64] & (1_u64 << (arm_id % 64)) == 0 {
+                continue;
+            }
+            guards.entry(index).or_default().push(*arm);
         }
     }
     guards
 }
 
-/// Closed tag a surrounding WHEN arm proves for a whole formal read.
+/// Value a surrounding WHEN arm proves for a whole formal read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GuardedWholeRead {
+    /// A bare tag arm proves the read is exactly that tag.
+    Tag(SymbolId),
+    /// A payload arm proves the read is the tagged value whose payload is
+    /// projected from the formal along the pattern's binding path. The tag
+    /// stays attached to the value instead of collapsing to its payload.
+    Tagged {
+        tag: SymbolId,
+        fields: boon_contract::PathId,
+    },
+}
+
+/// Value a surrounding WHEN arm proves for a whole formal read.
 ///
-/// Only bare tag patterns produce a closed value here. A tagged payload arm
-/// keeps its payload connected to the caller's formal, so it retains the
-/// existing forwarding until a guarded whole-value projection exists.
-fn guarded_whole_read_tag(
+/// An expression reachable under two different patterns of one selector is
+/// ambiguous and keeps its original unguarded forwarding.
+fn guarded_whole_read(
     context: &OwnerCompileContext<'_>,
     expression: usize,
-) -> Option<SymbolId> {
+) -> Option<GuardedWholeRead> {
     let node = context.input.nodes().get(expression)?;
     let PackedKernelOwnerNodeKind::FormalRead { formal, fields } = &node.kind else {
         return None;
     };
-    let mut matched: Option<SymbolId> = None;
+    let mut matched: Option<GuardedWholeRead> = None;
     for guard in context.tag_arm_guards.get(&expression)? {
         if guard.formal != *formal || guard.fields != *fields {
             continue;
@@ -15897,38 +16053,41 @@ fn guarded_whole_read_tag(
         else {
             return None;
         };
-        if pattern_fields != boon_contract::PathId::ROOT {
-            return None;
-        }
+        let guard = if pattern_fields == boon_contract::PathId::ROOT {
+            GuardedWholeRead::Tag(name)
+        } else {
+            GuardedWholeRead::Tagged {
+                tag: name,
+                fields: pattern_fields,
+            }
+        };
         match matched {
-            None => matched = Some(name),
-            Some(previous) if previous == name => {}
+            None => matched = Some(guard),
+            Some(previous) if previous == guard => {}
             Some(_) => return None,
         }
     }
     matched
 }
 
-/// Closed tag proven for a call argument by a surrounding WHEN arm.
+/// Whether a call argument is a whole formal read proven by a surrounding arm.
 ///
 /// The call and the argument read must both sit inside the arm, so an
 /// expression shared with an unguarded occurrence keeps its forwarding.
-fn guarded_call_argument_tag(
-    context: &OwnerCompileContext<'_>,
-    call: usize,
-    argument: usize,
-) -> Option<SymbolId> {
+fn guarded_call_argument(context: &OwnerCompileContext<'_>, call: usize, argument: usize) -> bool {
     if argument >= context.input.node_count() {
-        return None;
+        return false;
     }
-    let read_guards = context.tag_arm_guards.get(&argument)?;
+    let Some(read_guards) = context.tag_arm_guards.get(&argument) else {
+        return false;
+    };
     let call_guards = context.tag_arm_guards.get(&call);
     for guard in read_guards {
         if !call_guards.is_some_and(|guards| guards.contains(guard)) {
-            return None;
+            return false;
         }
     }
-    guarded_whole_read_tag(context, argument)
+    guarded_whole_read(context, argument).is_some()
 }
 
 fn edge_static_variants(
@@ -16469,7 +16628,7 @@ fn import_residual_packed_input_types<'a>(
 fn compile_residual_type_module(
     text: &ProjectTextSnapshot,
     packed_input_source: Option<&crate::TypeTermArena>,
-    packed_input_imports: &mut TypeTermImportScratch,
+    residual_modules: &mut ResidualModuleCache,
     owner_id: KernelOwnerId,
     owner: PackedKernelOwnerProgramRef<'_>,
     project: Option<&PackedKernelProjectProgram>,
@@ -16495,6 +16654,7 @@ fn compile_residual_type_module(
             })
             .collect::<Vec<_>>()
     });
+    let tag_arm_guards = residual_modules.tag_arm_guards(owner_id, owner);
     let mut builder = ComponentProgramBuilder::with_text(text.clone());
     let packed_input_types = packed_input_source
         .map(|source| {
@@ -16505,7 +16665,7 @@ fn compile_residual_type_module(
                 specialization,
                 invocation_dependencies,
                 residual_transparent_type_providers.as_deref(),
-                packed_input_imports,
+                &mut residual_modules.packed_type_imports,
             )
         })
         .transpose()?
@@ -16524,7 +16684,6 @@ fn compile_residual_type_module(
         .iter()
         .map(|_| builder.new_contextual_hole())
         .collect::<Vec<_>>();
-    let tag_arm_guards = owner_tag_arm_guards(owner);
     let context = OwnerCompileContext {
         initial_state_surface,
         text,
@@ -16548,7 +16707,7 @@ fn compile_residual_type_module(
         packed_input_types: packed_input_types
             .as_ref()
             .map(|imports| PackedInputTypeProjection { imports }),
-        tag_arm_guards: &tag_arm_guards,
+        tag_arm_guards: tag_arm_guards.as_ref(),
     };
     let mut invocations = HashMap::new();
     let mut specializations = HashMap::new();
@@ -16919,7 +17078,7 @@ fn instantiate_owner(
         let module = compile_residual_type_module(
             text,
             Some(builder.terms()),
-            &mut residual_modules.packed_type_imports,
+            &mut *residual_modules,
             target,
             owner,
             Some(project),
@@ -16945,7 +17104,7 @@ fn instantiate_owner(
     };
     let external_variables = principal_external_variables(owner, project, principals)?;
     stack.push(target);
-    let tag_arm_guards = owner_tag_arm_guards(owner);
+    let tag_arm_guards = residual_modules.tag_arm_guards(target, owner);
     let result = (|| {
         let context = OwnerCompileContext {
             initial_state_surface,
@@ -16968,7 +17127,7 @@ fn instantiate_owner(
             syntax_selected_calls: Some(&specialization.syntax_selected_calls),
             direct_summaries,
             packed_input_types: None,
-            tag_arm_guards: &tag_arm_guards,
+            tag_arm_guards: tag_arm_guards.as_ref(),
         };
         append_residual_type_frame(builder, &module, &instance, &external_variables)?;
         compile_work.residual_frames = compile_work.residual_frames.saturating_add(1);
@@ -17402,12 +17561,13 @@ impl DirectSummaryPlanCompiler<'_> {
         }
     }
 
-    /// Closed tag an enclosing WHEN arm proves for a whole formal read.
+    /// Closed tag an enclosing bare tag arm proves for a whole formal read.
     ///
     /// Only a selector at the formal root with a bare tag pattern yields a
-    /// closed value here. Deeper selector paths and payload patterns keep the
-    /// existing projection behavior until a guarded whole-value projection
-    /// exists.
+    /// closed value here. A payload arm keeps the existing projection: the
+    /// reconstructed tagged value is owned by the caller's definition program,
+    /// and duplicating it inside shared summary bytecode inflated TodoMVC solve
+    /// work by roughly six times in debug correctness runs.
     fn whole_value_tag_guard(
         &self,
         formal: u32,
@@ -17665,10 +17825,10 @@ impl DirectSummaryPlanCompiler<'_> {
                 PackedKernelOwnerNodeKind::FormalRead { formal, fields } => {
                     let fields = owner.path(*fields)?;
                     if let Some(name) = self.whole_value_tag_guard(*formal, fields) {
-                        // The enclosing arm proves the selector's tag, so the
-                        // whole read is that closed value. Forwarding the tag
-                        // keeps the callee's requirement from re-shaping the
-                        // caller's formal.
+                        // The enclosing bare tag arm proves the selector's
+                        // tag, so the whole read is that closed value.
+                        // Forwarding the tag keeps the callee's requirement
+                        // from re-shaping the caller's formal.
                         let tag = VariantTerm::Tag(name);
                         let term = self.builder.terms_mut().variant_set([tag]);
                         return Some(term_value(self, term));
@@ -19864,18 +20024,6 @@ fn compile_node(
                     "kernel owner node {index} formal read has explicit inputs"
                 )));
             }
-            if let Some(name) = guarded_whole_read_tag(context, index) {
-                // An enclosing tag arm proves this whole read is that tag.
-                // Publishing the closed snapshot keeps the read from aliasing
-                // the unguarded formal, so a callee requirement is checked
-                // against what the arm proves instead of widening the formal
-                // and this read is not exported as an unguarded requirement
-                // participant either.
-                let tag = VariantTerm::Tag(name);
-                let term = builder.terms_mut().variant_set([tag]);
-                builder.add_publish(output, [term], PublishMode::Replace);
-                return Ok(());
-            }
             let provider = context
                 .formals
                 .get(*formal as usize)
@@ -19885,6 +20033,64 @@ fn compile_node(
                         "kernel owner node {index} reads missing formal {formal}"
                     ))
                 })?;
+            if let Some(guard) = guarded_whole_read(context, index) {
+                // An enclosing tag arm proves this whole read. Publishing the
+                // proved value keeps the read from aliasing the unguarded
+                // formal, so a callee requirement is checked against what the
+                // arm proves instead of widening the formal, and this read is
+                // not exported as an unguarded requirement participant.
+                match guard {
+                    GuardedWholeRead::Tag(tag) => {
+                        let tag = VariantTerm::Tag(tag);
+                        let term = builder.terms_mut().variant_set([tag]);
+                        builder.add_publish(output, [term], PublishMode::Replace);
+                    }
+                    GuardedWholeRead::Tagged { tag, fields } => {
+                        let pattern = crate::PackedKernelPattern::Tag { name: tag, fields };
+                        let bindings = context
+                            .input
+                            .path(fields)
+                            .ok_or_else(|| {
+                                KernelOwnerBuildError::new(format!(
+                                    "kernel owner node {index} guard pattern has an invalid path"
+                                ))
+                            })?
+                            .iter()
+                            .collect::<Vec<_>>();
+                        let Some((first, rest)) = bindings.split_first() else {
+                            return Err(KernelOwnerBuildError::new(format!(
+                                "kernel owner node {index} tagged guard has no payload binding"
+                            )));
+                        };
+                        // The payload stays connected to the formal through the
+                        // pattern projection, so later payload evidence flows
+                        // into this read. Only the tag is reconstructed here.
+                        let payload = builder.new_variable();
+                        builder.add_pattern_projection_into(
+                            provider,
+                            pattern,
+                            bindings.iter().copied(),
+                            payload,
+                        );
+                        let mut value = payload;
+                        for name in rest.iter().rev() {
+                            let object = builder.new_variable();
+                            let entries = [KernelRecordEntry::Field {
+                                name: *name,
+                                value: builder.variable_term(value),
+                            }];
+                            builder.add_record(object, None, entries);
+                            value = object;
+                        }
+                        let entries = [KernelRecordEntry::Field {
+                            name: *first,
+                            value: builder.variable_term(value),
+                        }];
+                        builder.add_record(output, Some(tag), entries);
+                    }
+                }
+                return Ok(());
+            }
             let path = context.input.path(*fields).ok_or_else(|| {
                 KernelOwnerBuildError::new(format!(
                     "kernel owner node {index} formal read has an invalid packed path"
@@ -20108,8 +20314,7 @@ fn compile_node(
                     requirement,
                     requirement_backflow,
                     guarded: matches!(edge.role, KernelOwnerEdgeRole::CallArgument { .. })
-                        && guarded_call_argument_tag(context, index, edge.expression.0 as usize)
-                            .is_some(),
+                        && guarded_call_argument(context, index, edge.expression.0 as usize),
                     mode: edge_mode_variable(context, index, edge)?,
                     mode_source: mode_source_for_edge(
                         context,

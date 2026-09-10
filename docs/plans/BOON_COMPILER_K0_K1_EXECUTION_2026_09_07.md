@@ -614,3 +614,59 @@ summary paths, keep actual evidence separate from callee requirements, and
 verify both error directions before release measurements. Tagged payload and
 lexical containment semantics need checked-row tests, not dependency-closure
 inference or payload-projection substitution.
+
+### 2026-09-10: whole-selector arm guards closed (083ed083, 789dda76)
+
+The guard obligation is now carried by the caller's definition program rather
+than by shared summary bytecode. Each owner program gets one structural map of
+the tag arms that surround its expressions: an expression belongs to an arm
+only when every path from the owner roots reaches it through that arm, so a
+selector read that is also reachable outside its arm and an occurrence shared
+by sibling arms stay unguarded. The map is computed by one dominator-style
+intersection pass and cached per owner on the residual module cache, so
+specializations reuse it instead of recomputing it.
+
+Whole reads inside an arm now forward the proved value. A bare tag arm
+publishes the closed tag; a payload arm reconstructs the tagged value and keeps
+its payload connected to the formal through a pattern projection. A call whose
+argument is such a read carries an explicit `guarded` flag, which detaches the
+callee requirement channel: the requirement is checked against the proved
+value instead of reshaping the caller's formal, and an incompatible callee is
+still diagnosed. `CallActual.guarded` also suppresses the residual instance's
+formal-requirement binding for the same reason.
+
+The summary bytecode path intentionally keeps bare-tag forwarding only. An
+intermediate revision also reconstructed tagged payload records inside shared
+summary programs; the debug TodoMVC checked-publication oracle then took 143
+and 162 seconds against a 23.9-second guard-disabled baseline, while the
+owner-side reconstruction alone ran that oracle in 25.1 seconds. The expensive
+variant is deleted, not tuned, and is recorded as a rejected local experiment
+rather than a K1 hypothesis outcome.
+
+Checked results after both commits:
+
+- kernel library: 197 passed, none failed or ignored.
+- `kernel_transfer`: 10 passed, including the two formerly failing
+  `whole_selector` regressions and three new tagged cases (valid tagged call,
+  incompatible tagged payload, nested incompatible tagged payload).
+- compiler library: 98 passed, one pre-existing ignored directional probe;
+  the TodoMVC checked-publication/replay/verification oracle passed in 25.11 s
+  under the final configuration.
+- `staged_compilation` 3, `map_set` 3, `nested_boolean_match` 3, `pulses` 8,
+  `cargo check -p boon_cli --bins` clean.
+
+The valid tagged call keeps its `Other | Wrapped[value: NUMBER]` interface and
+the invalid one is rejected again, which the K1 WIP and the first committed
+guard revision both accepted. One limitation remains explicit: the candidate
+attributes the tagged mismatch to the call whose concrete actual violates the
+transmitted requirement, while the legacy oracle attributes it to the guarded
+inner call. The preserved K0 producer reports one diagnostic for that source;
+its exact site and bytes remain unclaimed. Closing that attribution difference
+requires validating guarded calls per call-site instantiation, which is not
+part of this cut.
+
+Next: keep the guard work counted (occurrence/site work is already in
+`KernelRequirementWork`), run the focused compiler gates once more, then build
+fresh release product/evidence producers and begin the K0/K1 comparison
+protocol. No performance claim is made from the debug correctness timings
+above.

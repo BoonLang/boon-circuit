@@ -1,0 +1,53 @@
+{
+  "status": "correctness checkpoint; no performance claim",
+  "date": "2026-09-10",
+  "checkpoints": {
+    "bare_tag_guard": "083ed083",
+    "tagged_guard": "789dda76",
+    "previous_red_wip": "840c1c5c",
+    "preserved_k0": "2d7a5343"
+  },
+  "guard_representation": {
+    "ownership": "caller definition program; shared summary bytecode keeps bare-tag forwarding only",
+    "membership": "an expression belongs to an arm only when every path from the owner roots reaches it through that arm",
+    "analysis": "one dominator-style intersection pass per owner program, cached on the residual module cache",
+    "bare_tag_value": "closed tag variant set published into the arm read",
+    "payload_tag_value": "pattern projection for the payload plus a reconstructed tagged record",
+    "requirement_channel": "CallActual.guarded detaches callee requirement backflow for whole guarded reads"
+  },
+  "rejected_experiment": {
+    "what": "tagged payload record reconstruction inside shared summary programs",
+    "debug_todomvc_oracle_seconds": {
+      "guards_fully_disabled": 23.9,
+      "summary_reconstruction_enabled": 145.07,
+      "earlier_summary_reconstruction_run": 162.26,
+      "owner_reconstruction_only": 25.11
+    },
+    "decision": "deleted, not tuned; recorded as a rejected local experiment, not a K1 hypothesis outcome",
+    "caveat": "debug correctness timings; not release latency and not a speedup claim"
+  },
+  "regressions": {
+    "whole_selector_forwarding_does_not_export_an_inactive_callee_alternative": "passed; wrapper domain stays First | Second",
+    "whole_selector_guard_does_not_hide_an_incompatible_callee": "passed; incompatible callee diagnosed at the guarded inner call",
+    "tagged_whole_selector_forwarding_keeps_the_tag_and_payload": "passed; Other | Wrapped[value: NUMBER]",
+    "tagged_whole_selector_forwarding_rejects_an_incompatible_payload": "passed; one error, attributed to the violating call",
+    "nested_tagged_whole_selector_forwarding_rejects_an_incompatible_payload": "passed; one error"
+  },
+  "oracle_comparison": {
+    "legacy": "rejects the tagged mismatch at the guarded inner call and keeps the caller payload type in the wrapper interface",
+    "preserved_k0": "one diagnostic for the tagged mismatch; exact site and bytes unclaimed",
+    "candidate": "rejects the tagged mismatch at the call whose concrete actual violates the transmitted requirement",
+    "open_obligation": "exact guarded-call attribution needs per-call-site instantiation validation"
+  },
+  "verified_gates": {
+    "kernel_library": "197 passed, 0 failed, 0 ignored",
+    "kernel_transfer": "10 passed",
+    "compiler_library": "98 passed, 1 pre-existing ignored",
+    "staged_compilation": "3 passed",
+    "map_set": "3 passed",
+    "nested_boolean_match": "3 passed",
+    "pulses": "8 passed",
+    "boon_cli_bins_check": "clean"
+  },
+  "next": "count guard work with KernelRequirementWork, then build fresh release product and evidence producers and start the K0/K1 comparison protocol"
+}

@@ -366,6 +366,10 @@ struct ComponentSolver {
     /// committed site change reuses the unchanged prefix and merges only the
     /// suffix.
     requirement_fold_state: std::collections::HashMap<u32, RetainedFold>,
+    /// Structural variable list per interned term, indexed by term id. A term's
+    /// syntactic variables never change, so the dependency receipt can reuse
+    /// them instead of walking every contributor on every fold.
+    term_variable_cache: Vec<Option<Box<[TypeVariableId]>>>,
     /// Opt-in K1″ sub-phase probe. Splits the fold into occurs, resolve and
     /// merge time so a release producer can attribute the refresh cost.
     /// Absent unless `BOON_KERNEL_TRACE_AGGREGATE_PHASE` is set.
@@ -805,6 +809,7 @@ impl ComponentSolver {
             requirement_fold_memo: std::collections::HashMap::new(),
             requirement_previous_bindings: std::collections::HashMap::new(),
             requirement_fold_state: std::collections::HashMap::new(),
+            term_variable_cache: Vec::new(),
             requirement_phase_probe: std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE_PHASE")
                 .map(|_| RequirementPhaseProbe::default()),
             requirement_closed_pairs: std::collections::HashSet::new(),
@@ -3753,17 +3758,34 @@ impl ComponentSolver {
         bindings: &[TypeTermId],
     ) {
         let parent = self.root(parent);
-        self.clear_binding_dependencies(parent);
         let mut dependencies = self.variable_scratch.take();
         for binding in bindings {
+            let index = binding.0 as usize;
+            if let Some(Some(cached)) = self.term_variable_cache.get(index) {
+                dependencies.extend_from_slice(cached);
+                continue;
+            }
             self.collect_term_variables(*binding);
-            dependencies.extend_from_slice(&self.term_variable_buffer);
+            let collected = std::mem::take(&mut self.term_variable_buffer);
+            dependencies.extend_from_slice(&collected);
+            if self.term_variable_cache.len() <= index {
+                self.term_variable_cache.resize_with(index + 1, || None);
+            }
+            self.term_variable_cache[index] = Some(collected.into_boxed_slice());
         }
         for dependency in dependencies.iter_mut() {
             *dependency = self.root(*dependency);
         }
         dependencies.sort_unstable();
         dependencies.dedup();
+        // The receipt is rebuilt from the same contributors most of the time.
+        // Comparing the freshly derived root set against the retained one skips
+        // both the O(len) dependent-list removals and the re-insertions.
+        if self.binding_dependencies[parent.0 as usize].as_slice() == dependencies.as_slice() {
+            self.variable_scratch.recycle(dependencies);
+            return;
+        }
+        self.clear_binding_dependencies(parent);
         for dependency in dependencies.iter().copied() {
             let dependency = self.root(dependency);
             if dependency != parent {

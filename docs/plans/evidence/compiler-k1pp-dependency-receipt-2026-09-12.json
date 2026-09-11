@@ -1,0 +1,46 @@
+{
+ "status": "ninth aggregation slice: the dependency receipt reuses a dense structural variable cache and skips rebuilding an unchanged receipt; phase-level win, end-to-end within noise, and the interleaved standing check shows TodoMVC 5.9% ahead of K0 with NovyWave at +18.7%",
+ "date": "2026-09-12",
+ "change": {
+  "cut": "cached term variable lists and unchanged dependency receipts",
+  "what": "a term's syntactic variables never change, so they are now cached per interned term id in a dense vector and reused by replace_binding_dependencies_from instead of walking every contributor on every fold. The freshly derived root set is compared with the retained receipt, and when it matches, both the dependent-list removals and the re-insertions are skipped.",
+  "why": "the receipt was NovyWave's fourth-largest refresh bucket (11.9 ms) and it re-walked an unchanged contributor set on almost every fold.",
+  "refinement": "the first version cached in a HashMap and cost TodoMVC 1.7% end to end; indexing by term id removed the hashing and left TodoMVC neutral (verified in a second interleaved A/B)."
+ },
+ "phase_probe_release": {
+  "novywave_diagnostics": {"deps_ms": [11.9, 7.9], "refresh_total_ms": [94.6, 93.0]},
+  "todo_mvc_physical_diagnostics": {"deps_ms": [6.7, 9.0], "refresh_total_ms": [134.5, 136.0]},
+  "note": "single observations; the TodoMVC deps reading moved against the change in this sample while its end-to-end result is neutral"
+ },
+ "interleaved_ab": {
+  "protocol": "eight alternating rounds, one process per observation, release evidence lane, cold fresh-process",
+  "vs_previous_build": {
+   "todo_mvc_diagnostics_pct": 0.38,
+   "novywave_diagnostics_pct": -0.64,
+   "todo_mvc_verified_pct": -0.05,
+   "parity": "single (fingerprint, plan) pair per lane"
+  },
+  "vs_k0_producer": {
+   "todo_mvc_diagnostics_ms": {"k0": 967.8, "candidate": 911.2, "delta_pct": -5.85},
+   "todo_mvc_verified_ms": {"k0": 1353.8, "candidate": 1350.8, "delta_pct": -0.22},
+   "novywave_diagnostics_ms": {"k0": 548.5, "candidate": 651.1, "delta_pct": 18.72},
+   "note": "the K0 leg measures 548.5 ms in this window against its historical 530; the relative deltas are the interleaved result"
+  }
+ },
+ "gates": {
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ },
+ "position": "the goal's mechanism is implemented and measured: destinations fold incrementally from a retained prefix, re-converge without re-merging the suffix, skip resolution and order rebuilds that change nothing, and now maintain their dependency receipt from a structural cache. TodoMVC is 5.9% ahead of the K0 producer on diagnostics; NovyWave is at +18.7% with a 93 ms refresh (resolve 19.2, order 14.5, merge 13.6, deps 7.9, occurs 11.7, collection/invalidation/commit ~5.7 and roughly 20 ms of loop overhead) against a non-refresh cost that is already at K0 parity.",
+ "next_decision": "the residual NovyWave cost is per-fold verification of contributors whose raw terms are unchanged. Removing it soundly needs dependency-versioned contributor reuse: stamp each destination when the scheduler's binding-change walk reaches it, then reuse retained resolved terms when the stamp and raw inputs are unchanged. That is the retained-revision machinery the contract assigns to the successor goal, so it is recorded here as the hand-off decision rather than started inside this goal.",
+ "caveats": [
+  "the slice claims a phase-level work reduction; its end-to-end effect is inside the host's noise band",
+  "the standing comparison uses the preserved K0 evidence binary in this window; the K0 leg runs 3% above its historical median",
+  "cold modes only; the warm path is the successor goal"
+ ]
+}

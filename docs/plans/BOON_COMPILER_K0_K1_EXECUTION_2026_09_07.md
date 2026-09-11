@@ -1367,3 +1367,32 @@ occurs 10.6, collection/invalidation/commit ~5.7 and roughly 20 ms of loop
 overhead. The remaining slice targets are the dependency receipt, occurs
 filtering and that loop overhead; the 3+30 acceptance run still needs a quiet
 window.
+
+### 2026-09-12: K1″ ninth slice — the dependency receipt reuses a structural cache
+
+A term's syntactic variables never change, so they are now cached per interned
+term id in a dense vector (indexed by term id, not hashed: the first version
+used a HashMap and cost TodoMVC 1.7% end to end, which a second interleaved A/B
+confirmed was removed by the dense form). `replace_binding_dependencies_from`
+reuses the cached lists and compares the freshly derived root set with the
+retained receipt; when they match it skips both the dependent-list removals and
+the re-insertions.
+
+Phase effect: NovyWave deps 11.9 → 7.9 ms and refresh 94.6 → 93.0 ms; the
+TodoMVC deps sample moved the other way while its end-to-end result is neutral
+(+0.4%). Interleaved A/B against the previous build: NovyWave −0.6%, TodoMVC
++0.4%, verified −0.1%, every lane a single (fingerprint, plan) pair. Recorded
+as a phase-level win:
+[dependency receipt](evidence/compiler-k1pp-dependency-receipt-2026-09-12.json).
+
+The same record carries the current standing against the preserved K0
+producer, measured interleaved in one window: TodoMVC diagnostics 911.2 vs
+967.8 ms (−5.9%) and verified at parity, NovyWave diagnostics 651.1 vs 548.5 ms
+(+18.7%, from +69.5% when this arc began). NovyWave's refresh is 93 ms with
+non-refresh work already at K0 parity, so the residual gap is per-fold
+verification of unchanged contributors. Removing that soundly needs
+dependency-versioned contributor reuse (stamp each destination when the
+scheduler's binding-change walk reaches it, then reuse retained resolved terms
+when the stamp and raw inputs are unchanged) — the retained-revision machinery
+the contract assigns to the successor goal. That decision is recorded in the
+evidence file rather than started here.

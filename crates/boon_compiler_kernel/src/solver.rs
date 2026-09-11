@@ -3574,15 +3574,26 @@ impl ComponentSolver {
             TypeTermHead::VariantSet(variants) => {
                 let mut rebuilt = self.variant_scratch.take();
                 rebuilt.reserve(variants.len());
+                let mut changed = false;
                 for ordinal in 0..variants.len() {
                     let variant = self.program.terms.variant_terms(variants)[ordinal];
                     rebuilt.push(match variant {
                         VariantTerm::Tag(tag) => VariantTerm::Tag(tag),
-                        VariantTerm::Tagged { tag, fields } => VariantTerm::Tagged {
-                            tag,
-                            fields: self.resolve_term_inner(fields, generation),
-                        },
+                        VariantTerm::Tagged { tag, fields } => {
+                            let resolved = self.resolve_term_inner(fields, generation);
+                            changed |= resolved != fields;
+                            VariantTerm::Tagged {
+                                tag,
+                                fields: resolved,
+                            }
+                        }
                     });
+                }
+                // Every child resolved to itself, so this set is already its
+                // own resolution: rebuilding and interning would return it.
+                if !changed {
+                    self.variant_scratch.recycle(rebuilt);
+                    return term;
                 }
                 let result = self
                     .program
@@ -3595,30 +3606,46 @@ impl ComponentSolver {
                 let field_count = self.program.terms.object_fields_for_shape(shape).len();
                 let mut fields = self.record_field_scratch.take();
                 fields.reserve(field_count);
+                let mut changed = false;
                 for ordinal in 0..field_count {
                     let field = self
                         .program
                         .terms
                         .object_field_for_shape(shape, ordinal)
                         .expect("sealed resolved object field exists");
-                    fields.push((field.name, self.resolve_term_inner(field.ty, generation)));
+                    let resolved = self.resolve_term_inner(field.ty, generation);
+                    changed |= resolved != field.ty;
+                    fields.push((field.name, resolved));
+                }
+                if !changed {
+                    self.record_field_scratch.recycle(fields);
+                    return term;
                 }
                 let result = self.program.terms.object(fields.iter().copied(), open);
                 self.record_field_scratch.recycle(fields);
                 result
             }
             TypeTermHead::List(item) => {
-                let item = self.resolve_term_inner(item, generation);
-                self.program.terms.list(item)
+                let resolved = self.resolve_term_inner(item, generation);
+                if resolved == item {
+                    return term;
+                }
+                self.program.terms.list(resolved)
             }
             TypeTermHead::Set(item) => {
-                let item = self.resolve_term_inner(item, generation);
-                self.program.terms.set(item)
+                let resolved = self.resolve_term_inner(item, generation);
+                if resolved == item {
+                    return term;
+                }
+                self.program.terms.set(resolved)
             }
             TypeTermHead::Map { key, value } => {
-                let key = self.resolve_term_inner(key, generation);
-                let value = self.resolve_term_inner(value, generation);
-                self.program.terms.map(key, value)
+                let resolved_key = self.resolve_term_inner(key, generation);
+                let resolved_value = self.resolve_term_inner(value, generation);
+                if resolved_key == key && resolved_value == value {
+                    return term;
+                }
+                self.program.terms.map(resolved_key, resolved_value)
             }
             TypeTermHead::Function {
                 args,
@@ -3627,11 +3654,20 @@ impl ComponentSolver {
             } => {
                 let mut rebuilt_args = self.term_id_scratch.take();
                 rebuilt_args.reserve(args.len());
+                let mut changed = false;
                 for ordinal in 0..args.len() {
                     let argument = self.program.terms.term_ids(args)[ordinal];
-                    rebuilt_args.push(self.resolve_term_inner(argument, generation));
+                    let resolved = self.resolve_term_inner(argument, generation);
+                    changed |= resolved != argument;
+                    rebuilt_args.push(resolved);
                 }
+                let original_result = result;
                 let result = self.resolve_term_inner(result, generation);
+                changed |= result != original_result;
+                if !changed {
+                    self.term_id_scratch.recycle(rebuilt_args);
+                    return term;
+                }
                 let function =
                     self.program
                         .terms
@@ -3642,9 +3678,16 @@ impl ComponentSolver {
             TypeTermHead::Union(members) => {
                 let mut rebuilt = self.term_id_scratch.take();
                 rebuilt.reserve(members.len());
+                let mut changed = false;
                 for ordinal in 0..members.len() {
                     let member = self.program.terms.term_ids(members)[ordinal];
-                    rebuilt.push(self.resolve_term_inner(member, generation));
+                    let resolved = self.resolve_term_inner(member, generation);
+                    changed |= resolved != member;
+                    rebuilt.push(resolved);
+                }
+                if !changed {
+                    self.term_id_scratch.recycle(rebuilt);
+                    return term;
                 }
                 let result = self.program.terms.union(rebuilt.iter().copied());
                 self.term_id_scratch.recycle(rebuilt);

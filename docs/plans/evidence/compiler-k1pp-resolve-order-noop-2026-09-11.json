@@ -1,0 +1,48 @@
+{
+ "status": "seventh aggregation slice: resolution and order retention skip the rebuild when nothing moved, cutting resolve interning 88% on NovyWave with no diagnostics or plan drift",
+ "date": "2026-09-11",
+ "change": {
+  "cut": "no-op fast paths in resolve_term_inner and retain_requirement_order",
+  "what": "resolution now tracks whether any child resolved to a different term; when none did, the composite term is already its own resolution and is returned without rebuilding or interning. Order retention does the same: the rebuilt field/variant sequence is compared against the current term, and when it already matches, the current term is returned instead of being re-interned. List, set, map, function and union arms reuse the term when their children are unchanged.",
+  "why": "NovyWave's resolve phase issued about 237,000 intern requests and order retention about 2,600, all of them re-deriving terms that were already in the arena (the overall intern hit rate is 92%).",
+  "soundness": "a container built from unchanged children is the identical structure, so the interned result would be the same term; the order receipt rebuild is compared element by element against the stored term before the short circuit. Nothing about resolution or receipt semantics changes."
+ },
+ "phase_probe_release": {
+  "novywave_diagnostics": {
+   "refresh_total_ms": [121.7, 107.0],
+   "resolve_ms": [35.9, 20.1],
+   "intern_resolve": [236985, 27782],
+   "intern_order": [2583, 348],
+   "merge_ms": [20.4, 22.2],
+   "order_ms": [15.6, 14.7]
+  },
+  "todo_mvc_physical_diagnostics": {
+   "refresh_total_ms": [133.9, 134.5],
+   "resolve_ms": [18.7, 15.6],
+   "intern_resolve": [79040, 42339],
+   "intern_order": [2836, 54]
+  },
+  "note": "pairs are [pre-slice build, no-op fast-path build]; one release observation per fixture and build"
+ },
+ "interleaved_ab": {
+  "protocol": "eight alternating rounds, one process per observation, release evidence lane, cold fresh-process",
+  "todo_mvc_diagnostics_ms": {"before_p50": 929.6, "before_min": 924.4, "after_p50": 892.9, "after_min": 886.1, "delta_p50_pct": -3.95},
+  "novywave_diagnostics_ms": {"before_p50": 714.0, "before_min": 679.4, "after_p50": 686.5, "after_min": 650.2, "delta_p50_pct": -3.85},
+  "todo_mvc_verified_ms": {"before_p50": 1397.7, "before_min": 1374.3, "after_p50": 1351.5, "after_min": 1335.6, "delta_p50_pct": -3.30},
+  "parity": "every lane produced a single (diagnostics fingerprint, plan) pair across both binaries"
+ },
+ "gates": {
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ },
+ "position": "NovyWave refresh is now 107.0 ms (from 251.1 ms at the start of this goal's second half): resolve 20.1, merge 22.2, order 14.7, deps 12.7, occurs 10.8, collection/invalidation/commit ~6 ms and roughly 20 ms of loop overhead. The remaining targets are merge re-convergence and the dependency receipt.",
+ "caveats": [
+  "the refresh total barely moves on TodoMVC because its refresh is now a small share of its latency; the end-to-end gain there comes from the solver's general resolution and merge paths, which share these arms",
+  "cold modes only; the warm path is the successor goal"
+ ]
+}

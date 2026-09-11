@@ -1313,3 +1313,30 @@ TodoMVC diagnostics at 909.9-961.3 ms against K0's 927.2-982.6 ms, i.e. at or
 below parity. The slice's own evidence remains the eight-round interleaved A/B
 with a single (fingerprint, plan) pair per lane. This acceptance run should be
 repeated in a quiet window before it is treated as the final record.
+
+### 2026-09-11: K1″ seventh slice — resolution and order receipts skip the rebuild
+
+Two no-op fast paths. `resolve_term_inner` now tracks whether any child
+resolved to a different term: when none did, the composite term is already its
+own resolution and is returned without rebuilding or interning. The same idea
+applies inside `retain_requirement_order`: the rebuilt field or variant
+sequence is compared against the current term and the current term is returned
+when it already matches, including the list, set, map and function arms.
+
+Release probe (one observation per fixture and build): NovyWave resolve 35.9 →
+20.1 ms with resolve interning 236,985 → 27,782 requests (−88%) and order
+interning 2,583 → 348; refresh 121.7 → 107.0 ms. TodoMVC resolve interning
+79,040 → 42,339 and order interning 2,836 → 54; its refresh total is unchanged
+in this probe because the gain lands in the solver's general paths. Interleaved
+A/B, eight rounds, one process per observation: TodoMVC diagnostics 929.6 →
+892.9 ms (−4.0%), NovyWave diagnostics 714.0 → 686.5 ms (−3.9%), TodoMVC
+verified 1397.7 → 1351.5 ms (−3.3%). Every lane produced a single
+(fingerprint, plan) pair, so there is no diagnostics or plan drift. All gates
+green. Full record:
+[resolve and order no-op](evidence/compiler-k1pp-resolve-order-noop-2026-09-11.json).
+
+NovyWave's refresh is now 107.0 ms: resolve 20.1, merge 22.2, order 14.7, deps
+12.7, occurs 10.8, collection/invalidation/commit ~6 ms and roughly 20 ms of
+loop overhead. The next targets are merge re-convergence (stop merging the
+suffix once the accumulator matches the retained prefix aggregate) and the
+dependency receipt.

@@ -891,6 +891,22 @@ impl super::ComponentSolver {
                         fields.push((field.name, field.ty));
                     }
                 }
+                // The rebuilt order already equals the current receipt, so the
+                // retained term is the receipt itself.
+                let stored_len = self.program.terms.object_fields_for_shape(new).len();
+                let already_ordered = stored_len == fields.len()
+                    && (0..stored_len).all(|ordinal| {
+                        let stored = self
+                            .program
+                            .terms
+                            .object_field_for_shape(new, ordinal)
+                            .expect("sealed object field exists");
+                        fields[ordinal].0 == stored.name && fields[ordinal].1 == stored.ty
+                    });
+                if already_ordered {
+                    self.record_field_scratch.recycle(fields);
+                    return current;
+                }
                 let result = self.program.terms.object(fields.iter().copied(), open);
                 self.record_field_scratch.recycle(fields);
                 result
@@ -921,6 +937,16 @@ impl super::ComponentSolver {
                         tag => tag,
                     });
                 }
+                let stored = self.program.terms.variant_terms(new);
+                if stored.len() == variants.len()
+                    && stored
+                        .iter()
+                        .zip(variants.iter())
+                        .all(|(left, right)| left == right)
+                {
+                    self.variant_scratch.recycle(variants);
+                    return current;
+                }
                 let result = self
                     .program
                     .terms
@@ -930,10 +956,16 @@ impl super::ComponentSolver {
             }
             (H::List(old), H::List(new)) => {
                 let item = self.retain_requirement_order(old, new);
+                if item == new {
+                    return current;
+                }
                 self.program.terms.list(item)
             }
             (H::Set(old), H::Set(new)) => {
                 let item = self.retain_requirement_order(old, new);
+                if item == new {
+                    return current;
+                }
                 self.program.terms.set(item)
             }
             (
@@ -941,10 +973,16 @@ impl super::ComponentSolver {
                     key: old_key,
                     value: old_value,
                 },
-                H::Map { key, value },
+                H::Map {
+                    key: current_key,
+                    value: current_value,
+                },
             ) => {
-                let key = self.retain_requirement_order(old_key, key);
-                let value = self.retain_requirement_order(old_value, value);
+                let key = self.retain_requirement_order(old_key, current_key);
+                let value = self.retain_requirement_order(old_value, current_value);
+                if key == current_key && value == current_value {
+                    return current;
+                }
                 self.program.terms.map(key, value)
             }
             (
@@ -960,12 +998,21 @@ impl super::ComponentSolver {
                 },
             ) if old.len() == args.len() => {
                 let mut arguments = self.term_id_scratch.take();
+                let mut changed = false;
                 for ordinal in 0..args.len() {
                     let old = self.program.terms.term_ids(old)[ordinal];
                     let new = self.program.terms.term_ids(args)[ordinal];
-                    arguments.push(self.retain_requirement_order(old, new));
+                    let retained = self.retain_requirement_order(old, new);
+                    changed |= retained != new;
+                    arguments.push(retained);
                 }
-                let result = self.retain_requirement_order(old_result, result);
+                let current_result = result;
+                let result = self.retain_requirement_order(old_result, current_result);
+                changed |= result != current_result;
+                if !changed {
+                    self.term_id_scratch.recycle(arguments);
+                    return current;
+                }
                 let function =
                     self.program
                         .terms

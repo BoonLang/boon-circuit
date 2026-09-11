@@ -1,0 +1,49 @@
+{
+  "status": "structure win, latency neutral; the regression is attributed to requirement-scaffold object interning, not node visits",
+  "date": "2026-09-11",
+  "change": {
+    "cut": "closed WHEN domain constraint fold",
+    "what": "one KernelSummaryNode::ConstrainDomain per closed WHEN resolves its pattern-requirement inputs and constrains the selector in arm order, replacing one Unify node and one Input node per arm plus the per-arm Sequence inputs",
+    "semantics": "arm-order constraining is preserved exactly; all correctness gates stay green and diagnostics are byte-identical",
+    "sites_updated": ["program.rs node enum", "owner.rs planner WHEN branch, fold, canonicalization, hash-cons, compaction reachability, relocation, size trace", "solver.rs evaluator"]
+  },
+  "structure_effect_todo_mvc_diagnostics": {
+    "summary_node_evaluations": {"before": 1017465, "after": 483995, "delta": -52.4},
+    "summary_definition_nodes": {"before": 2325, "after": 1114, "delta": -52.1},
+    "definition_104_final_program": {"before": 140, "after": 74, "inputs": {"before": 45, "after": 4}, "domain_nodes": 16},
+    "definition_79_final_program": {"before": 219, "after": 99, "inputs": {"before": 77, "after": 2}, "domain_nodes": 30}
+  },
+  "latency_release_fresh_process_ms": {
+    "todo_diagnostics": {"before": 1166.2, "after": 1174.1, "k0": 929.8},
+    "todo_verified": {"before": 1589.6, "after": 1579.1, "k0": 1281.1},
+    "novy_diagnostics": {"before": 913.0, "after": 915.1, "k0": 497.3},
+    "novy_verified": {"before": 2215.3, "after": 2304.8, "k0": 1845.4},
+    "finding": "halving the interpreted node visits changed nothing outside noise, so node-visit count is not the cost driver"
+  },
+  "corrected_cost_attribution": {
+    "method": "compare every kernel work counter between the pre-change candidate, the post-change candidate and the K0 baseline on TodoMVC fresh-process diagnostics",
+    "unchanged_counters_despite_the_fold": ["activations 181,056", "mutations 182,294", "union_operations 41,929", "term_intern_requests 1,645,514", "structural_widen_requests 131,659", "scratch_vector_reuses 5,923,303", "linked_operations 82,451"],
+    "k0_comparison": {
+      "activations": {"k0": 620555, "candidate": 181056},
+      "union_operations": {"k0": 196759, "candidate": 41929},
+      "mutations": {"k0": 465647, "candidate": 182294},
+      "term_intern_requests": {"k0": 342922, "candidate": 1645514, "delta": 1302592},
+      "nonempty_object_intern_requests": {"k0": 213235, "candidate": 1189597, "delta": 976362},
+      "scratch_vector_reuses": {"k0": 1494269, "candidate": 5923303, "delta": 4429034},
+      "summary_call_activations": {"k0": 6373, "candidate": 11227},
+      "dynamic_dependency_edges": {"k0": 4465, "candidate": 10963}
+    },
+    "intern_requests_by_kind": {
+      "k0": [16161, 215784, 33534, 61146, 3719, 0, 0, 12578],
+      "candidate": [11715, 1199989, 400888, 25560, 6997, 0, 0, 365],
+      "finding": "the extra interning is dominated by kind 1 objects (nonempty objects: +976k requests) and kind 2 (+367k)"
+    },
+    "conclusion": "the requirement machinery builds and interns roughly a million scaffold objects per TodoMVC diagnostics solve, one per reverse-projection step per call, plus four times K0's scratch-pool churn. That traffic, not the interpreted node walk, is the measured cost driver."
+  },
+  "next_cut": {
+    "target": "stop rebuilding requirement scaffold objects per call: memoize or precompute the reverse-projection scaffold for a (term, projection path) pair, and reduce scratch churn in the same path",
+    "first_gate": "object intern requests and scratch reuses must fall toward K0's 213k and 1.5M without changing diagnostics or any correctness gate",
+    "then": "re-measure the 3+30 cohort; only then is the K1-prime implemented ending testable"
+  },
+  "verified_gates": "kernel library 197, kernel_transfer 10, compiler library 98 with one pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match 3, pulses 8, all green"
+}

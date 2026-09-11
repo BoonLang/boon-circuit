@@ -2308,6 +2308,24 @@ impl ComponentSolver {
                 actual.term = self.resolve_term_head(actual.term);
                 Ok(actual)
             }
+            KernelSummaryNode::ConstrainDomain {
+                value,
+                requirements,
+            } => {
+                let mut actual = self.evaluate_summary_value(
+                    program,
+                    resolve_input,
+                    *value,
+                    scratch,
+                    node_evaluations,
+                )?;
+                for requirement in requirements {
+                    let expected = resolve_input(self, *requirement)?;
+                    self.constrain_summary_value(&mut actual, expected.term);
+                }
+                actual.term = self.resolve_term_head(actual.term);
+                Ok(actual)
+            }
             KernelSummaryNode::Constrain { value, expected } => {
                 let mut actual = self.evaluate_summary_value(
                     program,

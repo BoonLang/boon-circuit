@@ -108,6 +108,14 @@ pub enum KernelSummaryNode {
         value: KernelSummaryValueId,
         requirement: KernelSummaryValueId,
     },
+    /// One occurrence-private requirement fold for a closed WHEN domain.
+    /// Resolves each pattern-requirement input and constrains the selector
+    /// value with it in arm order. Equivalent to a chain of `Unify` nodes,
+    /// but one evaluation visit instead of one visit per arm.
+    ConstrainDomain {
+        value: KernelSummaryValueId,
+        requirements: Box<[u32]>,
+    },
     /// One occurrence-local contextual hole (`[]`). The evaluator allocates a
     /// fresh union-find variable for every summary invocation so an enclosing
     /// constraint can choose record, list, set, map, or bytes shape without

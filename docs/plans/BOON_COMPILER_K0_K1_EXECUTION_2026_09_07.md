@@ -897,3 +897,33 @@ evaluation is scheduled work rather than an interpreted per-call walk". The
 corrected next cut is therefore in scope, and the goal continues on it instead
 of stopping for a scope decision. K3/K4 warm work remains out of scope and is
 recorded as the product-critical follow-on.
+
+### 2026-09-11: K1′ domain fold — structure win, cost driver reattributed
+
+The first in-scope linked-evaluation slice replaces the per-arm `Unify` chain
+with one `KernelSummaryNode::ConstrainDomain` per closed WHEN: one node
+resolves its pattern-requirement inputs and constrains the selector in arm
+order, instead of one `Input` plus one `Unify` visit per arm. All gates stay
+green and diagnostics are byte-identical. Full record:
+[2026-09-11 domain fold](evidence/compiler-k1p-domain-fold-2026-09-11.json).
+
+The structure win is large: TodoMVC summary node evaluations fall 1,017,465 to
+483,995 (−52%) and summary definition nodes 2,325 to 1,114; definition 104's
+final program drops 140 to 74 nodes with inputs 45 to 4, and definition 79
+drops 219 to 99 with inputs 77 to 2.
+
+Release latency is unchanged: TodoMVC diagnostics 1166.2 → 1174.1 ms (K0
+929.8), verified 1589.6 → 1579.1 (K0 1281.1); NovyWave diagnostics 913.0 →
+915.1 (K0 497.3) and verified 2215.3 → 2304.8 (K0 1845.4). Halving the
+interpreted node visits changed nothing, so node-visit count is not the cost
+driver. Every other work counter is unchanged by the fold, and the K0
+comparison now points at the real one: term intern requests 342,922 → 1,645,514
+(+1.30M), dominated by non-empty object interning 213,235 → 1,189,597 (+976k,
+kind 1), plus scratch-pool reuses 1,494,269 → 5,923,303. The requirement
+machinery is building and interning roughly a million scaffold objects per
+TodoMVC diagnostics solve — one per reverse-projection step per call.
+
+Next cut: stop rebuilding those scaffolds per call — memoize or precompute the
+reverse-projection scaffold for a (term, projection path) pair and cut the
+scratch churn — with the gate that object intern requests and scratch reuses
+fall toward K0's 213k and 1.5M without changing diagnostics.

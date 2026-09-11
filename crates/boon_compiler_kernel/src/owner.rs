@@ -18430,11 +18430,7 @@ impl DirectSummaryPlanCompiler<'_> {
                                 owner: owner_id,
                                 pattern: arm.pattern,
                             });
-                            let requirement = self.push_node(KernelSummaryNode::Input(input));
-                            requirements.push(self.push_node(KernelSummaryNode::Unify {
-                                value: selector.value,
-                                requirement,
-                            }));
+                            requirements.push(input);
                         }
                     }
                     let selected = self.push_node(KernelSummaryNode::Select {
@@ -18446,8 +18442,12 @@ impl DirectSummaryPlanCompiler<'_> {
                         value: if requirements.is_empty() {
                             selected
                         } else {
+                            let domain = self.push_node(KernelSummaryNode::ConstrainDomain {
+                                value: selector.value,
+                                requirements: requirements.into_boxed_slice(),
+                            });
                             self.push_node(KernelSummaryNode::Sequence {
-                                inputs: requirements.into_boxed_slice(),
+                                inputs: vec![domain].into_boxed_slice(),
                                 result: selected,
                             })
                         },
@@ -18658,6 +18658,7 @@ fn fold_constant_summary_nodes(
             | KernelSummaryNode::ContextualHole
             | KernelSummaryNode::Constrain { .. }
             | KernelSummaryNode::Unify { .. }
+            | KernelSummaryNode::ConstrainDomain { .. }
             | KernelSummaryNode::Invoke { .. } => None,
             KernelSummaryNode::Term(term) => {
                 (!builder.terms().has_variable(*term)).then_some(*term)
@@ -18893,6 +18894,19 @@ fn canonicalize_summary_node(
                 )
                 .0;
             }
+            false
+        }
+        KernelSummaryNode::ConstrainDomain { value, .. } => {
+            *value = canonicalize_summary_value(
+                *value,
+                old_nodes,
+                relocations,
+                purities,
+                active,
+                interner,
+                canonical,
+            )
+            .0;
             false
         }
         KernelSummaryNode::Constrain { value, .. } => {
@@ -19132,6 +19146,7 @@ fn pure_summary_node_hash(node: &KernelSummaryNode) -> u64 {
         KernelSummaryNode::ContextualHole
         | KernelSummaryNode::Constrain { .. }
         | KernelSummaryNode::Unify { .. }
+        | KernelSummaryNode::ConstrainDomain { .. }
         | KernelSummaryNode::Sequence { .. }
         | KernelSummaryNode::Invoke { .. } => {
             unreachable!("effect-owning summary nodes are never hash-consed")
@@ -19179,6 +19194,18 @@ fn compact_summary_result(
             KernelSummaryNode::Constrain { value, .. } => pending.push(*value),
             KernelSummaryNode::Unify { value, requirement } => {
                 pending.extend([*value, *requirement])
+            }
+            KernelSummaryNode::ConstrainDomain {
+                value,
+                requirements,
+            } => {
+                pending.push(*value);
+                for input in requirements {
+                    *used_inputs
+                        .get_mut(*input as usize)
+                        .expect("kernel summary domain input belongs to its compact program") =
+                        true;
+                }
             }
             KernelSummaryNode::Sequence {
                 inputs: dependencies,
@@ -19298,6 +19325,16 @@ fn relocate_summary_node(
         KernelSummaryNode::Unify { value, requirement } => {
             *value = relocated_summary_value(*value, values);
             *requirement = relocated_summary_value(*requirement, values);
+        }
+        KernelSummaryNode::ConstrainDomain {
+            value,
+            requirements,
+        } => {
+            *value = relocated_summary_value(*value, values);
+            for input in requirements {
+                *input =
+                    inputs[*input as usize].expect("kernel summary domain input remains reachable");
+            }
         }
         KernelSummaryNode::Constrain { value, .. } => {
             *value = relocated_summary_value(*value, values);
@@ -19757,6 +19794,7 @@ fn compile_direct_result_summaries(
                     KernelSummaryNode::Input(_) => "input",
                     KernelSummaryNode::Term(_) => "term",
                     KernelSummaryNode::Unify { .. } => "unify",
+                    KernelSummaryNode::ConstrainDomain { .. } => "domain",
                     KernelSummaryNode::ContextualHole => "hole",
                     KernelSummaryNode::Projection { .. } => "projection",
                     KernelSummaryNode::Constrain { .. } => "constrain",

@@ -1,0 +1,45 @@
+{
+  "status": "K1-double-prime step 1: fold dedup landed; real but partial improvement, K0-class latency not yet reached",
+  "date": "2026-09-11",
+  "change": {
+    "cut": "duplicate-contribution dedup inside the requirement fold",
+    "what": "refresh_requirements resolves each contribution and skips terms already folded in this pass, preserving the original interleaved order (occurs check, then resolve, then merge) so payload-binding side effects stay identical",
+    "probe": "debug-only BOON_KERNEL_TRACE_AGGREGATE records folds, visits, distinct visits, repeat folds and single-delta folds",
+    "verified_gates": "kernel library 197, kernel_transfer 10, compiler library 98 with one pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match 3, pulses 8"
+  },
+  "redundancy_measured": {
+    "todo-mvc-physical": {"folds": 18792, "visits": 722579, "distinct_visits": 56797, "distinct_share": 0.079, "repeat_folds": 2949, "single_delta_folds": 2009},
+    "novywave": {"folds": 6374, "visits": 185441, "distinct_visits": 119183, "distinct_share": 0.643, "repeat_folds": 1739, "single_delta_folds": 733},
+    "finding": "TodoMVC re-merges each distinct term about twelve times per fold; NovyWave is mostly distinct, so dedup helps TodoMVC far more"
+  },
+  "work_effect": {
+    "todo-mvc_diagnostics": {
+      "aggregate_fact_visits": {"before": 722579, "after": 56796, "delta": -92.1},
+      "term_intern_requests": {"before": 1645514, "after": 840207, "delta": -48.9},
+      "nonempty_object_intern_requests": {"before": 1189597, "after": 390804, "delta": -67.2},
+      "scratch_vector_reuses": {"before": 5923303, "after": 2733895, "delta": -53.9}
+    },
+    "novywave_diagnostics": {
+      "aggregate_fact_visits": {"before": 185441, "after": 121561, "delta": -34.4},
+      "term_intern_requests": {"before": 1236424, "after": 1170580, "delta": -5.3},
+      "nonempty_object_intern_requests": {"before": 859614, "after": 819719, "delta": -4.6},
+      "scratch_vector_reuses": {"before": 4195103, "after": 4015159, "delta": -4.3}
+    }
+  },
+  "latency_interleaved_ab": {
+    "protocol": "alternating one-process observations, same machine and load, 15 rounds, release producers",
+    "todo_diagnostics_ms": {"pre_dedup_p50": 1667.2, "dedup_p50": 1603.0, "delta": -3.9, "pre_dedup_p95": 2168.7, "dedup_p95": 2721.5},
+    "novy_diagnostics_ms": {"pre_dedup_p50": 1408.0, "dedup_p50": 1294.2, "delta": -8.1, "pre_dedup_p95": 2139.2, "dedup_p95": 1498.4}
+  },
+  "k0_comparison_post_reboot": {
+    "protocol": "interleaved K0 producer and dedup candidate, 10 rounds, one process per observation, fresh diagnostics",
+    "todo_diagnostics_ms": {"k0_p50": 937.7, "candidate_p50": 1077.4, "delta": 14.9, "k0_p95": 979.2, "candidate_p95": 1127.2},
+    "novywave_diagnostics_ms": {"k0_p50": 503.6, "candidate_p50": 872.3, "delta": 73.2, "k0_p95": 567.6, "candidate_p95": 986.7},
+    "finding": "dedup moves the candidate from +28.9%/+81.7% versus K0 to +14.9%/+73.2%; the goal's K0-class gate is not met"
+  },
+  "next_step": {
+    "target": "make each remaining fold cheaper rather than only removing duplicates: NovyWave folds are 64% distinct, so the cost is genuine re-merging of about 29 contributions per fold",
+    "candidate_fast_path": "when every distinct contribution in a fold is a closed term, build the union once and canonicalize once instead of pairwise-merging; probe how often all contributions are closed before implementing",
+    "gate": "no diagnostic or oracle change, and cold TodoMVC/NovyWave moving further toward K0-class"
+  }
+}

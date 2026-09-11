@@ -509,25 +509,76 @@ impl super::ComponentSolver {
             inputs.extend(base);
             inputs.extend(facts.iter().map(|(_, term)| *term));
             self.requirement_fact_scratch.recycle(facts);
+            #[cfg(debug_assertions)]
+            if self.aggregate_probe.is_some() {
+                let mut signature = Vec::with_capacity(inputs.len());
+                for index in 0..inputs.len() {
+                    let term = inputs[index];
+                    signature.push(self.resolve_term(term).0);
+                }
+                signature.sort_unstable();
+                let distinct = {
+                    let mut distinct = signature.clone();
+                    distinct.dedup();
+                    distinct.len()
+                };
+                let probe = self.aggregate_probe.as_mut().expect("probe checked above");
+                probe.folds = probe.folds.saturating_add(1);
+                probe.visits = probe
+                    .visits
+                    .saturating_add(u64::try_from(signature.len()).unwrap_or(u64::MAX));
+                probe.distinct_visits = probe
+                    .distinct_visits
+                    .saturating_add(u64::try_from(distinct).unwrap_or(u64::MAX));
+                if let Some(previous) = probe.last.get(&target.0) {
+                    if previous == &signature {
+                        probe.repeat_folds = probe.repeat_folds.saturating_add(1);
+                    } else {
+                        let added = signature
+                            .iter()
+                            .filter(|term| !previous.contains(term))
+                            .count();
+                        let removed = previous
+                            .iter()
+                            .filter(|term| !signature.contains(term))
+                            .count();
+                        if added + removed == 1 {
+                            probe.single_delta_folds = probe.single_delta_folds.saturating_add(1);
+                        }
+                    }
+                }
+                probe.last.insert(target.0, signature);
+            }
             self.replace_binding_dependencies_from(target, &inputs);
+            // Folding is order-sensitive: merges can bind payload variables,
+            // so resolve in the same interleaved order as before. Duplicate
+            // contributions (aliases and repeated arm terms) are skipped
+            // because merging an already-folded term cannot add evidence; on
+            // TodoMVC only about 8% of the visited terms are distinct.
+            let mut folded_terms = self.term_id_scratch.take();
             let mut aggregate = None;
             for term in inputs.iter().copied() {
-                self.requirements.work.aggregate_fact_visits = self
-                    .requirements
-                    .work
-                    .aggregate_fact_visits
-                    .saturating_add(1);
                 // Match the existing recursive-shape guard without equating
                 // any contributor variable to its destination.
                 if self.occurs(target, term) {
                     continue;
                 }
                 let term = self.resolve_term(term);
+                if folded_terms.contains(&term) {
+                    continue;
+                }
+                folded_terms.push(term);
+                self.requirements.work.aggregate_fact_visits = self
+                    .requirements
+                    .work
+                    .aggregate_fact_visits
+                    .saturating_add(1);
                 aggregate = Some(match aggregate {
                     None => term,
                     Some(previous) => self.merge_type_evidence(previous, term, false),
                 });
             }
+            self.term_id_scratch.recycle(folded_terms);
             self.term_id_scratch.recycle(inputs);
             if let (Some(previous), Some(current)) = (
                 self.requirements.targets[target.0 as usize].order,

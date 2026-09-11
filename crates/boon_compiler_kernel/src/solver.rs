@@ -348,6 +348,39 @@ struct ComponentSolver {
     /// input terms. Debug-only; absent from release producers.
     #[cfg(debug_assertions)]
     reuse_probe: Option<SummaryReuseProbe>,
+    /// Opt-in K1″ aggregation probe. Records how often a destination's
+    /// resolved input signature repeats or differs by a single element, which
+    /// bounds what incremental aggregation can save. Debug-only.
+    #[cfg(debug_assertions)]
+    aggregate_probe: Option<AggregateProbe>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct AggregateProbe {
+    folds: u64,
+    visits: u64,
+    distinct_visits: u64,
+    repeat_folds: u64,
+    single_delta_folds: u64,
+    last: std::collections::HashMap<u32, Vec<u32>>,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for AggregateProbe {
+    fn drop(&mut self) {
+        if std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE").is_none() {
+            return;
+        }
+        eprintln!(
+            "kernel-aggregate folds={} visits={} distinct_visits={} repeat_folds={} single_delta_folds={}",
+            self.folds,
+            self.visits,
+            self.distinct_visits,
+            self.repeat_folds,
+            self.single_delta_folds
+        );
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -651,6 +684,9 @@ impl ComponentSolver {
             #[cfg(debug_assertions)]
             reuse_probe: std::env::var_os("BOON_KERNEL_TRACE_REUSE")
                 .map(|_| SummaryReuseProbe::default()),
+            #[cfg(debug_assertions)]
+            aggregate_probe: std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE")
+                .map(|_| AggregateProbe::default()),
         };
         let execution = SolverExecution {
             operations,

@@ -984,3 +984,33 @@ which selects:
 The full start commands for all three live in the prompt file. K2–K5 in the
 architecture plan keep their long-range order; these three cuts are the
 explicitly selected next tranche. No further work happens inside K1′.
+
+### 2026-09-11: K1″ step 1 — fold dedup landed, K0 parity still ahead
+
+The first requirement-aggregation slice deduplicates contributions inside a
+fold while preserving the original interleaved order. A debug probe
+(`BOON_KERNEL_TRACE_AGGREGATE`) first measured the redundancy: TodoMVC folds
+visit 722,579 terms of which only 56,797 are distinct (7.9%), with 2,949
+repeat folds and 2,009 single-delta folds; NovyWave is 64.3% distinct. Full
+record: [fold dedup](evidence/compiler-k1pp-fold-dedup-2026-09-11.json).
+
+Work effect on TodoMVC diagnostics: aggregate fact visits 722,579 → 56,796
+(−92%), term intern requests 1,645,514 → 840,207, non-empty object interning
+1,189,597 → 390,804 (−67%), scratch reuses 5.93M → 2.73M. NovyWave falls much
+less (fact visits −34%, interning −5%).
+
+Latency, measured as an interleaved A/B against the pre-dedup release binary
+(15 alternating one-process rounds): TodoMVC diagnostics p50 1667.2 → 1603.0 ms
+(−3.9%) and NovyWave 1408.0 → 1294.2 ms (−8.1%). Against the preserved K0
+producer, re-measured interleaved after a machine reboot (10 rounds): TodoMVC
+937.7 vs 1077.4 ms (+14.9%) and NovyWave 503.6 vs 872.3 ms (+73.2%). The
+dedup takes the candidate from +28.9%/+81.7% versus K0 to +14.9%/+73.2%, so it
+is real progress but the K0-class gate is not met. All gates stay green:
+kernel 197, kernel_transfer 10, compiler library 98 with one pre-existing
+ignored probe, staged 3, map_set 3, nested_boolean_match 3, pulses 8.
+
+Next: the NovyWave gap is genuine re-merging (29 mostly-distinct contributions
+per fold), so the next slice must make each fold cheaper, not just
+duplicate-free — for example a closed-term fast path that builds the union once
+instead of pairwise-merging, gated on a probe of how often every contribution
+in a fold is closed.

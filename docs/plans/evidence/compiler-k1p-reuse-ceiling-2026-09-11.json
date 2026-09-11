@@ -37,5 +37,21 @@
     "Per-class requirement targets fragment widely (up to 103 distinct targets in one TodoMVC class), confirming the architecture plan's split between reusable parametric transfer and per-occurrence bindings.",
     "A closed-call memo can therefore remove roughly a third of summary evaluation work, but it cannot by itself restore K0 latency; the open-call majority needs a parametric skeleton or linked code, or the evaluated fallback."
   ],
-  "decision": "Implement the closed-call memoization slice first as the low-risk, sound part of K1-prime, and use its measured reduction to decide whether a parametric open-call skeleton is reachable inside this goal or whether the reviewed fallback to linked residual evaluation is the honest ending."
+  "transfer_stability_at_quiescence": {
+    "method": "for each closed class, capture the evaluated value term and the accumulated requirement term per input, canonicalize unbound contextual holes exactly as summary_call publishes them, resolve deeply, and compare every repeat against the first capture",
+    "todo-mvc-physical": {
+      "closed_repeats": 3743,
+      "value_mismatches": 0,
+      "requirement_mismatches": 84,
+      "captures_with_live_variables": 0
+    },
+    "novywave": {
+      "closed_repeats": 1793,
+      "value_mismatches": 0,
+      "requirement_mismatches": 4,
+      "captures_with_live_variables": 0
+    },
+    "not_noise": "the first comparison on raw ids and the second on deeply resolved ids produced identical mismatch counts, so the value agreement is not an interning artifact; canonicalizing unbound contextual holes is what removed the 426 TodoMVC raw-id differences"
+  },
+  "decision": "The value half of a closed transfer is a pure function of the definition and resolved input terms, but the requirement half is not: 84 TodoMVC and 4 NovyWave repeats produce different closed requirement terms for identical inputs. A sound memo key must therefore cover the dependency state behind the requirement side, not just the input tuple, and no such key exists today. Implement the value-reuse experiment next (cache node values per closed class and replay the requirement accumulation per call) to measure the achievable win; if it cannot restore K0-class latency, the reviewed fallback is to evaluate through linked residual specialization with shared bytes."
 }

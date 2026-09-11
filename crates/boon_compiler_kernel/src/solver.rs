@@ -363,6 +363,13 @@ struct SummaryReuseProbe {
         std::collections::HashMap<(u32, Box<[u32]>), std::collections::HashSet<u32>>,
     /// Closed calls whose class is shared with at least one other call.
     closed_calls_in_shared_classes: u64,
+    /// First captured transfer for each closed class: the evaluated term and
+    /// the accumulated requirement term per input.
+    closed_transfers: std::collections::HashMap<(u32, Box<[u32]>), (u32, Vec<Option<u32>>)>,
+    closed_repeats: u64,
+    closed_value_mismatches: u64,
+    closed_requirement_mismatches: u64,
+    closed_entries_with_variables: u64,
 }
 
 #[cfg(debug_assertions)]
@@ -372,7 +379,7 @@ impl Drop for SummaryReuseProbe {
             return;
         }
         eprintln!(
-            "kernel-summary-reuse calls={} closed={} closed_without_backflow={} closed_classes={} closed_shared_classes={} closed_calls_in_shared_classes={} closed_class_max_targets={}",
+            "kernel-summary-reuse calls={} closed={} closed_without_backflow={} closed_classes={} closed_shared_classes={} closed_calls_in_shared_classes={} closed_class_max_targets={} closed_repeats={} closed_value_mismatches={} closed_requirement_mismatches={} closed_entries_with_variables={}",
             self.calls,
             self.closed_calls,
             self.closed_without_backflow,
@@ -386,7 +393,11 @@ impl Drop for SummaryReuseProbe {
                 .values()
                 .map(std::collections::HashSet::len)
                 .max()
-                .unwrap_or(0)
+                .unwrap_or(0),
+            self.closed_repeats,
+            self.closed_value_mismatches,
+            self.closed_requirement_mismatches,
+            self.closed_entries_with_variables
         );
     }
 }
@@ -1896,6 +1907,10 @@ impl ComponentSolver {
         self.record_summary_reuse(program.definition, inputs);
         self.begin_summary_requirements(output, inputs);
         let result = self.evaluate_summary_program(program, inputs);
+        #[cfg(debug_assertions)]
+        if let Ok(value) = &result {
+            self.probe_closed_transfer(program.definition, inputs, value.term);
+        }
         self.finish_summary_requirements(output, inputs, result.is_ok());
         let mut result = result?;
         // A contextual hole is allowed to escape shared definition bytecode,
@@ -1909,12 +1924,15 @@ impl ComponentSolver {
         Ok(())
     }
 
-    /// Opt-in K1′ probe: classify one summary call by its resolved inputs.
+    /// Opt-in K1′ probe: resolve one summary call's inputs for reuse analysis.
+    ///
+    /// Returns (all_closed, without_backflow, resolved input term ids,
+    /// caller requirement target ids).
     #[cfg(debug_assertions)]
-    fn record_summary_reuse(&mut self, definition: u32, inputs: &[KernelSummaryCallInput]) {
-        if self.reuse_probe.is_none() {
-            return;
-        }
+    fn classify_summary_inputs(
+        &mut self,
+        inputs: &[KernelSummaryCallInput],
+    ) -> (bool, bool, Vec<u32>, Vec<u32>) {
         let mut closed = true;
         let mut without_backflow = true;
         let mut key = Vec::with_capacity(inputs.len());
@@ -1964,6 +1982,15 @@ impl ComponentSolver {
                 }
             }
         }
+        (closed, without_backflow, key, targets)
+    }
+
+    #[cfg(debug_assertions)]
+    fn record_summary_reuse(&mut self, definition: u32, inputs: &[KernelSummaryCallInput]) {
+        if self.reuse_probe.is_none() {
+            return;
+        }
+        let (closed, without_backflow, key, targets) = self.classify_summary_inputs(inputs);
         let probe = self.reuse_probe.as_mut().expect("probe checked above");
         probe.calls = probe.calls.saturating_add(1);
         if closed {
@@ -1981,6 +2008,67 @@ impl ComponentSolver {
             let observed = probe.closed_class_targets.entry(class).or_default();
             for target in targets {
                 observed.insert(target);
+            }
+        }
+    }
+
+    /// Opt-in K1′ probe: capture the evaluated transfer of a closed call and
+    /// compare it with the first capture of the same class.
+    #[cfg(debug_assertions)]
+    fn probe_closed_transfer(
+        &mut self,
+        definition: u32,
+        inputs: &[KernelSummaryCallInput],
+        term: TypeTermId,
+    ) {
+        if self.reuse_probe.is_none() {
+            return;
+        }
+        let (closed, _, key, _) = self.classify_summary_inputs(inputs);
+        if !closed {
+            return;
+        }
+        // Compare resolved semantics, not raw ids: an unresolved binding can
+        // differ in identity while resolving to the same type.
+        let resolved_term = self.resolve_term(term);
+        let resolved_term = self.erase_unbound_contextual_holes(resolved_term);
+        let raw_requirements = self.summary_requirement_values.clone();
+        let mut requirements = Vec::with_capacity(raw_requirements.len());
+        for value in &raw_requirements {
+            requirements.push(value.map(|value| {
+                let value = self.resolve_term(value);
+                self.erase_unbound_contextual_holes(value).0
+            }));
+        }
+        let mut has_variables = self.program.terms.has_variable(resolved_term);
+        if !has_variables {
+            for value in requirements.iter().flatten() {
+                if self.program.terms.has_variable(TypeTermId(*value)) {
+                    has_variables = true;
+                    break;
+                }
+            }
+        }
+        let entry = (resolved_term.0, requirements);
+        let probe = self.reuse_probe.as_mut().expect("probe checked above");
+        if has_variables {
+            probe.closed_entries_with_variables =
+                probe.closed_entries_with_variables.saturating_add(1);
+        }
+        let class = (definition, key.into_boxed_slice());
+        match probe.closed_transfers.get(&class) {
+            Some(previous) => {
+                probe.closed_repeats = probe.closed_repeats.saturating_add(1);
+                if previous.0 != entry.0 {
+                    probe.closed_value_mismatches = probe.closed_value_mismatches.saturating_add(1);
+                }
+                if previous.1 != entry.1 {
+                    probe.closed_requirement_mismatches =
+                        probe.closed_requirement_mismatches.saturating_add(1);
+                }
+            }
+            None => {
+                probe.closed_transfers.insert(class, entry);
             }
         }
     }

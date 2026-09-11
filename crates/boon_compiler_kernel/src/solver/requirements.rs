@@ -712,31 +712,6 @@ impl super::ComponentSolver {
             // Closed contributions cannot be affected by merge side effects,
             // so a destination whose closed signature repeats can restore the
             // previously folded aggregate exactly instead of re-merging.
-            if self.requirement_phase_probe.is_some() {
-                let common = self
-                    .requirement_phase_probe
-                    .as_ref()
-                    .and_then(|probe| probe.last_signature.get(&target.0))
-                    .map(|previous| {
-                        previous
-                            .iter()
-                            .zip(folded_terms.iter())
-                            .take_while(|(left, right)| left == right)
-                            .count()
-                    })
-                    .unwrap_or(0);
-                if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                    if common > 0 {
-                        probe.prefix_reuse_folds = probe.prefix_reuse_folds.saturating_add(1);
-                        probe.prefix_reuse_terms = probe
-                            .prefix_reuse_terms
-                            .saturating_add(u64::try_from(common).unwrap_or(u64::MAX));
-                    }
-                    probe
-                        .last_signature
-                        .insert(target.0, folded_terms.clone().into_boxed_slice());
-                }
-            }
             let all_closed = folded_terms
                 .iter()
                 .all(|term| !self.program.terms.has_variable(*term));
@@ -754,50 +729,9 @@ impl super::ComponentSolver {
                     .requirement_phase_probe
                     .is_some()
                     .then(std::time::Instant::now);
-                // Homogeneous folds reproduce the pairwise left fold exactly
-                // but intern only the final term.
-                aggregate = self.merge_requirement_terms(&folded_terms);
-                if aggregate.is_some() {
-                    if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                        probe.single_pass_folds = probe.single_pass_folds.saturating_add(1);
-                    }
-                    self.requirements.work.aggregate_fact_visits = self
-                        .requirements
-                        .work
-                        .aggregate_fact_visits
-                        .saturating_add(u64::try_from(folded_terms.len()).unwrap_or(u64::MAX));
-                } else {
-                    if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                        probe.pairwise_folds = probe.pairwise_folds.saturating_add(1);
-                    }
-                    for term in folded_terms.iter().copied() {
-                        self.requirements.work.aggregate_fact_visits = self
-                            .requirements
-                            .work
-                            .aggregate_fact_visits
-                            .saturating_add(1);
-                        if let Some(previous) = aggregate
-                            && !self.program.terms.has_variable(previous)
-                            && !self.program.terms.has_variable(term)
-                        {
-                            if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                                probe.closed_merges = probe.closed_merges.saturating_add(1);
-                            }
-                            if self.requirement_closed_pairs.insert((previous.0, term.0)) {
-                                if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                                    probe.distinct_closed_pairs =
-                                        probe.distinct_closed_pairs.saturating_add(1);
-                                }
-                            } else if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                                probe.closed_pair_hits = probe.closed_pair_hits.saturating_add(1);
-                            }
-                        }
-                        aggregate = Some(match aggregate {
-                            None => term,
-                            Some(previous) => self.merge_type_evidence(previous, term, false),
-                        });
-                    }
-                }
+                // Ordered fold with retained prefixes: an unchanged prefix is
+                // restored and only the changed suffix is merged.
+                aggregate = self.fold_requirement_terms(target, &folded_terms);
                 if let Some(probe) = self.requirement_phase_probe.as_mut() {
                     probe.folds = probe.folds.saturating_add(1);
                 }

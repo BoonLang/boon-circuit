@@ -1262,3 +1262,35 @@ retained prefix aggregate would therefore skip roughly 88% of TodoMVC and 79%
 of NovyWave contributor terms — the incremental-aggregation shape the contract
 asks for — and it is the next slice. Full record:
 [merge no-op and prefix measurement](evidence/compiler-k1pp-merge-noop-2026-09-11.json).
+
+### 2026-09-11: K1″ sixth slice — destinations fold incrementally from their retained prefix
+
+This is the contract's headline mechanism. Every requirement destination now
+retains the resolved contributor list of its last fold together with the
+aggregate after every prefix of that list. The next fold compares the ordered
+lists, restores the stored aggregate at the last common contributor, and merges
+only the remaining suffix; the new prefix aggregates are retained in turn. The
+homogeneous single-pass fold is replaced, because it interned only the final
+term and could not expose prefix aggregates. Merging in this path is a pure
+left fold (no call binds a variable and structural widening is a cached pure
+function), so a stored prefix aggregate is exactly what the full fold would
+have computed; withdrawal, replacement and alias reordering simply shorten the
+common prefix.
+
+Release probe (one observation per fixture and build): NovyWave refresh 251.1 →
+121.7 ms, merge 143.6 → 20.4 ms, merge interning 123,087 → 24,368 requests,
+with 3,086 folds resuming a 93,283-term prefix against 1,506 full folds.
+TodoMVC refresh 138.5 → 133.9 ms, merge 8.5 → 7.8 ms. Interleaved A/B, eight
+rounds, one process per observation: NovyWave diagnostics 785.8 → 669.0 ms
+(−14.9%, min 661.2), TodoMVC diagnostics 949.7 vs 961.5 (−1.2%, noisy lane) and
+TodoMVC verified flat (+0.6%). Every lane produced a single (fingerprint, plan)
+pair across both binaries: the incremental fold reproduces byte-identical
+diagnostics and machine plans. All standing gates are green (kernel 197,
+kernel_transfer 10, compiler library 98 with one pre-existing ignored probe,
+staged 3, map_set 3, nested_boolean_match 3, pulses 8). Full record:
+[retained-prefix fold](evidence/compiler-k1pp-fold-prefix-2026-09-11.json).
+
+NovyWave now sits roughly +26% above the K0 producer on diagnostics (was
++45.8%). Its remaining refresh is resolve 35.9, merge 20.4, order 15.6, deps
+12.3, occurs 10.9 and collection/invalidation ~5 ms, so the next slice targets
+contributor resolution, which still issues about 237,000 intern requests.

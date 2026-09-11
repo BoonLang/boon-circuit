@@ -361,6 +361,11 @@ struct ComponentSolver {
     /// tell an unchanged aggregate from a changed one and only re-schedule the
     /// destinations whose binding actually moved. Drained every refresh.
     requirement_previous_bindings: std::collections::HashMap<u32, TypeTermId>,
+    /// Retained ordered fold state per destination: the resolved contributor
+    /// list of the last fold and the aggregate after every prefix of it. A
+    /// committed site change reuses the unchanged prefix and merges only the
+    /// suffix.
+    requirement_fold_state: std::collections::HashMap<u32, RetainedFold>,
     /// Opt-in K1″ sub-phase probe. Splits the fold into occurs, resolve and
     /// merge time so a release producer can attribute the refresh cost.
     /// Absent unless `BOON_KERNEL_TRACE_AGGREGATE_PHASE` is set.
@@ -368,6 +373,15 @@ struct ComponentSolver {
     /// Closed merge pairs already folded, used only by the phase probe to
     /// bound a closed-pair merge cache.
     requirement_closed_pairs: std::collections::HashSet<(u32, u32)>,
+}
+
+/// Ordered fold state retained per requirement destination. The prefix
+/// aggregates are pure fold results, so an unchanged ordered prefix can be
+/// restored instead of re-merged.
+#[derive(Default)]
+struct RetainedFold {
+    inputs: Box<[TypeTermId]>,
+    prefixes: Box<[TypeTermId]>,
 }
 
 #[cfg(debug_assertions)]
@@ -431,11 +445,9 @@ struct RequirementPhaseProbe {
     invalidate_affected: u64,
     invalidate_recorded: u64,
     commit_skipped_touches: u64,
-    single_pass_folds: u64,
-    pairwise_folds: u64,
+    full_folds: u64,
     prefix_reuse_folds: u64,
     prefix_reuse_terms: u64,
-    last_signature: std::collections::HashMap<u32, Box<[TypeTermId]>>,
     intern_invalidate: u64,
     intern_collect: u64,
     intern_resolve: u64,
@@ -451,7 +463,7 @@ impl Drop for RequirementPhaseProbe {
         }
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         eprintln!(
-            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} single_pass_folds={} pairwise_folds={} prefix_reuse_folds={} prefix_reuse_terms={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
+            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
             self.calls,
             self.folds,
             self.memo_hits,
@@ -470,8 +482,7 @@ impl Drop for RequirementPhaseProbe {
             self.invalidate_affected,
             self.invalidate_recorded,
             self.commit_skipped_touches,
-            self.single_pass_folds,
-            self.pairwise_folds,
+            self.full_folds,
             self.prefix_reuse_folds,
             self.prefix_reuse_terms,
             self.intern_invalidate,
@@ -793,6 +804,7 @@ impl ComponentSolver {
                 .map(|_| AggregateProbe::default()),
             requirement_fold_memo: std::collections::HashMap::new(),
             requirement_previous_bindings: std::collections::HashMap::new(),
+            requirement_fold_state: std::collections::HashMap::new(),
             requirement_phase_probe: std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE_PHASE")
                 .map(|_| RequirementPhaseProbe::default()),
             requirement_closed_pairs: std::collections::HashSet::new(),
@@ -3181,126 +3193,84 @@ impl ComponentSolver {
         result
     }
 
-    /// Fold a homogeneous list of requirement contributions in one pass.
+    /// Fold a destination's resolved contributions in order, resuming from the
+    /// retained prefix aggregate when the ordered prefix is unchanged.
     ///
-    /// This reproduces the pairwise left fold exactly — the same contributions
-    /// are combined in the same order with the same per-field and per-payload
-    /// merge rules — but interns only the final term instead of one
-    /// intermediate per contributor. Returns None when the contributions are
-    /// not all variant sets or not all objects, so the caller keeps the
-    /// pairwise path for variables, unions and mixed kinds.
-    fn merge_requirement_terms(&mut self, terms: &[TypeTermId]) -> Option<TypeTermId> {
-        let (first, rest) = terms.split_first()?;
-        let first = self.resolve_term_head(*first);
-        if rest.is_empty() {
-            return Some(first);
+    /// The fold is a pure left fold — merging never binds a variable and
+    /// structural widening is a cached pure function — so the aggregate after
+    /// any prefix is a function of that prefix alone. A committed site change
+    /// therefore only re-merges the suffix that follows the first changed
+    /// contributor, and every prefix aggregate is retained for the next fold.
+    fn fold_requirement_terms(
+        &mut self,
+        target: TypeVariableId,
+        folded_terms: &[TypeTermId],
+    ) -> Option<TypeTermId> {
+        let retained = self.requirement_fold_state.remove(&target.0);
+        let common = retained
+            .as_ref()
+            .map(|state| {
+                state
+                    .inputs
+                    .iter()
+                    .zip(folded_terms.iter())
+                    .take_while(|(left, right)| left == right)
+                    .count()
+            })
+            .unwrap_or(0);
+        let mut prefixes: Vec<TypeTermId> = Vec::with_capacity(folded_terms.len());
+        let mut aggregate = None;
+        if let Some(state) = retained.as_ref()
+            && common > 0
+        {
+            prefixes.extend_from_slice(&state.prefixes[..common]);
+            aggregate = Some(state.prefixes[common - 1]);
         }
-        match self.program.terms.term_head(first) {
-            TypeTermHead::VariantSet(span) => {
-                let mut variants = self.variant_scratch.take();
-                variants.extend_from_slice(self.program.terms.variant_terms(span));
-                let mut changed = false;
-                for term in rest {
-                    let term = self.resolve_term_head(*term);
-                    let TypeTermHead::VariantSet(span) = self.program.terms.term_head(term) else {
-                        self.variant_scratch.recycle(variants);
-                        return None;
-                    };
-                    for ordinal in 0..span.len() {
-                        let incoming = self.program.terms.variant_terms(span)[ordinal];
-                        let Some(index) = variants
-                            .iter()
-                            .position(|variant| variant.tag() == incoming.tag())
-                        else {
-                            variants.push(incoming);
-                            changed = true;
-                            continue;
-                        };
-                        let existing = variants[index];
-                        let merged = match (existing, incoming) {
-                            (
-                                VariantTerm::Tagged { tag, fields },
-                                VariantTerm::Tagged { fields: right, .. },
-                            ) => VariantTerm::Tagged {
-                                tag,
-                                fields: self.merge_type_evidence(fields, right, false),
-                            },
-                            (VariantTerm::Tag(_), tagged @ VariantTerm::Tagged { .. }) => tagged,
-                            (existing, _) => existing,
-                        };
-                        if merged != existing {
-                            variants[index] = merged;
-                            changed = true;
-                        }
-                    }
-                }
-                // A contributor that adds no tag and widens no payload leaves
-                // the accumulator exactly as it was, so rebuild nothing.
-                if !changed && self.program.terms.variant_set_is_canonical(span) {
-                    self.variant_scratch.recycle(variants);
-                    return Some(first);
-                }
-                let merged = self.program.terms.variant_set(variants.iter().copied());
-                self.variant_scratch.recycle(variants);
-                Some(merged)
+        if let Some(probe) = self.requirement_phase_probe.as_mut() {
+            if common > 0 {
+                probe.prefix_reuse_folds = probe.prefix_reuse_folds.saturating_add(1);
+                probe.prefix_reuse_terms = probe
+                    .prefix_reuse_terms
+                    .saturating_add(u64::try_from(common).unwrap_or(u64::MAX));
+            } else {
+                probe.full_folds = probe.full_folds.saturating_add(1);
             }
-            TypeTermHead::Object { shape, open } => {
-                let mut fields = self.record_field_scratch.take();
-                let count = self.program.terms.object_fields_for_shape(shape).len();
-                fields.reserve(count);
-                for ordinal in 0..count {
-                    let field = self
-                        .program
-                        .terms
-                        .object_field_for_shape(shape, ordinal)
-                        .expect("sealed object field exists");
-                    fields.push((field.name, field.ty));
-                }
-                let mut open = open;
-                let mut changed = false;
-                for term in rest {
-                    let term = self.resolve_term_head(*term);
-                    let TypeTermHead::Object {
-                        shape,
-                        open: term_open,
-                    } = self.program.terms.term_head(term)
-                    else {
-                        self.record_field_scratch.recycle(fields);
-                        return None;
-                    };
-                    changed |= term_open && !open;
-                    open |= term_open;
-                    let count = self.program.terms.object_fields_for_shape(shape).len();
-                    for ordinal in 0..count {
-                        let right = self
-                            .program
-                            .terms
-                            .object_field_for_shape(shape, ordinal)
-                            .expect("sealed object field exists");
-                        if let Some(index) = fields.iter().position(|left| left.0 == right.name) {
-                            let merged = self.merge_type_evidence(fields[index].1, right.ty, false);
-                            if merged != fields[index].1 {
-                                fields[index].1 = merged;
-                                changed = true;
-                            }
-                        } else {
-                            fields.push((right.name, right.ty));
-                            changed = true;
-                        }
-                    }
-                }
-                // Subsumed contributors keep the accumulator identical, so
-                // there is nothing to re-intern.
-                if !changed {
-                    self.record_field_scratch.recycle(fields);
-                    return Some(first);
-                }
-                let result = self.program.terms.object(fields.iter().copied(), open);
-                self.record_field_scratch.recycle(fields);
-                Some(result)
-            }
-            _ => None,
         }
+        for term in folded_terms.iter().copied().skip(common) {
+            self.requirements.work.aggregate_fact_visits = self
+                .requirements
+                .work
+                .aggregate_fact_visits
+                .saturating_add(1);
+            if let Some(previous) = aggregate
+                && !self.program.terms.has_variable(previous)
+                && !self.program.terms.has_variable(term)
+            {
+                if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                    probe.closed_merges = probe.closed_merges.saturating_add(1);
+                }
+                if self.requirement_closed_pairs.insert((previous.0, term.0)) {
+                    if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                        probe.distinct_closed_pairs = probe.distinct_closed_pairs.saturating_add(1);
+                    }
+                } else if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                    probe.closed_pair_hits = probe.closed_pair_hits.saturating_add(1);
+                }
+            }
+            aggregate = Some(match aggregate {
+                None => term,
+                Some(previous) => self.merge_type_evidence(previous, term, false),
+            });
+            prefixes.push(aggregate.expect("folded term was just stored"));
+        }
+        self.requirement_fold_state.insert(
+            target.0,
+            RetainedFold {
+                inputs: folded_terms.into(),
+                prefixes: prefixes.into_boxed_slice(),
+            },
+        );
+        aggregate
     }
 
     fn merge_equal_terms(&mut self, left: TypeTermId, right: TypeTermId) -> TypeTermId {

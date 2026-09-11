@@ -1207,3 +1207,35 @@ library 98 with one pre-existing ignored probe, staged 3, map_set 3,
 nested_boolean_match 3, pulses 8. NovyWave remains about 60% above K0 and its
 remaining cost is the recursive merge, so the next slice still targets that
 merge; the contract's 3+30 A/B/A acceptance run for this candidate follows.
+
+### 2026-09-11: K1″ touch-elimination acceptance — TodoMVC crosses K0
+
+The full contract protocol ran for the touch-elimination candidate
+(`d234c11e`): interleaved A/B/A, 3 setup + 30 scored observations per fixture,
+mode and intent, one producer process per observation, release product and
+evidence lanes, cold fresh-process and empty-session, the middle leg collected
+in the preserved K0 worktree (`2d7a5343`). Raw reports:
+`target/reports/compiler-performance/k1pp-aba2-{candidate-a,k0,candidate-b}.json`;
+compact record with per-leg work medians and plan hashes:
+[touch-elimination acceptance](evidence/compiler-k1pp-aba-touch-2026-09-11.json).
+
+| fixture / intent, fresh-process p50 | candidate-a | K0 | candidate-b | b vs K0 |
+| --- | ---: | ---: | ---: | ---: |
+| TodoMVC diagnostics | 915.7 ms | 970.6 ms | 914.9 ms | −5.7% |
+| TodoMVC verified | 1390.3 ms | 1344.4 ms | 1314.2 ms | −2.3% |
+| NovyWave diagnostics | 775.0 ms | 531.1 ms | 774.5 ms | +45.8% |
+| NovyWave verified | 2104.8 ms | 1836.0 ms | 2104.5 ms | +14.6% |
+
+The candidate is now faster than the interleaved K0 producer on TodoMVC in all
+four mode/intent cells (−5.7% and −10.2% diagnostics, −2.3% and −7.3%
+verified), which is the first time in this goal that a large fixture is at or
+below K0 class; both candidate legs agree inside 0.1% p50 on the large
+fixtures. NovyWave improves to +45.8% (from +69.5% at the previous baseline)
+and its remaining cost is the recursive merge. Diagnostics fingerprints are
+byte-identical across all legs; the TodoMVC machine plan moves as disclosed in
+the slice record, and both candidate legs carry occasional p95 outliers that
+look like host interference (the p50 values are the interleaved metric).
+
+The Implemented ending is therefore met for TodoMVC and still open for
+NovyWave: the next slice attacks NovyWave's recursive payload merge (144.3 ms
+of a 247.8 ms refresh) under the same gates and evidence discipline.

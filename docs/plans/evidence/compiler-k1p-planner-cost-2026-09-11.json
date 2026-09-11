@@ -23,14 +23,14 @@
       {"definition": 103, "owner_nodes": 0, "owner_calls": 0, "summary_nodes": 271, "unify": 59, "input": 62, "sequence": 24, "record": 17}
     ],
     "nested_call_sharing": {"nested_calls": 0, "targets_with_compiled_summary": 0, "share_attempts": 0},
-    "finding": "the programs are not inflated by transitive inlining; TodoMVC's dominant summaries contain no nested calls at all. A 97-node owner compiles into a 465-node summary program, about 4.8x, dominated by per-field input nodes and per-arm/per-field unify and sequence scaffolding."
+    "finding": "the programs are not inflated by transitive inlining; TodoMVC's dominant summaries contain no nested calls at all. A 97-node owner emits 465 nodes before folding and 140 nodes in the interpreted program, 1.44x the owner, dominated by per-field input nodes and per-arm/per-field unify and sequence scaffolding."
   },
   "final_transfer_program_composition": {
     "trace": "the same debug trace now prints the post-fold program histogram and the source owner's node and call counts",
     "todo-mvc-physical_definition_104": {"pre_fold_nodes": 465, "final_nodes": 140, "owner_nodes": 97, "owner_calls": 0, "input": 45, "unify": 41, "sequence": 16, "record": 16, "projection": 14, "term": 5, "select": 3},
-    "todo-mvc-physical_definition_79": {"pre_fold_nodes": 410, "final_nodes": 250, "owner_nodes": 254, "owner_calls": 0, "input": 77, "unify": 75, "sequence": 30, "record": 22, "term": 7, "select": 6, "collection": 2},
+    "todo-mvc-physical_definition_79": {"pre_fold_nodes": 410, "final_nodes": 219, "owner_nodes": 254, "owner_calls": 0, "input": 77, "unify": 75, "sequence": 30, "record": 22, "term": 7, "select": 6, "collection": 2},
     "scaffolding_origin": "the Unify nodes come from one emission site: for every closed WHEN, the planner emits one PatternRequirement input and one Unify node per arm (`requirements.push(... Unify { value: selector, requirement })`) wrapped in a Sequence. The Input nodes are per distinct formal projection. K0's planner has no Unify emission site at all, which is why its programs were small and also why it failed the closed-domain and whole-selector regressions the K1 correctness work fixed.",
-    "cost_model": "1,017,465 candidate summary node evaluations against a +268 ms TodoMVC typecheck excess implies about 265 ns per interpreted node visit. Removing 60% of the scaffolding would recover roughly 160 ms, still short of K0's 268 ms advantage; the remainder needs cheaper per-node execution (linked code) or restored K0 path quality."
+    "cost_model": "1,017,465 candidate summary node evaluations against a +268 ms TodoMVC typecheck excess implies about 265 ns per interpreted node visit; definition 104 evaluates 110.3 nodes per program evaluation and definition 79 evaluates 212.9, against K0's 17.0 and 5.1. The decisive problem is per-call evaluation cost, not program blow-up: 102 of definition 104's 140 final nodes are the requirement/pattern scaffolding. Removing 60% of it would recover roughly 160 ms, still short of K0's 268 ms advantage; the remainder needs cheaper per-node execution (linked code) or restored K0 path quality."
   },
   "per_definition_evaluation_cost": {
     "todo-mvc-physical_definition_79": {"k0_program_evaluations": 720, "k0_node_evaluations": 12248, "k0_nodes_per_evaluation": 17.0, "candidate_program_evaluations": 674, "candidate_node_evaluations": 143509, "candidate_nodes_per_evaluation": 212.9},
@@ -52,5 +52,26 @@
     "first_gate": "definition 79 and 104 node counts and nodes-per-evaluation must approach K0's profile (17-40 nodes per evaluation) without regressing kernel library, kernel_transfer, staged, or compiler library gates",
     "acceptance": "same 3+30 interleaved protocol, no cold regression against the fresh K0 producer, and no increase in requirement-mismatch or correctness oracles"
   },
-  "goal_status": "active; the bounded goal has reached its decision boundary and needs the next scope (planner/linked-code cut or K3/K4 warm work) selected by the user"
+  "independent_review": {
+    "reviewer": "fresh-context read-only subagent",
+    "verdict": "the K1-prime endpoint holds; both rejections and the stop-for-scope boundary survive independent reproduction",
+    "reproduced_exactly": [
+      "reuse probe: TodoMVC 11,227 calls / 3,911 closed / 168 classes / 3,743 shared / 103 max targets / 0 value mismatches / 84 requirement mismatches; NovyWave 5,566 / 1,936 / 143 / 1,793 / 89 / 0 / 4",
+      "residual A/B work counters: TodoMVC 747,280 activations / 335,756 linked / 10,205 frames; NovyWave 1,001,073 / 542,601 / 24,756; latency direction and class reproduced on a clean release rebuild",
+      "warm baseline report hashes, p50s and per-edit counters; per-definition node ratios (212.9 vs 17.0 and 25.5 vs 5.1); budget values 16.7 / 100 / 1.0 / 16.7 ms",
+      "probes are debug-only, the residual path is opt-in, and both sharing experiments are reverted"
+    ],
+    "corrections_applied": [
+      "the 465-node figure is the pre-fold IR count; the interpreted program is 140 nodes (1.44x the 97-node owner), and definition 79's final program is 219 nodes, not 250",
+      "the defensible root cause is per-call evaluation cost (110.3 and 212.9 nodes per evaluation against K0's 17.0 and 5.1), not program blow-up",
+      "warm multiples restated as p95 against p95 limits: 58.9x / 72.6x diagnostics and 23.3x / 28.9x preview"
+    ],
+    "not_verified": [
+      "the collector's 3+30 rejection itself (the 16 MiB cap was confirmed in code, not the rejection)",
+      "the K0 producer was not rebuilt; K0 latencies are read from stored reports and short reruns",
+      "the residual A/B is single-sample with no stored raw JSON; the reviewer's rerun drifted 2-10% upward"
+    ],
+    "recommendation": "store the raw residual A/B outputs on the next cut and keep the corrected per-call cost framing"
+  },
+  "goal_status": "active; the goal's Allowed Work explicitly includes linked compatible code variants and occurrence frames, so the corrected next cut is in scope and the goal continues on it rather than stopping for a scope decision"
 }

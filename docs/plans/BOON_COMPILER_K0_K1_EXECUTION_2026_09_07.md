@@ -817,8 +817,9 @@ the candidate's bundle path. Full record:
 | update ack | 0.051 ms | 0.051 ms | – |
 | switch ack / bundle lookup | 0.0003 / 0.0002 ms | 0.0002 / 0.0002 ms | 16.7 / 1.0 ms |
 
-Nowhere near the budget: diagnostics is 56x over at K0 and 72x at the
-candidate; preview is 23x and 29x over. The per-edit work counters explain it:
+Nowhere near the budget: warm diagnostics p95 is 58.9x the 16.7 ms limit at K0
+and 72.6x at the candidate; warm preview p95 is 23.3x the 100 ms limit at K0
+and 28.9x at the candidate. The per-edit work counters explain it:
 each warm edit performs the producer's full cold solve (K0: 620,555
 activations and 32,365 summary node evaluations; candidate: 181,056 and
 1,017,465). The session retains no solved state across edits, so the warm fix
@@ -869,8 +870,9 @@ probe, all green.
 
 Follow-up trace: the final (post-fold) transfer program for definition 104 is
 140 nodes — 45 input, 41 unify, 16 sequence, 16 record, 14 projection, 5 term
-and 3 select — against a 97-node owner with no calls. Definition 79 is about
-250 nodes. The unify scaffolding comes from one emission site that adds a
+and 3 select — against a 97-node owner with no calls; the 465 figure is the
+pre-fold count. Definition 79's final program is 219 nodes. The unify
+scaffolding comes from one emission site that adds a
 `PatternRequirement` input and one `Unify` node per closed WHEN arm, and K0's
 planner has no such site: that is exactly why K0's programs were small and why
 K0 failed the closed-domain and whole-selector regressions the K1 correctness
@@ -878,5 +880,20 @@ work fixed. At roughly 265 ns per interpreted node visit, deleting the whole
 scaffolding would recover about 160 ms of TodoMVC's +268 ms excess — close, but
 not sufficient without cheaper per-node execution. That is a K2-scale linked
 code cut, which this bounded goal excludes, so the goal stops here pending a
-scope decision: K2 linked transfer code, K3/K4 warm responsiveness, or accepting
-this report as the K1′ outcome.
+decision: this first report framed the remaining work as a K2 scope question.
+
+An independent fresh-context read-only review reproduced the reuse probe, the
+residual A/B work counters, the warm baseline and the per-definition ratios,
+and returned a support verdict with two load-bearing corrections now folded in:
+the 465-node figure is a pre-fold IR count (the interpreted program is 140
+nodes, 1.44x its owner) and definition 79's final program is 219 nodes, so the
+defensible root cause is per-call evaluation cost (110.3 and 212.9 nodes per
+evaluation against K0's 17.0 and 5.1), not program blow-up. The reviewer also
+noted the residual A/B should store raw outputs next cut.
+
+Scope reassessment after the review: the goal's Allowed Work explicitly lists
+"linked compatible code variants and occurrence frames inside the kernel, so
+evaluation is scheduled work rather than an interpreted per-call walk". The
+corrected next cut is therefore in scope, and the goal continues on it instead
+of stopping for a scope decision. K3/K4 warm work remains out of scope and is
+recorded as the product-critical follow-on.

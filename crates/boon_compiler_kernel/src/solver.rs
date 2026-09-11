@@ -342,6 +342,53 @@ struct ComponentSolver {
     variant_scratch: ScratchPool<VariantTerm>,
     variable_scratch: ScratchPool<TypeVariableId>,
     work: KernelSolveWork,
+    /// Opt-in K1′ reuse probe. It classifies each summary call by whether its
+    /// resolved inputs are closed and whether the call owns a requirement
+    /// backflow channel, then groups closed calls by definition and resolved
+    /// input terms. Debug-only; absent from release producers.
+    #[cfg(debug_assertions)]
+    reuse_probe: Option<SummaryReuseProbe>,
+}
+
+#[cfg(debug_assertions)]
+#[derive(Default)]
+struct SummaryReuseProbe {
+    calls: u64,
+    closed_calls: u64,
+    closed_without_backflow: u64,
+    /// Closed calls grouped by definition and resolved input terms.
+    closed_classes: std::collections::HashMap<(u32, Box<[u32]>), u64>,
+    /// Distinct requirement targets observed inside each closed class.
+    closed_class_targets:
+        std::collections::HashMap<(u32, Box<[u32]>), std::collections::HashSet<u32>>,
+    /// Closed calls whose class is shared with at least one other call.
+    closed_calls_in_shared_classes: u64,
+}
+
+#[cfg(debug_assertions)]
+impl Drop for SummaryReuseProbe {
+    fn drop(&mut self) {
+        if std::env::var_os("BOON_KERNEL_TRACE_REUSE").is_none() {
+            return;
+        }
+        eprintln!(
+            "kernel-summary-reuse calls={} closed={} closed_without_backflow={} closed_classes={} closed_shared_classes={} closed_calls_in_shared_classes={} closed_class_max_targets={}",
+            self.calls,
+            self.closed_calls,
+            self.closed_without_backflow,
+            self.closed_classes.len(),
+            self.closed_classes
+                .values()
+                .filter(|count| **count > 1)
+                .count(),
+            self.closed_calls_in_shared_classes,
+            self.closed_class_targets
+                .values()
+                .map(std::collections::HashSet::len)
+                .max()
+                .unwrap_or(0)
+        );
+    }
 }
 
 struct SolverExecution {
@@ -589,6 +636,9 @@ impl ComponentSolver {
             record_field_scratch: ScratchPool::default(),
             variant_scratch: ScratchPool::default(),
             variable_scratch: ScratchPool::default(),
+            #[cfg(debug_assertions)]
+            reuse_probe: std::env::var_os("BOON_KERNEL_TRACE_REUSE")
+                .map(|_| SummaryReuseProbe::default()),
         };
         let execution = SolverExecution {
             operations,
@@ -1842,6 +1892,8 @@ impl ComponentSolver {
         inputs: &[KernelSummaryCallInput],
     ) -> Result<(), KernelSolveError> {
         self.work.summary_call_activations = self.work.summary_call_activations.saturating_add(1);
+        #[cfg(debug_assertions)]
+        self.record_summary_reuse(program.definition, inputs);
         self.begin_summary_requirements(output, inputs);
         let result = self.evaluate_summary_program(program, inputs);
         self.finish_summary_requirements(output, inputs, result.is_ok());
@@ -1855,6 +1907,82 @@ impl ComponentSolver {
         self.set_syntax_selected(output, result.syntax_selected);
         self.call_syntax_selected[output.0 as usize] = result.syntax_selected;
         Ok(())
+    }
+
+    /// Opt-in K1′ probe: classify one summary call by its resolved inputs.
+    #[cfg(debug_assertions)]
+    fn record_summary_reuse(&mut self, definition: u32, inputs: &[KernelSummaryCallInput]) {
+        if self.reuse_probe.is_none() {
+            return;
+        }
+        let mut closed = true;
+        let mut without_backflow = true;
+        let mut key = Vec::with_capacity(inputs.len());
+        let mut targets = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            match input {
+                KernelSummaryCallInput::Term(term) => {
+                    let term = self.resolve_term(*term);
+                    if self.program.terms.has_variable(term) {
+                        closed = false;
+                    }
+                    key.push(term.0);
+                    targets.push(u32::MAX);
+                }
+                KernelSummaryCallInput::Projection {
+                    provider,
+                    steps,
+                    requirement,
+                    ..
+                } => {
+                    if requirement.is_some() {
+                        without_backflow = false;
+                    }
+                    targets.push(
+                        requirement
+                            .as_ref()
+                            .map_or(u32::MAX, |target| target.provider.0),
+                    );
+                    let mut term = self.program.terms.variable(*provider);
+                    for step in steps {
+                        term = self.resolve_term_head(term);
+                        term = match &step.projection {
+                            crate::KernelSummaryProjection::Whole => term,
+                            crate::KernelSummaryProjection::Field(field) => {
+                                self.project_field(term, *field).unwrap_or(term)
+                            }
+                            crate::KernelSummaryProjection::Pattern { pattern, fields } => self
+                                .narrow_pattern_payload(term, *pattern)
+                                .and_then(|payload| self.project_path_term(payload, fields))
+                                .unwrap_or(term),
+                        };
+                    }
+                    if self.program.terms.has_variable(term) {
+                        closed = false;
+                    }
+                    key.push(term.0);
+                }
+            }
+        }
+        let probe = self.reuse_probe.as_mut().expect("probe checked above");
+        probe.calls = probe.calls.saturating_add(1);
+        if closed {
+            probe.closed_calls = probe.closed_calls.saturating_add(1);
+            if without_backflow {
+                probe.closed_without_backflow = probe.closed_without_backflow.saturating_add(1);
+            }
+            let class = (definition, key.into_boxed_slice());
+            let count = probe.closed_classes.entry(class.clone()).or_insert(0);
+            *count = count.saturating_add(1);
+            if *count > 1 {
+                probe.closed_calls_in_shared_classes =
+                    probe.closed_calls_in_shared_classes.saturating_add(1);
+            }
+            let observed = probe.closed_class_targets.entry(class).or_default();
+            for target in targets {
+                observed.insert(target);
+            }
+        }
     }
 
     fn evaluate_summary_program(

@@ -1,0 +1,41 @@
+{
+  "status": "K1-prime reuse ceiling measured; a sound partial memo key exists for closed summary calls, the majority of calls stay open",
+  "date": "2026-09-11",
+  "probe": {
+    "where": "boon_compiler_kernel solver summary_call, debug-only and env-gated by BOON_KERNEL_TRACE_REUSE",
+    "classification": "resolves each call input term without mutation, marks the call closed when no resolved term contains a live variable, and groups closed calls by (definition, resolved input term ids) while tracking the distinct requirement targets seen per class",
+    "production_impact": "none; the probe is absent from release producers"
+  },
+  "measurements_debug_cli_fresh_process_diagnostics": {
+    "todo-mvc-physical": {
+      "summary_calls": 11227,
+      "closed_calls": 3911,
+      "closed_share": 0.348,
+      "closed_without_backflow": 0,
+      "closed_classes": 168,
+      "closed_shared_classes": 100,
+      "closed_calls_in_shared_classes": 3743,
+      "closed_calls_in_shared_share": 0.957,
+      "closed_class_max_targets": 103
+    },
+    "novywave": {
+      "summary_calls": 5566,
+      "closed_calls": 1936,
+      "closed_share": 0.348,
+      "closed_without_backflow": 365,
+      "closed_classes": 143,
+      "closed_shared_classes": 120,
+      "closed_calls_in_shared_classes": 1793,
+      "closed_calls_in_shared_share": 0.926,
+      "closed_class_max_targets": 89
+    }
+  },
+  "findings": [
+    "About 35% of summary calls have fully closed resolved inputs; the remaining 65% carry live variables and cannot be keyed by resolved terms alone.",
+    "Closed calls repeat heavily: 3,743 of 3,911 TodoMVC closed calls (95.7%) share their (definition, input terms) class with at least one other call, forming only 168 classes; NovyWave is 1,793 of 1,936 in 143 classes.",
+    "No closed call lacks a requirement channel: closed_without_backflow is zero on TodoMVC, so a transfer cache must separate the reusable value/requirement shape from per-occurrence requirement destinations.",
+    "Per-class requirement targets fragment widely (up to 103 distinct targets in one TodoMVC class), confirming the architecture plan's split between reusable parametric transfer and per-occurrence bindings.",
+    "A closed-call memo can therefore remove roughly a third of summary evaluation work, but it cannot by itself restore K0 latency; the open-call majority needs a parametric skeleton or linked code, or the evaluated fallback."
+  ],
+  "decision": "Implement the closed-call memoization slice first as the low-risk, sound part of K1-prime, and use its measured reduction to decide whether a parametric open-call skeleton is reachable inside this goal or whether the reviewed fallback to linked residual evaluation is the honest ending."
+}

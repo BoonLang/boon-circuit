@@ -1,0 +1,41 @@
+{
+ "status": "tenth aggregation slice: an unchanged (receipt, pre-receipt aggregate) pair reuses the retained ordering instead of walking the term; phase-level win, end-to-end inside the host's noise floor",
+ "date": "2026-09-12",
+ "change": {
+  "cut": "order-receipt reuse",
+  "what": "each destination's retained fold state now also records the pre-receipt aggregate of its last fold, the receipt that aggregate was ordered against, and the ordered result. When the new fold produces the same pre-receipt aggregate and the installed receipt is unchanged, the retained ordered result is published instead of calling retain_requirement_order.",
+  "why": "order retention was NovyWave's second-largest refresh bucket (14.5 ms) and most folds change nothing, so the same pair recurs.",
+  "soundness": "retain_requirement_order is a pure function of (receipt, aggregate): the reuse requires both the pre-receipt aggregate and the receipt to be identical to the retained pair. Release takes the reuse; debug builds fold normally and assert the fresh walk equals the retained result."
+ },
+ "debug_cross_check": {
+  "first_attempt": "consulted the state after the fold insert, which had already published the new pre-receipt aggregate next to a carried-over receipt, so an initial state matched with ordered = None; 14 kernel tests failed on the assertion",
+  "fix": "capture the previously recorded pair before the fold and only reuse it; all gates pass with the cross-check active"
+ },
+ "phase_probe_release": {
+  "novywave_diagnostics": {"order_ms": [14.5, 12.1], "intern_order": [348, 63], "order_reuses": 2112, "folds": 4592, "refresh_total_ms": [93.0, 97.5]},
+  "todo_mvc_physical_diagnostics": {"order_ms": [0.59, 0.76], "intern_order": [54, 2], "order_reuses": 4891, "folds": 9662, "refresh_total_ms": [131.9, 133.9]},
+  "note": "single observations; totals vary by several ms between runs, the order and interning figures are the signal"
+ },
+ "interleaved_ab": {
+  "protocol": "eight alternating rounds, one process per observation, release evidence lane, cold fresh-process",
+  "todo_mvc_diagnostics_pct": -0.53,
+  "novywave_diagnostics_pct": 2.35,
+  "todo_mvc_verified_pct": -1.10,
+  "mins": "NovyWave before min 656.8 vs after min 648.4 ms; the p50 moved against the change, so the lane is inside the measured +/-1-3% null-control floor",
+  "parity": "single (fingerprint, plan) pair per lane"
+ },
+ "gates": {
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ },
+ "position": "kept on phase evidence only. NovyWave's refresh is ~93-97 ms with order now 12.1 ms; the rest is resolve ~20, merge ~14, occurs ~12, deps ~6, collection/invalidation/commit ~7 and roughly 20 ms of untimed loop overhead, all of it the cost of re-deriving each dirty destination inside a cold compile.",
+ "caveats": [
+  "the end-to-end effect is inside the host's noise floor; the phase figures are the evidence",
+  "cold modes only; the warm path is the successor goal"
+ ]
+}

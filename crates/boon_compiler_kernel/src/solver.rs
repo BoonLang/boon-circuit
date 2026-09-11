@@ -386,6 +386,12 @@ struct ComponentSolver {
 struct RetainedFold {
     inputs: Box<[TypeTermId]>,
     prefixes: Box<[TypeTermId]>,
+    /// The pre-receipt aggregate of the last fold, the receipt it was ordered
+    /// against and the ordered result. When the same pair recurs the retained
+    /// result is reused instead of walking the term again.
+    merged: Option<TypeTermId>,
+    ordered_receipt: Option<TypeTermId>,
+    ordered: Option<TypeTermId>,
 }
 
 #[cfg(debug_assertions)]
@@ -452,6 +458,7 @@ struct RequirementPhaseProbe {
     full_folds: u64,
     prefix_reuse_folds: u64,
     prefix_reuse_terms: u64,
+    order_reuses: u64,
     intern_invalidate: u64,
     intern_collect: u64,
     intern_resolve: u64,
@@ -467,7 +474,7 @@ impl Drop for RequirementPhaseProbe {
         }
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         eprintln!(
-            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
+            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
             self.calls,
             self.folds,
             self.memo_hits,
@@ -489,6 +496,7 @@ impl Drop for RequirementPhaseProbe {
             self.full_folds,
             self.prefix_reuse_folds,
             self.prefix_reuse_terms,
+            self.order_reuses,
             self.intern_invalidate,
             self.intern_collect,
             self.intern_resolve,
@@ -3290,9 +3298,26 @@ impl ComponentSolver {
             RetainedFold {
                 inputs: folded_terms.into(),
                 prefixes: prefixes.into_boxed_slice(),
+                merged: aggregate,
+                ordered_receipt: None,
+                ordered: None,
             },
         );
         aggregate
+    }
+
+    /// Remember the receipt an ordered aggregate was derived from, so the same
+    /// (receipt, pre-receipt aggregate) pair can reuse it without a walk.
+    fn record_requirement_fold_order(
+        &mut self,
+        target: TypeVariableId,
+        receipt: Option<TypeTermId>,
+        ordered: Option<TypeTermId>,
+    ) {
+        if let Some(state) = self.requirement_fold_state.get_mut(&target.0) {
+            state.ordered_receipt = receipt;
+            state.ordered = ordered;
+        }
     }
 
     fn merge_equal_terms(&mut self, left: TypeTermId, right: TypeTermId) -> TypeTermId {

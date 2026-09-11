@@ -731,6 +731,10 @@ impl super::ComponentSolver {
                     .then(std::time::Instant::now);
                 // Ordered fold with retained prefixes: an unchanged prefix is
                 // restored and only the changed suffix is merged.
+                let previous_order = self
+                    .requirement_fold_state
+                    .get(&target.0)
+                    .map(|state| (state.merged, state.ordered_receipt, state.ordered));
                 aggregate = self.fold_requirement_terms(target, &folded_terms);
                 if let Some(probe) = self.requirement_phase_probe.as_mut() {
                     probe.folds = probe.folds.saturating_add(1);
@@ -759,12 +763,32 @@ impl super::ComponentSolver {
                     .requirement_phase_probe
                     .is_some()
                     .then(std::time::Instant::now);
-                if let (Some(previous), Some(current)) = (
-                    self.requirements.targets[target.0 as usize].order,
-                    aggregate,
-                ) {
-                    aggregate = Some(self.retain_requirement_order(previous, current));
+                let receipt = self.requirements.targets[target.0 as usize].order;
+                let reused_order = previous_order
+                    .filter(|(merged, ordered_receipt, _)| {
+                        *merged == aggregate && *ordered_receipt == receipt
+                    })
+                    .map(|(_, _, ordered)| ordered);
+                if let Some(retained) = reused_order
+                    && !cfg!(debug_assertions)
+                {
+                    aggregate = retained;
+                    if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                        probe.order_reuses = probe.order_reuses.saturating_add(1);
+                    }
+                } else {
+                    if let (Some(previous), Some(current)) = (receipt, aggregate) {
+                        aggregate = Some(self.retain_requirement_order(previous, current));
+                    }
+                    #[cfg(debug_assertions)]
+                    if let Some(expected) = reused_order {
+                        debug_assert_eq!(
+                            aggregate, expected,
+                            "a repeated (receipt, merged) pair must order to the retained aggregate"
+                        );
+                    }
                 }
+                self.record_requirement_fold_order(target, receipt, aggregate);
                 let order_ns = order_started
                     .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
                 let order_interned = order_intern.map(|before| {
@@ -790,6 +814,12 @@ impl super::ComponentSolver {
                 }
             } else if let Some(probe) = self.requirement_phase_probe.as_mut() {
                 probe.memo_hits = probe.memo_hits.saturating_add(1);
+            }
+            if memo_hit {
+                // The memo stores the published aggregate, so its receipt is
+                // the one currently installed for this destination.
+                let receipt = self.requirements.targets[target.0 as usize].order;
+                self.record_requirement_fold_order(target, receipt, aggregate);
             }
             self.term_id_scratch.recycle(folded_terms);
             self.term_id_scratch.recycle(inputs);

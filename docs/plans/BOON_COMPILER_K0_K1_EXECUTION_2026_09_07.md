@@ -1462,3 +1462,28 @@ TodoMVC sits below the K0 producer, and NovyWave's 93 ms refresh is the cost of
 maintaining requirement aggregation inside a cold compile. Removing that
 residual needs the retained-revision machinery the contract assigns to the
 successor goal.
+
+### 2026-09-12: K1″ tenth slice — order receipts are reused when their pair repeats
+
+Each destination's retained state now also records the pre-receipt aggregate of
+its last fold, the receipt it was ordered against, and the ordered result. When
+a fold produces the same pre-receipt aggregate and the installed receipt is
+unchanged, the retained ordering is published instead of walking the term.
+`retain_requirement_order` is a pure function of that pair, and the
+`cfg(debug_assertions)` cross-check (release reuses, debug folds normally and
+asserts equality) caught a first version that consulted the state after the
+fold insert and matched an invalid pair — 14 kernel tests failed until the
+previously recorded pair was consulted instead.
+
+Phase effect: NovyWave order 14.5 → 12.1 ms with order interning 348 → 63 and
+2,112 of 4,592 folds reusing; TodoMVC order interning 54 → 2 with 4,891 of
+9,662 folds reusing. Interleaved A/B sits inside the ±1-3% null-control floor
+(TodoMVC −0.5%, NovyWave +2.4% p50 but −1.3% by minimum, verified −1.1%), so
+the slice is kept on phase evidence. Full record:
+[order-receipt reuse](evidence/compiler-k1pp-order-receipt-reuse-2026-09-12.json).
+All gates green.
+
+NovyWave's refresh is ~93-97 ms: resolve ~20, merge ~14, occurs ~12, order 12,
+deps ~6, collection/invalidation/commit ~7 and roughly 20 ms of untimed loop
+overhead — the cost of re-deriving each dirty destination inside a cold
+compile. The only unexplored bucket left is that untimed overhead.

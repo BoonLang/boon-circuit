@@ -1398,3 +1398,29 @@ the contract's allowed work covers under dependency updates. Its soundness
 depends on the walk reaching every destination reachable through bindings, so
 it needs its own audit before implementation; it is not started here and the
 decision is recorded in the evidence file.
+
+### 2026-09-12: measurement calibration — the A/B harness reads ±1-3% on identical binaries
+
+Before interpreting any further slice, the harness was calibrated with a null
+control: the same release evidence binary in both A/B slots, eight alternating
+rounds, one process per observation, on the loaded host. It reported TodoMVC
+diagnostics +1.77%, NovyWave diagnostics +1.05% and TodoMVC verified −2.70%.
+The harness therefore carries a ±1-3% p50 noise floor in the current
+environment, and the last three slices' end-to-end readings (dependency
+receipt −0.6%/+0.4%, fold re-convergence −1.1%/+1.3%, and the resolve/order
+no-ops at −3.9%/−4.0%) must be read with that in mind: only the resolve/order
+slice is outside the floor, and the phase-level measurements are the primary
+evidence for the rest. Any end-to-end claim for this goal needs either the
+quiet-window acceptance run or a null-control-bounded comparison.
+
+### 2026-09-12: rejected experiment — dense fold-state slots
+
+Replacing the fold-state map with a dense slot vector indexed by destination
+and reusing its two buffers across folds was implemented, gated (all suites
+green, byte-identical diagnostics and plans) and measured. Phase totals moved
+within probe noise (NovyWave refresh 93.0 → 96.2 ms, TodoMVC 136.0 → 132.9 ms in
+single observations) and the end-to-end A/B (+1.6% TodoMVC, −2.3% NovyWave)
+also sits inside the ±1-3% null-control floor recorded above. The dense form
+would also hold a ~4.6 MB mostly-empty vector on TodoMVC-like programs, so the
+experiment is reverted with no code change rather than kept for an unmeasurable
+effect.

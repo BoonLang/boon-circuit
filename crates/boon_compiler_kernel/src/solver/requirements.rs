@@ -662,46 +662,57 @@ impl super::ComponentSolver {
                 memo_hit = true;
             }
             if !memo_hit {
-                for term in folded_terms.iter().copied() {
-                    let merge_started = self
-                        .requirement_phase_probe
-                        .is_some()
-                        .then(std::time::Instant::now);
-                    if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                        probe.folds = probe.folds.saturating_add(1);
-                    }
+                let merge_started = self
+                    .requirement_phase_probe
+                    .is_some()
+                    .then(std::time::Instant::now);
+                // Homogeneous folds reproduce the pairwise left fold exactly
+                // but intern only the final term.
+                aggregate = self.merge_requirement_terms(&folded_terms);
+                if aggregate.is_some() {
                     self.requirements.work.aggregate_fact_visits = self
                         .requirements
                         .work
                         .aggregate_fact_visits
-                        .saturating_add(1);
-                    if let Some(previous) = aggregate
-                        && !self.program.terms.has_variable(previous)
-                        && !self.program.terms.has_variable(term)
-                    {
-                        if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                            probe.closed_merges = probe.closed_merges.saturating_add(1);
-                        }
-                        if self.requirement_closed_pairs.insert((previous.0, term.0)) {
+                        .saturating_add(u64::try_from(folded_terms.len()).unwrap_or(u64::MAX));
+                } else {
+                    for term in folded_terms.iter().copied() {
+                        self.requirements.work.aggregate_fact_visits = self
+                            .requirements
+                            .work
+                            .aggregate_fact_visits
+                            .saturating_add(1);
+                        if let Some(previous) = aggregate
+                            && !self.program.terms.has_variable(previous)
+                            && !self.program.terms.has_variable(term)
+                        {
                             if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                                probe.distinct_closed_pairs =
-                                    probe.distinct_closed_pairs.saturating_add(1);
+                                probe.closed_merges = probe.closed_merges.saturating_add(1);
                             }
-                        } else if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                            probe.closed_pair_hits = probe.closed_pair_hits.saturating_add(1);
+                            if self.requirement_closed_pairs.insert((previous.0, term.0)) {
+                                if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                                    probe.distinct_closed_pairs =
+                                        probe.distinct_closed_pairs.saturating_add(1);
+                                }
+                            } else if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                                probe.closed_pair_hits = probe.closed_pair_hits.saturating_add(1);
+                            }
                         }
+                        aggregate = Some(match aggregate {
+                            None => term,
+                            Some(previous) => self.merge_type_evidence(previous, term, false),
+                        });
                     }
-                    aggregate = Some(match aggregate {
-                        None => term,
-                        Some(previous) => self.merge_type_evidence(previous, term, false),
-                    });
-                    if let Some(started) = merge_started
-                        && let Some(probe) = self.requirement_phase_probe.as_mut()
-                    {
-                        probe.merge_ns = probe.merge_ns.saturating_add(
-                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                        );
-                    }
+                }
+                if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                    probe.folds = probe.folds.saturating_add(1);
+                }
+                if let Some(started) = merge_started
+                    && let Some(probe) = self.requirement_phase_probe.as_mut()
+                {
+                    probe.merge_ns = probe.merge_ns.saturating_add(
+                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
                 }
                 if let (Some(previous), Some(current)) = (
                     self.requirements.targets[target.0 as usize].order,

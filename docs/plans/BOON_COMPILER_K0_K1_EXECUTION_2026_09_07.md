@@ -1052,3 +1052,32 @@ preserving canonical order and payload identity) and TodoMVC's 86.9 ms
 invalidation plus 68.1 ms commit/order (first measure how many refresh calls
 carry dirty entries and how much invalidation is real cone work). Goal C's
 opening condition is not met while the refresh path dominates.
+
+### 2026-09-11: K1″ third slice — sub-phase split and single-pass merge
+
+The release sub-phase probe (env-gated, inert when unset) splits the refresh
+cost. TodoMVC: 283.2 ms total = invalidation 86.9 + commit/order 68.1 +
+assembly 31.2 + resolve 26.7 + occurs 16.7 + merge 16.7, over 65,216 calls of
+which 55,947 carry an empty dirty queue. NovyWave: 290.5 ms = merge 189.8 +
+resolve 38.5 + occurs 11.9 + invalidation 3.9 + the rest, over 29,646 calls and
+119,920 pairwise merges. Closed-pair caching is worthless there: only 639 of
+those merges are between closed terms.
+
+The third slice builds homogeneous folds (all variant sets or all objects) in
+one pass and interns only the final term, keeping the pairwise path for
+variables, unions and mixed kinds. The per-element rules are copied exactly, so
+the final term is identical: both fixtures report byte-identical diagnostics
+fingerprints between the two builds. Phase effect: TodoMVC merge 16.7 → 10.0 ms
+and refresh 283.2 → 277.4; NovyWave merge 189.8 → 162.9 and refresh 290.5 →
+260.6. Fold iterations fall 44,262 → 12,553 and 119,920 → 4,717. Eight-round
+interleaved end-to-end is within noise (single-pass versus memo: +0.4% TodoMVC,
+−0.6% NovyWave), so no production claim is made. Full record:
+[single-pass merge](evidence/compiler-k1pp-single-pass-merge-2026-09-11.json).
+
+Remaining buckets: NovyWave's 162.9 ms merge now sits in recursive payload and
+field merges, so the next step is cheaper recursive merging (per-pair memo with
+an epoch guard, or field-wise fast paths); TodoMVC's 86.9 ms invalidation needs
+a requirement-relevant dependent index; its 68.1 ms commit/order path is
+untouched. All gates green: kernel 197, kernel_transfer 10, compiler library 98
+with one pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match
+3, pulses 8.

@@ -1,0 +1,44 @@
+{
+  "status": "third aggregation slice landed: homogeneous single-pass merge; phase win, end-to-end change below the noise floor",
+  "date": "2026-09-11",
+  "change": {
+    "cut": "single-pass merge for homogeneous requirement folds",
+    "what": "when every contribution in a fold resolves to a variant set (or every one to an object), the merged term is built in one pass over the contributors and interned once, instead of interning one intermediate term per pairwise merge. The per-variant and per-field merge rules are copied exactly from the pairwise path, including same-tag payload merging and tag-versus-tagged precedence, and the openness flag is accumulated as a disjunction.",
+    "fallback": "variables, unions, lists, sets and mixed-kind folds keep the pairwise left fold; the fast path returns None for them",
+    "why_equivalent": "pairwise left folding merges contributions in registration order, and the single pass processes the same contributions in the same order with the same per-element rules, so the final interned term is identical; only the intermediate terms are skipped",
+    "fingerprints": {
+      "todo_mvc_diagnostics_fingerprint_v1": "b0bf7b1700ec22334ffc5d05251268e4dbea957b9f00980cd7b4380e16e804dc",
+      "novywave_diagnostics_fingerprint_v1": "6f5d4bd58c8109829bde25d20f89b371e54a577fae3b3051abd4eb8b42484b00",
+      "note": "identical between the previous (memo) build and the single-pass build"
+    },
+    "gates": "kernel library 197, kernel_transfer 10, compiler library 98 with one pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match 3, pulses 8"
+  },
+  "phase_effect_release": {
+    "todo_mvc_diagnostics": {
+      "merge_ms": {"before": 16.7, "after": 10.0},
+      "refresh_total_ms": {"before": 283.2, "after": 277.4},
+      "invalidate_ms": 86.9,
+      "resolve_ms": 26.6,
+      "occurs_ms": 16.7
+    },
+    "novywave_diagnostics": {
+      "merge_ms": {"before": 189.8, "after": 162.9},
+      "refresh_total_ms": {"before": 290.5, "after": 260.6},
+      "invalidate_ms": 3.9,
+      "resolve_ms": 37.7,
+      "occurs_ms": 11.7
+    },
+    "caveat": "part of the measured merge drop is fewer probe timestamps because the fold now visits each contributor once instead of pairwise, but the contributor-count reduction is real work: TodoMVC fold iterations fall 44,262 to 12,553 and NovyWave 119,920 to 4,717"
+  },
+  "end_to_end_interleaved_ab": {
+    "protocol": "eight alternating rounds, one process per observation, release producers, fresh-process diagnostics",
+    "todo_diagnostics_ms": {"k0_p50": 957.1, "memo_p50": 1081.4, "single_pass_p50": 1085.3, "single_pass_vs_memo": 0.4, "single_pass_vs_k0": 13.4},
+    "novywave_diagnostics_ms": {"k0_p50": 510.1, "memo_p50": 869.3, "single_pass_p50": 864.2, "single_pass_vs_memo": -0.6, "single_pass_vs_k0": 69.4},
+    "finding": "the ~25 ms phase reduction is below the eight-round noise floor; no end-to-end claim is made"
+  },
+  "remaining_buckets": {
+    "novywave_merge_162_ms": "now dominated by recursive payload and field merges inside the single pass, not by intermediate interning; the next step is to make those recursive merges cheaper (per-pair memo with an epoch guard, or field-wise fast paths) rather than to reduce contributor counts",
+    "todo_mvc_invalidation_87_ms": "9,269 dirty refreshes over 65,216 calls; needs the empty-versus-dirty split and a requirement-relevant dependent index to stop walking unrelated type dependents",
+    "todo_mvc_commit_order_68_ms": "3.6 us per fold for retain_requirement_order plus set_order plus touch; no optimization attempted yet"
+  }
+}

@@ -3139,6 +3139,103 @@ impl ComponentSolver {
         result
     }
 
+    /// Fold a homogeneous list of requirement contributions in one pass.
+    ///
+    /// This reproduces the pairwise left fold exactly — the same contributions
+    /// are combined in the same order with the same per-field and per-payload
+    /// merge rules — but interns only the final term instead of one
+    /// intermediate per contributor. Returns None when the contributions are
+    /// not all variant sets or not all objects, so the caller keeps the
+    /// pairwise path for variables, unions and mixed kinds.
+    fn merge_requirement_terms(&mut self, terms: &[TypeTermId]) -> Option<TypeTermId> {
+        let (first, rest) = terms.split_first()?;
+        let first = self.resolve_term_head(*first);
+        if rest.is_empty() {
+            return Some(first);
+        }
+        match self.program.terms.term_head(first) {
+            TypeTermHead::VariantSet(span) => {
+                let mut variants = self.variant_scratch.take();
+                variants.extend_from_slice(self.program.terms.variant_terms(span));
+                for term in rest {
+                    let term = self.resolve_term_head(*term);
+                    let TypeTermHead::VariantSet(span) = self.program.terms.term_head(term) else {
+                        self.variant_scratch.recycle(variants);
+                        return None;
+                    };
+                    for ordinal in 0..span.len() {
+                        let incoming = self.program.terms.variant_terms(span)[ordinal];
+                        let Some(index) = variants
+                            .iter()
+                            .position(|variant| variant.tag() == incoming.tag())
+                        else {
+                            variants.push(incoming);
+                            continue;
+                        };
+                        variants[index] = match (variants[index], incoming) {
+                            (
+                                VariantTerm::Tagged { tag, fields },
+                                VariantTerm::Tagged { fields: right, .. },
+                            ) => VariantTerm::Tagged {
+                                tag,
+                                fields: self.merge_type_evidence(fields, right, false),
+                            },
+                            (VariantTerm::Tag(_), tagged @ VariantTerm::Tagged { .. }) => tagged,
+                            (existing, _) => existing,
+                        };
+                    }
+                }
+                let merged = self.program.terms.variant_set(variants.iter().copied());
+                self.variant_scratch.recycle(variants);
+                Some(merged)
+            }
+            TypeTermHead::Object { shape, open } => {
+                let mut fields = self.record_field_scratch.take();
+                let count = self.program.terms.object_fields_for_shape(shape).len();
+                fields.reserve(count);
+                for ordinal in 0..count {
+                    let field = self
+                        .program
+                        .terms
+                        .object_field_for_shape(shape, ordinal)
+                        .expect("sealed object field exists");
+                    fields.push((field.name, field.ty));
+                }
+                let mut open = open;
+                for term in rest {
+                    let term = self.resolve_term_head(*term);
+                    let TypeTermHead::Object {
+                        shape,
+                        open: term_open,
+                    } = self.program.terms.term_head(term)
+                    else {
+                        self.record_field_scratch.recycle(fields);
+                        return None;
+                    };
+                    open |= term_open;
+                    let count = self.program.terms.object_fields_for_shape(shape).len();
+                    for ordinal in 0..count {
+                        let right = self
+                            .program
+                            .terms
+                            .object_field_for_shape(shape, ordinal)
+                            .expect("sealed object field exists");
+                        if let Some(index) = fields.iter().position(|left| left.0 == right.name) {
+                            fields[index].1 =
+                                self.merge_type_evidence(fields[index].1, right.ty, false);
+                        } else {
+                            fields.push((right.name, right.ty));
+                        }
+                    }
+                }
+                let result = self.program.terms.object(fields.iter().copied(), open);
+                self.record_field_scratch.recycle(fields);
+                Some(result)
+            }
+            _ => None,
+        }
+    }
+
     fn merge_equal_terms(&mut self, left: TypeTermId, right: TypeTermId) -> TypeTermId {
         self.merge_type_evidence(left, right, true)
     }

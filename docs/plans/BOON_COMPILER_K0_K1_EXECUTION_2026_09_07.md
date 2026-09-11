@@ -866,3 +866,17 @@ interpreting a 400-node program per call. The warm product gap remains K3/K4.
 Gates after the experiments: kernel library 197, kernel_transfer 10,
 staged_compilation 3 and compiler library 98 with one pre-existing ignored
 probe, all green.
+
+Follow-up trace: the final (post-fold) transfer program for definition 104 is
+140 nodes — 45 input, 41 unify, 16 sequence, 16 record, 14 projection, 5 term
+and 3 select — against a 97-node owner with no calls. Definition 79 is about
+250 nodes. The unify scaffolding comes from one emission site that adds a
+`PatternRequirement` input and one `Unify` node per closed WHEN arm, and K0's
+planner has no such site: that is exactly why K0's programs were small and why
+K0 failed the closed-domain and whole-selector regressions the K1 correctness
+work fixed. At roughly 265 ns per interpreted node visit, deleting the whole
+scaffolding would recover about 160 ms of TodoMVC's +268 ms excess — close, but
+not sufficient without cheaper per-node execution. That is a K2-scale linked
+code cut, which this bounded goal excludes, so the goal stops here pending a
+scope decision: K2 linked transfer code, K3/K4 warm responsiveness, or accepting
+this report as the K1′ outcome.

@@ -25,6 +25,13 @@
     "nested_call_sharing": {"nested_calls": 0, "targets_with_compiled_summary": 0, "share_attempts": 0},
     "finding": "the programs are not inflated by transitive inlining; TodoMVC's dominant summaries contain no nested calls at all. A 97-node owner compiles into a 465-node summary program, about 4.8x, dominated by per-field input nodes and per-arm/per-field unify and sequence scaffolding."
   },
+  "final_transfer_program_composition": {
+    "trace": "the same debug trace now prints the post-fold program histogram and the source owner's node and call counts",
+    "todo-mvc-physical_definition_104": {"pre_fold_nodes": 465, "final_nodes": 140, "owner_nodes": 97, "owner_calls": 0, "input": 45, "unify": 41, "sequence": 16, "record": 16, "projection": 14, "term": 5, "select": 3},
+    "todo-mvc-physical_definition_79": {"pre_fold_nodes": 410, "final_nodes": 250, "owner_nodes": 254, "owner_calls": 0, "input": 77, "unify": 75, "sequence": 30, "record": 22, "term": 7, "select": 6, "collection": 2},
+    "scaffolding_origin": "the Unify nodes come from one emission site: for every closed WHEN, the planner emits one PatternRequirement input and one Unify node per arm (`requirements.push(... Unify { value: selector, requirement })`) wrapped in a Sequence. The Input nodes are per distinct formal projection. K0's planner has no Unify emission site at all, which is why its programs were small and also why it failed the closed-domain and whole-selector regressions the K1 correctness work fixed.",
+    "cost_model": "1,017,465 candidate summary node evaluations against a +268 ms TodoMVC typecheck excess implies about 265 ns per interpreted node visit. Removing 60% of the scaffolding would recover roughly 160 ms, still short of K0's 268 ms advantage; the remainder needs cheaper per-node execution (linked code) or restored K0 path quality."
+  },
   "per_definition_evaluation_cost": {
     "todo-mvc-physical_definition_79": {"k0_program_evaluations": 720, "k0_node_evaluations": 12248, "k0_nodes_per_evaluation": 17.0, "candidate_program_evaluations": 674, "candidate_node_evaluations": 143509, "candidate_nodes_per_evaluation": 212.9},
     "novywave_definition_996": {"k0_program_evaluations": 11212, "k0_node_evaluations": 57220, "k0_nodes_per_evaluation": 5.1, "candidate_program_evaluations": 14959, "candidate_node_evaluations": 381702, "candidate_nodes_per_evaluation": 25.5},

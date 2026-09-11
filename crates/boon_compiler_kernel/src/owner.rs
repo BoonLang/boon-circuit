@@ -19720,70 +19720,24 @@ fn compile_direct_result_summaries(
     #[cfg(debug_assertions)]
     if std::env::var_os("BOON_KERNEL_TRACE_SUMMARIES").is_some() {
         eprintln!(
-            "kernel-summary-share calls={} with_summary={} attempts={} successes={}",
-            nested_calls, nested_with_summary, shared_attempts, shared_successes
+            "kernel-summary-share calls={nested_calls} with_summary={nested_with_summary} attempts={shared_attempts} successes={shared_successes}"
         );
         let mut sizes = summaries
             .iter()
             .flatten()
             .map(|summary| {
-                let nodes = &summary.program.nodes;
-                let count = |kind: &str| match kind {
-                    "invoke" => nodes
-                        .iter()
-                        .filter(|node| matches!(node, KernelSummaryNode::Invoke { .. }))
-                        .count(),
-                    "input" => nodes
-                        .iter()
-                        .filter(|node| matches!(node, KernelSummaryNode::Input(_)))
-                        .count(),
-                    "constrain" => nodes
-                        .iter()
-                        .filter(|node| matches!(node, KernelSummaryNode::Constrain { .. }))
-                        .count(),
-                    "select" => nodes
-                        .iter()
-                        .filter(|node| matches!(node, KernelSummaryNode::Select { .. }))
-                        .count(),
-                    "record" => nodes
-                        .iter()
-                        .filter(|node| matches!(node, KernelSummaryNode::Record { .. }))
-                        .count(),
-                    "projection" => nodes
-                        .iter()
-                        .filter(|node| matches!(node, KernelSummaryNode::Projection { .. }))
-                        .count(),
-                    "unify" => nodes
-                        .iter()
-                        .filter(|node| matches!(node, KernelSummaryNode::Unify { .. }))
-                        .count(),
-                    "sequence" => nodes
-                        .iter()
-                        .filter(|node| matches!(node, KernelSummaryNode::Sequence { .. }))
-                        .count(),
-                    _ => 0,
-                };
                 (
                     summary.program.definition,
                     summary.compiled_node_count,
-                    count("invoke"),
-                    count("input"),
-                    count("constrain"),
-                    count("select"),
-                    count("record"),
-                    count("projection"),
-                    count("unify"),
-                    count("sequence"),
+                    summary.program.nodes.as_ref(),
                 )
             })
             .collect::<Vec<_>>();
         sizes.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
-        eprintln!(
-            "kernel-summary-sizes definition compiled invoke input constrain select record projection unify sequence"
-        );
-        for entry in sizes.iter().take(10) {
+        eprintln!("kernel-summary-sizes definition compiled owner_nodes owner_calls histogram");
+        for (definition, compiled, nodes) in sizes.iter().take(10) {
             let (owner_nodes, owner_calls) = project
-                .owner(crate::KernelOwnerId(entry.0))
+                .owner(crate::KernelOwnerId(*definition))
                 .map(|owner| {
                     (
                         owner.node_count(),
@@ -19797,21 +19751,34 @@ fn compile_direct_result_summaries(
                     )
                 })
                 .unwrap_or((0, 0));
+            let mut histogram = std::collections::BTreeMap::<&str, usize>::new();
+            for node in nodes.iter() {
+                let kind = match node {
+                    KernelSummaryNode::Input(_) => "input",
+                    KernelSummaryNode::Term(_) => "term",
+                    KernelSummaryNode::Unify { .. } => "unify",
+                    KernelSummaryNode::ContextualHole => "hole",
+                    KernelSummaryNode::Projection { .. } => "projection",
+                    KernelSummaryNode::Constrain { .. } => "constrain",
+                    KernelSummaryNode::Sequence { .. } => "sequence",
+                    KernelSummaryNode::Collection { .. } => "collection",
+                    KernelSummaryNode::Invoke { .. } => "invoke",
+                    KernelSummaryNode::Select { .. } => "select",
+                    KernelSummaryNode::Record { .. } => "record",
+                };
+                *histogram.entry(kind).or_default() += 1;
+            }
+            let rendered = histogram
+                .iter()
+                .map(|(kind, count)| format!("{kind}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             eprintln!(
-                "kernel-summary-size {} {} {} {} {} {} {} {} {} {} owner_nodes={owner_nodes} owner_calls={owner_calls}",
-                entry.0,
-                entry.1,
-                entry.2,
-                entry.3,
-                entry.4,
-                entry.5,
-                entry.6,
-                entry.7,
-                entry.8,
-                entry.9
+                "kernel-summary-size {definition} {compiled} owner_nodes={owner_nodes} owner_calls={owner_calls} {rendered}"
             );
         }
     }
+
     summaries
 }
 

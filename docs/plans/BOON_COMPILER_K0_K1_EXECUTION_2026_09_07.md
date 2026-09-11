@@ -670,3 +670,128 @@ Next: keep the guard work counted (occurrence/site work is already in
 fresh release product/evidence producers and begin the K0/K1 comparison
 protocol. No performance claim is made from the debug correctness timings
 above.
+
+### 2026-09-11: K1 decision — targeted replay removed, end-to-end regresses
+
+The K1 cut has now been measured against the preserved K0 producer with the
+manifest protocol: three setup plus 30 scored observations per fixture and
+intent in both cold modes, product and evidence lanes, one process per
+observation, one Cargo process at a time. The baseline ran first from the K0
+worktree producer (`2d7a5343`, product `178b6b58...`); the candidate ran twice
+from `c7ff71a8` (product `f80452ee...`). Both producers are clean, the budget
+manifest is untouched, and every report is an honest fail report.
+
+Measured p50 for the large fixtures (milliseconds, best candidate pass):
+
+| Fixture / mode / intent | K0 | candidate | delta |
+| --- | ---: | ---: | ---: |
+| TodoMVC fresh diagnostics | 930.2 | 1199.4 | +28.9% |
+| TodoMVC fresh verified | 1281.9 | 1597.0 | +24.6% |
+| TodoMVC empty diagnostics | 918.8 | 1170.2 | +27.4% |
+| TodoMVC empty verified | 1281.5 | 1573.7 | +22.8% |
+| NovyWave fresh diagnostics | 497.3 | 903.9 | +81.8% |
+| NovyWave fresh verified | 1847.6 | 2266.4 | +22.7% |
+| NovyWave empty diagnostics | 505.0 | 906.9 | +79.6% |
+| NovyWave empty verified | 1850.4 | 2277.4 | +23.1% |
+
+Counter is a work control: it shows no algorithmic change within about +/-
+3%, and the candidate's empty-session diagnostics outlier in the first pass is
+machine noise, not work. It is not a timing-clean baseline; its baseline
+fresh-process diagnostics p95 is 14.3 ms against a 10 ms budget. The first
+candidate pass was slower still (NovyWave verified p50 3693.8 ms) while its
+work counters are byte-identical to the second pass, so the spread is not
+algorithmic. Only the candidate has two passes, so this is not yet a
+like-for-like stability comparison; the next cut needs interleaved A/B/A
+ordering.
+
+The work counters explain the regression. The cut removes the targeted
+residual replay: TodoMVC linked operations fall from 282,393 to 82,451
+(-70.8%), activations from 620,555 to 181,056 (-70.8%), mutations from
+465,647 to 182,294 (-60.8%), union operations from 196,759 to 41,929 (-78.7%).
+NovyWave linked operations fall 59,057 to 39,276 and union operations 31,884
+to 15,052. The work does not disappear, though: TodoMVC summary node
+evaluations rise 32,365 to 1,017,465 (+3044%), summary definition nodes 236 to
+2,325 (+885%) and term intern requests 342,922 to 1,645,514 (+380%).
+NovyWave rises 462,003 to 2,172,644 summary node evaluations (+370%) and
+12,866 to 105,935 summary definition nodes (+723%). TodoMVC performs about 91
+summary node evaluations per summary call activation, so the shared program is
+re-walked per invocation instead of being reused across equivalent
+invocations. The candidate-only `KernelRequirementWork` block adds its own
+bookkeeping on top (NovyWave fresh diagnostics: 185,441 aggregate fact visits,
+37,215 invalidation variable visits, 25,355 commit site visits).
+
+Decision: the K1 reuse hypothesis is rejected as implemented. There is no
+verified end-to-end production speedup; the transfer cut's targeted work
+reduction is real but is outweighed by interpreted summary evaluation and
+interning work. The correctness cuts from this run are preserved (whole-value
+arm guards, tagged forwarding, the open-read projection-path requirement fix
+that restored NovyWave verified). The prior K1 machinery is prior committed
+work, not this run's disposable experiment, so it is not deleted without its
+own scope.
+
+Next architectural decision: make definition-transfer evaluation proportional
+to distinct typed input tuples rather than invocations. Evaluate a transfer
+once per distinct quiescent input tuple plus dependency epoch, reuse that
+result for equivalent invocations, and invalidate exactly when the tuple or a
+dependency epoch changes. K0 attribution found 125 quiescent tuple classes
+for 891 top-five-variant calls, a 7.1x ceiling on invocation reuse rather than
+tenfold; even a perfect 7x cut of 1,017,465 summary evaluations lands near
+1.43e5 against K0's 3.2e4, still about 4.4x above the K0 cohort, so the next
+cut must also reduce per-tuple evaluation cost. Final result-type equality is
+not a valid key; if the tuple key cannot be made sound, keep the shared
+physical bytes and return to linked residual specialization for evaluation,
+which was correct and faster than the interpreted summary path. Acceptance
+uses the same 3+30 protocol with interleaved A/B/A ordering and requires
+targeted summary work at or below the distinct-tuple count, per-tuple cost
+that does not reintroduce the gap, and no residual activation or interning
+regression.
+
+Stateful and invalid-source holdouts stayed green at the measured head:
+private-state capability, HOLD occurrence freshness, multi-contributor
+withdrawal and skipped nested invocation tests in the kernel suite, plus
+invalid-call, invalid-update and staged-rejection tests in the compiler suite.
+The candidate's tooling contract digest differs from the baseline because of
+candidate-only requirement accounting, so the measured bundle is the transfer
+cut plus the guard and requirement fixes rather than a byte-identical
+instrument. Latency figures are the upper-middle median of the 30 sorted
+scored samples; the report's own p50 field is the nearest-rank lower element
+and reads up to about 0.7% lower.
+
+The decision record, report hashes and full attribution are in
+[the 2026-09-11 evidence](evidence/compiler-k1-decision-2026-09-11.json).
+
+### Verification pass, 2026-09-11
+
+The focused correctness gates were re-run at the measured head `c7ff71a8` by
+the main agent: `boon_compiler_kernel` 197 passed, `boon_compiler` library 98
+passed with the one pre-existing ignored directional probe, `kernel_transfer`
+10, `map_set` 3, `nested_boolean_match` 3, `pulses` 8 and `staged_compilation`
+3, all green, with the whole-selector regressions enabled and passing. The
+figures above were re-derived directly from the three stored reports:
+
+- The report hashes match the decision record: baseline `91f866fe...` and the
+  two candidate passes `1151c6a8...` and `4d9194b0...`.
+- The two candidate passes have byte-identical numeric work counters across
+  every fixture, mode and intent, so the pass-to-pass latency spread is not an
+  algorithmic difference between them.
+- Every latency figure is the median of `normative_elapsed_ms` and every work
+  figure the median of the corresponding counter, both over the 30 scored
+  observations of a lane in `fixtures[*].modes[*].{diagnostics,verified}`.
+- The candidate's `machine_plan_hash_pass` oracle is inherited-failing rather
+  than K1-specific. All three fixtures fail it at K0 (`counter` observed
+  `6c284c85...`, TodoMVC `149c7f17...`, NovyWave `4fd22df2...`), and TodoMVC
+  (`4087c4ff...`) and NovyWave (`5926de7b...`) still fail it at the candidate;
+  only the `counter` lane passes at the candidate. `budgets/compiler.toml` is
+  unmodified, so this oracle separates nothing about K1 in either direction.
+The independent fresh-context read-only review has since returned a support
+verdict for the rejection decision. It reproduced the report hashes, producer
+identities, the byte-identical candidate work objects and all quoted counters;
+it also confirmed the untouched budget manifest and honest fail reports. Its
+record-precision corrections are folded into this section and the evidence
+file: the reuse ceiling is 7.1x with an additional per-tuple cost requirement,
+the stability claim applies only to the two candidate passes, the counter
+control band is about +/-3%, and the median convention and instrument-digest
+difference are disclosed. The reviewer did not re-run the correctness gates or
+the collector protocol, so those remain main-agent evidence. The decision
+therefore rests on the work attribution and the best-case end-to-end pass, not
+on the inherited-failing machine-plan hash oracle.

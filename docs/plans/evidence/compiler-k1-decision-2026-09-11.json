@@ -1,0 +1,172 @@
+{
+  "status": "K1 as implemented is rejected; targeted work reduction confirmed, end-to-end latency regressed",
+  "date": "2026-09-11",
+  "protocol": {
+    "collector": "cargo xtask verify-compiler-performance --setup-samples 3 --scored-samples 30",
+    "lanes": "product and evidence, every budget fixture, both cold modes",
+    "machine": "Intel i7-9700K, one Cargo process at a time with --jobs 2, natural page cache, one process per observation",
+    "order": "K0 baseline first, then two candidate passes; the two candidate passes have byte-identical work counters, so ordering did not create the regression",
+    "producers": {
+      "baseline": {
+        "head": "2d7a5343c9d98e9eeabc5c0de0c3c5728f4fb7f2",
+        "dirty": false,
+        "product_sha256": "178b6b58c641890f1028bbfbf612b1a3b5fd29df895f191ab0b536db43948ecf",
+        "evidence_sha256": "c547ddac0c80d0b4079953e972809525f2fbb96ab8289b61837a4a5abb6f329b"
+      },
+      "candidate": {
+        "head": "c7ff71a881061d6bb1fd6fb5c752b7ef4df842cb",
+        "head_note": "full head in the report identity below; the guard and requirement fixes are included because the fixture does not compile without them",
+        "dirty": false,
+        "product_sha256": "f80452eeb115d92a6050593da31754c7828ff7b9bf8b9a64752eb636b723be2b",
+        "evidence_sha256": "99db34f40992d4e1534b185e9faa3d0267dde9dffa51342649663836d1ebd0d8",
+        "workspace_digest": "873080e6924e5df37fcee40eb0a52f002377a3aef5f2582a2b8c8979b5f3ea27"
+      }
+    },
+    "local_reports": [
+      {
+        "path": "/home/martinkavik/repos/boon-compiler-k0-2d7a5343/target/reports/compiler-performance/k1-baseline-ab1.json",
+        "sha256": "91f866fe5778d6af6b1acb9549183bc2adedc7c5ff4cdca9704e7a3c919ae496"
+      },
+      {
+        "path": "/home/martinkavik/repos/boon-circuit/target/reports/compiler-performance/k1-candidate-ab1.json",
+        "sha256": "1151c6a84548113264a1941ecfc16925eeb516f3c4f5b1b9e52971ac9a936e52"
+      },
+      {
+        "path": "/home/martinkavik/repos/boon-circuit/target/reports/compiler-performance/k1-candidate-ab2.json",
+        "sha256": "4d9194b047de2d5e49ee498bb0d9542bf8962c8001212d71dc020c4d94804795"
+      }
+    ]
+  },
+  "latency_p50_p95_ms": {
+    "todo-mvc-physical/fresh-process/diagnostics": {"k0": [930.2, 960.9], "candidate_ab1": [1419.2, 1712.3], "candidate_ab2": [1199.4, 1226.5]},
+    "todo-mvc-physical/fresh-process/verified": {"k0": [1281.9, 1318.7], "candidate_ab1": [2050.9, 2772.8], "candidate_ab2": [1597.0, 1642.0]},
+    "todo-mvc-physical/empty-session/diagnostics": {"k0": [918.8, 958.4], "candidate_ab1": [1364.1, 2070.6], "candidate_ab2": [1170.2, 1197.1]},
+    "todo-mvc-physical/empty-session/verified": {"k0": [1281.5, 1343.0], "candidate_ab1": [2087.8, 3350.2], "candidate_ab2": [1573.7, 1607.7]},
+    "novywave/fresh-process/diagnostics": {"k0": [497.3, 520.5], "candidate_ab1": [1099.0, 1661.3], "candidate_ab2": [903.9, 945.2]},
+    "novywave/fresh-process/verified": {"k0": [1847.6, 1896.9], "candidate_ab1": [3693.8, 5248.7], "candidate_ab2": [2266.4, 2309.2]},
+    "novywave/empty-session/diagnostics": {"k0": [505.0, 526.0], "candidate_ab1": [1171.5, 2159.8], "candidate_ab2": [906.9, 947.8]},
+    "novywave/empty-session/verified": {"k0": [1850.4, 1891.9], "candidate_ab1": [3142.1, 5625.6], "candidate_ab2": [2277.4, 2336.3]},
+    "counter/all_modes": "within +/-2% between K0 and candidate_ab2; candidate_ab1 showed one noisy empty-session outlier"
+  },
+  "work_attribution_fresh_process_diagnostics_p50": {
+    "todo-mvc-physical": {
+      "activations": {"k0": 620555, "candidate": 181056},
+      "mutations": {"k0": 465647, "candidate": 182294},
+      "linked_operations": {"k0": 282393, "candidate": 82451},
+      "union_operations": {"k0": 196759, "candidate": 41929},
+      "projection_activations": {"k0": 191603, "candidate": 68986},
+      "select_activations": {"k0": 97865, "candidate": 17780},
+      "record_activations": {"k0": 87807, "candidate": 21545},
+      "summary_call_activations": {"k0": 6373, "candidate": 11227},
+      "summary_node_evaluations": {"k0": 32365, "candidate": 1017465},
+      "summary_definition_nodes": {"k0": 236, "candidate": 2325},
+      "term_intern_requests": {"k0": 342922, "candidate": 1645514},
+      "invocation_frames": {"k0": 8039, "candidate": 5789}
+    },
+    "novywave": {
+      "activations": {"k0": 102150, "candidate": 87987},
+      "mutations": {"k0": 133450, "candidate": 101732},
+      "linked_operations": {"k0": 59057, "candidate": 39276},
+      "union_operations": {"k0": 31884, "candidate": 15052},
+      "summary_call_activations": {"k0": 4690, "candidate": 5566},
+      "summary_node_evaluations": {"k0": 462003, "candidate": 2172644},
+      "summary_definition_nodes": {"k0": 12866, "candidate": 105935},
+      "term_intern_requests": {"k0": 334884, "candidate": 1236424},
+      "invocation_frames": {"k0": 703, "candidate": 703}
+    }
+  },
+  "findings": [
+    "The transfer cut removes the targeted residual replay: TodoMVC linked operations fall 71%, activations 71%, mutations 61%, union operations 79%.",
+    "The work does not disappear; it moves into interpreted summary evaluation: TodoMVC summary node evaluations rise 3044% and term interning 380%; NovyWave rises 370% and 269%.",
+    "Summary programs are 9.9x (TodoMVC) and 8.2x (NovyWave) larger in definition nodes than the K0 residual module cohort they replace.",
+    "TodoMVC performs about 91 summary node evaluations per summary call activation (1,017,465 / 11,227), so the shared program is re-walked for every invocation instead of being reused across equivalent invocations.",
+    "End-to-end latency regresses on every large fixture and cold mode. The best candidate pass is still 23-29% slower on TodoMVC and NovyWave verified, and 80% slower on NovyWave diagnostics.",
+    "The two candidate passes have byte-identical work but very different latency (NovyWave verified p50 3694 vs 2266 ms), so the spread is not algorithmic; only the candidate has two passes, so this is not yet a like-for-like stability comparison against the baseline.",
+    "Counter shows no algorithmic change, so the fixture is a work control and confirms the harness; its band is about +/-3% under this record's median convention, and its first-pass empty-session outlier (p95 101.9 ms) is noise. Counter is not a timing-clean baseline: its 3+30 baseline fresh-process diagnostics p95 is 14.3 ms against a 10 ms budget.",
+    "Plan-hash oracles are inherited red on both sides: K0 reports counter 6c284c85, TodoMVC 149c7f17, NovyWave 4fd22df2; the candidate reaches the expected counter oracle 5158476e while TodoMVC 4087c4ff and NovyWave 5926de7b still differ. No oracle was rewritten.",
+    "The rendered budgets remain untouched and the reports are honest fail reports; no manifest or oracle was weakened."
+  ],
+  "requirement_machinery_work_candidate_only": {
+    "note": "the K0 report predates KernelRequirementWork, so absence in the baseline and presence in the candidate is itself part of the attribution",
+    "novywave_fresh_process_diagnostics_p50": {
+      "owners": 2940,
+      "sites": 7454,
+      "activations": 9369,
+      "begin_site_visits": 25355,
+      "staged_writes": 24016,
+      "commit_site_visits": 25355,
+      "changed_sites": 7696,
+      "withdrawn_sites": 6,
+      "aggregate_evaluations": 6374,
+      "aggregate_fact_visits": 185441,
+      "invalidation_variable_visits": 37215,
+      "invalidation_edge_visits": 32528,
+      "order_term_visits": 35684,
+      "projection_evaluations": 3803,
+      "path_step_evaluations": 63334
+    }
+  },
+  "decision": {
+    "outcome": "reject the K1 reuse hypothesis as implemented",
+    "why": "the measured candidate removes targeted residual work but re-walks shared summary programs per invocation, shifting more work into summary evaluation and interning than it removes, so no production speedup exists and no accepted checkpoint can claim one",
+    "preserved_work": [
+      "the whole-selector arm-guard correctness cut and the tagged forwarding fix",
+      "the open-read projection-path requirement fix that restores NovyWave verified",
+      "K0 baseline, producers, reports and budget manifest"
+    ],
+    "not_deleted": "the K1 shared-transfer machinery is prior committed work, not this run's disposable experiment; removing it requires its own accepted scope"
+  },
+  "next_architectural_decision": {
+    "cut": "Make definition-transfer evaluation proportional to distinct typed input tuples instead of invocations: evaluate a transfer once per distinct quiescent input tuple plus dependency epoch, reuse the result for equivalent invocations, and invalidate exactly when the tuple or a dependency epoch changes.",
+    "evidence_basis": "K0 attribution found 125 quiescent input tuple classes for 891 top-five-variant calls, a 7.1x ceiling on invocation reuse rather than 10x; the candidate performs about 91 summary node evaluations per call activation. Even a perfect 7x cut of 1,017,465 summary evaluations lands near 1.43e5 against K0's 3.2e4, still about 4.4x above the K0 cohort, so the next cut must also reduce per-tuple evaluation cost, not only the number of tuple evaluations.",
+    "soundness_requirements": [
+      "final result-type equality is not a valid reuse key; open roots, provider identities and dependency epochs must be part of the key or the cut must fall back to the residual path",
+      "no second solver, no result-type cache, no fixture-specific fast path",
+      "inactive arms must not contribute; A to B to A replacement must equal a fresh A solve"
+    ],
+    "fallback": "if the tuple key cannot be made sound for the measured cohort, keep shared physical bytes and return to linked residual specialization for evaluation, which was correct and faster than the interpreted summary path",
+    "acceptance": "same 3+30 protocol with interleaved A/B/A ordering, targeted summary work at or below the distinct-tuple count, per-tuple evaluation cost that does not reintroduce the gap, and no residual activation or interning regression; a targeted work win without end-to-end benefit is still not a production speedup"
+  },
+  "limitations": [
+    "Single machine and single session; the baseline has one 3+30 pass, supported by the stored 2026-09-07 five-sample K0 preflight matching within about 2.3%. Only the candidate has two passes, so the stability comparison is not like-for-like.",
+    "The candidate ran after the baseline; byte-identical counters exclude algorithmic differences but not order or thermal drift, so the next cut needs interleaved A/B/A ordering.",
+    "The candidate tooling contract digest differs from the baseline (bfd48cc8 vs 7a75640b) because of candidate-only requirement accounting; the bundle under test is the transfer cut plus the guard and requirement fixes.",
+    "Exact K0 diagnostic bytes and the tagged mismatch attribution difference remain unclaimed.",
+    "The verified machine-plan hash oracle is inherited-failing and separates nothing about K1: all three fixtures fail it at K0 (counter 6c284c85..., TodoMVC 149c7f17..., NovyWave 4fd22df2...) and TodoMVC and NovyWave still fail it at the candidate; only the counter lane passes at the candidate. budgets/compiler.toml is unmodified.",
+    "Latency figures are medians of normative_elapsed_ms and work figures are medians of the corresponding counters over the 30 scored observations of each lane."
+  ],
+  "holdout_coverage_at_candidate_checkpoint": {
+    "stateful": [
+      "boon_compiler_kernel owner::tests::stateful_calls_use_fresh_occurrences_without_losing_the_state_domain",
+      "boon_compiler kernel_oracle::tests::hold_update_statements_read_the_private_state_capability",
+      "boon_compiler kernel_oracle::tests::hold_updates_widen_in_one_component_without_recursive_replay",
+      "boon_compiler_kernel solver::requirements::tests::replacement_withdraws_only_its_own_occurrence",
+      "boon_compiler_kernel solver::requirements::tests::skipped_nested_invocation_withdraws_all_its_sites"
+    ],
+    "invalid_source": [
+      "boon_compiler kernel_oracle::tests::invalid_calls_remain_supported_unknown_owners_with_exact_diagnostics",
+      "boon_compiler session::tests::invalid_update_keeps_the_last_verified_artifact",
+      "boon_compiler session::tests::update_invalidates_checked_and_verified_results",
+      "boon_compiler tests/staged_compilation.rs::staged_finish_rejects_checked_errors"
+    ],
+    "status": "all listed holdouts passed in the kernel library (197), compiler library (98) and staged (3) suites at c7ff71a8"
+  },
+  "independent_review": {
+    "reviewer": "fresh-context read-only subagent",
+    "verdict": "the K1 rejection decision holds; all load-bearing figures reproduced exactly",
+    "independently_reproduced": [
+      "report sha256 values, producer heads, dirty flags, product and evidence hashes, workspace digest",
+      "byte-identical candidate work objects across ab1 and ab2 (canonical digest 416f4677f2a6...)",
+      "all quoted work counters, budget manifest integrity, honest fail reports, counter-lane work unchanged apart from scratch-vector churn"
+    ],
+    "corrections_applied": [
+      "reuse ceiling restated to 7.1x with the additional per-tuple cost requirement",
+      "stability claim narrowed to the two candidate passes",
+      "counter control band restated to about +/-3%",
+      "median convention and instrument-digest difference disclosed"
+    ],
+    "not_verified_by_reviewer": [
+      "the correctness gates at c7ff71a8 were not re-run by the reviewer; protocol internals and ordering are taken from the record"
+    ]
+  }
+}

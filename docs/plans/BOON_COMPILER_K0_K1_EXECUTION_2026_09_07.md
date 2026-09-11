@@ -927,3 +927,17 @@ Next cut: stop rebuilding those scaffolds per call — memoize or precompute the
 reverse-projection scaffold for a (term, projection path) pair and cut the
 scratch churn — with the gate that object intern requests and scratch reuses
 fall toward K0's 213k and 1.5M without changing diagnostics.
+
+That next cut was attempted and rejected by measurement. A bounded per-solve
+cache keyed by (term id, field) at all three production single-field scaffold
+sites left TodoMVC term interning at 1,634,822 against 1,645,514 and object
+interning at 1,178,905 against 1,189,597 — about one percent — while latency
+rose from 1174.1 to 1238.9 ms; NovyWave diagnostics went 915.1 to 966.8 ms with
+identical interning. The arena already serves 97% of intern requests as hits,
+so the traffic is structural-equal lookups made from fresh per-call term
+identities, which a term-id-keyed cache cannot capture. The experiment is
+reverted exactly (the worktree is unchanged). Two measured attempts — the
+domain fold and the scaffold cache — have now shown that no single cheap node
+or cache reduction moves end-to-end latency; the remaining gap is distributed
+across the per-call summary machinery and needs the larger linked-code cut
+(compile the transfer to scheduled operations) to have a chance of closing.

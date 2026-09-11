@@ -45,5 +45,12 @@
     "first_gate": "object intern requests and scratch reuses must fall toward K0's 213k and 1.5M without changing diagnostics or any correctness gate",
     "then": "re-measure the 3+30 cohort; only then is the K1-prime implemented ending testable"
   },
+  "rejected_experiment_scaffold_cache": {
+    "what": "a bounded per-solve cache keyed by (term id, field) shared by all three production single-field scaffold sites (finish_summary_requirements reverse step, publish_projection backflow, project fallback)",
+    "measured_todo_mvc_diagnostics": {"term_intern_requests": {"before": 1645514, "after": 1634822}, "nonempty_object_intern_requests": {"before": 1189597, "after": 1178905}, "latency_ms": {"before": 1174.1, "after": 1238.9}},
+    "measured_novywave_diagnostics": {"term_intern_requests": {"before": 1211835, "after": 1211835}, "latency_ms": {"before": 915.1, "after": 966.8}},
+    "finding": "the cache almost never hits: interning traffic fell by about 1% while latency rose 3-6%. The 97% intern hit rate means the arena is already finding structurally equal terms, but the requests are made from fresh per-call term identities, so a term-id-keyed cache cannot capture them. The experiment is reverted exactly; the tree is unchanged by the revert.",
+    "revised_attribution": "the extra cost is not one addressable cache. It is distributed across the per-call summary machinery: fresh term construction that interns (mostly hits), scratch-pool churn four times K0, and the evaluation bookkeeping around each call. No single cheap cache has moved latency in two measured attempts (domain fold, scaffold cache)."
+  },
   "verified_gates": "kernel library 197, kernel_transfer 10, compiler library 98 with one pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match 3, pulses 8, all green"
 }

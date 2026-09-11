@@ -1,0 +1,31 @@
+{
+ "status": "reviewed rejection: dependency-versioned contributor reuse is sound but does not pay — the sound stamping walk costs more than the reuse saves and the qualifying folds are rare",
+ "date": "2026-09-12",
+ "question": "the retained-prefix fold still resolves and re-checks every contributor on every fold. Could a destination skip that verification whenever no binding reachable from its inputs moved and its raw contributor list is unchanged, reusing the retained resolution and aggregate outright?",
+ "design": {
+  "stamp": "bump a per-destination counter whenever the scheduler's binding-change walk reaches it, plus whenever invalidation clears a binding that the destination can read; then reuse the retained state when the stamp, the destination root and the raw contributor list are all unchanged",
+  "reuse": "publish the retained post-order aggregate directly and skip the dependency receipt, occurs filtering, resolution, merging and ordering for that fold"
+ },
+ "soundness_audit": {
+  "first_attempt": "stamping only from schedule_variable looked sufficient, but the debug cross-check (release fast path disabled under cfg(debug_assertions), which instead folds normally and asserts equality with the retained aggregate) failed on withdrawing_cycle_seed_removes_self_supported_evidence: invalidate_requirement_cone clears affected bindings without a scheduler walk, so a destination that reads a cleared binding kept a stale stamp",
+  "second_attempt": "stamping every affected destination removed the unsoundness but made the stamp dirty on essentially every fold (0 reuses)",
+  "final_rule": "walk dependents from the cleared cells, queueing only their dependents so that a cleared cell reached again through an edge (a cycle) is stamped while a cell cleared on its own account is not; all standing gates pass with the cross-check active on every test scenario",
+  "lesson": "the cfg(debug_assertions) cross-check is what caught the unsound rule; without it the fast path would have shipped a real staleness bug"
+ },
+ "measurement": {
+  "release_probe_novywave": {"unchanged_fold_reuses": 10, "stamp_clean_folds": 1429, "raw_unchanged_folds": 1964, "refresh_total_ms": [90.2, 95.8]},
+  "release_probe_todo_mvc": {"unchanged_fold_reuses": 1802, "stamp_clean_folds": 3181, "raw_unchanged_folds": 2934, "invalidate_ms": [17.5, 33.7], "refresh_total_ms": [131.1, 143.2]},
+  "reading": "with the naive rule 1,966 NovyWave folds looked reusable; with the sound rule only 10 qualify, because a fold is nearly always caused either by a fact change or by a cleared binding the destination reads. The stamping walk itself costs about 16 ms on TodoMVC (invalidation 17.5 -> 33.7 ms), so the slice is a net regression."
+ },
+ "decision": "rejected and reverted with no code change. The experiment diff is kept at target/reports/compiler-performance/k1pp-rejected-dependency-stamp.diff. This closes the last identified in-scope avenue for removing the residual per-fold verification: the remaining NovyWave refresh (93 ms: resolve 19, order 14, merge 13, deps 8, occurs 12, collection/invalidation/commit ~6, loop overhead ~20) is the cost of maintaining requirement aggregation within a cold compile, and removing it needs the retained-revision machinery that the contract assigns to the successor goal.",
+ "gates": {
+  "note": "the experiment passed every standing gate with the cross-check active before it was measured and rejected",
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ }
+}

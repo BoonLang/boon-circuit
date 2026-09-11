@@ -1424,3 +1424,41 @@ also sits inside the ±1-3% null-control floor recorded above. The dense form
 would also hold a ~4.6 MB mostly-empty vector on TodoMVC-like programs, so the
 experiment is reverted with no code change rather than kept for an unmeasurable
 effect.
+
+### 2026-09-12: K1″ rejected — dependency-versioned contributor reuse
+
+The last identified in-scope avenue for the residual per-fold verification was
+tested: stamp each destination whenever the scheduler's binding-change walk
+reaches it (plus whenever invalidation clears a binding it can read), then
+publish the retained aggregate outright when the stamp, the destination root
+and the raw contributor list are all unchanged.
+
+The `cfg(debug_assertions)` cross-check — release takes the fast path, debug
+folds normally and asserts equality — caught a real unsoundness on the first
+rule: `invalidate_requirement_cone` clears affected bindings without a
+scheduler walk, so a destination reading a cleared binding kept a stale stamp
+(`withdrawing_cycle_seed_removes_self_supported_evidence` failed). Stamping
+every affected destination fixed that but made the stamp dirty on essentially
+every fold (zero reuses). The final rule walks dependents from the cleared
+cells and queues only their dependents, so a cleared cell reached again through
+an edge (a cycle) is stamped while a cell cleared on its own account is not;
+all standing gates pass with the cross-check active.
+
+Measured: with the naive rule 1,966 NovyWave folds looked reusable; with the
+sound rule only **10** qualify, because a fold is nearly always caused by a
+fact change or by a cleared binding the destination reads. The stamping walk
+itself costs about 16 ms on TodoMVC (invalidation 17.5 → 33.7 ms), so the slice
+is a net regression. Rejected and reverted with no code change; the experiment
+diff is kept at
+`target/reports/compiler-performance/k1pp-rejected-dependency-stamp.diff` and
+the full record is
+[dependency-stamp rejection](evidence/compiler-k1pp-dependency-stamp-rejection-2026-09-12.json).
+
+This closes the last in-scope avenue for removing NovyWave's residual per-fold
+verification. Combined with the earlier slices, the position is: the contract's
+mechanism is implemented and measured (retained-prefix folding, re-convergence,
+no-op resolution and order rebuilds, structural-cache dependency receipts),
+TodoMVC sits below the K0 producer, and NovyWave's 93 ms refresh is the cost of
+maintaining requirement aggregation inside a cold compile. Removing that
+residual needs the retained-revision machinery the contract assigns to the
+successor goal.

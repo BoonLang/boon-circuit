@@ -321,6 +321,36 @@ semantic and 219.2 ms of backend on top of 682.1 ms of typecheck. K2—K5 remain
 unchanged; K5 owns the semantic/backend share for the verified product, and
 the warm interaction budget owns the IDE-shaped near-term gate.
 
+**K1′ result (2026-09-11): blocked on scope.** Five bounded attempts failed to
+reach either K1′ ending: no sound memo tuple key exists (35% closed calls,
+requirement half differs on identical inputs), the residual fallback is
+33–212% slower than the summary path, halving interpreted node visits moved
+nothing, a scaffold cache cut interning by 1% while latency rose, and refresh
+batching broke the withdrawn-evidence invariant. The measured cost is
+requirement re-aggregation: 18,792 aggregate evaluations over 722,579 fact
+visits from 11,553 changed sites on TodoMVC, with object interning 213,235 to
+1,189,597 and scratch reuses 1.49M to 5.92M against K0. Evidence:
+[planner cost](evidence/compiler-k1p-planner-cost-2026-09-11.json) and
+[domain fold and rejections](evidence/compiler-k1p-domain-fold-2026-09-11.json).
+
+**K1″ (next default cut): incremental requirement aggregation.** Maintain each
+destination's aggregate per committed site change with exact removal and
+refresh-before-read preserved, so unchanged contributors are never re-merged.
+Exit: cold TodoMVC/NovyWave back to K0-class latency with byte-identical
+diagnostics and interning/scratch churn falling toward K0, or a reviewed
+rejection with source evidence. Contract:
+[requirement aggregation](BOON_COMPILER_REQUIREMENT_AGGREGATION_GOAL_PROMPT.md).
+
+**Declared successors (own goals, not part of K1″):** *Goal B, warm revision
+retention* — retain the packed solved revision across edits, solve demanded
+definitions only, exact dirty cones with backdating and last-good publication;
+gates are the manifest warm budgets (16.7 ms diagnostics p95, 100 ms preview
+p95). *Goal C, conditional linked transfer code* — opens only if fresh profiles
+after A and B still show transfer evaluation dominating cold first-solve cost;
+the original premise is measured weak because node visits are not the cost.
+The roadmap entries below remain the long-range sequence; this refinement names
+the next three selected cuts explicitly.
+
 ### K2 — Shared Definition Code Through Semantic and Executable Consumers
 
 Separate code compatibility from occurrence state/capture/resource identity.

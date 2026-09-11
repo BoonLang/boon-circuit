@@ -1,6 +1,12 @@
 # Next Compiler /goal — K1′ Transfer Cost
 
-Updated: 2026-09-11. Status: recommended next bounded compiler goal. It
+Updated: 2026-09-11. **Status: blocked on scope and superseded. Do not start
+this goal again.** Five measured attempts (memoization, residual fallback,
+domain fold, scaffold cache, refresh batching) failed to reach either ending,
+and closing the remaining gap needs a new architectural cut. The successor is
+[the requirement-aggregation prompt](BOON_COMPILER_REQUIREMENT_AGGREGATION_GOAL_PROMPT.md),
+which also declares the warm-retention and conditional linked-code successor
+goals. The text below is the historical contract that was executed. It
 replaces the completed
 [K0+K1 prompt](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md), which now
 records a reviewed rejection rather than an active objective. This document

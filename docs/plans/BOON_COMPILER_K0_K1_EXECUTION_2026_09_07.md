@@ -959,3 +959,28 @@ exact removal), K2-style linked transfer code, or the product-critical K3/K4
 warm path — all of which exceed this bounded goal's authorized cuts. The goal
 is therefore blocked on scope, and the handoff asks for a new cut to be
 selected.
+
+### 2026-09-11: K1′ handoff and the selected successor sequence
+
+K1′ closed blocked on scope. The successor contract is
+[the requirement-aggregation prompt](BOON_COMPILER_REQUIREMENT_AGGREGATION_GOAL_PROMPT.md),
+which selects:
+
+1. **K1″ — incremental requirement aggregation.** Maintain each destination's
+   aggregate per committed site change with exact removal, preserving
+   refresh-before-read, so unchanged contributors are never re-merged. Gate:
+   cold TodoMVC/NovyWave back to K0-class latency with byte-identical
+   diagnostics and interning/scratch churn falling toward K0's 213k object
+   intern requests and 1.5M scratch reuses.
+2. **Goal B — warm revision retention (K3/K4-lite).** The product-critical
+   cut: retain the packed solved revision across edits, solve demanded
+   definitions only, exact dirty cones with backdating, last-good publication.
+   Gates: warm diagnostics p95 <= 16.7 ms and preview p95 <= 100 ms at 3+30,
+   no cold regression, no stale publication.
+3. **Goal C — conditional linked transfer code.** Opens only if fresh profiles
+   after A and B still show transfer evaluation dominating cold first-solve
+   cost; otherwise it is recorded as unnecessary with the profile evidence.
+
+The full start commands for all three live in the prompt file. K2–K5 in the
+architecture plan keep their long-range order; these three cuts are the
+explicitly selected next tranche. No further work happens inside K1′.

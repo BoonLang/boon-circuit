@@ -431,6 +431,11 @@ struct RequirementPhaseProbe {
     invalidate_affected: u64,
     invalidate_recorded: u64,
     commit_skipped_touches: u64,
+    single_pass_folds: u64,
+    pairwise_folds: u64,
+    prefix_reuse_folds: u64,
+    prefix_reuse_terms: u64,
+    last_signature: std::collections::HashMap<u32, Box<[TypeTermId]>>,
     intern_invalidate: u64,
     intern_collect: u64,
     intern_resolve: u64,
@@ -446,7 +451,7 @@ impl Drop for RequirementPhaseProbe {
         }
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         eprintln!(
-            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
+            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} single_pass_folds={} pairwise_folds={} prefix_reuse_folds={} prefix_reuse_terms={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
             self.calls,
             self.folds,
             self.memo_hits,
@@ -465,6 +470,10 @@ impl Drop for RequirementPhaseProbe {
             self.invalidate_affected,
             self.invalidate_recorded,
             self.commit_skipped_touches,
+            self.single_pass_folds,
+            self.pairwise_folds,
+            self.prefix_reuse_folds,
+            self.prefix_reuse_terms,
             self.intern_invalidate,
             self.intern_collect,
             self.intern_resolve,
@@ -3190,6 +3199,7 @@ impl ComponentSolver {
             TypeTermHead::VariantSet(span) => {
                 let mut variants = self.variant_scratch.take();
                 variants.extend_from_slice(self.program.terms.variant_terms(span));
+                let mut changed = false;
                 for term in rest {
                     let term = self.resolve_term_head(*term);
                     let TypeTermHead::VariantSet(span) = self.program.terms.term_head(term) else {
@@ -3203,9 +3213,11 @@ impl ComponentSolver {
                             .position(|variant| variant.tag() == incoming.tag())
                         else {
                             variants.push(incoming);
+                            changed = true;
                             continue;
                         };
-                        variants[index] = match (variants[index], incoming) {
+                        let existing = variants[index];
+                        let merged = match (existing, incoming) {
                             (
                                 VariantTerm::Tagged { tag, fields },
                                 VariantTerm::Tagged { fields: right, .. },
@@ -3216,7 +3228,17 @@ impl ComponentSolver {
                             (VariantTerm::Tag(_), tagged @ VariantTerm::Tagged { .. }) => tagged,
                             (existing, _) => existing,
                         };
+                        if merged != existing {
+                            variants[index] = merged;
+                            changed = true;
+                        }
                     }
+                }
+                // A contributor that adds no tag and widens no payload leaves
+                // the accumulator exactly as it was, so rebuild nothing.
+                if !changed && self.program.terms.variant_set_is_canonical(span) {
+                    self.variant_scratch.recycle(variants);
+                    return Some(first);
                 }
                 let merged = self.program.terms.variant_set(variants.iter().copied());
                 self.variant_scratch.recycle(variants);
@@ -3235,6 +3257,7 @@ impl ComponentSolver {
                     fields.push((field.name, field.ty));
                 }
                 let mut open = open;
+                let mut changed = false;
                 for term in rest {
                     let term = self.resolve_term_head(*term);
                     let TypeTermHead::Object {
@@ -3245,6 +3268,7 @@ impl ComponentSolver {
                         self.record_field_scratch.recycle(fields);
                         return None;
                     };
+                    changed |= term_open && !open;
                     open |= term_open;
                     let count = self.program.terms.object_fields_for_shape(shape).len();
                     for ordinal in 0..count {
@@ -3254,12 +3278,22 @@ impl ComponentSolver {
                             .object_field_for_shape(shape, ordinal)
                             .expect("sealed object field exists");
                         if let Some(index) = fields.iter().position(|left| left.0 == right.name) {
-                            fields[index].1 =
-                                self.merge_type_evidence(fields[index].1, right.ty, false);
+                            let merged = self.merge_type_evidence(fields[index].1, right.ty, false);
+                            if merged != fields[index].1 {
+                                fields[index].1 = merged;
+                                changed = true;
+                            }
                         } else {
                             fields.push((right.name, right.ty));
+                            changed = true;
                         }
                     }
+                }
+                // Subsumed contributors keep the accumulator identical, so
+                // there is nothing to re-intern.
+                if !changed {
+                    self.record_field_scratch.recycle(fields);
+                    return Some(first);
                 }
                 let result = self.program.terms.object(fields.iter().copied(), open);
                 self.record_field_scratch.recycle(fields);
@@ -3294,6 +3328,7 @@ impl ComponentSolver {
         if left == right {
             return left;
         }
+        let left_id = left;
         let left_term = self.program.terms.term_head(left);
         let right_term = self.program.terms.term_head(right);
         match (left_term, right_term) {
@@ -3308,6 +3343,7 @@ impl ComponentSolver {
                 // equating them through this solver's union-find authority.
                 let mut variants = self.variant_scratch.take();
                 variants.extend_from_slice(self.program.terms.variant_terms(left));
+                let mut changed = false;
                 for ordinal in 0..right.len() {
                     let incoming = self.program.terms.variant_terms(right)[ordinal];
                     let Some(index) = variants
@@ -3315,9 +3351,11 @@ impl ComponentSolver {
                         .position(|variant| variant.tag() == incoming.tag())
                     else {
                         variants.push(incoming);
+                        changed = true;
                         continue;
                     };
-                    variants[index] = match (variants[index], incoming) {
+                    let existing = variants[index];
+                    let merged = match (existing, incoming) {
                         (
                             VariantTerm::Tagged { tag, fields: left },
                             VariantTerm::Tagged { fields: right, .. },
@@ -3328,6 +3366,14 @@ impl ComponentSolver {
                         (VariantTerm::Tag(_), tagged @ VariantTerm::Tagged { .. }) => tagged,
                         (existing, _) => existing,
                     };
+                    if merged != existing {
+                        variants[index] = merged;
+                        changed = true;
+                    }
+                }
+                if !changed && self.program.terms.variant_set_is_canonical(left) {
+                    self.variant_scratch.recycle(variants);
+                    return left_id;
                 }
                 let merged = self.program.terms.variant_set(variants.iter().copied());
                 self.variant_scratch.recycle(variants);
@@ -3351,6 +3397,7 @@ impl ComponentSolver {
                     .len();
                 let mut fields = self.record_field_scratch.take();
                 fields.reserve(left_field_count.saturating_add(right_field_count));
+                let mut changed = left_open != (left_open || right_open);
                 for ordinal in 0..left_field_count {
                     let field = self
                         .program
@@ -3366,11 +3413,19 @@ impl ComponentSolver {
                         .object_field_for_shape(right_shape, ordinal)
                         .expect("sealed right equality field exists");
                     if let Some(index) = fields.iter().position(|left| left.0 == right.name) {
-                        fields[index].1 =
-                            self.merge_type_evidence(fields[index].1, right.ty, permanent);
+                        let merged = self.merge_type_evidence(fields[index].1, right.ty, permanent);
+                        if merged != fields[index].1 {
+                            fields[index].1 = merged;
+                            changed = true;
+                        }
                     } else {
                         fields.push((right.name, right.ty));
+                        changed = true;
                     }
+                }
+                if !changed {
+                    self.record_field_scratch.recycle(fields);
+                    return left_id;
                 }
                 let result = self
                     .program

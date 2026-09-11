@@ -1,0 +1,51 @@
+{
+ "status": "fifth aggregation slice: a merge that adds nothing returns the accumulator unchanged; TodoMVC improves 2.4% with no plan drift and the probe now measures how much a retained fold prefix would save",
+ "date": "2026-09-11",
+ "change": {
+  "cut": "no-op merge fast path",
+  "what": "merge_type_evidence (variant-set and object arms) and merge_requirement_terms (single-pass arms) now track whether any variant was added or payload widened or any field added or retyped. When nothing changed the left operand is returned directly instead of rebuilding the term and re-interning it. Variant sets additionally require the stored set to be in canonical order, so the skipped rebuild would have interned to the same term.",
+  "why": "NovyWave issues 615,214 object intern requests against K0's 220,717 while the merge phase itself is 143.6 ms of a 251.1 ms refresh; a subsumed contributor used to rebuild and re-intern the whole accumulator.",
+  "soundness": "the rebuild result is by construction equal to the left operand whenever nothing was added, widened, retyped or opened, and the object arm preserves field order from the left operand, so returning left is the identical term. Variant sets pass through the arena's new canonical-order check so a non-canonical left operand still takes the rebuilding path."
+ },
+ "interleaved_ab": {
+  "protocol": "eight alternating rounds, one process per observation, release evidence lane, cold fresh-process",
+  "todo_mvc_diagnostics_ms": {"before_p50": 921.5, "before_min": 917.5, "after_p50": 899.5, "after_min": 890.5, "delta_p50_pct": -2.39},
+  "todo_mvc_verified_ms": {"before_p50": 1332.6, "before_min": 1322.7, "after_p50": 1311.6, "after_min": 1300.7, "delta_p50_pct": -1.58},
+  "novywave_diagnostics_ms": {"before_p50": 782.3, "before_min": 777.9, "after_p50": 781.7, "after_min": 778.4, "delta_p50_pct": -0.08},
+  "parity": "each lane produced a single (diagnostics fingerprint, plan) pair across both binaries: no diagnostics or plan drift"
+ },
+ "prefix_reuse_attribution": {
+  "probe": "BOON_KERNEL_TRACE_AGGREGATE_PHASE release observation per fixture (diagnostics, fresh-process)",
+  "todo_mvc_physical": {
+   "evaluations": "15,029 folds of which 5,367 memo hits",
+   "single_pass_folds": 9391,
+   "pairwise_folds": 271,
+   "folds_with_unchanged_prefix": 10966,
+   "reusable_prefix_terms": 31281,
+   "contributor_visits_in_non_memo_folds": 35616
+  },
+  "novywave": {
+   "evaluations": "6,287 folds of which 1,695 memo hits",
+   "single_pass_folds": 4178,
+   "pairwise_folds": 414,
+   "folds_with_unchanged_prefix": 4689,
+   "reusable_prefix_terms": 94908,
+   "contributor_visits_in_non_memo_folds": 119920
+  },
+  "reading": "an ordered fold that resumes from the retained prefix aggregate would skip roughly 88% of TodoMVC and 79% of NovyWave contributor terms, which is the shape of the incremental-aggregation ending the contract asks for"
+ },
+ "gates": {
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ },
+ "caveats": [
+  "the NovyWave merge phase is unchanged by this slice (143.6 ms) because its contributors genuinely widen the accumulator; the gain is in the solver's general merge path, which shares these arms",
+  "prefix figures count all evaluations including memo hits, so they are an upper bound on what prefix retention adds beyond the existing memo",
+  "cold modes only; the warm path is the successor goal"
+ ]
+}

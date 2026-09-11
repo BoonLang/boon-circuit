@@ -1097,6 +1097,14 @@ impl TypeTermArena {
         &self.variants[span.range()]
     }
 
+    /// True when a stored variant set is already in canonical order, so a
+    /// rebuild that adds and widens nothing would intern to the same term.
+    pub(crate) fn variant_set_is_canonical(&self, span: TermSpan) -> bool {
+        self.variant_terms(span)
+            .windows(2)
+            .all(|pair| self.compare_variants_canonically(&pair[0], &pair[1]) != Ordering::Greater)
+    }
+
     pub(crate) fn object_fields_for_shape(&self, shape: u32) -> ObjectFields<'_> {
         let shape = self.object_shapes[shape as usize];
         ObjectFields {

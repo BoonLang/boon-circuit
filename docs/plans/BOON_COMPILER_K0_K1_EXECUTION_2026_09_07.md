@@ -1239,3 +1239,26 @@ look like host interference (the p50 values are the interleaved metric).
 The Implemented ending is therefore met for TodoMVC and still open for
 NovyWave: the next slice attacks NovyWave's recursive payload merge (144.3 ms
 of a 247.8 ms refresh) under the same gates and evidence discipline.
+
+### 2026-09-11: K1″ fifth slice — no-op merges return the accumulator, and the prefix is measured
+
+`merge_type_evidence` and the single-pass fold now track whether a contributor
+actually added a variant, widened a payload, added a field or opened the shape.
+When nothing changed they return the left operand instead of rebuilding and
+re-interning it; variant sets also require the stored set to be in canonical
+order so the skipped rebuild would have produced the same term. Interleaved
+A/B, eight rounds, one process per observation: TodoMVC diagnostics 921.5 →
+899.5 ms (−2.4%, min 890.5) and verified 1332.6 → 1311.6 ms (−1.6%), NovyWave
+flat (782.3 → 781.7). Every lane produced a single (fingerprint, plan) pair, so
+this slice changes no diagnostics and no plan.
+
+The probe now also measures what a retained fold prefix would save. TodoMVC:
+15,029 evaluations, 9,391 single-pass and 271 pairwise folds, 10,966 folds
+whose ordered prefix is unchanged, 31,281 reusable prefix terms against 35,616
+contributor visits. NovyWave: 6,287 evaluations, 4,178 single-pass and 414
+pairwise folds, 4,689 folds with an unchanged prefix, 94,908 reusable prefix
+terms against 119,920 contributor visits. Resuming an ordered fold from the
+retained prefix aggregate would therefore skip roughly 88% of TodoMVC and 79%
+of NovyWave contributor terms — the incremental-aggregation shape the contract
+asks for — and it is the next slice. Full record:
+[merge no-op and prefix measurement](evidence/compiler-k1pp-merge-noop-2026-09-11.json).

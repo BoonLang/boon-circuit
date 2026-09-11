@@ -1,12 +1,20 @@
 # Goal Entry Point
 
-Updated: 2026-09-06.
+Updated: 2026-09-11.
 
 The active compiler execution prompt is
-[Next Compiler /goal — K0 + K1](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md).
-Read its complete contract before starting. It selects a bounded, reviewed
-kernel-transfer cut, not an indefinite attempt to implement every future
-compiler, language, runtime, console and product plan.
+[Next Compiler /goal — K1′ Transfer Cost](BOON_COMPILER_K1_TRANSFER_COST_GOAL_PROMPT.md).
+Read its complete contract before starting. It makes definition-transfer
+evaluation cost-proportional or falls back to linked residual evaluation; it
+is not an indefinite attempt to implement every future compiler, language,
+runtime, console and product plan.
+
+The previous
+[K0 + K1 prompt](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md) is
+completed and retired: K1 was measured as a regression and rejected as
+implemented, with the decision, report hashes and attribution in the
+[2026-09-11 evidence](evidence/compiler-k1-decision-2026-09-11.json). Do not
+re-run that objective.
 
 The active roadmap is
 [Definition-Owned Work and Responsive Revisions](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md).

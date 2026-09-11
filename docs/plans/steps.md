@@ -3,8 +3,10 @@
 Status, 2026-09-06: historical unified-portfolio sequence, not the current
 compiler goal. The active compiler sequence is
 [Definition-Owned Work and Responsive Revisions](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md),
-and [the next goal](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md) selects
-K0+K1 only. `GOAL_PROMPT.md` is now an index, not the retired unified objective.
+and [the next goal](BOON_COMPILER_K1_TRANSFER_COST_GOAL_PROMPT.md) selects the
+K1′ transfer-cost cut only. The earlier K0+K1 objective is completed and
+rejected as implemented. `GOAL_PROMPT.md` is now an index, not the retired
+unified objective.
 Do not execute the old resumption points below, defer warm responsiveness until
 all cold stretch hypotheses pass, or expand into later language/native/console/
 product work without a newly selected scope. Linked semantic plans retain their

@@ -27,6 +27,16 @@ places to change. It is acceptable to simplify or restructure example Boon code
 when that makes the intended app cleaner, but do not hide engine limitations in
 example-specific hacks.
 
+For compiler-performance work, measure the warm interaction path
+(`cargo xtask verify-compiler-interactions`) before cold micro-optimizations,
+and use interleaved A/B/A 3+30 observations in both lanes and cold modes with
+the `KernelRequirementWork` counters included. Never edit
+`budgets/compiler.toml` to make a candidate pass. Do not grow the interpreted
+summary evaluator without per-tuple reuse: the measured K1 cut re-walked
+shared summary programs per invocation and lost 23-130% end to end despite
+removing 71% of the targeted residual work. Reuse keys must be exact semantic
+input tuples plus dependency epochs, never final result-type equality.
+
 When the user asks for or explicitly permits parallel help, use subagents for
 independent reads before continuing micro-fixes. Good splits include native
 input/event-shape analysis, retained WGPU/render/readback architecture,

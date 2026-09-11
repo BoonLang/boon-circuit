@@ -1,16 +1,26 @@
 # Next Compiler /goal — K0 + K1
 
-Updated: 2026-09-06. Status: recommended next bounded compiler goal.
+Updated: 2026-09-06. **Status: completed 2026-09-11 — K1 rejected as
+implemented, not an active objective.** Do not start this goal again; the
+measured decision lives in
+[the 2026-09-11 evidence](evidence/compiler-k1-decision-2026-09-11.json) and
+the next bounded objective is
+[the K1′ transfer-cost prompt](BOON_COMPILER_K1_TRANSFER_COST_GOAL_PROMPT.md).
+The text below is the historical contract that was executed.
+
 This replaces the former all-M0--M6 goal and the older unified-product prompt.
 It does not start, clear, resume or change a live goal by itself.
 
 ## Start Command
 
-In a fresh thread for this repository, paste:
-
-```text
-/goal Execute the K0+K1 contract in docs/plans/BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md from the current HEAD. Deliver the reviewed kernel-transfer decision and a verified production speedup if the hypothesis holds. Follow its scope, evidence, checkpoint and stopping rules. Do not push or continue into later cuts.
-```
+Superseded, with no replacement command here on purpose. The K1 run measured
+the transfer cut as a regression: targeted residual work fell (TodoMVC linked
+operations 282,393 to 82,451) while summary node evaluations rose 32,365 to
+1,017,465 and end-to-end latency regressed (TodoMVC diagnostics +28.9%,
+NovyWave diagnostics +81.7% in the best candidate pass). Use the start command
+in
+[the K1′ transfer-cost prompt](BOON_COMPILER_K1_TRANSFER_COST_GOAL_PROMPT.md)
+instead of re-running this one.
 
 If reusing a thread that still holds the superseded goal, clear that objective
 with `/goal clear` first; do not resume its old attachment. Starting a goal is a

@@ -2,8 +2,11 @@
 
 This is an execution log, not a replacement goal or acceptance contract.
 The bounded [K0 + K1 goal](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md)
-remains active. Starting HEAD: `9901854231ffc248e5bd3db79b582e86bc57b71c`;
-starting compiler implementation: `37a576b6`. No pushes are authorized.
+completed on 2026-09-11 with a reviewed rejection of K1 as implemented; its
+successor is the
+[K1′ transfer-cost goal](BOON_COMPILER_K1_TRANSFER_COST_GOAL_PROMPT.md).
+Starting HEAD: `9901854231ffc248e5bd3db79b582e86bc57b71c`; starting compiler
+implementation: `37a576b6`. No pushes are authorized.
 
 ## Producer identity prerequisite
 

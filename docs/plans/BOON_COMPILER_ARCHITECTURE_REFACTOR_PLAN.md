@@ -3,7 +3,8 @@
 Execution status, 2026-09-06: historical architecture/checkpoint journal.
 [Definition-Owned Work and Responsive Revisions](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md)
 is the single active cut sequence; use its
-[K0+K1 goal](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md) and
+[K1′ transfer-cost goal](BOON_COMPILER_K1_TRANSFER_COST_GOAL_PROMPT.md)
+(the earlier K0+K1 objective is completed and rejected as implemented) and
 [current evidence](BOON_COMPILER_REASSESSMENT_2026_09_06.md).
 All dated "active", "current", "next", "resume" and M-number instructions
 below describe their historical checkpoint, not present authorization. They

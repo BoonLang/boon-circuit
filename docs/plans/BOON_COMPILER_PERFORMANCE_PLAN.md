@@ -6,8 +6,10 @@ Status: normative measurement, semantic-preservation and full-program
 acceptance contract. The single active implementation order and bug/feature
 register are in
 [the compiler architecture plan](BOON_COMPILER_TENS_OF_MILLISECONDS_ARCHITECTURE_PLAN.md).
-[The K0+K1 prompt](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md) selects the
-next bounded goal; this entire program is not implicitly that goal's scope.
+[The K1′ transfer-cost prompt](BOON_COMPILER_K1_TRANSFER_COST_GOAL_PROMPT.md)
+selects the next bounded goal; the earlier K0+K1 objective is completed and was
+rejected as implemented, and this entire program is not implicitly any one
+goal's scope.
 
 [budgets/compiler.toml](../../budgets/compiler.toml) is the sole executable
 budget, sample-protocol and oracle authority. This document defines meanings,

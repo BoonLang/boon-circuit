@@ -18,8 +18,11 @@ not competing resumption instructions.
   not silently substituted for its gates.
 - [2026-09-06 evidence](BOON_COMPILER_REASSESSMENT_2026_09_06.md) records the
   source audit, report identities, measurements, corrections and uncertainty.
-- [Goal prompt](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md) selects the
-  next bounded tranche. It does not authorize every item in this roadmap.
+- [K1′ goal prompt](BOON_COMPILER_K1_TRANSFER_COST_GOAL_PROMPT.md) selects the
+  next bounded tranche; the earlier
+  [K0+K1 prompt](BOON_COMPILER_TENS_OF_MILLISECONDS_GOAL_PROMPT.md) is
+  completed and was rejected as implemented. Neither authorizes every item in
+  this roadmap.
 - Language, exact values, type inference, persistence, formal verification and
   native GPU contracts keep their semantic authority. In particular,
   [the WHERE plan](BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md) owns proof meaning
@@ -287,6 +290,36 @@ changes, preserve user work, record the next owning architectural decision and
 request the next scope. One failed experiment is not evidence of impossibility.
 Do not describe that outcome as implemented optimization or full performance
 completion. The bounded prompt states this decision boundary explicitly.
+
+**K1 result (2026-09-11): rejected as implemented.** The transfer cut removes
+the targeted replay (TodoMVC linked operations 282,393 to 82,451, activations
+620,555 to 181,056; peak RSS 180 to 126 MiB) but re-walks shared summary
+programs per invocation (summary node evaluations 32,365 to 1,017,465, term
+interning +380%, summary definition nodes 236 to 2,325), so end-to-end latency
+regressed on every large fixture and cold mode even in the faster pass
+(TodoMVC diagnostics +28.9%, NovyWave diagnostics +81.7%). Decision, report
+hashes and attribution:
+[2026-09-11 evidence](evidence/compiler-k1-decision-2026-09-11.json).
+
+**K1′ (next default cut): cost-proportional transfer evaluation.** Evaluate a
+definition transfer once per distinct quiescent typed input tuple plus
+dependency epoch, and/or execute linked compatible code variants bound to
+per-occurrence frames, so summary work grows with distinct inputs rather than
+invocations. The invocation-reuse ceiling is 7.1x (891 calls to 125 tuple
+classes) and a perfect 7x still leaves about 4.4x more summary work than the
+K0 cohort, so per-tuple evaluation cost must fall too. If no sound key exists
+for the measured cohort, keep shared physical bytes and evaluate through
+linked residual specialization instead. Acceptance: no cold regression
+against the fresh K0 producer, summary work near the distinct-tuple count,
+interleaved A/B/A 3+30 measurement, warm interactions recorded, and an
+independent read-only review. The bounded contract is
+[the K1′ goal prompt](BOON_COMPILER_K1_TRANSFER_COST_GOAL_PROMPT.md).
+
+Phase attribution keeps the target honest: TodoMVC diagnostics is 908.7 ms of
+typecheck out of 929.8 ms at K0, and NovyWave verified adds 785.0 ms of
+semantic and 219.2 ms of backend on top of 682.1 ms of typecheck. K2—K5 remain
+unchanged; K5 owns the semantic/backend share for the verified product, and
+the warm interaction budget owns the IDE-shaped near-term gate.
 
 ### K2 — Shared Definition Code Through Semantic and Executable Consumers
 

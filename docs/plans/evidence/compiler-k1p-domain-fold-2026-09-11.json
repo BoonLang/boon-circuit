@@ -52,5 +52,22 @@
     "finding": "the cache almost never hits: interning traffic fell by about 1% while latency rose 3-6%. The 97% intern hit rate means the arena is already finding structurally equal terms, but the requests are made from fresh per-call term identities, so a term-id-keyed cache cannot capture them. The experiment is reverted exactly; the tree is unchanged by the revert.",
     "revised_attribution": "the extra cost is not one addressable cache. It is distributed across the per-call summary machinery: fresh term construction that interns (mostly hits), scratch-pool churn four times K0, and the evaluation bookkeeping around each call. No single cheap cache has moved latency in two measured attempts (domain fold, scaffold cache)."
   },
+  "rejected_experiment_refresh_batching": {
+    "what": "removed the three in-pass refresh_requirements calls (publish_projection start and end, finish_summary_requirements) and relied on the drain loop's per-iteration refresh, to see whether the 18,792 aggregate evaluations were redundant",
+    "result": "kernel library 196 passed and 1 failed: solver::requirements::tests::projection_does_not_reimport_a_withdrawn_requirement_as_base. The immediate refresh after staging is load-bearing; a projection must observe the refreshed aggregate before the next read.",
+    "finding": "the requirement fold's cost is inherent to refresh-before-read semantics, not redundant cadence. Reducing it requires incremental aggregation that maintains a target's aggregate per site change with exact removal, which is a solver-core redesign rather than a bounded optimization.",
+    "reverted": "exact revert; the worktree is unchanged"
+  },
+  "bounded_levers_exhausted": {
+    "measured_attempts": [
+      "memoization: no sound tuple key (requirement half state-dependent, open majority unkeyable)",
+      "residual fallback: 33-212% slower than the summary path in release",
+      "node-count reduction (domain fold): -52% summary nodes, latency unchanged",
+      "scaffold object cache: ~1% interning reduction, latency worse",
+      "refresh batching: rejected by the withdrawn-evidence invariant"
+    ],
+    "remaining_work": "solver-core incremental requirement aggregation, K2-style linked transfer code, or K3/K4 warm revision work; all exceed the bounded goal's authorized cuts",
+    "goal_status": "blocked on scope: the bounded goal cannot reach either of its endings without a new architectural cut"
+  },
   "verified_gates": "kernel library 197, kernel_transfer 10, compiler library 98 with one pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match 3, pulses 8, all green"
 }

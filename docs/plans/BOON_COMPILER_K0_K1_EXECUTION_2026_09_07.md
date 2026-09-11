@@ -941,3 +941,21 @@ domain fold and the scaffold cache — have now shown that no single cheap node
 or cache reduction moves end-to-end latency; the remaining gap is distributed
 across the per-call summary machinery and needs the larger linked-code cut
 (compile the transfer to scheduled operations) to have a chance of closing.
+
+A third bounded attempt is also rejected. Removing the three in-pass
+`refresh_requirements` calls (in `publish_projection` and
+`finish_summary_requirements`) and relying on the drain loop's per-iteration
+refresh left 196 kernel tests passing and one failing:
+`projection_does_not_reimport_a_withdrawn_requirement_as_base`. The immediate
+refresh after staging is load-bearing — a projection must observe the refreshed
+aggregate before the next read — so the requirement fold's cost is inherent to
+refresh-before-read semantics, not redundant cadence. It is reverted exactly.
+
+Three measured attempts (domain fold, scaffold cache, refresh batching) now
+show the same result: the remaining TodoMVC gap is not addressable with bounded
+node, cache or cadence changes. Closing it needs solver-core incremental
+requirement aggregation (maintain each target's aggregate per site change with
+exact removal), K2-style linked transfer code, or the product-critical K3/K4
+warm path — all of which exceed this bounded goal's authorized cuts. The goal
+is therefore blocked on scope, and the handoff asks for a new cut to be
+selected.

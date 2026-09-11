@@ -370,6 +370,7 @@ struct SummaryReuseProbe {
     closed_value_mismatches: u64,
     closed_requirement_mismatches: u64,
     closed_entries_with_variables: u64,
+    closed_requirement_examples: u64,
 }
 
 #[cfg(debug_assertions)]
@@ -2065,6 +2066,27 @@ impl ComponentSolver {
                 if previous.1 != entry.1 {
                     probe.closed_requirement_mismatches =
                         probe.closed_requirement_mismatches.saturating_add(1);
+                    if probe.closed_requirement_examples < 4 {
+                        probe.closed_requirement_examples =
+                            probe.closed_requirement_examples.saturating_add(1);
+                        let index = previous
+                            .1
+                            .iter()
+                            .zip(entry.1.iter())
+                            .position(|(first, current)| first != current);
+                        let render = |values: &[Option<u32>]| {
+                            index
+                                .and_then(|index| values.get(index).copied().flatten())
+                                .map(|term| {
+                                    self.program.terms.export_checked_type(TypeTermId(term))
+                                })
+                        };
+                        eprintln!(
+                            "kernel-summary-reuse-mismatch definition={definition} input={index:?} first={:?} current={:?}",
+                            render(&previous.1),
+                            render(&entry.1)
+                        );
+                    }
                 }
             }
             None => {

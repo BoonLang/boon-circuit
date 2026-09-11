@@ -1,0 +1,49 @@
+{
+  "status": "K1-prime decision evidence: neither memoization nor the in-tree residual fallback can restore K0-class cold latency; the measured root cause is summary-program planner amplification",
+  "date": "2026-09-11",
+  "release_ab_summary_vs_residual_fresh_process": {
+    "protocol": "target/release/boon_cli compiler-sample, one sample per configuration, same machine; BOON_KERNEL_DISABLE_DIRECT_SUMMARIES=1 selects the residual instantiation path",
+    "todo-mvc-physical": {
+      "diagnostics_ms": {"summary_path": 1166.2, "residual_path": 1553.1, "k0_baseline": 929.8},
+      "verified_ms": {"summary_path": 1589.6, "residual_path": 1854.3, "k0_baseline": 1281.1},
+      "residual_work": {"activations": 747280, "linked_operations": 335756, "invocation_frames": 10205}
+    },
+    "novywave": {
+      "diagnostics_ms": {"summary_path": 913.0, "residual_path": 2849.3, "k0_baseline": 497.3},
+      "verified_ms": {"summary_path": 2215.3, "residual_path": 4201.2, "k0_baseline": 1845.4},
+      "residual_work": {"activations": 1001073, "linked_operations": 542601, "invocation_frames": 24756}
+    },
+    "finding": "the residual fallback is 33-212% slower than the current summary path and 67-473% slower than K0, because the residual instantiation path in the current tree also carries the K1 requirement machinery (NovyWave 24,756 frames against K0's 703). The fallback ending's acceptance condition, restoring K0-class cold latency, is not reachable by switching paths in this tree."
+  },
+  "summary_planner_amplification_debug_trace": {
+    "trace": "BOON_KERNEL_TRACE_SUMMARIES=1 prints the largest compiled summary programs with per-kind node counts and the source owner's node/call counts",
+    "todo-mvc-physical_examples": [
+      {"definition": 104, "owner_nodes": 97, "owner_calls": 0, "summary_nodes": 465, "invoke_nodes": 0, "input": 45, "unify": 41, "sequence": 16, "record": 16, "projection": 14, "select": 3},
+      {"definition": 79, "owner_nodes": 254, "owner_calls": 0, "summary_nodes": 410, "invoke_nodes": 0, "input": 77, "unify": 75, "sequence": 30, "record": 22, "select": 6},
+      {"definition": 103, "owner_nodes": 0, "owner_calls": 0, "summary_nodes": 271, "unify": 59, "input": 62, "sequence": 24, "record": 17}
+    ],
+    "nested_call_sharing": {"nested_calls": 0, "targets_with_compiled_summary": 0, "share_attempts": 0},
+    "finding": "the programs are not inflated by transitive inlining; TodoMVC's dominant summaries contain no nested calls at all. A 97-node owner compiles into a 465-node summary program, about 4.8x, dominated by per-field input nodes and per-arm/per-field unify and sequence scaffolding."
+  },
+  "per_definition_evaluation_cost": {
+    "todo-mvc-physical_definition_79": {"k0_program_evaluations": 720, "k0_node_evaluations": 12248, "k0_nodes_per_evaluation": 17.0, "candidate_program_evaluations": 674, "candidate_node_evaluations": 143509, "candidate_nodes_per_evaluation": 212.9},
+    "novywave_definition_996": {"k0_program_evaluations": 11212, "k0_node_evaluations": 57220, "k0_nodes_per_evaluation": 5.1, "candidate_program_evaluations": 14959, "candidate_node_evaluations": 381702, "candidate_nodes_per_evaluation": 25.5},
+    "finding": "the same definitions are evaluated a comparable number of times, but each evaluation walks 5-12x more nodes than K0. The regression is program shape and per-call scaffolding, not invocation count."
+  },
+  "experiments_run_and_reverted": [
+    "Extending compile_shared_invoke to accept computed actuals (fresh Projection nodes): kernel library 197 and kernel_transfer 10 stayed green, but the sharing branch is never reached on TodoMVC (0 nested calls with compiled summaries), so the change was inert and reverted to keep the accepted baseline.",
+    "Lowering the nested-share threshold to pre-fold program size: the structural tests encode the accepted inline-trivial / share-large heuristic, and the branch remained inert for the same reason; reverted."
+  ],
+  "decision": {
+    "outcome": "neither K1-prime ending is reachable inside this bounded goal",
+    "ending_1_memoization": "rejected by measurement: only 35% of summary calls have closed inputs, the value half is tuple-pure but the requirement half is not (84 TodoMVC and 4 NovyWave mismatches on identical inputs), and the open 65% cannot be keyed by resolved terms. Even a perfect closed memo removes about a third of summary work, which cannot close a 25-82% latency gap.",
+    "ending_2_residual_fallback": "rejected by measurement: the in-tree residual path is 33-212% slower than the summary path and 67-473% slower than K0, so switching to it cannot restore K0-class latency.",
+    "root_cause": "the K1 summary planner compiles a ~97-node owner into a ~465-node transfer program (per-field inputs plus per-arm/per-field unify and sequence scaffolding) and interprets it per call, so the same definitions evaluate 5-12x more nodes per call than K0."
+  },
+  "next_architectural_decision": {
+    "cut": "Shrink the transfer program and its per-call evaluation instead of memoizing it: audit the per-field requirement inputs and the per-arm/per-field unify and sequence scaffolding the planner emits, delete or hoist what the accepted correctness gates do not require, and re-measure the same definitions. If the scaffolding is irreducible, compile the transfer to linked code once per definition and bind occurrence frames (K2-style) rather than interpreting a 400-node program per call.",
+    "first_gate": "definition 79 and 104 node counts and nodes-per-evaluation must approach K0's profile (17-40 nodes per evaluation) without regressing kernel library, kernel_transfer, staged, or compiler library gates",
+    "acceptance": "same 3+30 interleaved protocol, no cold regression against the fresh K0 producer, and no increase in requirement-mismatch or correctness oracles"
+  },
+  "goal_status": "active; the bounded goal has reached its decision boundary and needs the next scope (planner/linked-code cut or K3/K4 warm work) selected by the user"
+}

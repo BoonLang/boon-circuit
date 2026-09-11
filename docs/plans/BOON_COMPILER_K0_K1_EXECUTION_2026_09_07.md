@@ -831,3 +831,38 @@ unsupported in both producers; only pre-canceled requests are measured.
 K1′ therefore stays on the cold transfer-cost cut or its reviewed fallback,
 with the warm numbers recorded so the handoff names K3/K4 as the
 product-critical next goal.
+
+### 2026-09-11: K1′ decision evidence — planner amplification, not reuse keys
+
+The bounded goal hit its decision boundary with measurements that reject both
+of its endings. Full record:
+[2026-09-11 planner cost](evidence/compiler-k1p-planner-cost-2026-09-11.json).
+
+Memoization is rejected by the earlier probe: only 35% of summary calls have
+closed inputs, the value half is tuple-pure but the requirement half is not
+(84 TodoMVC and 4 NovyWave mismatches on identical inputs), and the open 65%
+cannot be keyed by resolved terms. The in-tree residual fallback is rejected by
+release A/B: with `BOON_KERNEL_DISABLE_DIRECT_SUMMARIES=1` TodoMVC diagnostics
+runs 1553 ms against 1166 ms for the summary path (K0 930 ms) and NovyWave runs
+2849 ms against 913 ms (K0 497 ms), because the residual path also carries the
+K1 requirement machinery (NovyWave 24,756 frames against K0's 703).
+
+The measured root cause of the whole regression is transfer-program shape. A
+97-node owner with no calls compiles into a 465-node summary program (45 input,
+41 unify, 16 sequence, 16 record, 14 projection, 3 select nodes), and the same
+definitions evaluate 5–12x more nodes per call than K0 (definition 79: 213 vs
+17 nodes per evaluation; NovyWave definition 996: 25.5 vs 5.1). No nested-call
+sharing is attempted on TodoMVC (zero nested calls in the dominant summaries),
+so this is planner scaffolding, not transitive inlining. Two sharing
+experiments (computed-actual support in `compile_shared_invoke` and a lowered
+nested-share threshold) stayed green but were inert and were reverted; the
+debug-only reuse and summary-size probes remain as measurement support.
+
+Next cut to select: shrink the transfer program and its per-call evaluation —
+audit the per-field requirement inputs and per-arm unify/sequence scaffolding
+against the accepted correctness gates, and if the scaffolding is irreducible
+compile the transfer to linked code once per definition (K2-style) instead of
+interpreting a 400-node program per call. The warm product gap remains K3/K4.
+Gates after the experiments: kernel library 197, kernel_transfer 10,
+staged_compilation 3 and compiler library 98 with one pre-existing ignored
+probe, all green.

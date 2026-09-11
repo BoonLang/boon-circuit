@@ -17459,6 +17459,9 @@ struct CompiledDirectSummary {
     inputs: Box<[DirectSummaryInput]>,
     result_mode: DirectSummaryMode,
     formal_count: usize,
+    /// Pre-fold node count. Folding can shrink a large record to one term, so
+    /// the nested-share decision uses the compiled size, not the final size.
+    compiled_node_count: usize,
     constant_folded_nodes: u64,
     selector_fused_records: u64,
     deduplicated_nodes: u64,
@@ -17496,6 +17499,14 @@ struct DirectSummaryPlanCompiler<'a> {
     )>,
     formal_projection_inputs:
         HashMap<(u32, Box<[crate::KernelSummaryProjection]>, bool), (u32, KernelSummaryValueId)>,
+    #[cfg(debug_assertions)]
+    shared_attempts: u64,
+    #[cfg(debug_assertions)]
+    shared_successes: u64,
+    #[cfg(debug_assertions)]
+    nested_calls: u64,
+    #[cfg(debug_assertions)]
+    nested_with_summary: u64,
 }
 
 impl DirectSummaryPlanCompiler<'_> {
@@ -18141,16 +18152,36 @@ impl DirectSummaryPlanCompiler<'_> {
                         }
                     }
                     let target_actuals = target_actuals.into_iter().collect::<Option<Vec<_>>>()?;
+                    #[cfg(debug_assertions)]
+                    {
+                        self.nested_calls = self.nested_calls.saturating_add(1);
+                        if self
+                            .summaries
+                            .get(target.0 as usize)
+                            .is_some_and(Option::is_some)
+                        {
+                            self.nested_with_summary = self.nested_with_summary.saturating_add(1);
+                        }
+                    }
                     let shared = self
                         .summaries
                         .get(target.0 as usize)
                         .and_then(Clone::clone)
                         .filter(|summary| summary.shared_bytecode);
-                    if let Some(shared) = shared
-                        && let Some(result) =
+                    if let Some(shared) = shared {
+                        #[cfg(debug_assertions)]
+                        {
+                            self.shared_attempts = self.shared_attempts.saturating_add(1);
+                        }
+                        if let Some(result) =
                             self.compile_shared_invoke(shared.as_ref(), &target_actuals)
-                    {
-                        return Some(result);
+                        {
+                            #[cfg(debug_assertions)]
+                            {
+                                self.shared_successes = self.shared_successes.saturating_add(1);
+                            }
+                            return Some(result);
+                        }
                     }
                     self.compile_expression(
                         *target,
@@ -19604,6 +19635,14 @@ fn compile_direct_result_summaries(
         })
         .collect::<BTreeSet<_>>();
     let mut order = Vec::with_capacity(supported.len());
+    #[cfg(debug_assertions)]
+    let mut shared_attempts = 0_u64;
+    #[cfg(debug_assertions)]
+    let mut shared_successes = 0_u64;
+    #[cfg(debug_assertions)]
+    let mut nested_calls = 0_u64;
+    #[cfg(debug_assertions)]
+    let mut nested_with_summary = 0_u64;
     let mut states = vec![0_u8; project.definition_count()];
     for target in supported.iter().copied() {
         append_direct_summary_order(project, target, &supported, &mut states, &mut order);
@@ -19625,13 +19664,29 @@ fn compile_direct_result_summaries(
             inputs: Vec::new(),
             pattern_contexts: Vec::new(),
             formal_projection_inputs: HashMap::new(),
+            #[cfg(debug_assertions)]
+            shared_attempts: 0,
+            #[cfg(debug_assertions)]
+            shared_successes: 0,
+            #[cfg(debug_assertions)]
+            nested_calls: 0,
+            #[cfg(debug_assertions)]
+            nested_with_summary: 0,
         };
         let Some(mut result) =
             compiler.compile_expression(target, result, &actuals, &mut BTreeSet::new())
         else {
             continue;
         };
-        let shared_bytecode = compiler.nodes.len() >= SHARED_SUMMARY_MIN_NODES;
+        let compiled_node_count = compiler.nodes.len();
+        let shared_bytecode = compiled_node_count >= SHARED_SUMMARY_MIN_NODES;
+        #[cfg(debug_assertions)]
+        {
+            shared_attempts = shared_attempts.saturating_add(compiler.shared_attempts);
+            shared_successes = shared_successes.saturating_add(compiler.shared_successes);
+            nested_calls = nested_calls.saturating_add(compiler.nested_calls);
+            nested_with_summary = nested_with_summary.saturating_add(compiler.nested_with_summary);
+        }
         let (constant_folded_nodes, selector_fused_records) = compiler.fold_constant_nodes();
         let deduplicated_nodes = compiler.deduplicate_nodes(&mut result);
         let (pruned_nodes, pruned_inputs) = compiler.compact_result(&mut result);
@@ -19653,6 +19708,7 @@ fn compile_direct_result_summaries(
             inputs: compiler.inputs.into_boxed_slice(),
             result_mode: result.mode,
             formal_count: owner.formal_count() as usize,
+            compiled_node_count,
             constant_folded_nodes,
             selector_fused_records,
             deduplicated_nodes,
@@ -19660,6 +19716,101 @@ fn compile_direct_result_summaries(
             pruned_inputs,
             shared_bytecode,
         }));
+    }
+    #[cfg(debug_assertions)]
+    if std::env::var_os("BOON_KERNEL_TRACE_SUMMARIES").is_some() {
+        eprintln!(
+            "kernel-summary-share calls={} with_summary={} attempts={} successes={}",
+            nested_calls, nested_with_summary, shared_attempts, shared_successes
+        );
+        let mut sizes = summaries
+            .iter()
+            .flatten()
+            .map(|summary| {
+                let nodes = &summary.program.nodes;
+                let count = |kind: &str| match kind {
+                    "invoke" => nodes
+                        .iter()
+                        .filter(|node| matches!(node, KernelSummaryNode::Invoke { .. }))
+                        .count(),
+                    "input" => nodes
+                        .iter()
+                        .filter(|node| matches!(node, KernelSummaryNode::Input(_)))
+                        .count(),
+                    "constrain" => nodes
+                        .iter()
+                        .filter(|node| matches!(node, KernelSummaryNode::Constrain { .. }))
+                        .count(),
+                    "select" => nodes
+                        .iter()
+                        .filter(|node| matches!(node, KernelSummaryNode::Select { .. }))
+                        .count(),
+                    "record" => nodes
+                        .iter()
+                        .filter(|node| matches!(node, KernelSummaryNode::Record { .. }))
+                        .count(),
+                    "projection" => nodes
+                        .iter()
+                        .filter(|node| matches!(node, KernelSummaryNode::Projection { .. }))
+                        .count(),
+                    "unify" => nodes
+                        .iter()
+                        .filter(|node| matches!(node, KernelSummaryNode::Unify { .. }))
+                        .count(),
+                    "sequence" => nodes
+                        .iter()
+                        .filter(|node| matches!(node, KernelSummaryNode::Sequence { .. }))
+                        .count(),
+                    _ => 0,
+                };
+                (
+                    summary.program.definition,
+                    summary.compiled_node_count,
+                    count("invoke"),
+                    count("input"),
+                    count("constrain"),
+                    count("select"),
+                    count("record"),
+                    count("projection"),
+                    count("unify"),
+                    count("sequence"),
+                )
+            })
+            .collect::<Vec<_>>();
+        sizes.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
+        eprintln!(
+            "kernel-summary-sizes definition compiled invoke input constrain select record projection unify sequence"
+        );
+        for entry in sizes.iter().take(10) {
+            let (owner_nodes, owner_calls) = project
+                .owner(crate::KernelOwnerId(entry.0))
+                .map(|owner| {
+                    (
+                        owner.node_count(),
+                        owner
+                            .nodes()
+                            .iter()
+                            .filter(|node| {
+                                matches!(node.kind, PackedKernelOwnerNodeKind::UserCall { .. })
+                            })
+                            .count(),
+                    )
+                })
+                .unwrap_or((0, 0));
+            eprintln!(
+                "kernel-summary-size {} {} {} {} {} {} {} {} {} {} owner_nodes={owner_nodes} owner_calls={owner_calls}",
+                entry.0,
+                entry.1,
+                entry.2,
+                entry.3,
+                entry.4,
+                entry.5,
+                entry.6,
+                entry.7,
+                entry.8,
+                entry.9
+            );
+        }
     }
     summaries
 }
@@ -20506,19 +20657,26 @@ fn compile_node(
                 return Ok(());
             }
             if let Some(Some(summary)) = context.direct_summaries.get(target.0 as usize) {
-                emit_compiled_direct_summary(
-                    builder,
-                    mode_builder,
-                    context,
-                    index,
-                    output,
-                    output_mode,
-                    &actuals,
-                    summary,
-                )?;
-                compile_work.direct_result_summaries =
-                    compile_work.direct_result_summaries.saturating_add(1);
-                return Ok(());
+                // K1′ experiment: evaluate through the residual specialization
+                // path with shared physical bytes instead of the interpreted
+                // summary cut. Opt-in so the accepted path is unchanged.
+                let summary_enabled =
+                    std::env::var_os("BOON_KERNEL_DISABLE_DIRECT_SUMMARIES").is_none();
+                if summary_enabled {
+                    emit_compiled_direct_summary(
+                        builder,
+                        mode_builder,
+                        context,
+                        index,
+                        output,
+                        output_mode,
+                        &actuals,
+                        summary,
+                    )?;
+                    compile_work.direct_result_summaries =
+                        compile_work.direct_result_summaries.saturating_add(1);
+                    return Ok(());
+                }
             }
             let instance = instantiate_owner(
                 builder,

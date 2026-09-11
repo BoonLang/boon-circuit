@@ -51,5 +51,20 @@
     "novywave": "resolve_merge 233.1 ms over 6,425 folds (36.3 us per fold, about 19 contributors). Duplicate removal and the closed memo are exhausted; the remaining cost is genuine pairwise merging of mostly distinct contributions. Next mechanisms to evaluate: per-site resolved-term reuse with an epoch guard, and delta-based aggregate maintenance with exact removal or a balanced merge tree that preserves canonical order and payload identity.",
     "todo_mvc": "invalidation 86.9 ms over 65,216 refresh calls and commit/order 68.1 ms over 18,792 folds. First measurement needed: how many refresh calls carry dirty entries versus an empty queue, and how much of invalidation is real cone work rather than per-call overhead.",
     "opening_condition_for_goal_c": "not met; no program-shape cut should start while the refresh path is the dominant measured cost"
+  },
+  "sub_phase_profile_release": {
+    "probe": "BOON_KERNEL_TRACE_AGGREGATE_PHASE, env-gated and inert when unset; measured by the main agent after the reviewer's disclosure forced a rebuild",
+    "todo_mvc_diagnostics": {"refresh_total_ms": 283.2, "occurs_ms": 16.7, "resolve_ms": 26.7, "merge_ms": 16.7, "refresh_calls": 65216, "empty_refreshes": 55947, "dirty_refreshes": 9269, "memo_hits": 6239, "merge_iterations": 44262},
+    "novywave_diagnostics": {"refresh_total_ms": 290.5, "occurs_ms": 11.9, "resolve_ms": 38.5, "merge_ms": 189.8, "refresh_calls": 29646, "empty_refreshes": 25707, "dirty_refreshes": 3939, "memo_hits": 1708, "merge_iterations": 119920},
+    "findings": [
+      "NovyWave's refresh cost is almost entirely merge_type_evidence: 189.8 ms over 119,920 variable-bearing merges, about 1.6 us each. Closed-pair caching cannot help: only 639 of those merges are between closed terms.",
+      "TodoMVC's merge work is trivial (16.7 ms over 44,262 merges); its refresh cost sits in invalidation (86.9 ms per the reviewer), commit/order (68.1 ms) and assembly (31.2 ms), with 85.8% of refresh calls carrying an empty dirty queue.",
+      "Closed-merge pairs are cacheable in principle but small: TodoMVC 3,753 closed merges over 78 distinct pairs (3,675 hits), NovyWave 639 over 131 pairs."
+    ]
+  },
+  "next_targets_refined": {
+    "novywave": "make variable-bearing merges cheaper or fewer: single-pass construction of the merged variant set or object from all contributors instead of 18-19 pairwise intermediate interns, preserving variant order and payload identity; fall back to the pairwise path for mixed kinds.",
+    "todo_mvc": "prune the requirement invalidation cone with a requirement-relevant dependent index so 9,269 dirty refreshes stop walking unrelated type dependents, and reduce the 3.6 us per fold commit/order path.",
+    "gate": "release sub-phase milliseconds and end-to-end interleaved A/B against the preserved K0 producer, with all correctness gates green"
   }
 }

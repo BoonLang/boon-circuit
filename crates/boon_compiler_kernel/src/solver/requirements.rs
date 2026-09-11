@@ -233,6 +233,10 @@ impl RequirementContributions {
         self.targets[target.0 as usize].dirty = false;
         Some(target)
     }
+
+    pub(super) fn has_dirty(&self) -> bool {
+        !self.dirty.is_empty()
+    }
 }
 
 impl super::ComponentSolver {
@@ -487,7 +491,33 @@ impl super::ComponentSolver {
     /// terms remain the dependency authority even when their current resolved
     /// aggregate is closed, unchanged, or has widened away a payload.
     pub(super) fn refresh_requirements(&mut self) {
+        let phase_started = self
+            .requirement_phase_probe
+            .is_some()
+            .then(std::time::Instant::now);
+        if let Some(probe) = self.requirement_phase_probe.as_mut() {
+            probe.calls = probe.calls.saturating_add(1);
+        }
+        let has_dirty = self.requirements.has_dirty();
+        if let Some(probe) = self.requirement_phase_probe.as_mut() {
+            if has_dirty {
+                probe.dirty_refreshes = probe.dirty_refreshes.saturating_add(1);
+            } else {
+                probe.empty_refreshes = probe.empty_refreshes.saturating_add(1);
+            }
+        }
+        let invalidate_started = self
+            .requirement_phase_probe
+            .is_some()
+            .then(std::time::Instant::now);
         self.invalidate_requirement_cone();
+        if let Some(started) = invalidate_started
+            && let Some(probe) = self.requirement_phase_probe.as_mut()
+        {
+            probe.invalidate_ns = probe
+                .invalidate_ns
+                .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
         while let Some(target) = self.requirements.pop_dirty() {
             let target = self.root(target);
             let Some(base) = self.cells[target.0 as usize].requirement_base else {
@@ -525,8 +555,25 @@ impl super::ComponentSolver {
                 let closed = signature
                     .iter()
                     .all(|term| !self.program.terms.has_variable(crate::TypeTermId(*term)));
+                let mut variant_terms = 0_usize;
+                let mut object_terms = 0_usize;
+                let mut other_terms = 0_usize;
+                for term in &signature {
+                    match self.program.terms.term_head(crate::TypeTermId(*term)) {
+                        crate::TypeTermHead::VariantSet(_) => variant_terms += 1,
+                        crate::TypeTermHead::Object { .. } => object_terms += 1,
+                        _ => other_terms += 1,
+                    }
+                }
                 let probe = self.aggregate_probe.as_mut().expect("probe checked above");
                 probe.folds = probe.folds.saturating_add(1);
+                if other_terms == 0 && object_terms == 0 {
+                    probe.variant_folds = probe.variant_folds.saturating_add(1);
+                } else if other_terms == 0 && variant_terms == 0 {
+                    probe.object_folds = probe.object_folds.saturating_add(1);
+                } else {
+                    probe.mixed_kind_folds = probe.mixed_kind_folds.saturating_add(1);
+                }
                 if closed {
                     probe.closed_folds = probe.closed_folds.saturating_add(1);
                 } else {
@@ -568,10 +615,33 @@ impl super::ComponentSolver {
             for term in inputs.iter().copied() {
                 // Match the existing recursive-shape guard without equating
                 // any contributor variable to its destination.
-                if self.occurs(target, term) {
+                let occurs_started = self
+                    .requirement_phase_probe
+                    .is_some()
+                    .then(std::time::Instant::now);
+                let occurs = self.occurs(target, term);
+                if let Some(started) = occurs_started
+                    && let Some(probe) = self.requirement_phase_probe.as_mut()
+                {
+                    probe.occurs_ns = probe.occurs_ns.saturating_add(
+                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+                }
+                if occurs {
                     continue;
                 }
+                let resolve_started = self
+                    .requirement_phase_probe
+                    .is_some()
+                    .then(std::time::Instant::now);
                 let term = self.resolve_term(term);
+                if let Some(started) = resolve_started
+                    && let Some(probe) = self.requirement_phase_probe.as_mut()
+                {
+                    probe.resolve_ns = probe.resolve_ns.saturating_add(
+                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                    );
+                }
                 if folded_terms.contains(&term) {
                     continue;
                 }
@@ -593,15 +663,45 @@ impl super::ComponentSolver {
             }
             if !memo_hit {
                 for term in folded_terms.iter().copied() {
+                    let merge_started = self
+                        .requirement_phase_probe
+                        .is_some()
+                        .then(std::time::Instant::now);
+                    if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                        probe.folds = probe.folds.saturating_add(1);
+                    }
                     self.requirements.work.aggregate_fact_visits = self
                         .requirements
                         .work
                         .aggregate_fact_visits
                         .saturating_add(1);
+                    if let Some(previous) = aggregate
+                        && !self.program.terms.has_variable(previous)
+                        && !self.program.terms.has_variable(term)
+                    {
+                        if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                            probe.closed_merges = probe.closed_merges.saturating_add(1);
+                        }
+                        if self.requirement_closed_pairs.insert((previous.0, term.0)) {
+                            if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                                probe.distinct_closed_pairs =
+                                    probe.distinct_closed_pairs.saturating_add(1);
+                            }
+                        } else if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                            probe.closed_pair_hits = probe.closed_pair_hits.saturating_add(1);
+                        }
+                    }
                     aggregate = Some(match aggregate {
                         None => term,
                         Some(previous) => self.merge_type_evidence(previous, term, false),
                     });
+                    if let Some(started) = merge_started
+                        && let Some(probe) = self.requirement_phase_probe.as_mut()
+                    {
+                        probe.merge_ns = probe.merge_ns.saturating_add(
+                            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+                        );
+                    }
                 }
                 if let (Some(previous), Some(current)) = (
                     self.requirements.targets[target.0 as usize].order,
@@ -615,6 +715,8 @@ impl super::ComponentSolver {
                         (folded_terms.clone().into_boxed_slice(), aggregate),
                     );
                 }
+            } else if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                probe.memo_hits = probe.memo_hits.saturating_add(1);
             }
             self.term_id_scratch.recycle(folded_terms);
             self.term_id_scratch.recycle(inputs);
@@ -623,6 +725,13 @@ impl super::ComponentSolver {
                 self.cells[target.0 as usize].binding = aggregate;
                 self.touch(target);
             }
+        }
+        if let Some(started) = phase_started
+            && let Some(probe) = self.requirement_phase_probe.as_mut()
+        {
+            probe.total_ns = probe
+                .total_ns
+                .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
     }
 

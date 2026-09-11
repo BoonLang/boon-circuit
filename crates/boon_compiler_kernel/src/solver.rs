@@ -357,6 +357,13 @@ struct ComponentSolver {
     /// the resulting aggregate. An identical signature skips the merge loop
     /// and restores the previous aggregate exactly.
     requirement_fold_memo: std::collections::HashMap<u32, (Box<[TypeTermId]>, Option<TypeTermId>)>,
+    /// Opt-in K1″ sub-phase probe. Splits the fold into occurs, resolve and
+    /// merge time so a release producer can attribute the refresh cost.
+    /// Absent unless `BOON_KERNEL_TRACE_AGGREGATE_PHASE` is set.
+    requirement_phase_probe: Option<RequirementPhaseProbe>,
+    /// Closed merge pairs already folded, used only by the phase probe to
+    /// bound a closed-pair merge cache.
+    requirement_closed_pairs: std::collections::HashSet<(u32, u32)>,
 }
 
 #[cfg(debug_assertions)]
@@ -369,6 +376,9 @@ struct AggregateProbe {
     single_delta_folds: u64,
     closed_folds: u64,
     mixed_folds: u64,
+    variant_folds: u64,
+    object_folds: u64,
+    mixed_kind_folds: u64,
     last: std::collections::HashMap<u32, Vec<u32>>,
 }
 
@@ -379,14 +389,59 @@ impl Drop for AggregateProbe {
             return;
         }
         eprintln!(
-            "kernel-aggregate folds={} visits={} distinct_visits={} repeat_folds={} single_delta_folds={} closed_folds={} mixed_folds={}",
+            "kernel-aggregate folds={} visits={} distinct_visits={} repeat_folds={} single_delta_folds={} closed_folds={} mixed_folds={} variant_folds={} object_folds={} mixed_kind_folds={}",
             self.folds,
             self.visits,
             self.distinct_visits,
             self.repeat_folds,
             self.single_delta_folds,
             self.closed_folds,
-            self.mixed_folds
+            self.mixed_folds,
+            self.variant_folds,
+            self.object_folds,
+            self.mixed_kind_folds
+        );
+    }
+}
+
+#[derive(Default)]
+struct RequirementPhaseProbe {
+    calls: u64,
+    folds: u64,
+    memo_hits: u64,
+    occurs_ns: u64,
+    resolve_ns: u64,
+    merge_ns: u64,
+    total_ns: u64,
+    closed_merges: u64,
+    distinct_closed_pairs: u64,
+    closed_pair_hits: u64,
+    empty_refreshes: u64,
+    dirty_refreshes: u64,
+    invalidate_ns: u64,
+}
+
+impl Drop for RequirementPhaseProbe {
+    fn drop(&mut self) {
+        if std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE_PHASE").is_none() {
+            return;
+        }
+        let ms = |ns: u64| ns as f64 / 1_000_000.0;
+        eprintln!(
+            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} merge_ms={:.3} empty_refreshes={} dirty_refreshes={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
+            self.calls,
+            self.folds,
+            self.memo_hits,
+            ms(self.total_ns),
+            ms(self.invalidate_ns),
+            ms(self.occurs_ns),
+            ms(self.resolve_ns),
+            ms(self.merge_ns),
+            self.empty_refreshes,
+            self.dirty_refreshes,
+            self.closed_merges,
+            self.distinct_closed_pairs,
+            self.closed_pair_hits
         );
     }
 }
@@ -696,6 +751,9 @@ impl ComponentSolver {
             aggregate_probe: std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE")
                 .map(|_| AggregateProbe::default()),
             requirement_fold_memo: std::collections::HashMap::new(),
+            requirement_phase_probe: std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE_PHASE")
+                .map(|_| RequirementPhaseProbe::default()),
+            requirement_closed_pairs: std::collections::HashSet::new(),
         };
         let execution = SolverExecution {
             operations,

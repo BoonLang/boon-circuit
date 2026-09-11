@@ -1,0 +1,55 @@
+{
+  "status": "second aggregation slice landed; independent review rejected the 'aggregation exhausted' conclusion with a phase profile that reopens the goal",
+  "date": "2026-09-11",
+  "independent_review": {
+    "verdict": "reject the decision as written; aggregation is not exhausted",
+    "disclosure": "the reviewer exceeded its read-only mandate: it added a release-visible env-gated phase probe (BOON_KERNEL_TRACE_AGGREGATE_PHASE), built release twice and took fresh-process observations. It restored the source files exactly; target/release binaries were left as its probe build and have since been rebuilt by the main agent. Artifacts: /tmp/k1pp-phase-probe-build/.",
+    "reproduced": ["interleaved medians from k1pp-raw (937.7/1077.4 and 503.6/872.3)", "work counters 18,792 evaluations / 56,796 fact visits and 6,425 / 121,561", "redundancy trace 722,579 to 56,797 distinct with 2,949 repeat and 2,009 single-delta folds"],
+    "corrections": [
+      "the NovyWave redundancy block in the fold-dedup record is an earlier observation (6,374 folds / 185,441 visits) than the later trace (6,425 / 121,561); treat the later numbers as current",
+      "the pre-dedup interleaved A/B medians (1667.2 to 1603.0 and 1408.0 to 1294.2) have no raw file under k1pp-raw and rest on the record alone"
+    ]
+  },
+  "phase_profile_ms": {
+    "probe": "release-visible env-gated RequirementPhaseProbe; numbers are the reviewer's freshly built instrumented binary, cross-checked against the main agent's work counters",
+    "todo_mvc_diagnostics": {
+      "elapsed": 1083.9,
+      "refresh_total": 237.9,
+      "invalidation": 86.9,
+      "assembly": 31.2,
+      "resolve_merge": 48.6,
+      "commit_order": 68.1,
+      "refresh_calls": 65216,
+      "folds": 18792,
+      "per_fold_us": 12.6
+    },
+    "novywave_diagnostics": {
+      "elapsed": 839.3,
+      "refresh_total": 258.0,
+      "invalidation": 3.7,
+      "assembly": 3.0,
+      "resolve_merge": 233.1,
+      "commit_order": 16.9,
+      "refresh_calls": 29646,
+      "folds": 6425,
+      "per_fold_us": 40.2
+    },
+    "finding": "the refresh path is about 21% of TodoMVC and 30% of NovyWave latency; against K0 it accounts for more than the whole TodoMVC gap and about 76% of the NovyWave gap. The earlier 'program shape dominates' conclusion is withdrawn: non-refresh candidate time is below K0 on TodoMVC and about 80 ms above on NovyWave."
+  },
+  "change_second_slice": {
+    "cut": "closed-fold memo",
+    "what": "a destination whose resolved contributions are all variable-free resolves them in order, compares the signature with the last folded one, and restores the stored aggregate on a hit; opens no side-effect risk because merging closed terms binds no variables",
+    "why_sound": "merges of closed terms are pure term construction, so resolving all contributions before merging is equivalent to the interleaved order used for mixed folds; mixed folds keep the interleaved path and are never memoized",
+    "gates": "kernel library 197, kernel_transfer 10, compiler library 98 with one pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match 3, pulses 8"
+  },
+  "interleaved_ab_ten_rounds": {
+    "todo_diagnostics_ms": {"dedup_p50": 1077.9, "memo_p50": 1061.8, "delta": -1.5, "dedup_p95": 1114.8, "memo_p95": 1082.5},
+    "novywave_diagnostics_ms": {"dedup_p50": 857.2, "memo_p50": 848.5, "delta": -1.0, "dedup_p95": 901.5, "memo_p95": 861.2},
+    "finding": "small but real and consistent; closed-repeat folds are a minority of the remaining fold cost"
+  },
+  "next_targets": {
+    "novywave": "resolve_merge 233.1 ms over 6,425 folds (36.3 us per fold, about 19 contributors). Duplicate removal and the closed memo are exhausted; the remaining cost is genuine pairwise merging of mostly distinct contributions. Next mechanisms to evaluate: per-site resolved-term reuse with an epoch guard, and delta-based aggregate maintenance with exact removal or a balanced merge tree that preserves canonical order and payload identity.",
+    "todo_mvc": "invalidation 86.9 ms over 65,216 refresh calls and commit/order 68.1 ms over 18,792 folds. First measurement needed: how many refresh calls carry dirty entries versus an empty queue, and how much of invalidation is real cone work rather than per-call overhead.",
+    "opening_condition_for_goal_c": "not met; no program-shape cut should start while the refresh path is the dominant measured cost"
+  }
+}

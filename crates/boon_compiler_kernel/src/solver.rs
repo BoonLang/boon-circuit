@@ -353,6 +353,10 @@ struct ComponentSolver {
     /// bounds what incremental aggregation can save. Debug-only.
     #[cfg(debug_assertions)]
     aggregate_probe: Option<AggregateProbe>,
+    /// Per-destination fold memo: the resolved input signature last folded and
+    /// the resulting aggregate. An identical signature skips the merge loop
+    /// and restores the previous aggregate exactly.
+    requirement_fold_memo: std::collections::HashMap<u32, (Box<[TypeTermId]>, Option<TypeTermId>)>,
 }
 
 #[cfg(debug_assertions)]
@@ -363,6 +367,8 @@ struct AggregateProbe {
     distinct_visits: u64,
     repeat_folds: u64,
     single_delta_folds: u64,
+    closed_folds: u64,
+    mixed_folds: u64,
     last: std::collections::HashMap<u32, Vec<u32>>,
 }
 
@@ -373,12 +379,14 @@ impl Drop for AggregateProbe {
             return;
         }
         eprintln!(
-            "kernel-aggregate folds={} visits={} distinct_visits={} repeat_folds={} single_delta_folds={}",
+            "kernel-aggregate folds={} visits={} distinct_visits={} repeat_folds={} single_delta_folds={} closed_folds={} mixed_folds={}",
             self.folds,
             self.visits,
             self.distinct_visits,
             self.repeat_folds,
-            self.single_delta_folds
+            self.single_delta_folds,
+            self.closed_folds,
+            self.mixed_folds
         );
     }
 }
@@ -687,6 +695,7 @@ impl ComponentSolver {
             #[cfg(debug_assertions)]
             aggregate_probe: std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE")
                 .map(|_| AggregateProbe::default()),
+            requirement_fold_memo: std::collections::HashMap::new(),
         };
         let execution = SolverExecution {
             operations,

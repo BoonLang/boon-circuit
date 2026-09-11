@@ -1014,3 +1014,41 @@ per fold), so the next slice must make each fold cheaper, not just
 duplicate-free — for example a closed-term fast path that builds the union once
 instead of pairwise-merging, gated on a probe of how often every contribution
 in a fold is closed.
+
+### 2026-09-11: K1″ sliced further — phase attribution corrected, closed-fold memo
+
+An independent fresh-context review rejected the conclusion that aggregation
+was exhausted and produced the missing measurement with a release-visible
+env-gated phase probe (it exceeded its read-only mandate to do so, restored the
+sources exactly, and disclosed the deviation; artifacts in
+`/tmp/k1pp-phase-probe-build/`). The profile changes the target map:
+
+| refresh sub-part | TodoMVC | NovyWave |
+| --- | ---: | ---: |
+| total | 237.9 ms | 258.0 ms |
+| invalidation | 86.9 | 3.7 |
+| assembly | 31.2 | 3.0 |
+| resolve + merge | 48.6 | 233.1 |
+| commit/order | 68.1 | 16.9 |
+| refresh calls / folds | 65,216 / 18,792 | 29,646 / 6,425 |
+
+The refresh path is about 21% of TodoMVC and 30% of NovyWave latency; against
+K0 it exceeds the whole TodoMVC gap and covers about 76% of the NovyWave gap.
+The earlier "program shape dominates" conclusion is withdrawn. Full record:
+[fold memo and phase profile](evidence/compiler-k1pp-fold-memo-2026-09-11.json).
+
+The second aggregation slice is a closed-fold memo: a destination whose
+resolved contributions are all variable-free compares the signature with the
+last folded one and restores the stored aggregate on a hit. Merging closed
+terms binds no variables, so resolving before merging is equivalent to the
+interleaved order; mixed folds keep the interleaved path and are never
+memoized. Interleaved ten-round A/B against the dedup build: TodoMVC
+diagnostics 1077.9 → 1061.8 ms (−1.5%), NovyWave 857.2 → 848.5 ms (−1.0%), with
+all gates green.
+
+Next targets: NovyWave's 233.1 ms resolve+merge (per-site resolved-term reuse
+with an epoch guard, or delta-based aggregation with exact removal while
+preserving canonical order and payload identity) and TodoMVC's 86.9 ms
+invalidation plus 68.1 ms commit/order (first measure how many refresh calls
+carry dirty entries and how much invalidation is real cone work). Goal C's
+opening condition is not met while the refresh path dominates.

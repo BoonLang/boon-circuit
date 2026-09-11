@@ -522,8 +522,16 @@ impl super::ComponentSolver {
                     distinct.dedup();
                     distinct.len()
                 };
+                let closed = signature
+                    .iter()
+                    .all(|term| !self.program.terms.has_variable(crate::TypeTermId(*term)));
                 let probe = self.aggregate_probe.as_mut().expect("probe checked above");
                 probe.folds = probe.folds.saturating_add(1);
+                if closed {
+                    probe.closed_folds = probe.closed_folds.saturating_add(1);
+                } else {
+                    probe.mixed_folds = probe.mixed_folds.saturating_add(1);
+                }
                 probe.visits = probe
                     .visits
                     .saturating_add(u64::try_from(signature.len()).unwrap_or(u64::MAX));
@@ -568,24 +576,48 @@ impl super::ComponentSolver {
                     continue;
                 }
                 folded_terms.push(term);
-                self.requirements.work.aggregate_fact_visits = self
-                    .requirements
-                    .work
-                    .aggregate_fact_visits
-                    .saturating_add(1);
-                aggregate = Some(match aggregate {
-                    None => term,
-                    Some(previous) => self.merge_type_evidence(previous, term, false),
-                });
+            }
+            // Closed contributions cannot be affected by merge side effects,
+            // so a destination whose closed signature repeats can restore the
+            // previously folded aggregate exactly instead of re-merging.
+            let all_closed = folded_terms
+                .iter()
+                .all(|term| !self.program.terms.has_variable(*term));
+            let mut memo_hit = false;
+            if all_closed
+                && let Some((signature, stored)) = self.requirement_fold_memo.get(&target.0)
+                && signature.as_ref() == folded_terms.as_slice()
+            {
+                aggregate = *stored;
+                memo_hit = true;
+            }
+            if !memo_hit {
+                for term in folded_terms.iter().copied() {
+                    self.requirements.work.aggregate_fact_visits = self
+                        .requirements
+                        .work
+                        .aggregate_fact_visits
+                        .saturating_add(1);
+                    aggregate = Some(match aggregate {
+                        None => term,
+                        Some(previous) => self.merge_type_evidence(previous, term, false),
+                    });
+                }
+                if let (Some(previous), Some(current)) = (
+                    self.requirements.targets[target.0 as usize].order,
+                    aggregate,
+                ) {
+                    aggregate = Some(self.retain_requirement_order(previous, current));
+                }
+                if all_closed {
+                    self.requirement_fold_memo.insert(
+                        target.0,
+                        (folded_terms.clone().into_boxed_slice(), aggregate),
+                    );
+                }
             }
             self.term_id_scratch.recycle(folded_terms);
             self.term_id_scratch.recycle(inputs);
-            if let (Some(previous), Some(current)) = (
-                self.requirements.targets[target.0 as usize].order,
-                aggregate,
-            ) {
-                aggregate = Some(self.retain_requirement_order(previous, current));
-            }
             self.requirements.set_order(target, aggregate);
             if self.cells[target.0 as usize].binding != aggregate {
                 self.cells[target.0 as usize].binding = aggregate;

@@ -41,5 +41,43 @@
     "target": "make each remaining fold cheaper rather than only removing duplicates: NovyWave folds are 64% distinct, so the cost is genuine re-merging of about 29 contributions per fold",
     "candidate_fast_path": "when every distinct contribution in a fold is a closed term, build the union once and canonicalize once instead of pairwise-merging; probe how often all contributions are closed before implementing",
     "gate": "no diagnostic or oracle change, and cold TodoMVC/NovyWave moving further toward K0-class"
+  },
+  "decomposition_after_dedup": {
+    "todo-mvc_diagnostics": {
+      "candidate_ms": 1069.3,
+      "k0_ms": 937.7,
+      "summary_node_evaluations": {"k0": 32365, "candidate": 483995},
+      "summary_definition_nodes": {"k0": 236, "candidate": 1114},
+      "term_intern_requests": {"k0": 342922, "candidate": 840207},
+      "scratch_vector_reuses": {"k0": 1494269, "candidate": 2733895},
+      "activations": {"k0": 620555, "candidate": 181056}
+    },
+    "novywave_diagnostics": {
+      "candidate_ms": 856.2,
+      "k0_ms": 503.6,
+      "summary_node_evaluations": {"k0": 462003, "candidate": 1818701},
+      "summary_definition_nodes": {"k0": 12866, "candidate": 101753},
+      "term_intern_requests": {"k0": 334884, "candidate": 1170580},
+      "scratch_vector_reuses": {"k0": 1100373, "candidate": 4015159},
+      "top_definitions": [
+        {"definition": 996, "program_evaluations": 14959, "node_evaluations": 226125, "nodes_per_evaluation": 15.1, "k0_nodes_per_evaluation": 5.1},
+        {"definition": 1109, "program_evaluations": 1508, "node_evaluations": 145160, "nodes_per_evaluation": 96.3},
+        {"definition": 1091, "program_evaluations": 168, "node_evaluations": 72776, "nodes_per_evaluation": 433.2},
+        {"definition": 1344, "program_evaluations": 2410, "node_evaluations": 65070, "nodes_per_evaluation": 27.0}
+      ]
+    },
+    "program_shape_trace": [
+      {"definition": 1155, "owner_nodes": 34, "owner_calls": 4, "compiled_nodes": 5000, "input": 4961, "invoke": 4, "domain": 2, "record": 4, "select": 1},
+      {"definition": 1091, "owner_nodes": 15, "owner_calls": 4, "compiled_nodes": 2861, "input": 2848, "invoke": 3, "domain": 1, "select": 3},
+      {"definition": 1191, "owner_nodes": 3, "owner_calls": 1, "compiled_nodes": 2316, "input": 2314, "invoke": 1},
+      {"definition": 1133, "owner_nodes": 8, "owner_calls": 2, "compiled_nodes": 2531, "input": 2527, "invoke": 2, "select": 1}
+    ],
+    "finding": "the remaining cold gap is transfer-program evaluation, not aggregation. A three-node owner with one call compiles into a 2,316-node program with 2,314 inputs because nested callees are inlined transitively and every formal-root projection becomes a distinct input; each evaluation resolves those inputs. Aggregation after dedup costs about 57k (TodoMVC) and 122k (NovyWave) fact visits, which cannot explain the remaining +14.9% / +73.2% versus K0."
+  },
+  "decision": {
+    "outcome": "reviewed rejection of aggregation sufficiency, with the aggregation win preserved",
+    "what_landed": "contribution dedup inside the fold: 722,579 to 56,796 fact visits and 1,189,597 to 390,804 object internings on TodoMVC, with interleaved A/B latency -3.9% (TodoMVC) and -8.1% (NovyWave)",
+    "why_not_k0_class": "the residual gap is dominated by transfer-program size and input resolution: NovyWave summary node evaluations 462,003 to 1,818,701 and definition nodes 12,866 to 101,753, traced to transitive inlining exploding formal projections into thousands of inputs per program",
+    "next_architectural_decision": "open Goal C, conditional linked transfer code: stop inlining nested callees into parent transfer programs and evaluate shared transfers through bound occurrence frames, starting with the definitions whose programs exceed a few hundred nodes"
   }
 }

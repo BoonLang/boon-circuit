@@ -1294,3 +1294,22 @@ NovyWave now sits roughly +26% above the K0 producer on diagnostics (was
 +45.8%). Its remaining refresh is resolve 35.9, merge 20.4, order 15.6, deps
 12.3, occurs 10.9 and collection/invalidation ~5 ms, so the next slice targets
 contributor resolution, which still issues about 237,000 intern requests.
+
+### 2026-09-11: K1″ retained-prefix acceptance run (contaminated second half)
+
+The contract protocol ran again for `f0f26538` (interleaved A/B/A, 3 setup +
+30 scored per fixture, mode and intent, the middle leg in the preserved K0
+worktree). The run started while the desktop was busy — firefox, cursor,
+cosmic-term and the compositor were consuming 5-18% CPU — and the later legs
+are visibly inflated: candidate-a's TodoMVC fresh-process leg is tight
+(p50 909.9 ms, p95 914.2) while the K0 and candidate-b legs of the same lane
+report p95 1291-1304, and verified-lane p95s reach 3779 ms. Raw reports:
+`target/reports/compiler-performance/k1pp-aba3-{candidate-a,k0,candidate-b}.json`;
+record: [retained-prefix acceptance](evidence/compiler-k1pp-aba-prefix-2026-09-11.json).
+
+What the tight legs and the interleaved A/B agree on: NovyWave diagnostics
+660.6 / 649.8 ms against the K0 leg's 530.1 ms, i.e. +22.6% (was +45.8%), and
+TodoMVC diagnostics at 909.9-961.3 ms against K0's 927.2-982.6 ms, i.e. at or
+below parity. The slice's own evidence remains the eight-round interleaved A/B
+with a single (fingerprint, plan) pair per lane. This acceptance run should be
+repeated in a quiet window before it is treated as the final record.

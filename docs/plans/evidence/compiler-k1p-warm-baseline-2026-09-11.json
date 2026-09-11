@@ -1,0 +1,49 @@
+{
+  "status": "K1-prime step 0 warm product baseline recorded; warm interaction budgets are 23-72x away and no cross-edit reuse exists in either producer",
+  "date": "2026-09-11",
+  "protocol": {
+    "warm_session": "boon_cli_evidence compiler-sample warm-session examples/todo_mvc_physical/RUN.bn --switch-source examples/counter.bn --edit-from 'TEXT { Walk the dog }' --edit-to 'TEXT { Walk the dogs }' --setup-samples 3 --scored-samples 30",
+    "collector_preflight": "cargo xtask verify-compiler-interactions --setup-samples 1 --scored-samples 5",
+    "collector_3_30": "blocked: the interaction collector refuses a report larger than 16777216 bytes and the 3+30 report is 23506165 bytes, so both producers were measured directly at 3+30 with identical flags and parsed from their own JSON",
+    "edit_unit_note": "the preserved K0 producer expects the unit-relative path `RUN.bn`; the candidate producer accepts `examples/todo_mvc_physical/RUN.bn`",
+    "machine": "same machine and session as the 2026-09-11 cold reports, one producer process per observation"
+  },
+  "producers": {
+    "baseline": {"head": "2d7a5343c9d98e9eeabc5c0de0c3c5728f4fb7f2", "dirty": false, "binary_sha256": "c547ddac0c80d0b4079953e972809525f2fbb96ab8289b61837a4a5abb6f329b"},
+    "candidate": {"head": "ed2545df6363610cd6ce1dfbdb242f9429eb4dfe", "dirty": false}
+  },
+  "local_reports": [
+    {"path": "/home/martinkavik/repos/boon-compiler-k0-2d7a5343/target/reports/compiler-performance/k1p-warm-baseline-direct.json", "sha256": "bd2f3ff89614ac98e32a3b5d4dfc2258b0f0174a847533717e201a3255c79271"},
+    {"path": "/home/martinkavik/repos/boon-circuit/target/reports/compiler-performance/k1p-warm-candidate-direct.json", "sha256": "981683a06c054b22da6094550cc748ec5bb509802873c841613338fd5b167c30"},
+    {"path": "/home/martinkavik/repos/boon-circuit/target/reports/compiler-performance/k1p-warm-preflight-candidate.json", "sha256": "c8efb2e0b6fc02ca5a16064a678a8b78056e60d4d5646fa4d8a08c0b6351ede2"}
+  ],
+  "warm_latency_ms_3_setup_30_scored": {
+    "diagnostics_edit_to_ready": {"k0_p50": 945.711, "k0_p95": 982.824, "candidate_p50": 1189.129, "candidate_p95": 1213.101, "budget_p95": 16.7},
+    "verified_preview_edit_to_ready": {"k0_p50": 2277.718, "k0_p95": 2334.868, "candidate_p50": 2802.031, "candidate_p95": 2891.077, "budget_p95": 100.0},
+    "update_ack": {"k0_p50": 0.051, "candidate_p50": 0.051},
+    "switch_ack": {"k0_p50": 0.0003, "candidate_p50": 0.0002, "budget_p95": 16.7},
+    "loaded_bundle_lookup": {"k0_p50": 0.0002, "candidate_p50": 0.0002, "budget_max": 1.0},
+    "latest_generation_publish": {"k0_ms": 1333.587, "candidate_ms": 1604.533}
+  },
+  "warm_memory_mib": {
+    "k0_resident_start": 174.5, "k0_resident_end": 197.4, "k0_peak": 238.5,
+    "candidate_resident_start": 162.4, "candidate_resident_end": 185.1, "candidate_peak": 191.9
+  },
+  "per_edit_work_proves_no_cross_edit_reuse": {
+    "k0_diagnostics_per_edit": {"activations": 620555, "mutations": 465647, "summary_node_evaluations": 32365},
+    "candidate_diagnostics_per_edit": {"activations": 181056, "mutations": 182294, "summary_node_evaluations": 1017465},
+    "interpretation": "each warm edit performs exactly the full cold solve work of its producer, so the session retains no reusable solved state across edits; the candidate's warm regression mirrors its cold regression (+23-26% on diagnostics and preview) and its warm RSS is lower than K0 (191.9 vs 238.5 MiB peak)"
+  },
+  "missing_acceptance_evidence": [
+    "native-presented-frame: compiler-only harness cannot replace app-owned WGPU readback",
+    "in-flight-supersession: synchronous CompilerSession exposes no worker generation handle; only pre-canceled requests are measured (stop latency 0.0012-0.0016 ms)"
+  ],
+  "findings": [
+    "Warm diagnostics is 56x over the manifest p95 at K0 (982.8 vs 16.7 ms) and 72x at the candidate (1213.1 ms).",
+    "Warm verified preview is 23x over the manifest p95 at K0 (2334.9 vs 100 ms) and 29x at the candidate (2891.1 ms).",
+    "Acknowledgement, switch and bundle lookup are already fast; the entire cost is the recompute behind an edit.",
+    "Neither producer reuses solved state across edits, so the warm fix is K3/K4 work (retained session, definition-local finalization, exact dirty cones), which this goal does not authorize.",
+    "The interaction collector cannot currently emit an acceptance-sized report; it needs bounded per-sample trimming before warm acceptance can be claimed through it."
+  ],
+  "goal_decision": "K1-prime remains scoped to the cold transfer-cost cut or its reviewed fallback; the warm baseline is recorded so the handoff names K3/K4 as the product-critical next cut."
+}

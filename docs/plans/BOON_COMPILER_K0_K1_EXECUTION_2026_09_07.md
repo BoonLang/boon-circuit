@@ -798,3 +798,36 @@ difference are disclosed. The reviewer did not re-run the correctness gates or
 the collector protocol, so those remain main-agent evidence. The decision
 therefore rests on the work attribution and the best-case end-to-end pass, not
 on the inherited-failing machine-plan hash oracle.
+
+### 2026-09-11: K1′ step 0 — warm product baseline
+
+The successor goal's first step measured the IDE-shaped warm path for the
+preserved K0 producer and the current candidate at three setup plus 30 scored
+edits on physical TodoMVC. The interaction collector cannot persist that
+sample count (its 16 MiB report limit rejects the 23.5 MB 3+30 report), so both
+producers were invoked directly with identical flags and parsed from their own
+JSON; the K0 producer needs the unit-relative edit path `RUN.bn` instead of
+the candidate's bundle path. Full record:
+[2026-09-11 warm baseline](evidence/compiler-k1p-warm-baseline-2026-09-11.json).
+
+| Warm metric, TodoMVC edit | K0 p50 / p95 | candidate p50 / p95 | manifest p95 |
+| --- | ---: | ---: | ---: |
+| diagnostics edit to ready | 945.7 / 982.8 ms | 1189.1 / 1213.1 ms | 16.7 ms |
+| verified preview edit to ready | 2277.7 / 2334.9 ms | 2802.0 / 2891.1 ms | 100 ms |
+| update ack | 0.051 ms | 0.051 ms | – |
+| switch ack / bundle lookup | 0.0003 / 0.0002 ms | 0.0002 / 0.0002 ms | 16.7 / 1.0 ms |
+
+Nowhere near the budget: diagnostics is 56x over at K0 and 72x at the
+candidate; preview is 23x and 29x over. The per-edit work counters explain it:
+each warm edit performs the producer's full cold solve (K0: 620,555
+activations and 32,365 summary node evaluations; candidate: 181,056 and
+1,017,465). The session retains no solved state across edits, so the warm fix
+is K3/K4 work — retained sessions, definition-local finalization and exact
+dirty cones — which this bounded goal does not authorize. The candidate's warm
+regression mirrors its cold regression (+23-26%), and its warm peak RSS is
+lower than K0 (191.9 vs 238.5 MiB). In-flight cancellation remains
+unsupported in both producers; only pre-canceled requests are measured.
+
+K1′ therefore stays on the cold transfer-cost cut or its reviewed fallback,
+with the warm numbers recorded so the handoff names K3/K4 as the
+product-critical next goal.

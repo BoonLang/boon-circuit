@@ -1081,3 +1081,44 @@ a requirement-relevant dependent index; its 68.1 ms commit/order path is
 untouched. All gates green: kernel 197, kernel_transfer 10, compiler library 98
 with one pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match
 3, pulses 8.
+
+### 2026-09-11: K1″ A/B/A acceptance baseline — the K0 gap is real and not yet closed
+
+The contract's acceptance protocol ran end to end — a mid-session machine hard
+reset killed nothing, because the preserved K0 collector survived it: the
+interleaved A/B/A (candidate `7ebc6e38` / K0 producer `2d7a5343` / candidate
+`7ebc6e38`), 3 setup + 30 scored observations per fixture, mode and intent,
+one producer process per observation, release product and evidence lanes, cold
+fresh-process and empty-session. Raw reports:
+`target/reports/compiler-performance/k1pp-aba-{candidate-a,k0,candidate-b}.json`
+(sha256 recorded in the evidence file); the compact record with per-sample
+latency and CPU arrays plus every kernel work counter is
+[the A/B/A evidence file](evidence/compiler-k1pp-aba-2026-09-11.json).
+
+| fixture / intent, fresh-process p50 | candidate-a | K0 | candidate-b | b vs K0 |
+| --- | ---: | ---: | ---: | ---: |
+| TodoMVC diagnostics | 1067.5 ms | 922.1 ms | 1073.4 ms | +16.4% |
+| TodoMVC verified | 1462.7 ms | 1284.5 ms | 1470.2 ms | +14.5% |
+| NovyWave diagnostics | 839.5 ms | 493.5 ms | 836.2 ms | +69.5% |
+| NovyWave verified | 2167.9 ms | 1833.8 ms | 2173.3 ms | +18.5% |
+
+The two candidate legs agree inside 0.8% on all twelve fixture/mode/intent
+cells, and the empty-session mode repeats the picture, so the gap to K0 is
+real rather than protocol noise. The aggregation slices land real work
+reductions — TodoMVC term intern requests are 814,114 against K0's 342,922,
+non-empty object interning 377,373 against 213,235 (down from 1,189,597 before
+the dedup slice), scratch reuses 2.65M against 1.49M, and the candidate runs
+3.4x fewer kernel operations (82,451 vs 282,393) — but its remaining
+operations are much more expensive, and the refresh path stays at 26-31% of
+latency: it alone exceeds the whole TodoMVC gap and covers about 76% of
+NovyWave's. NovyWave's verified gap (+18.5%) is smaller than its diagnostics
+gap because backend and plan-verification work dominate that lane.
+
+Honest position: the Implemented ending (cold TodoMVC and NovyWave back to
+K0-class latency) is not met by the three landed slices, and neither is the
+Reviewed-rejection ending — the phase probe shows the remaining cost sits in
+refresh sub-buckets that are still inside the contract's scope. Work continues
+on NovyWave's 162.9 ms recursive payload merge and TodoMVC's 86.9 ms
+invalidation plus 68.1 ms commit/order, and every further slice must move the
+A/B/A p50 outside the measured 0.8% inter-leg agreement before it claims a
+production effect.

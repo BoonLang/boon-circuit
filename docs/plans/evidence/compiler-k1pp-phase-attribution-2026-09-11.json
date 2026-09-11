@@ -1,0 +1,47 @@
+{
+ "status": "phase attribution: the K1-double-prime refresh is dominated by destination touch/scheduling on TodoMVC and by recursive merging on NovyWave; the earlier commit/order label is corrected",
+ "date": "2026-09-11",
+ "probe": {
+  "env": "BOON_KERNEL_TRACE_AGGREGATE_PHASE=1",
+  "lane": "release evidence lane, intent diagnostics, mode fresh-process, one observation per fixture",
+  "build_head": "3e2b80e2",
+  "build_note": "measured while the probe change was uncommitted; build_source_dirty=true in the producer identity, and the committed probe source is byte-identical to the measured source",
+  "evidence_binary_sha256": "db18d5868c69a640a6ddcd75d8603b0cf182e783614be70f11a37378e6762c1b"
+ },
+ "extended_counters": {
+  "added": [
+   "collect_ns, deps_ns, order_ns, commit_ns",
+   "invalidate_dirty_pops, invalidate_affected, invalidate_touches",
+   "intern_invalidate, intern_collect, intern_resolve, intern_merge, intern_order, intern_commit"
+  ],
+  "rationale": "the previous probe split occurs/resolve/merge only, so assembly, dependency replacement, order retention and the commit/touch path were residual buckets and interning could not be attributed"
+ },
+ "probe_lines": {
+  "todo_mvc_physical": "calls=65216 folds=12553 memo_hits=6239 total_ms=311.498 invalidate_ms=88.314 collect_ms=32.542 deps_ms=8.209 occurs_ms=16.667 resolve_ms=26.501 merge_ms=9.976 order_ms=0.833 commit_ms=67.960 empty_refreshes=55947 dirty_refreshes=9269 invalidate_dirty_pops=12541 invalidate_affected=14988 invalidate_touches=14120 intern_invalidate=0 intern_collect=0 intern_resolve=121013 intern_merge=40348 intern_order=2850 intern_commit=0 closed_merges=27 distinct_closed_pairs=5 closed_pair_hits=22",
+  "novywave": "calls=29646 folds=4717 memo_hits=1708 total_ms=263.191 invalidate_ms=3.724 collect_ms=2.905 deps_ms=12.425 occurs_ms=11.487 resolve_ms=37.111 merge_ms=156.534 order_ms=14.575 commit_ms=2.202 empty_refreshes=25707 dirty_refreshes=3939 invalidate_dirty_pops=4735 invalidate_affected=6246 invalidate_touches=5617 intern_invalidate=0 intern_collect=0 intern_resolve=252978 intern_merge=138947 intern_order=2606 intern_commit=0 closed_merges=46 distinct_closed_pairs=3 closed_pair_hits=43"
+ },
+ "findings": [
+  "TodoMVC refresh 311.5 ms = invalidate 88.3 + commit 68.0 + collect 32.5 + resolve 26.5 + occurs 16.7 + merge 10.0 + deps 8.2 + order 0.8, with roughly 60 ms left in loop overhead, scratch take/recycle and probe timestamps.",
+  "The previous record described the 68.1 ms bucket as retain_requirement_order plus set_order plus touch. The split shows retain_requirement_order is only 0.833 ms: the bucket is the commit path (set_order, binding update and touch) and it is dominated by the touch scheduling walk.",
+  "Invalidation is 88.3 ms against only 12,541 dirty pops, 14,988 affected cells, 25,231 variable visits and 12,690 edge visits, so the requirement cone BFS is not the cost: both large buckets are dominated by about 27,000 touch calls at roughly 5-6 us each inside schedule_variable's transitive dependent walk.",
+  "Intern requests inside refresh: TodoMVC 164,211 of 814,114 (resolve 121,013, merge 40,348, order 2,850); NovyWave 394,531 of 1,067,405 (resolve 252,978, merge 138,947, order 2,606). Refresh interning is a minority of total interning, so the interning bloat theory cannot explain the whole K0 gap.",
+  "NovyWave refresh 263.2 ms = merge 156.5 + resolve 37.1 + order 14.6 + deps 12.4 + occurs 11.5 + invalidate 3.7 + collect 2.9 + commit 2.2, so its remaining cost is the recursive merge itself.",
+  "Closed-pair caching stays dead: closed merges are 27 of 44,262 TodoMVC contributor visits and 46 of 119,920 NovyWave contributor visits (distinct closed pairs 5 and 3).",
+  "Fold memo hits: TodoMVC 6,239 of 18,792 evaluations (33%), NovyWave 1,708 of 6,425 (27%)."
+ ],
+ "gates": {
+  "note": "all standing focused gates green on the committed probe",
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ },
+ "caveats": [
+  "One observation per fixture: these are attribution numbers, not acceptance measurements.",
+  "These are single observations, not medians: the TodoMVC observation ran 1203.7 ms end to end against the A/B/A p50 of 1067-1073 ms, and the probe adds Instant::now pairs per fold, so the absolute sub-phase values are inflated relative to the acceptance medians. The ratios and the counter values are the result.",
+  "Sub-phase totals do not sum to total_ms; the residual is loop overhead, scratch checkout/recycle and probe timestamps."
+ ]
+}

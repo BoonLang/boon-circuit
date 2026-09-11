@@ -487,6 +487,13 @@ impl super::ComponentSolver {
         self.requirements.site(owner, target)
     }
 
+    /// Live term-arena intern count while the phase probe is enabled.
+    fn probe_intern_snapshot(&self) -> Option<u64> {
+        self.requirement_phase_probe
+            .is_some()
+            .then(|| self.program.terms.work().intern_requests)
+    }
+
     /// Refresh derived bindings before dequeuing another operation. Raw input
     /// terms remain the dependency authority even when their current resolved
     /// aggregate is closed, unchanged, or has widened away a payload.
@@ -506,17 +513,28 @@ impl super::ComponentSolver {
                 probe.empty_refreshes = probe.empty_refreshes.saturating_add(1);
             }
         }
+        let invalidate_intern = self.probe_intern_snapshot();
         let invalidate_started = self
             .requirement_phase_probe
             .is_some()
             .then(std::time::Instant::now);
         self.invalidate_requirement_cone();
-        if let Some(started) = invalidate_started
-            && let Some(probe) = self.requirement_phase_probe.as_mut()
-        {
-            probe.invalidate_ns = probe
-                .invalidate_ns
-                .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        let invalidate_ns = invalidate_started
+            .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        let invalidate_interned = invalidate_intern.map(|before| {
+            self.program
+                .terms
+                .work()
+                .intern_requests
+                .saturating_sub(before)
+        });
+        if let Some(probe) = self.requirement_phase_probe.as_mut() {
+            if let Some(ns) = invalidate_ns {
+                probe.invalidate_ns = probe.invalidate_ns.saturating_add(ns);
+            }
+            if let Some(interned) = invalidate_interned {
+                probe.intern_invalidate = probe.intern_invalidate.saturating_add(interned);
+            }
         }
         while let Some(target) = self.requirements.pop_dirty() {
             let target = self.root(target);
@@ -528,6 +546,11 @@ impl super::ComponentSolver {
                 .work
                 .aggregate_evaluations
                 .saturating_add(1);
+            let collect_intern = self.probe_intern_snapshot();
+            let collect_started = self
+                .requirement_phase_probe
+                .is_some()
+                .then(std::time::Instant::now);
             let mut facts = self.requirement_fact_scratch.take();
             let mut member = Some(self.equivalence_head[target.0 as usize]);
             while let Some(variable) = member {
@@ -539,6 +562,23 @@ impl super::ComponentSolver {
             inputs.extend(base);
             inputs.extend(facts.iter().map(|(_, term)| *term));
             self.requirement_fact_scratch.recycle(facts);
+            let collect_ns = collect_started
+                .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            let collect_interned = collect_intern.map(|before| {
+                self.program
+                    .terms
+                    .work()
+                    .intern_requests
+                    .saturating_sub(before)
+            });
+            if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                if let Some(ns) = collect_ns {
+                    probe.collect_ns = probe.collect_ns.saturating_add(ns);
+                }
+                if let Some(interned) = collect_interned {
+                    probe.intern_collect = probe.intern_collect.saturating_add(interned);
+                }
+            }
             #[cfg(debug_assertions)]
             if self.aggregate_probe.is_some() {
                 let mut signature = Vec::with_capacity(inputs.len());
@@ -604,7 +644,18 @@ impl super::ComponentSolver {
                 }
                 probe.last.insert(target.0, signature);
             }
+            let deps_started = self
+                .requirement_phase_probe
+                .is_some()
+                .then(std::time::Instant::now);
             self.replace_binding_dependencies_from(target, &inputs);
+            let deps_ns = deps_started
+                .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                if let Some(ns) = deps_ns {
+                    probe.deps_ns = probe.deps_ns.saturating_add(ns);
+                }
+            }
             // Folding is order-sensitive: merges can bind payload variables,
             // so resolve in the same interleaved order as before. Duplicate
             // contributions (aliases and repeated arm terms) are skipped
@@ -620,27 +671,37 @@ impl super::ComponentSolver {
                     .is_some()
                     .then(std::time::Instant::now);
                 let occurs = self.occurs(target, term);
-                if let Some(started) = occurs_started
-                    && let Some(probe) = self.requirement_phase_probe.as_mut()
+                let occurs_ns = occurs_started
+                    .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                if let (Some(ns), Some(probe)) = (occurs_ns, self.requirement_phase_probe.as_mut())
                 {
-                    probe.occurs_ns = probe.occurs_ns.saturating_add(
-                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    );
+                    probe.occurs_ns = probe.occurs_ns.saturating_add(ns);
                 }
                 if occurs {
                     continue;
                 }
+                let resolve_intern = self.probe_intern_snapshot();
                 let resolve_started = self
                     .requirement_phase_probe
                     .is_some()
                     .then(std::time::Instant::now);
                 let term = self.resolve_term(term);
-                if let Some(started) = resolve_started
-                    && let Some(probe) = self.requirement_phase_probe.as_mut()
-                {
-                    probe.resolve_ns = probe.resolve_ns.saturating_add(
-                        u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
-                    );
+                let resolve_ns = resolve_started
+                    .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                let resolve_interned = resolve_intern.map(|before| {
+                    self.program
+                        .terms
+                        .work()
+                        .intern_requests
+                        .saturating_sub(before)
+                });
+                if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                    if let Some(ns) = resolve_ns {
+                        probe.resolve_ns = probe.resolve_ns.saturating_add(ns);
+                    }
+                    if let Some(interned) = resolve_interned {
+                        probe.intern_resolve = probe.intern_resolve.saturating_add(interned);
+                    }
                 }
                 if folded_terms.contains(&term) {
                     continue;
@@ -662,6 +723,7 @@ impl super::ComponentSolver {
                 memo_hit = true;
             }
             if !memo_hit {
+                let merge_intern = self.probe_intern_snapshot();
                 let merge_started = self
                     .requirement_phase_probe
                     .is_some()
@@ -714,11 +776,45 @@ impl super::ComponentSolver {
                         u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
                     );
                 }
+                let merge_interned = merge_intern.map(|before| {
+                    self.program
+                        .terms
+                        .work()
+                        .intern_requests
+                        .saturating_sub(before)
+                });
+                if let Some(probe) = self.requirement_phase_probe.as_mut()
+                    && let Some(interned) = merge_interned
+                {
+                    probe.intern_merge = probe.intern_merge.saturating_add(interned);
+                }
+                let order_intern = self.probe_intern_snapshot();
+                let order_started = self
+                    .requirement_phase_probe
+                    .is_some()
+                    .then(std::time::Instant::now);
                 if let (Some(previous), Some(current)) = (
                     self.requirements.targets[target.0 as usize].order,
                     aggregate,
                 ) {
                     aggregate = Some(self.retain_requirement_order(previous, current));
+                }
+                let order_ns = order_started
+                    .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+                let order_interned = order_intern.map(|before| {
+                    self.program
+                        .terms
+                        .work()
+                        .intern_requests
+                        .saturating_sub(before)
+                });
+                if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                    if let Some(ns) = order_ns {
+                        probe.order_ns = probe.order_ns.saturating_add(ns);
+                    }
+                    if let Some(interned) = order_interned {
+                        probe.intern_order = probe.intern_order.saturating_add(interned);
+                    }
                 }
                 if all_closed {
                     self.requirement_fold_memo.insert(
@@ -731,10 +827,32 @@ impl super::ComponentSolver {
             }
             self.term_id_scratch.recycle(folded_terms);
             self.term_id_scratch.recycle(inputs);
+            let commit_intern = self.probe_intern_snapshot();
+            let commit_started = self
+                .requirement_phase_probe
+                .is_some()
+                .then(std::time::Instant::now);
             self.requirements.set_order(target, aggregate);
             if self.cells[target.0 as usize].binding != aggregate {
                 self.cells[target.0 as usize].binding = aggregate;
                 self.touch(target);
+            }
+            let commit_ns = commit_started
+                .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            let commit_interned = commit_intern.map(|before| {
+                self.program
+                    .terms
+                    .work()
+                    .intern_requests
+                    .saturating_sub(before)
+            });
+            if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                if let Some(ns) = commit_ns {
+                    probe.commit_ns = probe.commit_ns.saturating_add(ns);
+                }
+                if let Some(interned) = commit_interned {
+                    probe.intern_commit = probe.intern_commit.saturating_add(interned);
+                }
             }
         }
         if let Some(started) = phase_started
@@ -889,8 +1007,10 @@ impl super::ComponentSolver {
         let mut pending = self.variable_scratch.take();
         let mut affected = self.variable_scratch.take();
         pending.push(first);
+        let mut popped = 1_u64;
         while let Some(target) = self.requirements.pop_dirty() {
             pending.push(target);
+            popped = popped.saturating_add(1);
         }
         self.schedule_generation = super::next_generation(
             &mut self.schedule_generation,
@@ -932,6 +1052,15 @@ impl super::ComponentSolver {
         }
         for target in pending.iter().copied() {
             self.touch(target);
+        }
+        if let Some(probe) = self.requirement_phase_probe.as_mut() {
+            probe.invalidate_dirty_pops = probe.invalidate_dirty_pops.saturating_add(popped);
+            probe.invalidate_affected = probe
+                .invalidate_affected
+                .saturating_add(u64::try_from(affected.len()).unwrap_or(u64::MAX));
+            probe.invalidate_touches = probe
+                .invalidate_touches
+                .saturating_add(u64::try_from(pending.len()).unwrap_or(u64::MAX));
         }
         self.variable_scratch.recycle(pending);
         self.variable_scratch.recycle(affected);

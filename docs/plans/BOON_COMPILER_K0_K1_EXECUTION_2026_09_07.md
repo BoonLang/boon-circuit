@@ -1122,3 +1122,50 @@ on NovyWave's 162.9 ms recursive payload merge and TodoMVC's 86.9 ms
 invalidation plus 68.1 ms commit/order, and every further slice must move the
 A/B/A p50 outside the measured 0.8% inter-leg agreement before it claims a
 production effect.
+
+### 2026-09-11: K1″ probe extension — the TodoMVC refresh cost is touch scheduling
+
+The env-gated release phase probe now splits the untimed refresh regions
+(assembly, dependency replacement, order retention, commit/touch) and
+attributes term-arena intern requests to each region. One release observation
+per large fixture (diagnostics, fresh-process); raw probe lines and counters in
+[the attribution evidence](evidence/compiler-k1pp-phase-attribution-2026-09-11.json):
+
+| refresh region | TodoMVC | NovyWave |
+| --- | ---: | ---: |
+| total | 311.5 ms | 263.2 ms |
+| invalidate | 88.3 | 3.7 |
+| commit (set_order + binding + touch) | 68.0 | 2.2 |
+| assembly (facts + sort + inputs) | 32.5 | 2.9 |
+| resolve | 26.5 | 37.1 |
+| occurs | 16.7 | 11.5 |
+| merge | 10.0 | 156.5 |
+| dependency replacement | 8.2 | 12.4 |
+| order retention | 0.8 | 14.6 |
+
+Three corrections and consequences:
+
+- The 68.1 ms bucket recorded earlier as "commit/order
+  (`retain_requirement_order` + `set_order` + `touch`)" is not order
+  retention: `retain_requirement_order` is 0.833 ms. The bucket is the commit
+  path including `touch`.
+- Neither large TodoMVC bucket is the requirement cone walk. Invalidation
+  handles 12,541 dirty pops, 14,988 affected cells and 12,690 edge visits,
+  while the two buckets together carry about 27,000 `touch` calls; the cost is
+  `schedule_variable`'s transitive dependent walk at roughly 5-6 us per touch.
+- Intern requests inside refresh are 164,211 of 814,114 on TodoMVC and 394,531
+  of 1,067,405 on NovyWave, so the interning bloat that the K0 comparison
+  exposes is not local to the refresh path.
+
+NovyWave's remaining refresh cost is the recursive payload merge (156.5 ms),
+and closed-pair caching stays dead there: 27 of 44,262 TodoMVC contributor
+visits and 46 of 119,920 NovyWave visits merge two closed terms. Fold-memo
+hits are 33% of TodoMVC and 27% of NovyWave aggregate evaluations.
+
+All standing focused gates stay green: kernel 197, kernel_transfer 10, compiler
+library 98 with one pre-existing ignored probe, staged 3, map_set 3,
+nested_boolean_match 3, pulses 8. Next targets are the touch/scheduling walk
+behind TodoMVC's invalidation and commit buckets and NovyWave's recursive
+merge; the scheduler change is a dependency-update change inside the
+aggregation path, so refresh-before-read and the withdrawal invariant must
+stay green.

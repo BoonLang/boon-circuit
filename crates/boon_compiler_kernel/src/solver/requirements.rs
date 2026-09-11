@@ -498,6 +498,7 @@ impl super::ComponentSolver {
     /// terms remain the dependency authority even when their current resolved
     /// aggregate is closed, unchanged, or has widened away a payload.
     pub(super) fn refresh_requirements(&mut self) {
+        self.requirement_previous_bindings.clear();
         let phase_started = self
             .requirement_phase_probe
             .is_some()
@@ -832,10 +833,22 @@ impl super::ComponentSolver {
                 .requirement_phase_probe
                 .is_some()
                 .then(std::time::Instant::now);
+            let current_binding = self.cells[target.0 as usize].binding;
+            let previous_binding = self
+                .requirement_previous_bindings
+                .remove(&target.0)
+                .or(current_binding);
             self.requirements.set_order(target, aggregate);
-            if self.cells[target.0 as usize].binding != aggregate {
+            if current_binding != aggregate {
                 self.cells[target.0 as usize].binding = aggregate;
+            }
+            // Only a real binding change can move a consumer's input, so an
+            // unchanged recomputed aggregate restores its binding without the
+            // schedule_variable walk.
+            if previous_binding != aggregate {
                 self.touch(target);
+            } else if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                probe.commit_skipped_touches = probe.commit_skipped_touches.saturating_add(1);
             }
             let commit_ns = commit_started
                 .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
@@ -862,6 +875,10 @@ impl super::ComponentSolver {
                 .total_ns
                 .saturating_add(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
         }
+        debug_assert!(
+            self.requirement_previous_bindings.is_empty(),
+            "every cleared binding is refolded in the refresh that cleared it"
+        );
     }
 
     /// Preserve only the order of surviving fields. Every value, shape kind,
@@ -1044,23 +1061,25 @@ impl super::ComponentSolver {
         }
         // Stable order is independent of hash maps and alias traversal.
         affected.sort_unstable();
+        let mut recorded = 0_u64;
         for target in affected.iter().copied() {
             self.requirements.mark_dirty(target);
-            if self.cells[target.0 as usize].binding.take().is_some() {
-                pending.push(target);
+            // Keep the cleared binding so the fold can tell an unchanged
+            // aggregate from a changed one. Re-scheduling every affected
+            // destination unconditionally burned about 85 ms of TodoMVC time
+            // in schedule_variable consumer scans that found nothing queued.
+            if let Some(previous) = self.cells[target.0 as usize].binding.take() {
+                self.requirement_previous_bindings
+                    .insert(target.0, previous);
+                recorded = recorded.saturating_add(1);
             }
-        }
-        for target in pending.iter().copied() {
-            self.touch(target);
         }
         if let Some(probe) = self.requirement_phase_probe.as_mut() {
             probe.invalidate_dirty_pops = probe.invalidate_dirty_pops.saturating_add(popped);
             probe.invalidate_affected = probe
                 .invalidate_affected
                 .saturating_add(u64::try_from(affected.len()).unwrap_or(u64::MAX));
-            probe.invalidate_touches = probe
-                .invalidate_touches
-                .saturating_add(u64::try_from(pending.len()).unwrap_or(u64::MAX));
+            probe.invalidate_recorded = probe.invalidate_recorded.saturating_add(recorded);
         }
         self.variable_scratch.recycle(pending);
         self.variable_scratch.recycle(affected);

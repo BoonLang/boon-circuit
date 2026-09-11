@@ -1,0 +1,73 @@
+{
+ "status": "fourth aggregation slice: a destination whose recomputed aggregate is unchanged is no longer re-scheduled; TodoMVC reaches K0-class diagnostics p50 with byte-identical diagnostics",
+ "date": "2026-09-11",
+ "change": {
+  "cut": "reschedule only destinations whose binding actually moved",
+  "what": "invalidate_requirement_cone records each cleared binding instead of touching every affected destination, and the refresh commit compares the new aggregate against that recorded previous binding: equal aggregates restore the binding without running the schedule_variable dependent walk, changed aggregates touch exactly as before. The map is cleared at the start of every refresh and a debug assertion proves every recorded binding is refolded in the same refresh.",
+  "why": "the phase probe showed TodoMVC refresh carrying about 27,000 touch calls at roughly 5-6 us each (invalidate 88.3 ms + commit 68.0 ms of a 311.5 ms refresh) while the requirement cone BFS visits only 12,690 edges: the cost was repeated consumer scans that found nothing new to enqueue.",
+  "soundness": "the schedule walk is only needed when a consumer's input can move, and a consumer reads the destination's binding. An unchanged aggregate restores the identical binding; the invalidation BFS already marks every reachable requirement destination dirty, so the marking side effect of the removed touches is preserved. Refresh-before-read and the withdrawal invariant are untouched: the refresh still runs before every dequeue and still folds every dirty destination."
+ },
+ "phase_probe_release": {
+  "todo_mvc_physical_diagnostics": {
+   "total_ms": [311.5, 135.6],
+   "invalidate_ms": [88.3, 16.9],
+   "commit_ms": [68.0, 1.4],
+   "collect_ms": [32.5, 20.9],
+   "resolve_ms": [26.5, 18.8],
+   "occurs_ms": [16.7, 12.4],
+   "merge_ms": [10.0, 8.4],
+   "deps_ms": [8.2, 6.4],
+   "order_ms": [0.8, 0.7],
+   "refresh_calls": [65216, 58699],
+   "folds": [12553, 9662],
+   "commit_skipped_touches": 12514,
+   "invalidate_recorded_bindings": 14120
+  },
+  "novywave_diagnostics": {
+   "total_ms": [263.2, 247.8],
+   "merge_ms": [156.5, 144.3],
+   "resolve_ms": [37.1, 36.8],
+   "order_ms": [14.6, 15.5],
+   "deps_ms": [12.4, 12.7],
+   "commit_ms": [2.2, 1.2],
+   "invalidate_ms": [3.7, 2.0],
+   "folds": [4717, 4592],
+   "commit_skipped_touches": 4530,
+   "invalidate_recorded_bindings": 5607
+  },
+  "note": "one release observation per fixture per build (diagnostics, fresh-process); the pairs are [baseline e618891c probe build, candidate probe build]"
+ },
+ "interleaved_ab": {
+  "protocol": "eight alternating rounds, one process per observation, release evidence lane, cold fresh-process",
+  "todo_mvc_diagnostics_ms": {"before_p50": 1088.4, "before_min": 1081.9, "after_p50": 927.3, "after_min": 923.1, "delta_p50_pct": -14.81},
+  "novywave_diagnostics_ms": {"before_p50": 849.2, "before_min": 840.9, "after_p50": 789.4, "after_min": 781.9, "delta_p50_pct": -7.04},
+  "todo_mvc_verified_ms": {"before_p50": 1514.3, "before_min": 1494.2, "after_p50": 1369.2, "after_min": 1333.2, "delta_p50_pct": -9.58},
+  "fingerprint_parity": "the diagnostics lanes produced a single (diagnostics fingerprint, plan) pair across both binaries; the TodoMVC verified lane produced two pairs that differ only in the machine plan hash, never in the diagnostics fingerprint"
+ },
+ "machine_plan_drift_disclosure": {
+  "todo_mvc_physical": {
+   "k0_producer": "8e7120c33db1d5a5c03a1d5aaeb9cc112e102fafed8c0e518c557903309eb949 (equals the budget constant)",
+   "baseline_head_e618891c": "4087c4ff58a5eb8e4cbc71889d2b1a0b5db752f2fc326b406a2e050e69424cb9",
+   "candidate": "0befc7f89cdeb6d6911b33883c238d42c67bdaae8ebcc01e9b56aa99d3c0ed34",
+   "shape": "the candidate plan is the baseline plan with two projected-scalar expressions removed and downstream ids renumbered: the op-kind sequence aligns under a +2 id offset for 64,481 of 64,482 rows, and 501 rows differ beyond pure renumbering, concentrated around the rewrite and in binding tables",
+   "baseline_condition": "the machine-plan-hash budget for TodoMVC and NovyWave verified is already red at HEAD e618891c (the budget constant is the K0-era plan), so this drift continues an inherited red rather than regressing a green gate"
+  },
+  "novywave": "plan hash unchanged between baseline and candidate: both dump to 5926de7bed188b50a1726b9e4f0abdc581fbf83a31ffff760f8b47ad71aa00a7"
+ },
+ "gates": {
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ },
+ "position": "this is the first slice of the goal that moves end-to-end latency outside the noise floor: TodoMVC diagnostics p50 1088 -> 927 ms against the K0 producer's 922 ms, i.e. K0-class for that fixture and lane, with byte-identical diagnostics. NovyWave improves 7% and remains about 60% above K0, dominated by its recursive merge.",
+ "caveats": [
+  "single machine, one boot; the A/B is interleaved one-process observations, not the full 3+30 A/B/A acceptance protocol",
+  "the TodoMVC machine plan changes shape as disclosed above; the plan-hash budget for the large fixtures is already red at baseline",
+  "the warm interaction path is the declared successor goal and is not measured here",
+  "NovyWave's remaining cost is the recursive merge (144.3 ms of a 247.8 ms refresh), not scheduling"
+ ]
+}

@@ -357,6 +357,10 @@ struct ComponentSolver {
     /// the resulting aggregate. An identical signature skips the merge loop
     /// and restores the previous aggregate exactly.
     requirement_fold_memo: std::collections::HashMap<u32, (Box<[TypeTermId]>, Option<TypeTermId>)>,
+    /// Bindings cleared by the current refresh's invalidation, so the fold can
+    /// tell an unchanged aggregate from a changed one and only re-schedule the
+    /// destinations whose binding actually moved. Drained every refresh.
+    requirement_previous_bindings: std::collections::HashMap<u32, TypeTermId>,
     /// Opt-in K1″ sub-phase probe. Splits the fold into occurs, resolve and
     /// merge time so a release producer can attribute the refresh cost.
     /// Absent unless `BOON_KERNEL_TRACE_AGGREGATE_PHASE` is set.
@@ -425,7 +429,8 @@ struct RequirementPhaseProbe {
     invalidate_ns: u64,
     invalidate_dirty_pops: u64,
     invalidate_affected: u64,
-    invalidate_touches: u64,
+    invalidate_recorded: u64,
+    commit_skipped_touches: u64,
     intern_invalidate: u64,
     intern_collect: u64,
     intern_resolve: u64,
@@ -441,7 +446,7 @@ impl Drop for RequirementPhaseProbe {
         }
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         eprintln!(
-            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_touches={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
+            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
             self.calls,
             self.folds,
             self.memo_hits,
@@ -458,7 +463,8 @@ impl Drop for RequirementPhaseProbe {
             self.dirty_refreshes,
             self.invalidate_dirty_pops,
             self.invalidate_affected,
-            self.invalidate_touches,
+            self.invalidate_recorded,
+            self.commit_skipped_touches,
             self.intern_invalidate,
             self.intern_collect,
             self.intern_resolve,
@@ -777,6 +783,7 @@ impl ComponentSolver {
             aggregate_probe: std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE")
                 .map(|_| AggregateProbe::default()),
             requirement_fold_memo: std::collections::HashMap::new(),
+            requirement_previous_bindings: std::collections::HashMap::new(),
             requirement_phase_probe: std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE_PHASE")
                 .map(|_| RequirementPhaseProbe::default()),
             requirement_closed_pairs: std::collections::HashSet::new(),

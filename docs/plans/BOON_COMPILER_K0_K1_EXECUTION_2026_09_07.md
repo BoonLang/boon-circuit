@@ -1169,3 +1169,41 @@ behind TodoMVC's invalidation and commit buckets and NovyWave's recursive
 merge; the scheduler change is a dependency-update change inside the
 aggregation path, so refresh-before-read and the withdrawal invariant must
 stay green.
+
+### 2026-09-11: K1″ fourth slice — only changed aggregates reschedule, TodoMVC reaches K0-class p50
+
+The extended probe showed the refresh carrying about 27,000 `touch` calls at
+roughly 5-6 us each while the requirement cone BFS moves only 12,690 edges, so
+the cost was `schedule_variable` consumer scans re-run for destinations whose
+recomputed aggregate had not moved. The slice records every binding that
+invalidation clears and compares the new aggregate with it: an equal aggregate
+restores the binding without the walk, a changed aggregate touches exactly as
+before. Refresh-before-read is untouched — the refresh still runs before every
+dequeue and still folds every dirty destination — and a debug assertion proves
+every recorded binding is refolded in the refresh that cleared it.
+
+Release phase effect (one observation per build, diagnostics, fresh-process):
+TodoMVC refresh 311.5 → 135.6 ms (invalidate 88.3 → 16.9, commit 68.0 → 1.4,
+folds 12,553 → 9,662, 12,514 skipped touches); NovyWave 263.2 → 247.8 ms
+(merge 156.5 → 144.3, 4,530 skipped touches). Interleaved A/B, eight rounds,
+one process per observation: TodoMVC diagnostics 1088.4 → 927.3 ms (−14.8%,
+min 923.1), NovyWave diagnostics 849.2 → 789.4 ms (−7.0%), TodoMVC verified
+1514.3 → 1369.2 ms (−9.6%). Diagnostics fingerprints are identical across the
+lanes, and TodoMVC now sits at the K0 producer's 922.1 ms p50 for the
+diagnostics lane — the first slice of this goal to move end to end.
+
+Disclosure: the TodoMVC machine plan changes shape. The candidate plan is the
+baseline plan with two projected-scalar expressions removed and downstream ids
+renumbered (the op-kind sequence aligns under a +2 id offset for 64,481 of
+64,482 rows; 501 rows differ beyond pure renumbering). The plan-hash budget for
+the large fixtures is already red at HEAD — the budget constant is the K0-era
+plan `8e7120c3…`, HEAD produces `4087c4ff…` and the candidate `0befc7f8…` — so
+this continues an inherited red rather than regressing a green gate.
+NovyWave's plan is byte-identical (`5926de7b…`). Full record:
+[touch elimination](evidence/compiler-k1pp-touch-elimination-2026-09-11.json).
+
+All standing focused gates are green: kernel 197, kernel_transfer 10, compiler
+library 98 with one pre-existing ignored probe, staged 3, map_set 3,
+nested_boolean_match 3, pulses 8. NovyWave remains about 60% above K0 and its
+remaining cost is the recursive merge, so the next slice still targets that
+merge; the contract's 3+30 A/B/A acceptance run for this candidate follows.

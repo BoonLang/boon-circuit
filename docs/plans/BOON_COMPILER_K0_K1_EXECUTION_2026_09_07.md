@@ -1393,6 +1393,8 @@ non-refresh work already at K0 parity, so the residual gap is per-fold
 verification of unchanged contributors. Removing that soundly needs
 dependency-versioned contributor reuse (stamp each destination when the
 scheduler's binding-change walk reaches it, then reuse retained resolved terms
-when the stamp and raw inputs are unchanged) — the retained-revision machinery
-the contract assigns to the successor goal. That decision is recorded in the
-evidence file rather than started here.
+for positions whose raw term is unchanged while the stamp is unchanged), which
+the contract's allowed work covers under dependency updates. Its soundness
+depends on the walk reaching every destination reachable through bindings, so
+it needs its own audit before implementation; it is not started here and the
+decision is recorded in the evidence file.

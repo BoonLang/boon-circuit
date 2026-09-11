@@ -3236,7 +3236,9 @@ impl ComponentSolver {
                 probe.full_folds = probe.full_folds.saturating_add(1);
             }
         }
-        for term in folded_terms.iter().copied().skip(common) {
+        let mut index = common;
+        while index < folded_terms.len() {
+            let term = folded_terms[index];
             self.requirements.work.aggregate_fact_visits = self
                 .requirements
                 .work
@@ -3261,7 +3263,22 @@ impl ComponentSolver {
                 None => term,
                 Some(previous) => self.merge_type_evidence(previous, term, false),
             });
-            prefixes.push(aggregate.expect("folded term was just stored"));
+            let merged = aggregate.expect("folded term was just stored");
+            prefixes.push(merged);
+            // Once the accumulator matches the retained aggregate at this
+            // position and the remaining contributors are identical, the rest
+            // of the fold is the retained fold: reuse its tail instead of
+            // re-merging unchanged contributors.
+            if let Some(state) = retained.as_ref()
+                && index < state.inputs.len()
+                && merged == state.prefixes[index]
+                && folded_terms[index + 1..] == state.inputs[index + 1..]
+            {
+                prefixes.extend_from_slice(&state.prefixes[index + 1..]);
+                aggregate = state.prefixes.last().copied();
+                break;
+            }
+            index += 1;
         }
         self.requirement_fold_state.insert(
             target.0,

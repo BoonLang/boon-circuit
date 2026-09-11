@@ -1340,3 +1340,30 @@ NovyWave's refresh is now 107.0 ms: resolve 20.1, merge 22.2, order 14.7, deps
 loop overhead. The next targets are merge re-convergence (stop merging the
 suffix once the accumulator matches the retained prefix aggregate) and the
 dependency receipt.
+
+### 2026-09-11: K1″ eighth slice — the fold stops at re-convergence
+
+While merging a changed suffix the fold now compares the accumulator with the
+retained prefix aggregate at the same position; when they match and the
+remaining contributor slices are identical, the rest of the fold is the
+retained fold and its tail is reused without merging. The check requires both
+conditions, so withdrawal and reordering (which change the tail) disable the
+reuse. Release probe: NovyWave merge 22.2 → 13.1 ms (−41%), merge interning
+24,368 → 16,403, refresh 107.0 → 94.6 ms; TodoMVC merge 8.9 → 8.1 ms and
+refresh 134.5 → 131.9 ms.
+
+Interleaved A/B, eight rounds, one process per observation: NovyWave
+diagnostics 662.1 → 655.1 ms (−1.1%), TodoMVC diagnostics +1.3% and verified
+0.0%, all inside the noise band the busy host now shows (repeat windows move by
+1-3%). Every lane produced a single (fingerprint, plan) pair. The slice is
+recorded as a phase-level work reduction rather than an end-to-end speedup:
+[fold re-convergence](evidence/compiler-k1pp-fold-convergence-2026-09-11.json).
+All gates green (kernel 197, kernel_transfer 10, compiler library 98 with one
+pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match 3,
+pulses 8).
+
+NovyWave's refresh is 94.6 ms: resolve 19.2, order 14.2, merge 13.1, deps 11.9,
+occurs 10.6, collection/invalidation/commit ~5.7 and roughly 20 ms of loop
+overhead. The remaining slice targets are the dependency receipt, occurs
+filtering and that loop overhead; the 3+30 acceptance run still needs a quiet
+window.

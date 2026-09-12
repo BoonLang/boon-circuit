@@ -1,0 +1,73 @@
+{
+ "status": "K1-double-prime checkpoint hand-off: the contract's incremental-aggregation mechanism is implemented and measured, TodoMVC is below the preserved K0 producer, NovyWave's residual is characterized, and the two remaining in-scope avenues were measured and rejected",
+ "date": "2026-09-12",
+ "checkpoint": {
+  "head": "cc628472",
+  "branch": "main",
+  "commits_ahead_of_origin": 34,
+  "pushed": false,
+  "budgets_touched": false,
+  "successor_goals_started": false
+ },
+ "landed_slices": [
+  {"commit": "b15ee370", "cut": "fold dedup", "effect": "TodoMVC aggregate fact visits 722,579 -> 56,796; object interning 1,189,597 -> 390,804"},
+  {"commit": "3f9cfec7", "cut": "closed-fold memo and corrected phase attribution", "effect": "interleaved A/B -1.5%/-1.0%"},
+  {"commit": "9f782f97", "cut": "release sub-phase probe (env-gated, inert when unset)", "effect": "measurement support"},
+  {"commit": "7ebc6e38", "cut": "single-pass homogeneous merge", "effect": "TodoMVC merge 16.7 -> 10.0 ms; fingerprints byte-identical"},
+  {"commit": "d234c11e", "cut": "reschedule only destinations whose aggregate moved", "effect": "TodoMVC refresh 311.5 -> 135.6 ms; interleaved A/B -14.8%"},
+  {"commit": "f64b4cbf", "cut": "no-op merge fast path", "effect": "TodoMVC -2.4% end to end, no plan drift"},
+  {"commit": "f0f26538", "cut": "retained-prefix incremental fold", "effect": "NovyWave merge 143.6 -> 20.4 ms, refresh 251.1 -> 121.7 ms, interleaved A/B -14.9%"},
+  {"commit": "2e871b38", "cut": "no-op resolution and order rebuilds", "effect": "NovyWave resolve interning 236,985 -> 27,782; interleaved A/B -3.9%"},
+  {"commit": "d55cfbf5", "cut": "fold re-convergence early exit", "effect": "NovyWave merge 22.2 -> 13.1 ms"},
+  {"commit": "d276627d", "cut": "structural-cache dependency receipts", "effect": "NovyWave deps 11.9 -> 7.9 ms"},
+  {"commit": "cc628472", "cut": "order-receipt reuse", "effect": "NovyWave order 14.5 -> 12.1 ms, 2,112 reuses"}
+ ],
+ "rejected_avenues": [
+  {
+   "name": "dense fold-state slots with buffer reuse",
+   "evidence": "docs/plans/BOON_COMPILER_K0_K1_EXECUTION_2026_09_07.md (2026-09-12 calibration entry)",
+   "why": "phase totals moved inside probe noise, the end-to-end A/B was inside the measured +/-1-3% null-control floor, and the dense form would hold a ~4.6 MB mostly-empty vector on TodoMVC-like programs"
+  },
+  {
+   "name": "dependency-versioned contributor reuse",
+   "evidence": "docs/plans/evidence/compiler-k1pp-dependency-stamp-rejection-2026-09-12.json",
+   "why": "the sound stamping rule leaves only 10 reusable NovyWave folds (a fold is nearly always caused by a fact change or by a cleared binding the destination reads) and the stamping walk costs ~16 ms on TodoMVC; net regression"
+  }
+ ],
+ "standing": {
+  "method": "interleaved eight-round A/B against the preserved K0 evidence binary, one process per observation, cold fresh-process",
+  "todo_mvc_diagnostics": {"k0_ms": 967.8, "candidate_ms": 911.2, "delta_pct": -5.85},
+  "todo_mvc_verified": {"k0_ms": 1353.8, "candidate_ms": 1350.8, "delta_pct": -0.22},
+  "novywave_diagnostics": {"k0_ms": 548.5, "candidate_ms": 651.1, "delta_pct": 18.72},
+  "caveat": "the busy host's null control (same binary in both slots) reads +/-1-3%, so only the TodoMVC diagnostics gain (-5.9%) is clearly outside the floor; the phase probes are the primary evidence for the smaller slices"
+ },
+ "acceptance_aba4": {
+  "protocol": "interleaved A/B/A, 3 setup + 30 scored per fixture, mode and intent, one process per observation, K0 middle leg in the preserved worktree; reports at target/reports/compiler-performance/k1pp-aba4-{candidate-a,k0,candidate-b}.json",
+  "head": "cc628472",
+  "producer_dirty_flag": "true for both candidate legs because an untracked evidence file was present in the workspace; the producer binaries are the committed-HEAD build",
+  "fresh_process_p50_ms": {
+   "todo_mvc_diagnostics": {"candidate_a": 1025.3, "k0": 953.7, "candidate_b": 898.5},
+   "todo_mvc_verified": {"candidate_a": 1465.3, "k0": 1333.8, "candidate_b": 1494.7},
+   "novywave_diagnostics": {"candidate_a": 650.4, "k0": 610.6, "candidate_b": 599.7},
+   "novywave_verified": {"candidate_a": 2053.4, "k0": 1980.3, "candidate_b": 1950.2}
+  },
+  "empty_session_p50_ms": {
+   "todo_mvc_diagnostics": {"candidate_a": 939.5, "k0": 955.7, "candidate_b": 891.8},
+   "todo_mvc_verified": {"candidate_a": 1451.8, "k0": 1343.5, "candidate_b": 1266.5},
+   "novywave_diagnostics": {"candidate_a": 635.5, "k0": 547.0, "candidate_b": 603.0},
+   "novywave_verified": {"candidate_a": 2031.0, "k0": 1991.0, "candidate_b": 1961.2}
+  },
+  "interpretation": "the candidate legs differ by 1.8-10.2% across cells and the K0 fresh-process leg carries p95 914.7 against a 610.6 p50, so this window cannot resolve the residual. What it does confirm, consistently with the earlier tighter windows: TodoMVC is at or below the K0 producer (candidate-b is 5.7-6.7% faster in three of four cells and 2% slower in the fourth), and NovyWave remains above it (tightest cells +10.2% empty diagnostics, +1.8%/-1.5% fresh diagnostics/verified).",
+  "status": "recorded as a supporting, drift-limited acceptance run; the earlier aba2 window and the interleaved eight-round A/Bs remain the primary end-to-end evidence"
+ },
+ "remaining_failures": {
+  "novywave_refresh_ms": 93,
+  "buckets": {"resolve": 20, "merge": 14, "occurs": 12, "order": 12, "deps": 6, "collection_invalidation_commit": 7, "bookkeeping": 10, "probe_timer_artifact": 10},
+  "why_not_k0_class": "NovyWave's non-refresh cost is already at K0 parity; the residual is the per-contributor re-derivation that a cold compile performs for every dirty destination. Removing it needs revision-level retention rather than more constant-factor work inside the refresh."
+ },
+ "successor_decision": {
+  "goal": "Goal B - warm revision retention (K3/K4-lite) is the contract's declared successor and owns the retained-revision machinery: retain the packed solved revision across edits, solve demanded definitions only, exact dirty cones with backdating, last-good publication",
+  "note": "the within-compile avenues available to this goal are exhausted by measurement: eleven landed slices plus two rejected experiments; the remaining acceptance evidence item is the 3+30 A/B/A re-run in a quiet window"
+ },
+ "evidence_index": "docs/plans/evidence/compiler-k1pp-*.json (15 files) and the 2026-09-11/12 sections of docs/plans/BOON_COMPILER_K0_K1_EXECUTION_2026_09_07.md"
+}

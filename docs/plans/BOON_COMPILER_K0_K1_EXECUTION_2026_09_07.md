@@ -1487,3 +1487,26 @@ NovyWave's refresh is ~93-97 ms: resolve ~20, merge ~14, occurs ~12, order 12,
 deps ~6, collection/invalidation/commit ~7 and roughly 20 ms of untimed loop
 overhead — the cost of re-deriving each dirty destination inside a cold
 compile. The only unexplored bucket left is that untimed overhead.
+
+### 2026-09-12: K1″ checkpoint hand-off record and a third acceptance run
+
+The accumulated evidence is consolidated into
+[the checkpoint hand-off](evidence/compiler-k1pp-handoff-2026-09-12.json): the
+eleven landed slices with their measured effects and evidence files, the two
+rejected avenues with their measurements, the current standing, the remaining
+failures and the successor decision. It is a hand-off record, not a claimed
+ending: the contract needs NovyWave at K0-class as well, and the mechanism's
+remaining work belongs to the retained-revision successor.
+
+A third 3+30 A/B/A ran for `cc628472`
+(`target/reports/compiler-performance/k1pp-aba4-{candidate-a,k0,candidate-b}.json`).
+The window was drift-limited: the candidate legs differ by 1.8-10.2% across
+cells and the K0 fresh-process leg carries p95 914.7 against a 610.6 p50. It
+still confirms the earlier picture — TodoMVC at or below the K0 producer
+(candidate-b 5.7-6.7% faster in three of four cells, 2% slower in the fourth)
+and NovyWave above it (tightest cells +10.2% empty diagnostics, −1.8%/+1.5%
+fresh diagnostics/verified) — and is recorded as supporting, drift-limited
+evidence rather than the decisive record. Note for future runs: an untracked
+file added while a measurement is in flight changes the workspace digest and
+the xtask refuses to write the report; the first attempt here was discarded for
+exactly that reason.

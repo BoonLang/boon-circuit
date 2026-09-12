@@ -667,29 +667,24 @@ impl super::ComponentSolver {
             for term in inputs.iter().copied() {
                 // Match the existing recursive-shape guard without equating
                 // any contributor variable to its destination.
-                let occurs_started = self
+                if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                    if self.program.terms.has_variable(term) {
+                        probe.open_contributor_visits =
+                            probe.open_contributor_visits.saturating_add(1);
+                    } else {
+                        probe.closed_contributor_visits =
+                            probe.closed_contributor_visits.saturating_add(1);
+                    }
+                }
+                let check_intern = self.probe_intern_snapshot();
+                let check_started = self
                     .requirement_phase_probe
                     .is_some()
                     .then(std::time::Instant::now);
-                let occurs = self.occurs(target, term);
-                let occurs_ns = occurs_started
+                let resolved = self.resolve_requirement_contributor(target, term);
+                let check_ns = check_started
                     .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
-                if let (Some(ns), Some(probe)) = (occurs_ns, self.requirement_phase_probe.as_mut())
-                {
-                    probe.occurs_ns = probe.occurs_ns.saturating_add(ns);
-                }
-                if occurs {
-                    continue;
-                }
-                let resolve_intern = self.probe_intern_snapshot();
-                let resolve_started = self
-                    .requirement_phase_probe
-                    .is_some()
-                    .then(std::time::Instant::now);
-                let term = self.resolve_term(term);
-                let resolve_ns = resolve_started
-                    .map(|started| u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
-                let resolve_interned = resolve_intern.map(|before| {
+                let check_interned = check_intern.map(|before| {
                     self.program
                         .terms
                         .work()
@@ -697,13 +692,28 @@ impl super::ComponentSolver {
                         .saturating_sub(before)
                 });
                 if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                    if let Some(ns) = resolve_ns {
-                        probe.resolve_ns = probe.resolve_ns.saturating_add(ns);
+                    if let Some(ns) = check_ns {
+                        probe.contributor_check_ns = probe.contributor_check_ns.saturating_add(ns);
                     }
-                    if let Some(interned) = resolve_interned {
+                    if let Some(interned) = check_interned {
                         probe.intern_resolve = probe.intern_resolve.saturating_add(interned);
                     }
                 }
+                #[cfg(debug_assertions)]
+                {
+                    let separate = if self.occurs(target, term) {
+                        None
+                    } else {
+                        Some(self.resolve_term(term))
+                    };
+                    debug_assert_eq!(
+                        separate, resolved,
+                        "the combined occurs/resolve check must match the separate walks"
+                    );
+                }
+                let Some(term) = resolved else {
+                    continue;
+                };
                 if folded_terms.contains(&term) {
                     continue;
                 }

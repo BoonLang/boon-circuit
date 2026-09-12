@@ -326,6 +326,11 @@ struct ComponentSolver {
     resolve_cache_values: Vec<TypeTermId>,
     resolve_active: Vec<u32>,
     resolve_generation: u32,
+    /// Target root of the combined occurs/resolve contributor check and
+    /// whether that root was reached while resolving. Set only around a
+    /// requirement contributor check.
+    resolve_occurs_target: Option<TypeVariableId>,
+    resolve_occurs_hit: bool,
     occurs_active: Vec<u32>,
     occurs_generation: u32,
     term_visit_seen: Vec<u32>,
@@ -459,6 +464,9 @@ struct RequirementPhaseProbe {
     prefix_reuse_folds: u64,
     prefix_reuse_terms: u64,
     order_reuses: u64,
+    open_contributor_visits: u64,
+    closed_contributor_visits: u64,
+    contributor_check_ns: u64,
     intern_invalidate: u64,
     intern_collect: u64,
     intern_resolve: u64,
@@ -474,7 +482,7 @@ impl Drop for RequirementPhaseProbe {
         }
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         eprintln!(
-            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
+            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} contributor_check_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} open_contributor_visits={} closed_contributor_visits={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
             self.calls,
             self.folds,
             self.memo_hits,
@@ -484,6 +492,7 @@ impl Drop for RequirementPhaseProbe {
             ms(self.deps_ns),
             ms(self.occurs_ns),
             ms(self.resolve_ns),
+            ms(self.contributor_check_ns),
             ms(self.merge_ns),
             ms(self.order_ns),
             ms(self.commit_ns),
@@ -497,6 +506,8 @@ impl Drop for RequirementPhaseProbe {
             self.prefix_reuse_folds,
             self.prefix_reuse_terms,
             self.order_reuses,
+            self.open_contributor_visits,
+            self.closed_contributor_visits,
             self.intern_invalidate,
             self.intern_collect,
             self.intern_resolve,
@@ -797,6 +808,8 @@ impl ComponentSolver {
             resolve_cache_values: Vec::new(),
             resolve_active: vec![0; variable_count],
             resolve_generation: 0,
+            resolve_occurs_target: None,
+            resolve_occurs_hit: false,
             occurs_active: vec![0; variable_count],
             occurs_generation: 0,
             term_visit_seen: Vec::new(),
@@ -3575,6 +3588,29 @@ impl ComponentSolver {
         }
     }
 
+    /// Resolve one requirement contributor, returning `None` when the
+    /// destination root occurs in it. The occurs check rides along with the
+    /// resolution walk, so an open contributor is traversed once instead of
+    /// twice.
+    fn resolve_requirement_contributor(
+        &mut self,
+        target: TypeVariableId,
+        term: TypeTermId,
+    ) -> Option<TypeTermId> {
+        if !self.program.terms.has_variable(term) {
+            return Some(term);
+        }
+        self.resolve_occurs_target = Some(self.root_readonly(target));
+        self.resolve_occurs_hit = false;
+        let resolved = self.resolve_term(term);
+        self.resolve_occurs_target = None;
+        if self.resolve_occurs_hit {
+            None
+        } else {
+            Some(resolved)
+        }
+    }
+
     fn resolve_term(&mut self, term: TypeTermId) -> TypeTermId {
         if !self.program.terms.has_variable(term) {
             return term;
@@ -3606,6 +3642,9 @@ impl ComponentSolver {
         let resolved = match source {
             TypeTermHead::Variable(variable) => {
                 let root = self.root(variable);
+                if self.resolve_occurs_target == Some(root) {
+                    self.resolve_occurs_hit = true;
+                }
                 if self.resolve_active[root.0 as usize] == generation {
                     return self.program.terms.variable(root);
                 }

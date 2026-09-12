@@ -1535,3 +1535,25 @@ already at parity, so the whole residual is the 93 ms aggregation refresh.
 This is the hand-off's headline number: the contract's mechanism works, one of
 its two large fixtures now beats the baseline it was measured against, and the
 other's remaining gap is revision-level work the successor goal owns.
+
+### 2026-09-12: K1″ eleventh slice — one walk for occurs and resolution
+
+`resolve_requirement_contributor` now sets the destination root as the check
+target and calls the resolver; the resolver's variable arm flags a hit when it
+reaches that root, and the contributor is dropped when it does. The separate
+`term_occurs` walk is gone from the refresh loop, so an open contributor is
+traversed once instead of twice — the probe had shown NovyWave carrying 99,167
+open visits against 78,371 closed ones with occurs plus resolve costing 30.3 ms
+of an 87.0 ms refresh. Debug builds still run both walks and assert the
+combined result is identical, and all gates pass with that assertion active.
+
+Measured: NovyWave contributor check 20.96 ms replacing 30.3 ms, refresh 87.0 →
+72.9 ms; TodoMVC 16.5 ms replacing 28.3 ms, refresh 129.6 → 105.3 ms. Part of
+that phase delta is probe overhead (two Instant pairs per open contributor
+before, one after), so the honest end-to-end reading is the interleaved A/B:
+NovyWave −0.84%, TodoMVC +0.3%, verified −0.3%, each lane a single
+(fingerprint, plan) pair. Full record:
+[combined contributor check](evidence/compiler-k1pp-combined-contributor-check-2026-09-12.json).
+
+NovyWave's refresh is now ~73 ms: a 21 ms contributor check, 12.6 ms merge,
+11.7 ms order, 4.8 ms deps and ~5.5 ms of collection, invalidation and commit.

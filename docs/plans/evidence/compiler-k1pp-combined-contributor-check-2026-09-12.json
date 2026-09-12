@@ -1,0 +1,50 @@
+{
+ "status": "eleventh aggregation slice: the occurs check rides along with the resolution walk, so an open contributor is traversed once instead of twice; NovyWave -0.8% end to end with byte-identical diagnostics and plans",
+ "date": "2026-09-12",
+ "change": {
+  "cut": "combined occurs/resolve contributor check",
+  "what": "resolve_requirement_contributor sets the destination root as the check target and calls the resolver; resolve_term_inner flags a hit when the variable arm reaches that root, and the contributor is dropped when it does. The separate term_occurs walk is gone from the refresh loop.",
+  "why": "the probe showed NovyWave carrying 99,167 open contributor visits against 78,371 closed ones, and every open visit was walked twice (occurs 11.1 ms plus resolve 19.2 ms of an 87.0 ms refresh).",
+  "soundness": "the target check runs in the variable arm before the cycle guard and after root compression, which is exactly where term_occurs tests it, and the resolver's per-call cache generation means every cached subtree was walked under the same target. Debug builds still run both walks and assert that the combined result is identical; all gates pass with that assertion active."
+ },
+ "phase_probe_release": {
+  "novywave_diagnostics": {
+   "contributor_check_ms": 20.96,
+   "replaced_occurs_plus_resolve_ms": [30.3, 0.0],
+   "refresh_total_ms": [87.0, 72.9],
+   "open_contributor_visits": 99167,
+   "closed_contributor_visits": 78371
+  },
+  "todo_mvc_physical_diagnostics": {
+   "contributor_check_ms": 16.47,
+   "replaced_occurs_plus_resolve_ms": [28.3, 0.0],
+   "refresh_total_ms": [129.6, 105.3],
+   "open_contributor_visits": 21263,
+   "closed_contributor_visits": 548158
+  },
+  "caveat": "part of the phase delta is probe overhead: the old path ran two Instant pairs per open contributor and the combined path runs one, so the honest end-to-end effect is the A/B below"
+ },
+ "interleaved_ab": {
+  "protocol": "eight alternating rounds, one process per observation, release evidence lane, cold fresh-process",
+  "todo_mvc_diagnostics_pct": 0.26,
+  "novywave_diagnostics_pct": -0.84,
+  "todo_mvc_verified_pct": -0.28,
+  "mins": "NovyWave before min 606.5 vs after min 601.6 ms; TodoMVC mins 873.9 vs 872.7 ms",
+  "parity": "single (fingerprint, plan) pair per lane"
+ },
+ "gates": {
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ },
+ "position": "NovyWave's refresh is ~73 ms in probe runs (resolve/occurs now one 21 ms contributor check, merge 12.6, order 11.7, deps 4.8, collection/invalidation/commit ~5.5) against a K0-class target of roughly zero; the remaining gap is still the per-destination re-derivation that the successor goal's revision retention owns.",
+ "caveats": [
+  "kept on phase evidence plus a small but consistently signed end-to-end reading; the host was quiet during the A/B",
+  "occurs/resolve are reported as 0.0 ms in probe output because they are folded into contributor_check_ms",
+  "cold modes only; the warm path is the successor goal"
+ ]
+}

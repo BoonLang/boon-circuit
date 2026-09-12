@@ -1510,3 +1510,28 @@ evidence rather than the decisive record. Note for future runs: an untracked
 file added while a measurement is in flight changes the workspace digest and
 the xtask refuses to write the report; the first attempt here was discarded for
 exactly that reason.
+
+### 2026-09-12: K1″ decisive quiet-window acceptance
+
+The host went quiet (CPU pressure 0.00/0.01) and the contract protocol ran
+again for `a0579b2c` with clean producer identity:
+`target/reports/compiler-performance/k1pp-aba5-{candidate-a,k0,candidate-b}.json`
+and [the quiet-window record](evidence/compiler-k1pp-aba-quiet-2026-09-12.json).
+Both candidate legs agree inside 0.6% on all twelve cells and every p95 stays
+within about 6% of its p50, so this is the checkpoint's decisive end-to-end
+measurement:
+
+| fixture / intent, fresh-process p50 | candidate-b | K0 | b vs K0 |
+| --- | ---: | ---: | ---: |
+| TodoMVC diagnostics | 860.1 ms | 925.7 ms | −7.1% |
+| TodoMVC verified | 1257.6 ms | 1288.1 ms | −2.4% |
+| NovyWave diagnostics | 599.0 ms | 497.6 ms | +20.4% |
+| NovyWave verified | 1951.9 ms | 1842.0 ms | +6.0% |
+
+Empty-session repeats it (−7.0% and −2.0% on TodoMVC, +19.9% and +6.4% on
+NovyWave). TodoMVC is therefore faster than the preserved K0 producer in every
+cell; NovyWave remains 20.4% above it on diagnostics with its non-refresh work
+already at parity, so the whole residual is the 93 ms aggregation refresh.
+This is the hand-off's headline number: the contract's mechanism works, one of
+its two large fixtures now beats the baseline it was measured against, and the
+other's remaining gap is revision-level work the successor goal owns.

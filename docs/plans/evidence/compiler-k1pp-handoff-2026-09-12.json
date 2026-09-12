@@ -35,13 +35,15 @@
   }
  ],
  "standing": {
-  "method": "interleaved eight-round A/B against the preserved K0 evidence binary, one process per observation, cold fresh-process",
-  "todo_mvc_diagnostics": {"k0_ms": 967.8, "candidate_ms": 911.2, "delta_pct": -5.85},
-  "todo_mvc_verified": {"k0_ms": 1353.8, "candidate_ms": 1350.8, "delta_pct": -0.22},
-  "novywave_diagnostics": {"k0_ms": 548.5, "candidate_ms": 651.1, "delta_pct": 18.72},
-  "caveat": "the busy host's null control (same binary in both slots) reads +/-1-3%, so only the TodoMVC diagnostics gain (-5.9%) is clearly outside the floor; the phase probes are the primary evidence for the smaller slices"
+  "method": "interleaved A/B/A 3 setup + 30 scored per fixture, mode and intent, one process per observation, collected in a quiet window (CPU pressure 0.00/0.01) with clean producer identity; decisive record at docs/plans/evidence/compiler-k1pp-aba-quiet-2026-09-12.json",
+  "todo_mvc_diagnostics": {"k0_ms": 925.7, "candidate_ms": 860.1, "delta_pct": -7.08},
+  "todo_mvc_verified": {"k0_ms": 1288.1, "candidate_ms": 1257.6, "delta_pct": -2.37},
+  "novywave_diagnostics": {"k0_ms": 497.6, "candidate_ms": 599.0, "delta_pct": 20.37},
+  "novywave_verified": {"k0_ms": 1842.0, "candidate_ms": 1951.9, "delta_pct": 5.96},
+  "caveat": "the two candidate legs agree inside 0.6% on all twelve cells and every p95 stays within about 6% of its p50, so these deltas are the checkpoint's end-to-end result"
  },
  "acceptance_aba4": {
+  "superseded_by": "acceptance run k1pp-aba5 (see standing above and docs/plans/evidence/compiler-k1pp-aba-quiet-2026-09-12.json); this earlier run is kept as the drift-limited counterexample",
   "protocol": "interleaved A/B/A, 3 setup + 30 scored per fixture, mode and intent, one process per observation, K0 middle leg in the preserved worktree; reports at target/reports/compiler-performance/k1pp-aba4-{candidate-a,k0,candidate-b}.json",
   "head": "cc628472",
   "producer_dirty_flag": "true for both candidate legs because an untracked evidence file was present in the workspace; the producer binaries are the committed-HEAD build",

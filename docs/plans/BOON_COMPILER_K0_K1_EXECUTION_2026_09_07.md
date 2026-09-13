@@ -1643,3 +1643,17 @@ usual ~500, p95 1134.6) and K0's TodoMVC verified fresh leg (p95 2318.2 against
 1337-1424 in the candidate legs). The formal acceptance item for this
 checkpoint is therefore closed, with the interference called out rather than
 averaged away.
+
+### 2026-09-13: sixteen-round paired matrix
+
+A tighter paired matrix (sixteen rounds per cell, both binaries back to back
+with alternating order) gives the narrowest error bars yet on the current HEAD:
+TodoMVC faster in all four cells (−6.06% diagnostics fresh, −5.85% empty,
+−0.53% verified fresh, −0.65% empty) and NovyWave slower in all four (+18.13%
+diagnostics fresh, +17.16% empty, +4.99% verified fresh, +5.74% empty). Read
+together with the formal aba8 acceptance (−5.5%/−6.5% and +16.7%) and the
+earlier decisive window (+20.4%), the three designs bound NovyWave's
+diagnostics gap at roughly +17% to +20% and TodoMVC's diagnostics advantage at
+roughly −5.5% to −7%; TodoMVC's verified cells sit at parity to slightly ahead.
+Record:
+[paired matrix](evidence/compiler-k1pp-paired-matrix-2026-09-13.json).

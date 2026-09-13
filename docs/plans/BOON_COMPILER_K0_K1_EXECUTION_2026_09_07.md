@@ -1609,3 +1609,21 @@ millisecond of comparison work against merge phases of 13.5 ms and 8.4 ms. The
 merge cost is the recursive rebuild and interning of genuinely changed terms,
 which the no-op fast path already skips when nothing changes, so no slice
 follows from this measurement.
+
+### 2026-09-13: warm checkpoint recorded
+
+The contract asks for the warm interaction collector on every checkpoint. The
+collector still refuses an acceptance-sized report (23,503,323 bytes against
+the 16,777,216-byte sidecar budget — the same limitation the K1′ warm baseline
+documented), so the producer was measured directly with identical flags at
+3 setup + 30 scored: warm diagnostics edit-to-ready **884.5 ms p50 / 916.1 ms
+p95** against the 16.7 ms budget (55x) and verified preview **2203.7 / 2286.5**
+against 100 ms (23x), with update acknowledgement at 0.052 ms and peak RSS
+194.5 MiB. Against the K1′ baseline (1213.1 / 2891.1) that is −25.6% and
+−20.9%, and the diagnostics p95 is now 6.8% below the K0 warm baseline
+(982.8 ms): every warm edit still performs a full solve, so the cold cuts carry
+straight into warm. The fix for the remaining 55x/23x is the successor goal's
+retained revision. Full record:
+[warm checkpoint](evidence/compiler-k1pp-warm-2026-09-13.json). The host was
+loaded during the run, so the absolute numbers are inflated and the comparison
+is directional.

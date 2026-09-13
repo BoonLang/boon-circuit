@@ -1,0 +1,34 @@
+{
+ "status": "warm checkpoint: warm diagnostics is 884.5 ms p50 / 916.1 ms p95 against the 16.7 ms product budget, 25.6% faster than the K1-prime warm baseline and now below the K0 warm baseline; the product-critical fix remains the successor goal's retained revision",
+ "date": "2026-09-13",
+ "protocol": {
+  "warm_session": "boon_cli_evidence compiler-sample warm-session examples/todo_mvc_physical/RUN.bn --switch-source examples/counter.bn --edit-unit examples/todo_mvc_physical/RUN.bn --edit-from 'TEXT { Walk the dog }' --edit-to 'TEXT { Walk the dogs }' --setup-samples 3 --scored-samples 30 (RAYON_NUM_THREADS=1)",
+  "collector": "cargo xtask verify-compiler-interactions refuses an acceptance-sized report: the 3+30 report is 23,503,323 bytes against the 16,777,216-byte sidecar budget, exactly the limitation the K1-prime warm baseline documented, so the producer was measured directly with identical flags and its own JSON parsed",
+  "raw_report": "target/reports/compiler-performance/k1pp-warm-direct-2026-09-13.json",
+  "producer": {"head": "0614aac9", "dirty": false}
+ },
+ "warm_latency_ms_3_setup_30_scored": {
+  "diagnostics_edit_to_ready": {"p50": 884.5, "p95": 916.1, "budget_p95": 16.7, "over_budget": "55x"},
+  "verified_preview_edit_to_ready": {"p50": 2203.7, "p95": 2286.5, "budget_p95": 100.0, "over_budget": "23x"},
+  "update_ack_p50": 0.052,
+  "latest_generation_publish_ms": 1313.5
+ },
+ "warm_memory_mib": {"resident_start": 160.4, "resident_end": 191.2, "peak": 194.5},
+ "comparison": {
+  "k1p_warm_baseline_2026_09_11_candidate": {"diagnostics_p50": 1189.1, "diagnostics_p95": 1213.1, "preview_p50": 2802.0, "preview_p95": 2891.1, "peak_mib": 191.9},
+  "k0_warm_baseline": {"diagnostics_p50": 945.7, "diagnostics_p95": 982.8, "preview_p50": 2277.7, "preview_p95": 2334.9},
+  "reading": "the candidate's warm diagnostics improved 25.6% since the K1-prime baseline (1213.1 -> 916.1 p95) and is now 6.8% below the K0 warm p95 (982.8), because every warm edit still performs the producer's full solve and the cold cuts carry straight into it; warm verified preview improved 20.9% (2891.1 -> 2286.5) and peak RSS moved from 191.9 to 194.5 MiB"
+ },
+ "per_edit_work": {
+  "note": "one scored edit's diagnostics kernel work; it equals a full cold solve's shape, so the session still retains no solved state across edits",
+  "activations": 169680,
+  "operations": 82451,
+  "term_intern_requests": 296455
+ },
+ "caveats": [
+  "the host was loaded during this run (CPU pressure some avg10 ~1.5, avg60 ~5.7, other projects' builds active), so the absolute numbers are inflated; the K1-prime and K0 warm baselines were taken in a quieter window and the comparison is therefore directional",
+  "warm remains 55x and 23x over the product budgets: the fix is the successor goal's retained revision, not more cold work",
+  "the interaction collector needs bounded per-sample trimming before warm acceptance can be claimed through it"
+ ],
+ "position": "recorded because the contract requires the warm collector on every checkpoint; it also quantifies how much of the warm gap the cold cuts already closed."
+}

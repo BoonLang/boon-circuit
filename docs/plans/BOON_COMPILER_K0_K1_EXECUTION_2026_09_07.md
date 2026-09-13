@@ -1595,3 +1595,17 @@ kernel_transfer 10, compiler library 98 with one pre-existing ignored probe,
 staged 3, map_set 3, nested_boolean_match 3, pulses 8). The evidence set was
 checked too: all 26 evidence links in this log resolve and all 19
 `compiler-k1pp-*` evidence files parse and carry a status.
+
+### 2026-09-13: merge linear scans measured and ruled out
+
+The merge keeps its per-element rules with linear `position` scans over the
+accumulator's variants and fields, which looked like a candidate for an
+indexed merge-join. A counting build (counters incremented per comparison,
+reverted afterwards because they cost release time; diff kept at
+`target/reports/compiler-performance/k1pp-rejected-merge-scan-counters.diff`)
+shows the scans are not the bottleneck: NovyWave performs 170,934 variant and
+248,766 field comparisons, TodoMVC 1,030,135 and 20,662, i.e. under a
+millisecond of comparison work against merge phases of 13.5 ms and 8.4 ms. The
+merge cost is the recursive rebuild and interning of genuinely changed terms,
+which the no-op fast path already skips when nothing changes, so no slice
+follows from this measurement.

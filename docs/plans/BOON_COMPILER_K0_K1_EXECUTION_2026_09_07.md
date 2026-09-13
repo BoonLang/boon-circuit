@@ -1567,3 +1567,19 @@ K0 leg aborted on resume with a clock anomaly: the artifact endpoint read
 136,739,120 ms against a process exit of 4,569 ms, which the xtask rejects as
 inconsistent. The attempt is recorded rather than patched into a window-mixed
 record, and the re-run will use one uninterrupted window.
+
+### 2026-09-13: paired standing for the current HEAD
+
+A fresh leg-level run for `0e75532c` was started but the host became busy again
+(CPU pressure avg60 6.6, a preempt helper and Firefox active) after leg one, so
+the standing was re-measured with a paired design instead: twelve rounds, both
+binaries back to back inside each round with alternating lane order, reporting
+the per-round delta so slow host drift cancels rather than accumulating between
+long legs. Against the preserved K0 producer: TodoMVC diagnostics **−7.8%**
+(round deltas −18.6% to −4.5%), TodoMVC verified **−1.3%** (−7.9% to +3.6%),
+NovyWave diagnostics **+20.2%** (+12.4% to +24.3%), one distinct diagnostics
+fingerprint per lane. This reproduces the decisive quiet-window acceptance for
+`a0579b2c` (−7.1%/−2.4% and +20.4%), so the current HEAD's standing is
+confirmed while the formal 3+30 A/B/A on `0e75532c` waits for an uninterrupted
+quiet window. Record:
+[paired standing](evidence/compiler-k1pp-paired-standing-2026-09-13.json).

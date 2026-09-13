@@ -1,0 +1,19 @@
+{
+ "status": "current-HEAD standing by paired A/B: TodoMVC is 7.8% faster than the preserved K0 producer on diagnostics and NovyWave 20.2% slower, with every round delta consistently signed",
+ "date": "2026-09-13",
+ "why": "the host became busy again after the aborted aba6 attempt and a fresh 3+30 leg-level run would have been drift-limited, so the standing was re-measured with a paired design that runs both binaries back to back inside each round and reports the per-round delta; slow host drift then cancels instead of accumulating between long legs",
+ "protocol": {
+  "shape": "twelve rounds, alternating lane order, one process per observation, release evidence lane, cold fresh-process",
+  "candidate": "target/release/boon_cli_evidence at HEAD 0e75532c (a26f3619 is docs only)",
+  "baseline": "the preserved K0 producer 2d7a5343",
+  "host": "CPU pressure some avg10/avg60 1.2/6.6 during the run; the paired structure is what makes it usable"
+ },
+ "results": {
+  "todo_mvc_diagnostics": {"before_p50_ms": 981.7, "after_p50_ms": 906.0, "paired_median_delta_pct": -7.81, "round_delta_range_pct": [-18.55, -4.52]},
+  "novywave_diagnostics": {"before_p50_ms": 532.5, "after_p50_ms": 628.7, "paired_median_delta_pct": 20.15, "round_delta_range_pct": [12.35, 24.30]},
+  "todo_mvc_verified": {"before_p50_ms": 1342.3, "after_p50_ms": 1328.9, "paired_median_delta_pct": -1.25, "round_delta_range_pct": [-7.90, 3.58]}
+ },
+ "parity": "one distinct diagnostics fingerprint in every lane; the verified lane shows the two known machine-plan variants (candidate versus the K0-era plan constant)",
+ "consistency": "the numbers reproduce the decisive quiet-window acceptance for a0579b2c (-7.1% diagnostics and -2.4% verified on TodoMVC, +20.4% on NovyWave diagnostics), so the current HEAD's standing is confirmed without a fresh leg-level run",
+ "position": "recorded as supporting evidence; a 3+30 A/B/A on 0e75532c remains the formal acceptance item and is pending an uninterrupted quiet window (leg one of attempt aba7 completed at NovyWave fresh p50 644.7 ms with p95 765.6 during interference and is not used)"
+}

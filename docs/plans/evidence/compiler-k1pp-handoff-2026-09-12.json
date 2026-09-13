@@ -71,6 +71,8 @@
  "acceptance_attempts": {
   "aba5": "decisive quiet-window run for a0579b2c (see standing above)",
   "aba6": "attempted for 0e75532c: candidate-a completed in a quiet window (NovyWave fresh-process p50 594.8 ms), then the host suspended for about fourteen hours and the K0 leg aborted with a clock anomaly (artifact endpoint 136,739 s against a 4,569 s process exit). Re-run scheduled rather than mixing windows."
+  ,
+  "aba7": "leg one of a fresh run for 0e75532c completed at NovyWave fresh-process p50 644.7 ms with p95 765.6 during renewed interference and is not used; the current HEAD's standing was instead re-measured with a paired per-round A/B (docs/plans/evidence/compiler-k1pp-paired-standing-2026-09-13.json) which reproduces the aba5 numbers: TodoMVC -7.8% diagnostics and -1.3% verified, NovyWave +20.2%, every round delta consistently signed"
  },
  "successor_decision": {
   "goal": "Goal B - warm revision retention (K3/K4-lite) is the contract's declared successor and owns the retained-revision machinery: retain the packed solved revision across edits, solve demanded definitions only, exact dirty cones with backdating, last-good publication",

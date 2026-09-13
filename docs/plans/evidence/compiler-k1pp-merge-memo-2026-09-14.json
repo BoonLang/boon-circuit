@@ -1,0 +1,41 @@
+{
+ "status": "fourteenth aggregation slice: non-permanent evidence merges are memoized by term-id pair, cutting the merge phase 25% on TodoMVC and giving the largest end-to-end gain of the late batch (TodoMVC -2.4%/-2.9% diagnostics)",
+ "date": "2026-09-14",
+ "change": {
+  "cut": "merge-pair memo",
+  "what": "merge_type_evidence memoizes the non-permanent path keyed by (left.0, right.0) when both operands already have a non-variable head, returning the cached result on a repeat and storing it otherwise. The permanent path (which equates variables) and variable-headed operands skip the memo.",
+  "why": "counting duplicate pairs before implementing showed the merge repeats itself constantly: NovyWave 137,287 of 154,361 non-permanent calls (89%) and TodoMVC 266,183 of 290,548 (92%) recompute a pair that was already merged.",
+  "soundness": "the guard matters: resolve_term_head follows a variable head's binding chain, so only operands that are not variables have a binding-independent result. With that guard the path never binds a variable itself and every recursive step goes through structural_widen, which lives in the term arena and cannot read solver bindings — it is a cached pure function of its two term ids. Variable-headed operands keep taking the uncached path (structural_widen already caches them internally), and the permanent path is never memoized."
+ },
+ "phase_probe_release": {
+  "novywave_diagnostics": {"merge_ms": [13.1, 12.2], "refresh_total_ms": [64.4, 63.1], "merge_memo_hits": 125125},
+  "todo_mvc_physical_diagnostics": {"merge_ms": [8.6, 6.5], "refresh_total_ms": [108.8, 105.1], "merge_memo_hits": 255781},
+  "note": "single observations per build; the merge phase is the signal"
+ },
+ "paired_ab": {
+  "protocol": "twelve rounds per cell, both binaries back to back with alternating order, one process per observation",
+  "todo_mvc_diagnostics_fresh_pct": -2.43,
+  "todo_mvc_diagnostics_empty_pct": -2.91,
+  "todo_mvc_verified_fresh_pct": -1.21,
+  "todo_mvc_verified_empty_pct": -1.96,
+  "novywave_diagnostics_fresh_pct": -0.46,
+  "novywave_diagnostics_empty_pct": -0.88,
+  "novywave_verified_fresh_pct": 0.06,
+  "novywave_verified_empty_pct": 0.18,
+  "reading": "every TodoMVC cell moves in the same direction with round deltas of the same sign, which is the clearest end-to-end signal of this batch; NovyWave diagnostics improves slightly, verified is flat"
+ },
+ "gates": {
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ },
+ "position": "NovyWave's refresh is ~63 ms: contributor check 14.9, merge 12.2, order 7.5, deps 4.8, collection/invalidation/commit ~5.6 and the rest bookkeeping. The memo costs about 400 KB of retained pairs on NovyWave and a few hundred KB on TodoMVC.",
+ "caveats": [
+  "the non-variable-head guard is what makes the memo sound, so a future change that lets merge_type_evidence read bindings through another path must revisit the memo",
+  "cold modes only; the warm path is the successor goal"
+ ]
+}

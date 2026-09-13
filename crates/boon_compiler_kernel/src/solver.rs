@@ -362,6 +362,10 @@ struct ComponentSolver {
     /// the resulting aggregate. An identical signature skips the merge loop
     /// and restores the previous aggregate exactly.
     requirement_fold_memo: std::collections::HashMap<u32, (Box<[TypeTermId]>, Option<TypeTermId>)>,
+    /// Non-permanent evidence merges already computed. That path never binds a
+    /// variable and structural widening is a cached pure function, so the pair
+    /// of term ids determines the result and a repeated pair skips the merge.
+    requirement_merge_memo: std::collections::HashMap<(u32, u32), TypeTermId>,
     /// Bindings cleared by the current refresh's invalidation, so the fold can
     /// tell an unchanged aggregate from a changed one and only re-schedule the
     /// destinations whose binding actually moved. Drained every refresh.
@@ -466,6 +470,7 @@ struct RequirementPhaseProbe {
     closed_contributor_visits: u64,
     flat_contributor_visits: u64,
     order_early_matches: u64,
+    merge_memo_hits: u64,
     contributor_check_ns: u64,
     intern_invalidate: u64,
     intern_collect: u64,
@@ -482,7 +487,7 @@ impl Drop for RequirementPhaseProbe {
         }
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         eprintln!(
-            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} contributor_check_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} open_contributor_visits={} closed_contributor_visits={} flat_contributor_visits={} order_early_matches={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
+            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} contributor_check_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} open_contributor_visits={} closed_contributor_visits={} flat_contributor_visits={} order_early_matches={} merge_memo_hits={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
             self.calls,
             self.folds,
             self.memo_hits,
@@ -508,6 +513,7 @@ impl Drop for RequirementPhaseProbe {
             self.closed_contributor_visits,
             self.flat_contributor_visits,
             self.order_early_matches,
+            self.merge_memo_hits,
             self.intern_invalidate,
             self.intern_collect,
             self.intern_resolve,
@@ -828,6 +834,7 @@ impl ComponentSolver {
             aggregate_probe: std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE")
                 .map(|_| AggregateProbe::default()),
             requirement_fold_memo: std::collections::HashMap::new(),
+            requirement_merge_memo: std::collections::HashMap::new(),
             requirement_previous_bindings: std::collections::HashMap::new(),
             requirement_fold_state: std::collections::HashMap::new(),
             term_variable_cache: Vec::new(),
@@ -3337,7 +3344,40 @@ impl ComponentSolver {
         self.merge_type_evidence(left, right, true)
     }
 
+    /// Merge two evidence terms, memoizing the non-permanent path when both
+    /// operands already have a non-variable head. With that guard head
+    /// resolution is the identity, the path never binds a variable and
+    /// structural widening is a cached pure function, so `(left, right)`
+    /// determines the result. Variable-headed operands skip the memo because
+    /// `resolve_term_head` follows their bindings; the permanent path equates
+    /// variables and is never memoized.
     fn merge_type_evidence(
+        &mut self,
+        left: TypeTermId,
+        right: TypeTermId,
+        permanent: bool,
+    ) -> TypeTermId {
+        if permanent {
+            return self.merge_type_evidence_uncached(left, right, true);
+        }
+        let memoisable = !matches!(self.program.terms.term(left), TypeTerm::Variable(_))
+            && !matches!(self.program.terms.term(right), TypeTerm::Variable(_));
+        if memoisable {
+            if let Some(cached) = self.requirement_merge_memo.get(&(left.0, right.0)).copied() {
+                if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                    probe.merge_memo_hits = probe.merge_memo_hits.saturating_add(1);
+                }
+                return cached;
+            }
+            let result = self.merge_type_evidence_uncached(left, right, false);
+            self.requirement_merge_memo
+                .insert((left.0, right.0), result);
+            return result;
+        }
+        self.merge_type_evidence_uncached(left, right, false)
+    }
+
+    fn merge_type_evidence_uncached(
         &mut self,
         left: TypeTermId,
         right: TypeTermId,

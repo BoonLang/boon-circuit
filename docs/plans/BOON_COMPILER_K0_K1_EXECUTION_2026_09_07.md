@@ -1761,3 +1761,25 @@ the session still retains nothing across edits — the warm gain is the cold
 cuts carrying through, and the remaining 53x/22x over budget is the successor's
 retained revision. Record:
 [warm checkpoint](evidence/compiler-k1pp-warm-current-2026-09-14.json).
+
+### 2026-09-14: K1″ fourteenth slice — merge-pair memo
+
+Before implementing, a counter asked how often a non-permanent
+`merge_type_evidence` call repeats a pair it has already merged: NovyWave
+137,287 of 154,361 calls (89%) and TodoMVC 266,183 of 290,548 (92%). The path
+never binds a variable and every recursive step is `structural_widen`, which
+lives in the term arena and cannot read solver bindings, so the pair of term
+ids determines the result — with one guard: `resolve_term_head` follows a
+variable head's binding chain, so only operands that are not variables may be
+memoized. The permanent path and variable-headed operands stay uncached.
+
+Effect: NovyWave merge 13.1 → 12.2 ms (refresh 64.4 → 63.1) and TodoMVC merge
+8.6 → **6.5 ms** (refresh 108.8 → 105.1), with 125,125 and 255,781 memo hits.
+Paired A/B, twelve rounds per cell: TodoMVC **−2.43%/−2.91%** diagnostics and
+−1.21%/−1.96% verified, every round delta of the same sign; NovyWave diagnostics
+−0.46%/−0.88% with verified flat. That makes this the strongest end-to-end
+slice of the late batch. All gates green. Full record:
+[merge-pair memo](evidence/compiler-k1pp-merge-memo-2026-09-14.json).
+
+NovyWave's refresh is now ~63 ms: contributor check 14.9, merge 12.2, order
+7.5, deps 4.8, collection/invalidation/commit ~5.6 and the rest bookkeeping.

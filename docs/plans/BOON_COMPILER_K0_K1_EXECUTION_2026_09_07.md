@@ -1676,3 +1676,26 @@ pre-slice binary: NovyWave fresh diagnostics **−1.59%** (empty +0.1%, verified
 −0.1%), TodoMVC −0.18%/−0.18%/+0.15%/−0.61%; one fingerprint and one plan per
 cell. All gates green. Full record:
 [flat contributors](evidence/compiler-k1pp-flat-contributor-2026-09-13.json).
+
+### 2026-09-13: order and merge composition measured — an order memo that does not pay
+
+Two counters answered where the remaining refresh time goes. The order receipt
+walk is almost always wasted work: on NovyWave 1,305 walks break down as 634
+identity returns (receipt equals the merged value), 1,276 walks that rebuild and
+find the rebuilt term equals the current one, and 29 that actually change
+something — i.e. 97.8% of the walks are no-ops against a 12.4 ms order phase.
+TodoMVC shows the same shape (1,330 / 1,643 / 1). The merge, by contrast, is
+real work: NovyWave 2,324 no-op merges against 10,548 that change the
+accumulator, so there is nothing to win there.
+
+Because `retain_requirement_order` reads only immutable term data — a pure
+function of its two term ids — a memo keyed by that pair looked sound and
+free, but it hits only 176 (NovyWave) and 343 (TodoMVC) times: consecutive
+folds pair different receipts with different merged values, so the pairs do
+not repeat. Order time was unchanged (12.1 → 12.4 ms) and the experiment is
+reverted with no code change (diff at
+`target/reports/compiler-performance/k1pp-rejected-order-memo.diff`). The
+remaining lever for the order phase is an early structural check that decides
+"already in receipt order" before building the rebuilt field list, worth
+roughly half of 12 ms on NovyWave; it needs the debug cross-check to keep it
+honest against the walk.

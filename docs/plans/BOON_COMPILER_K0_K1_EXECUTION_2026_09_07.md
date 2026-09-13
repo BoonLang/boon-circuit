@@ -1627,3 +1627,19 @@ retained revision. Full record:
 [warm checkpoint](evidence/compiler-k1pp-warm-2026-09-13.json). The host was
 loaded during the run, so the absolute numbers are inflated and the comparison
 is directional.
+
+### 2026-09-13: formal current-HEAD acceptance (aba8)
+
+The quiet window that the pressure gauge promised arrived and the full 3+30
+A/B/A ran for `fd8ca4da` with clean producer identities:
+`target/reports/compiler-performance/k1pp-aba8-{candidate-a,k0,candidate-b}.json`
+and [the current-HEAD record](evidence/compiler-k1pp-aba-current-2026-09-13.json).
+The tight cells reproduce the standing: TodoMVC is faster in all four cells
+(diagnostics −5.5% fresh and −6.5% empty, verified −10.2% and −2.1%), and
+NovyWave's fresh-process diagnostics is +16.7% with the two candidate legs
+agreeing to 0.03% (611.5 vs 611.7 ms; K0 524.2). Two cells were interfered and
+are not read as results: K0's NovyWave empty-session leg (p50 842.7 against its
+usual ~500, p95 1134.6) and K0's TodoMVC verified fresh leg (p95 2318.2 against
+1337-1424 in the candidate legs). The formal acceptance item for this
+checkpoint is therefore closed, with the interference called out rather than
+averaged away.

@@ -464,6 +464,7 @@ struct RequirementPhaseProbe {
     order_reuses: u64,
     open_contributor_visits: u64,
     closed_contributor_visits: u64,
+    flat_contributor_visits: u64,
     contributor_check_ns: u64,
     intern_invalidate: u64,
     intern_collect: u64,
@@ -480,7 +481,7 @@ impl Drop for RequirementPhaseProbe {
         }
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         eprintln!(
-            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} contributor_check_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} open_contributor_visits={} closed_contributor_visits={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
+            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} contributor_check_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} open_contributor_visits={} closed_contributor_visits={} flat_contributor_visits={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
             self.calls,
             self.folds,
             self.memo_hits,
@@ -504,6 +505,7 @@ impl Drop for RequirementPhaseProbe {
             self.order_reuses,
             self.open_contributor_visits,
             self.closed_contributor_visits,
+            self.flat_contributor_visits,
             self.intern_invalidate,
             self.intern_collect,
             self.intern_resolve,
@@ -3596,7 +3598,16 @@ impl ComponentSolver {
         if !self.program.terms.has_variable(term) {
             return Some(term);
         }
-        self.resolve_occurs_target = Some(self.root_readonly(target));
+        let target_root = self.root_readonly(target);
+        if let Some(variables) = self.flat_contributor_variables(term) {
+            // Every variable is unbound and its own root: resolution is the
+            // identity and occurs is a membership test.
+            if variables.contains(&target_root) {
+                return None;
+            }
+            return Some(term);
+        }
+        self.resolve_occurs_target = Some(target_root);
         self.resolve_occurs_hit = false;
         let resolved = self.resolve_term(term);
         self.resolve_occurs_target = None;
@@ -3605,6 +3616,24 @@ impl ComponentSolver {
         } else {
             Some(resolved)
         }
+    }
+
+    /// Variables of a contributor whose resolution is the term itself: every
+    /// variable it mentions is unbound and already its own root. The cached
+    /// syntactic variable list answers both resolution and occurs, so no term
+    /// walk is needed.
+    fn flat_contributor_variables(&self, term: TypeTermId) -> Option<&[TypeVariableId]> {
+        let variables = self
+            .term_variable_cache
+            .get(term.0 as usize)
+            .and_then(|cached| cached.as_deref())?;
+        variables
+            .iter()
+            .all(|variable| {
+                self.root_readonly(*variable) == *variable
+                    && self.cells[variable.0 as usize].binding.is_none()
+            })
+            .then_some(variables)
     }
 
     fn resolve_term(&mut self, term: TypeTermId) -> TypeTermId {

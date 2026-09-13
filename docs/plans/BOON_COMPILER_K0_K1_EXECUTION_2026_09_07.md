@@ -1657,3 +1657,22 @@ diagnostics gap at roughly +17% to +20% and TodoMVC's diagnostics advantage at
 roughly −5.5% to −7%; TodoMVC's verified cells sit at parity to slightly ahead.
 Record:
 [paired matrix](evidence/compiler-k1pp-paired-matrix-2026-09-13.json).
+
+### 2026-09-13: K1″ twelfth slice — flat contributors skip the walk
+
+Counting the shape of open contributor visits showed most of them are trivial:
+NovyWave 86,860 of 99,167 (87.6%) and TodoMVC 14,578 of 21,263 (68.6%) mention
+only variables that are unbound and already their own root. For those, the
+resolver's variable arm has nothing to rewrite and no binding to follow, and
+occurs visits exactly those variables, so resolution is the identity and occurs
+is a membership test on the cached syntactic variable list.
+`resolve_requirement_contributor` now asks for that shape first and skips the
+walk entirely; debug builds still run the separate occurs and resolve walks and
+assert equality, so every gate exercises the fast path against the slow one.
+
+Phase effect: NovyWave contributor check 21.2 → 15.3 ms (refresh 73.0 → 72.0);
+TodoMVC 16.4 → 14.9 ms. Paired A/B, twelve rounds per cell against the
+pre-slice binary: NovyWave fresh diagnostics **−1.59%** (empty +0.1%, verified
+−0.1%), TodoMVC −0.18%/−0.18%/+0.15%/−0.61%; one fingerprint and one plan per
+cell. All gates green. Full record:
+[flat contributors](evidence/compiler-k1pp-flat-contributor-2026-09-13.json).

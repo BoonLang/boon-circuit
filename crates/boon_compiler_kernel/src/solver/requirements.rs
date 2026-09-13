@@ -667,10 +667,26 @@ impl super::ComponentSolver {
             for term in inputs.iter().copied() {
                 // Match the existing recursive-shape guard without equating
                 // any contributor variable to its destination.
+                let open = self.program.terms.has_variable(term);
+                let flat = open
+                    && self
+                        .term_variable_cache
+                        .get(term.0 as usize)
+                        .and_then(|cached| cached.as_deref())
+                        .is_some_and(|variables| {
+                            variables.iter().all(|variable| {
+                                self.root_readonly(*variable) == *variable
+                                    && self.cells[variable.0 as usize].binding.is_none()
+                            })
+                        });
                 if let Some(probe) = self.requirement_phase_probe.as_mut() {
-                    if self.program.terms.has_variable(term) {
+                    if open {
                         probe.open_contributor_visits =
                             probe.open_contributor_visits.saturating_add(1);
+                        if flat {
+                            probe.flat_contributor_visits =
+                                probe.flat_contributor_visits.saturating_add(1);
+                        }
                     } else {
                         probe.closed_contributor_visits =
                             probe.closed_contributor_visits.saturating_add(1);

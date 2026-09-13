@@ -1,0 +1,40 @@
+{
+ "status": "twelfth aggregation slice: a contributor whose variables are all unbound and self-rooted needs no walk at all; NovyWave's contributor check falls 28% and end to end 1.6% on fresh diagnostics",
+ "date": "2026-09-13",
+ "change": {
+  "cut": "flat-contributor fast path",
+  "what": "resolve_requirement_contributor asks flat_contributor_variables(term) first: when every variable the term mentions is unbound and already its own root, resolution is the identity and occurs is a membership test of the destination root in the cached syntactic variable list, so the term is returned (or dropped) without a walk.",
+  "why": "the combined occurs/resolve slice left one walk per open contributor, and the counters showed most open contributors are trivial: NovyWave 86,860 of 99,167 open visits (87.6%) and TodoMVC 14,578 of 21,263 (68.6%) are flat.",
+  "soundness": "with every variable unbound and self-rooted, the resolver's variable arm has nothing to rewrite and no binding to follow, so the no-op path would return the term after walking it; occurs visits exactly those variables and compares their roots to the destination root. The cached list holds the term's syntactic variables, filled by the dependency receipt before the contributor loop. Debug builds still run the separate occurs and resolve walks and assert the combined result matches, so every gate exercises the fast path against the slow one."
+ },
+ "phase_probe_release": {
+  "novywave_diagnostics": {"contributor_check_ms": [21.2, 15.3], "refresh_total_ms": [73.0, 72.0], "flat_visits": 86860, "open_visits": 99167},
+  "todo_mvc_physical_diagnostics": {"contributor_check_ms": [16.4, 14.9], "refresh_total_ms": [105.3, 107.2], "flat_visits": 14578, "open_visits": 21263},
+  "note": "single observations per build; the contributor check is the signal, total refresh varies by several ms"
+ },
+ "paired_ab": {
+  "protocol": "twelve rounds per cell, both binaries back to back with alternating order, one process per observation",
+  "novywave_diagnostics_fresh_pct": -1.59,
+  "novywave_diagnostics_empty_pct": 0.08,
+  "novywave_verified_fresh_pct": -0.06,
+  "todo_mvc_diagnostics_fresh_pct": -0.18,
+  "todo_mvc_diagnostics_empty_pct": -0.18,
+  "todo_mvc_verified_fresh_pct": 0.15,
+  "todo_mvc_verified_empty_pct": -0.61,
+  "parity": "one distinct diagnostics fingerprint and one plan per cell"
+ },
+ "gates": {
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ },
+ "position": "NovyWave's refresh is ~72 ms; the contributor check is 15.3 of it. The remaining checks walk genuinely bound or non-flat terms, which is the successor goal's dependency-versioned territory.",
+ "caveats": [
+  "the end-to-end effect is small and only clearly signed on NovyWave's fresh diagnostics lane; TodoMVC is flat",
+  "cold modes only; the warm path is the successor goal"
+ ]
+}

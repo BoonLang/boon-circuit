@@ -180,22 +180,28 @@
   "final_acceptance": "docs/plans/evidence/compiler-k1pp-aba-final-2026-09-14.json (TodoMVC -5.9%/-1.0%/-0.7%, NovyWave +16.9%/+16.4%/+4.0%/+4.4%, all twelve cells tight)"
  },
  "warm_checkpoint": {
-  "record": "docs/plans/evidence/compiler-k1pp-warm-2026-09-13.json",
+  "record": "docs/plans/evidence/compiler-k1pp-warm-current-2026-09-14.json (quietest window, clean producer identity)",
   "warm_diagnostics_ms": {
-   "p50": 884.5,
-   "p95": 916.1,
+   "p50": 863.2,
+   "p95": 882.8,
    "budget_p95": 16.7
   },
   "warm_verified_preview_ms": {
-   "p50": 2203.7,
-   "p95": 2286.5,
+   "p50": 2144.9,
+   "p95": 2185.6,
    "budget_p95": 100.0
   },
   "change_since_k1_prime_baseline_pct": {
-   "diagnostics_p95": -25.6,
-   "preview_p95": -20.9
+   "diagnostics_p95": -27.2,
+   "preview_p95": -24.4
   },
-  "reading": "every warm edit still performs a full solve, so the cold cuts carry into warm and the candidate's warm diagnostics is now 6.8% below the K0 warm baseline; the remaining 55x/23x over budget is the successor goal's retained revision"
+  "vs_k0_warm_baseline_pct": {
+   "diagnostics_p50": -8.7,
+   "diagnostics_p95": -10.2,
+   "preview_p50": -5.8,
+   "preview_p95": -6.4
+  },
+  "reading": "every warm edit still performs a full solve, so the cold cuts carry into warm and the candidate is now faster than the K0 warm baseline in both lanes; the remaining 53x/22x over budget is the successor goal's retained revision"
  },
  "acceptance_attempts": {
   "aba5": "decisive quiet-window run for a0579b2c (see standing above)",

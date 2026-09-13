@@ -1,0 +1,34 @@
+{
+ "status": "current-HEAD warm checkpoint in the quietest window of the goal: warm diagnostics 863.2 ms p50 / 882.8 p95 and verified preview 2144.9 / 2185.6, both now below the K0 warm baseline",
+ "date": "2026-09-14",
+ "protocol": {
+  "warm_session": "boon_cli_evidence compiler-sample warm-session examples/todo_mvc_physical/RUN.bn --switch-source examples/counter.bn --edit-unit examples/todo_mvc_physical/RUN.bn --edit-from 'TEXT { Walk the dog }' --edit-to 'TEXT { Walk the dogs }' --setup-samples 3 --scored-samples 30 (RAYON_NUM_THREADS=1)",
+  "collector": "cargo xtask verify-compiler-interactions still refuses an acceptance-sized report (23.5 MB against the 16.8 MB sidecar budget), so the producer was measured directly with identical flags as in the earlier warm records",
+  "raw_report": "target/reports/compiler-performance/k1pp-warm-2026-09-14.json",
+  "producer": {"head": "458b6359", "dirty": false},
+  "host": "the quietest window of the goal: CPU pressure some avg10/avg60/avg300 all 0.00, load 0.63"
+ },
+ "warm_latency_ms_3_setup_30_scored": {
+  "diagnostics_edit_to_ready": {"p50": 863.2, "p95": 882.8, "budget_p95": 16.7, "over_budget": "53x"},
+  "verified_preview_edit_to_ready": {"p50": 2144.9, "p95": 2185.6, "budget_p95": 100.0, "over_budget": "22x"},
+  "update_ack_p50": 0.055,
+  "latest_generation_publish_ms": 1331.3
+ },
+ "warm_memory_mib": {"resident_start": 160.4, "resident_end": 184.8, "peak": 194.4},
+ "comparison": {
+  "k1_prime_candidate_2026_09_11": {"diagnostics_p50": 1189.1, "diagnostics_p95": 1213.1, "preview_p50": 2802.0, "preview_p95": 2891.1},
+  "k0_warm_baseline": {"diagnostics_p50": 945.7, "diagnostics_p95": 982.8, "preview_p50": 2277.7, "preview_p95": 2334.9},
+  "previous_checkpoint_2026_09_13": {"diagnostics_p50": 884.5, "diagnostics_p95": 916.1, "preview_p50": 2203.7, "preview_p95": 2286.5, "host": "loaded"},
+  "reading": "against the K1-prime baseline the candidate improved 27.4% on diagnostics p50 and 23.4% on preview p50; against K0 it is now 8.7% faster on diagnostics p50 and 10.2% on p95, and 5.8%/6.4% faster on preview — because every warm edit still performs the producer's full solve and the cold cuts carry into the product metric"
+ },
+ "per_edit_work": {
+  "note": "one scored edit's diagnostics kernel work, identical to the previous checkpoint: the session still retains no solved state across edits",
+  "activations": 169680,
+  "operations": 82451,
+  "term_intern_requests": 296455
+ },
+ "caveats": [
+  "warm remains 53x and 22x over the product budgets; the fix is the successor goal's retained revision",
+  "the interaction collector needs bounded per-sample trimming before warm acceptance can be claimed through it"
+ ]
+}

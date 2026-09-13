@@ -1744,3 +1744,20 @@ This settles the checkpoint's end-to-end position: TodoMVC ahead in every
 cell, NovyWave +16.4% to +16.9% on diagnostics and +4% to +4.4% verified, its
 whole residual the ~64 ms aggregation refresh with non-refresh work at K0
 parity.
+
+### 2026-09-14: warm checkpoint re-run on the quietest window
+
+The contract asks for the warm collector on each checkpoint, and the tree has
+moved three slices since the last warm record. The re-run (direct warm session,
+same flags, producer identity clean, CPU pressure 0.00 across all windows)
+gives warm diagnostics **863.2 ms p50 / 882.8 p95** and verified preview
+**2144.9 / 2185.6**, acknowledgement 0.055 ms and peak RSS 194.4 MiB.
+
+That is 27.2% below the K1′ baseline's p95 (1213.1) and, for the first time,
+clearly below the K0 warm baseline in both lanes: 8.7% on diagnostics p50 and
+10.2% on p95, 5.8%/6.4% on preview. The per-edit work counters are unchanged
+(169,680 activations, 82,451 operations, 296,455 intern requests per edit), so
+the session still retains nothing across edits — the warm gain is the cold
+cuts carrying through, and the remaining 53x/22x over budget is the successor's
+retained revision. Record:
+[warm checkpoint](evidence/compiler-k1pp-warm-current-2026-09-14.json).

@@ -1722,3 +1722,25 @@ byte-identical results. Full record:
 NovyWave's refresh is now ~64 ms with the contributor check (15.0) and merge
 (13.1) the only buckets above 10 ms — both doing genuine work for changed
 contributors.
+
+### 2026-09-14: final current-HEAD acceptance, every cell tight
+
+The quietest window of the goal carried the full 3+30 A/B/A for `458b6359` —
+the tree that includes the combined occurs/resolve check, the flat-contributor
+fast path and the early receipt-order match:
+`target/reports/compiler-performance/k1pp-aba9-{candidate-a,k0,candidate-b}.json`
+and [the final acceptance record](evidence/compiler-k1pp-aba-final-2026-09-14.json).
+There is no interfered cell this time: candidate p95 stays within 3-6% of its
+p50 and the two candidate legs agree inside 0.3% in all twelve cells.
+
+| fixture / intent, p50 | fresh candidate / K0 | empty candidate / K0 |
+| --- | --- | --- |
+| TodoMVC diagnostics | 867.3 / 921.3 (−5.9%) | 868.4 / 923.0 (−5.9%) |
+| TodoMVC verified | 1265.3 / 1278.6 (−1.0%) | 1268.1 / 1276.4 (−0.7%) |
+| NovyWave diagnostics | 580.2 / 496.2 (+16.9%) | 584.7 / 502.4 (+16.4%) |
+| NovyWave verified | 1914.6 / 1840.2 (+4.0%) | 1913.2 / 1832.5 (+4.4%) |
+
+This settles the checkpoint's end-to-end position: TodoMVC ahead in every
+cell, NovyWave +16.4% to +16.9% on diagnostics and +4% to +4.4% verified, its
+whole residual the ~64 ms aggregation refresh with non-refresh work at K0
+parity.

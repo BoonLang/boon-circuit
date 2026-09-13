@@ -10,18 +10,66 @@
   "successor_goals_started": false
  },
  "landed_slices": [
-  {"commit": "b15ee370", "cut": "fold dedup", "effect": "TodoMVC aggregate fact visits 722,579 -> 56,796; object interning 1,189,597 -> 390,804"},
-  {"commit": "3f9cfec7", "cut": "closed-fold memo and corrected phase attribution", "effect": "interleaved A/B -1.5%/-1.0%"},
-  {"commit": "9f782f97", "cut": "release sub-phase probe (env-gated, inert when unset)", "effect": "measurement support"},
-  {"commit": "7ebc6e38", "cut": "single-pass homogeneous merge", "effect": "TodoMVC merge 16.7 -> 10.0 ms; fingerprints byte-identical"},
-  {"commit": "d234c11e", "cut": "reschedule only destinations whose aggregate moved", "effect": "TodoMVC refresh 311.5 -> 135.6 ms; interleaved A/B -14.8%"},
-  {"commit": "f64b4cbf", "cut": "no-op merge fast path", "effect": "TodoMVC -2.4% end to end, no plan drift"},
-  {"commit": "f0f26538", "cut": "retained-prefix incremental fold", "effect": "NovyWave merge 143.6 -> 20.4 ms, refresh 251.1 -> 121.7 ms, interleaved A/B -14.9%"},
-  {"commit": "2e871b38", "cut": "no-op resolution and order rebuilds", "effect": "NovyWave resolve interning 236,985 -> 27,782; interleaved A/B -3.9%"},
-  {"commit": "d55cfbf5", "cut": "fold re-convergence early exit", "effect": "NovyWave merge 22.2 -> 13.1 ms"},
-  {"commit": "d276627d", "cut": "structural-cache dependency receipts", "effect": "NovyWave deps 11.9 -> 7.9 ms"},
-  {"commit": "cc628472", "cut": "order-receipt reuse", "effect": "NovyWave order 14.5 -> 12.1 ms, 2,112 reuses"},
-  {"commit": "0e75532c", "cut": "occurs check folded into the resolution walk", "effect": "NovyWave contributor check 30.3 -> 21.0 ms and refresh 87.0 -> 72.9 ms; interleaved A/B -0.8%, TodoMVC flat, byte-identical diagnostics and plans"}
+  {
+   "commit": "b15ee370",
+   "cut": "fold dedup",
+   "effect": "TodoMVC aggregate fact visits 722,579 -> 56,796; object interning 1,189,597 -> 390,804"
+  },
+  {
+   "commit": "3f9cfec7",
+   "cut": "closed-fold memo and corrected phase attribution",
+   "effect": "interleaved A/B -1.5%/-1.0%"
+  },
+  {
+   "commit": "9f782f97",
+   "cut": "release sub-phase probe (env-gated, inert when unset)",
+   "effect": "measurement support"
+  },
+  {
+   "commit": "7ebc6e38",
+   "cut": "single-pass homogeneous merge",
+   "effect": "TodoMVC merge 16.7 -> 10.0 ms; fingerprints byte-identical"
+  },
+  {
+   "commit": "d234c11e",
+   "cut": "reschedule only destinations whose aggregate moved",
+   "effect": "TodoMVC refresh 311.5 -> 135.6 ms; interleaved A/B -14.8%"
+  },
+  {
+   "commit": "f64b4cbf",
+   "cut": "no-op merge fast path",
+   "effect": "TodoMVC -2.4% end to end, no plan drift"
+  },
+  {
+   "commit": "f0f26538",
+   "cut": "retained-prefix incremental fold",
+   "effect": "NovyWave merge 143.6 -> 20.4 ms, refresh 251.1 -> 121.7 ms, interleaved A/B -14.9%"
+  },
+  {
+   "commit": "2e871b38",
+   "cut": "no-op resolution and order rebuilds",
+   "effect": "NovyWave resolve interning 236,985 -> 27,782; interleaved A/B -3.9%"
+  },
+  {
+   "commit": "d55cfbf5",
+   "cut": "fold re-convergence early exit",
+   "effect": "NovyWave merge 22.2 -> 13.1 ms"
+  },
+  {
+   "commit": "d276627d",
+   "cut": "structural-cache dependency receipts",
+   "effect": "NovyWave deps 11.9 -> 7.9 ms"
+  },
+  {
+   "commit": "cc628472",
+   "cut": "order-receipt reuse",
+   "effect": "NovyWave order 14.5 -> 12.1 ms, 2,112 reuses"
+  },
+  {
+   "commit": "0e75532c",
+   "cut": "occurs check folded into the resolution walk",
+   "effect": "NovyWave contributor check 30.3 -> 21.0 ms and refresh 87.0 -> 72.9 ms; interleaved A/B -0.8%, TodoMVC flat, byte-identical diagnostics and plans"
+  }
  ],
  "rejected_avenues": [
   {
@@ -36,12 +84,34 @@
   }
  ],
  "standing": {
-  "method": "interleaved A/B/A 3 setup + 30 scored per fixture, mode and intent, one process per observation, collected in a quiet window (CPU pressure 0.00/0.01) with clean producer identity; decisive record at docs/plans/evidence/compiler-k1pp-aba-quiet-2026-09-12.json",
-  "todo_mvc_diagnostics": {"k0_ms": 925.7, "candidate_ms": 860.1, "delta_pct": -7.08},
-  "todo_mvc_verified": {"k0_ms": 1288.1, "candidate_ms": 1257.6, "delta_pct": -2.37},
-  "novywave_diagnostics": {"k0_ms": 497.6, "candidate_ms": 599.0, "delta_pct": 20.37},
-  "novywave_verified": {"k0_ms": 1842.0, "candidate_ms": 1951.9, "delta_pct": 5.96},
-  "caveat": "the two candidate legs agree inside 0.6% on all twelve cells and every p95 stays within about 6% of its p50, so these deltas are the checkpoint's end-to-end result"
+  "method": "final interleaved A/B/A 3 setup + 30 scored per fixture, mode and intent, one producer process per observation, collected in the quietest window of the goal (record: docs/plans/evidence/compiler-k1pp-aba-final-2026-09-14.json)",
+  "todo_mvc_diagnostics": {
+   "k0_ms": 921.3,
+   "candidate_ms": 867.3,
+   "delta_pct": -5.9
+  },
+  "todo_mvc_verified": {
+   "k0_ms": 1278.6,
+   "candidate_ms": 1265.3,
+   "delta_pct": -1.0
+  },
+  "novywave_diagnostics": {
+   "k0_ms": 496.2,
+   "candidate_ms": 580.2,
+   "delta_pct": 16.9
+  },
+  "novywave_verified": {
+   "k0_ms": 1840.2,
+   "candidate_ms": 1914.6,
+   "delta_pct": 4.0
+  },
+  "empty_session": {
+   "todo_mvc_diagnostics_pct": -5.9,
+   "todo_mvc_verified_pct": -0.7,
+   "novywave_diagnostics_pct": 16.4,
+   "novywave_verified_pct": 4.4
+  },
+  "caveat": "every cell is tight (candidate p95 within 3-6% of p50, candidate legs inside 0.3%), so this replaces the earlier drift-limited windows as the headline standing; the paired designs agree within a few points"
  },
  "acceptance_aba4": {
   "superseded_by": "acceptance run k1pp-aba5 (see standing above and docs/plans/evidence/compiler-k1pp-aba-quiet-2026-09-12.json); this earlier run is kept as the drift-limited counterexample",
@@ -49,39 +119,88 @@
   "head": "cc628472",
   "producer_dirty_flag": "true for both candidate legs because an untracked evidence file was present in the workspace; the producer binaries are the committed-HEAD build",
   "fresh_process_p50_ms": {
-   "todo_mvc_diagnostics": {"candidate_a": 1025.3, "k0": 953.7, "candidate_b": 898.5},
-   "todo_mvc_verified": {"candidate_a": 1465.3, "k0": 1333.8, "candidate_b": 1494.7},
-   "novywave_diagnostics": {"candidate_a": 650.4, "k0": 610.6, "candidate_b": 599.7},
-   "novywave_verified": {"candidate_a": 2053.4, "k0": 1980.3, "candidate_b": 1950.2}
+   "todo_mvc_diagnostics": {
+    "candidate_a": 1025.3,
+    "k0": 953.7,
+    "candidate_b": 898.5
+   },
+   "todo_mvc_verified": {
+    "candidate_a": 1465.3,
+    "k0": 1333.8,
+    "candidate_b": 1494.7
+   },
+   "novywave_diagnostics": {
+    "candidate_a": 650.4,
+    "k0": 610.6,
+    "candidate_b": 599.7
+   },
+   "novywave_verified": {
+    "candidate_a": 2053.4,
+    "k0": 1980.3,
+    "candidate_b": 1950.2
+   }
   },
   "empty_session_p50_ms": {
-   "todo_mvc_diagnostics": {"candidate_a": 939.5, "k0": 955.7, "candidate_b": 891.8},
-   "todo_mvc_verified": {"candidate_a": 1451.8, "k0": 1343.5, "candidate_b": 1266.5},
-   "novywave_diagnostics": {"candidate_a": 635.5, "k0": 547.0, "candidate_b": 603.0},
-   "novywave_verified": {"candidate_a": 2031.0, "k0": 1991.0, "candidate_b": 1961.2}
+   "todo_mvc_diagnostics": {
+    "candidate_a": 939.5,
+    "k0": 955.7,
+    "candidate_b": 891.8
+   },
+   "todo_mvc_verified": {
+    "candidate_a": 1451.8,
+    "k0": 1343.5,
+    "candidate_b": 1266.5
+   },
+   "novywave_diagnostics": {
+    "candidate_a": 635.5,
+    "k0": 547.0,
+    "candidate_b": 603.0
+   },
+   "novywave_verified": {
+    "candidate_a": 2031.0,
+    "k0": 1991.0,
+    "candidate_b": 1961.2
+   }
   },
   "interpretation": "the candidate legs differ by 1.8-10.2% across cells and the K0 fresh-process leg carries p95 914.7 against a 610.6 p50, so this window cannot resolve the residual. What it does confirm, consistently with the earlier tighter windows: TodoMVC is at or below the K0 producer (candidate-b is 5.7-6.7% faster in three of four cells and 2% slower in the fourth), and NovyWave remains above it (tightest cells +10.2% empty diagnostics, +1.8%/-1.5% fresh diagnostics/verified).",
   "status": "recorded as a supporting, drift-limited acceptance run; the earlier aba2 window and the interleaved eight-round A/Bs remain the primary end-to-end evidence"
  },
  "remaining_failures": {
   "novywave_refresh_ms": 73,
-  "buckets": {"contributor_check_occurs_plus_resolve": 21, "merge": 12.6, "order": 11.7, "deps": 4.8, "collection_invalidation_commit": 5.5, "bookkeeping_and_probe_timers": 17.4},
+  "buckets": {
+   "contributor_check_occurs_plus_resolve": 21,
+   "merge": 12.6,
+   "order": 11.7,
+   "deps": 4.8,
+   "collection_invalidation_commit": 5.5,
+   "bookkeeping_and_probe_timers": 17.4
+  },
   "why_not_k0_class": "NovyWave's non-refresh cost is already at K0 parity; the residual is the per-contributor re-derivation that a cold compile performs for every dirty destination. Removing it needs revision-level retention rather than more constant-factor work inside the refresh."
  },
  "warm_checkpoint": {
   "record": "docs/plans/evidence/compiler-k1pp-warm-2026-09-13.json",
-  "warm_diagnostics_ms": {"p50": 884.5, "p95": 916.1, "budget_p95": 16.7},
-  "warm_verified_preview_ms": {"p50": 2203.7, "p95": 2286.5, "budget_p95": 100.0},
-  "change_since_k1_prime_baseline_pct": {"diagnostics_p95": -25.6, "preview_p95": -20.9},
+  "warm_diagnostics_ms": {
+   "p50": 884.5,
+   "p95": 916.1,
+   "budget_p95": 16.7
+  },
+  "warm_verified_preview_ms": {
+   "p50": 2203.7,
+   "p95": 2286.5,
+   "budget_p95": 100.0
+  },
+  "change_since_k1_prime_baseline_pct": {
+   "diagnostics_p95": -25.6,
+   "preview_p95": -20.9
+  },
   "reading": "every warm edit still performs a full solve, so the cold cuts carry into warm and the candidate's warm diagnostics is now 6.8% below the K0 warm baseline; the remaining 55x/23x over budget is the successor goal's retained revision"
  },
  "acceptance_attempts": {
   "aba5": "decisive quiet-window run for a0579b2c (see standing above)",
-  "aba6": "attempted for 0e75532c: candidate-a completed in a quiet window (NovyWave fresh-process p50 594.8 ms), then the host suspended for about fourteen hours and the K0 leg aborted with a clock anomaly (artifact endpoint 136,739 s against a 4,569 s process exit). Re-run scheduled rather than mixing windows."
-  ,
-  "aba7": "leg one of a fresh run for 0e75532c completed at NovyWave fresh-process p50 644.7 ms with p95 765.6 during renewed interference and is not used; the current HEAD's standing was instead re-measured with a paired per-round A/B (docs/plans/evidence/compiler-k1pp-paired-standing-2026-09-13.json), first on diagnostics and verified, then across the full four-cell matrix: TodoMVC faster in all four cells (-5.8/-6.0 diagnostics, -1.3/-1.9 verified), NovyWave slower in all four (+22.0/+15.6 diagnostics, +3.6/+4.6 verified), reproducing the aba5 acceptance within the host's noise"
-  ,
-  "aba8": "formal 3+30 A/B/A on the current HEAD (fd8ca4da) in the quietest window yet, with clean producer identities: TodoMvc faster in all four cells (diagnostics -5.5% fresh and -6.5% empty, verified -10.2% and -2.1%) and NovyWave fresh-process diagnostics +16.7% with the candidate legs agreeing to 0.03%; two cells (K0's NovyWave empty-session and K0's TodoMVC verified fresh) were interfered and are excluded. Record: docs/plans/evidence/compiler-k1pp-aba-current-2026-09-13.json"
+  "aba6": "attempted for 0e75532c: candidate-a completed in a quiet window (NovyWave fresh-process p50 594.8 ms), then the host suspended for about fourteen hours and the K0 leg aborted with a clock anomaly (artifact endpoint 136,739 s against a 4,569 s process exit). Re-run scheduled rather than mixing windows.",
+  "aba7": "leg one of a fresh run for 0e75532c completed at NovyWave fresh-process p50 644.7 ms with p95 765.6 during renewed interference and is not used; the current HEAD's standing was instead re-measured with a paired per-round A/B (docs/plans/evidence/compiler-k1pp-paired-standing-2026-09-13.json), first on diagnostics and verified, then across the full four-cell matrix: TodoMVC faster in all four cells (-5.8/-6.0 diagnostics, -1.3/-1.9 verified), NovyWave slower in all four (+22.0/+15.6 diagnostics, +3.6/+4.6 verified), reproducing the aba5 acceptance within the host's noise",
+  "aba8": "formal 3+30 A/B/A on the current HEAD (fd8ca4da) in the quietest window yet, with clean producer identities: TodoMvc faster in all four cells (diagnostics -5.5% fresh and -6.5% empty, verified -10.2% and -2.1%) and NovyWave fresh-process diagnostics +16.7% with the candidate legs agreeing to 0.03%; two cells (K0's NovyWave empty-session and K0's TodoMVC verified fresh) were interfered and are excluded. Record: docs/plans/evidence/compiler-k1pp-aba-current-2026-09-13.json",
+  "aba9": "final 3+30 A/B/A for 458b6359 in the quietest window: TodoMVC -5.9% diagnostics and -1.0%/-0.7% verified, NovyWave +16.9%/+16.4% diagnostics and +4.0%/+4.4% verified, all twelve cells tight. Record: docs/plans/evidence/compiler-k1pp-aba-final-2026-09-14.json"
  },
  "successor_decision": {
   "goal": "Goal B - warm revision retention (K3/K4-lite) is the contract's declared successor and owns the retained-revision machinery: retain the packed solved revision across edits, solve demanded definitions only, exact dirty cones with backdating, last-good publication",
@@ -89,8 +208,7 @@
   "start_command": "/goal Execute the warm-revision-retention contract in docs/plans/BOON_COMPILER_REQUIREMENT_AGGREGATION_GOAL_PROMPT.md from current HEAD (Goal B section). Retain the kernel's packed solved revision across edits, solve only demanded definitions, and recompute exact dirty cones with backdating and last-good publication. Follow the scope, evidence, checkpoint and stopping rules of that section. Do not push, do not edit budgets/compiler.toml, and do not start linked code.",
   "why_this_goal_cannot_finish_novywave": "its residual is the 73 ms aggregation refresh: a cold compile re-derives every dirty destination from its contributors, and the two ways to avoid that within this goal's scope (dependency-versioned reuse and dense fold-state slots) were implemented, gated and measured as neutral or net-negative. Revision-level retention, which the next goal owns, is what removes the re-derivation itself."
  },
- "evidence_index": "docs/plans/evidence/compiler-k1pp-*.json (15 files) and the 2026-09-11/12 sections of docs/plans/BOON_COMPILER_K0_K1_EXECUTION_2026_09_07.md"
- ,
+ "evidence_index": "docs/plans/evidence/compiler-k1pp-*.json (15 files) and the 2026-09-11/12 sections of docs/plans/BOON_COMPILER_K0_K1_EXECUTION_2026_09_07.md",
  "contract_invariants": {
   "note": "the contract names specific correctness constraints; each is mapped here to the test that proves it, run explicitly on the checkpoint (HEAD 01555861 is docs only, so the kernel/compiler tests below are the 0e75532c tree)",
   "refresh_before_read_withdrawn_requirement": "solver::requirements::tests::projection_does_not_reimport_a_withdrawn_requirement_as_base",

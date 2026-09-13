@@ -1557,3 +1557,13 @@ NovyWave −0.84%, TodoMVC +0.3%, verified −0.3%, each lane a single
 
 NovyWave's refresh is now ~73 ms: a 21 ms contributor check, 12.6 ms merge,
 11.7 ms order, 4.8 ms deps and ~5.5 ms of collection, invalidation and commit.
+
+### 2026-09-13: K1″ checkpoint after a suspend
+
+The host suspended for about fourteen hours mid-run. A first `0e75532c`
+acceptance attempt (leg reports `k1pp-aba6-*`) completed its candidate-a leg in
+a quiet window — NovyWave fresh-process p50 594.8 ms, p95 627.8 — and then the
+K0 leg aborted on resume with a clock anomaly: the artifact endpoint read
+136,739,120 ms against a process exit of 4,569 ms, which the xtask rejects as
+inconsistent. The attempt is recorded rather than patched into a window-mixed
+record, and the re-run will use one uninterrupted window.

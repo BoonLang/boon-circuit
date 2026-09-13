@@ -20,7 +20,8 @@
   {"commit": "2e871b38", "cut": "no-op resolution and order rebuilds", "effect": "NovyWave resolve interning 236,985 -> 27,782; interleaved A/B -3.9%"},
   {"commit": "d55cfbf5", "cut": "fold re-convergence early exit", "effect": "NovyWave merge 22.2 -> 13.1 ms"},
   {"commit": "d276627d", "cut": "structural-cache dependency receipts", "effect": "NovyWave deps 11.9 -> 7.9 ms"},
-  {"commit": "cc628472", "cut": "order-receipt reuse", "effect": "NovyWave order 14.5 -> 12.1 ms, 2,112 reuses"}
+  {"commit": "cc628472", "cut": "order-receipt reuse", "effect": "NovyWave order 14.5 -> 12.1 ms, 2,112 reuses"},
+  {"commit": "0e75532c", "cut": "occurs check folded into the resolution walk", "effect": "NovyWave contributor check 30.3 -> 21.0 ms and refresh 87.0 -> 72.9 ms; interleaved A/B -0.8%, TodoMVC flat, byte-identical diagnostics and plans"}
  ],
  "rejected_avenues": [
   {
@@ -63,9 +64,13 @@
   "status": "recorded as a supporting, drift-limited acceptance run; the earlier aba2 window and the interleaved eight-round A/Bs remain the primary end-to-end evidence"
  },
  "remaining_failures": {
-  "novywave_refresh_ms": 93,
-  "buckets": {"resolve": 20, "merge": 14, "occurs": 12, "order": 12, "deps": 6, "collection_invalidation_commit": 7, "bookkeeping": 10, "probe_timer_artifact": 10},
+  "novywave_refresh_ms": 73,
+  "buckets": {"contributor_check_occurs_plus_resolve": 21, "merge": 12.6, "order": 11.7, "deps": 4.8, "collection_invalidation_commit": 5.5, "bookkeeping_and_probe_timers": 17.4},
   "why_not_k0_class": "NovyWave's non-refresh cost is already at K0 parity; the residual is the per-contributor re-derivation that a cold compile performs for every dirty destination. Removing it needs revision-level retention rather than more constant-factor work inside the refresh."
+ },
+ "acceptance_attempts": {
+  "aba5": "decisive quiet-window run for a0579b2c (see standing above)",
+  "aba6": "attempted for 0e75532c: candidate-a completed in a quiet window (NovyWave fresh-process p50 594.8 ms), then the host suspended for about fourteen hours and the K0 leg aborted with a clock anomaly (artifact endpoint 136,739 s against a 4,569 s process exit). Re-run scheduled rather than mixing windows."
  },
  "successor_decision": {
   "goal": "Goal B - warm revision retention (K3/K4-lite) is the contract's declared successor and owns the retained-revision machinery: retain the packed solved revision across edits, solve demanded definitions only, exact dirty cones with backdating, last-good publication",

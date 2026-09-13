@@ -129,8 +129,10 @@ Execution record, written by the goal itself. Full detail in
 **Mechanism: implemented.** Every requirement destination retains its ordered
 fold state; a committed site change restores the unchanged prefix, merges only
 the changed region, stops at re-convergence, publishes the retained ordering
-when its pair repeats, checks occurs during the resolution walk, and maintains
-its dependency receipt from a structural cache (eleven landed slices).
+when its pair repeats, checks occurs during the resolution walk, maintains its
+dependency receipt from a structural cache, skips the walk for contributors
+whose variables are unbound and self-rooted, and decides the receipt order
+before rebuilding a term (thirteen landed slices).
 
 **Correctness: proven on the current tree.** Refresh-before-read, exact
 withdrawal, A-to-B-to-A equality, alias ordering, ordering receipts that cannot
@@ -140,13 +142,15 @@ each map to a named passing test (kernel requirements suite 15, kernel_transfer
 fingerprint, and the machine plan is byte-identical except for the disclosed
 TodoMVC change from the touch-elimination slice.
 
-**Latency: one fixture met, one not.** In the decisive quiet-window A/B/A and
-the paired full-matrix re-measurement, TodoMVC is faster than the preserved K0
-producer in all four cells (−5.8% to −7.1% diagnostics, −1.3% to −2.4%
-verified). NovyWave remains slower (+22.0%/+15.6% diagnostics, +3.6%/+4.6%
-verified) with its non-refresh work already at parity; its whole residual is
-the ~73 ms aggregation refresh (21 ms contributor check, 12.6 merge, 11.7
-order, 4.8 deps, ~5.5 collection/invalidation/commit, rest bookkeeping).
+**Latency: one fixture met, one not.** The final A/B/A for `458b6359` was
+collected in the quietest window of the goal with every cell tight (candidate
+p95 within 3-6% of p50, the two candidate legs inside 0.3%): TodoMVC is faster
+than the preserved K0 producer in all four cells (diagnostics −5.9% in both
+modes, verified −1.0% and −0.7%). NovyWave remains slower (+16.9%/+16.4%
+diagnostics, +4.0%/+4.4% verified) with its non-refresh work already at parity;
+its whole residual is the ~64 ms aggregation refresh (15.0 ms contributor
+check, 13.1 merge, 7.4 order, 4.9 deps, ~5.5 collection/invalidation/commit,
+rest bookkeeping).
 
 **Rejected by measurement:** dependency-versioned contributor reuse (the sound
 stamping walk costs more than it saves; ten qualifying NovyWave folds), dense

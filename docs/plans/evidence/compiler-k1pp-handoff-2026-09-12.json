@@ -166,16 +166,18 @@
   "status": "recorded as a supporting, drift-limited acceptance run; the earlier aba2 window and the interleaved eight-round A/Bs remain the primary end-to-end evidence"
  },
  "remaining_failures": {
-  "novywave_refresh_ms": 73,
+  "novywave_refresh_ms": 64,
   "buckets": {
-   "contributor_check_occurs_plus_resolve": 21,
-   "merge": 12.6,
-   "order": 11.7,
-   "deps": 4.8,
+   "contributor_check_occurs_plus_resolve": 15.0,
+   "merge": 13.1,
+   "order": 7.4,
+   "deps": 4.9,
    "collection_invalidation_commit": 5.5,
-   "bookkeeping_and_probe_timers": 17.4
+   "bookkeeping": 10.0,
+   "probe_timer_artifact": 8.0
   },
-  "why_not_k0_class": "NovyWave's non-refresh cost is already at K0 parity; the residual is the per-contributor re-derivation that a cold compile performs for every dirty destination. Removing it needs revision-level retention rather than more constant-factor work inside the refresh."
+  "why_not_k0_class": "NovyWave's non-refresh cost is already at K0 parity; the residual is the per-contributor re-derivation that a cold compile performs for every dirty destination. The two in-scope ways to avoid that re-derivation (dependency-versioned reuse, dense fold-state slots) were implemented, gated and measured as neutral or net-negative, so removing it needs revision-level retention rather than more constant-factor work inside the refresh.",
+  "final_acceptance": "docs/plans/evidence/compiler-k1pp-aba-final-2026-09-14.json (TodoMVC -5.9%/-1.0%/-0.7%, NovyWave +16.9%/+16.4%/+4.0%/+4.4%, all twelve cells tight)"
  },
  "warm_checkpoint": {
   "record": "docs/plans/evidence/compiler-k1pp-warm-2026-09-13.json",
@@ -225,5 +227,6 @@
    "kernel_transfer": "cargo test -p boon_compiler --test kernel_transfer -> 10 passed",
    "full_gates": "kernel 197, kernel_transfer 10, compiler library 98 with one pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match 3, pulses 8"
   }
- }
+ },
+ "position": "thirteen landed slices and four measured rejections; TodoMVC ahead of the preserved K0 producer in every cell, NovyWave's residual narrowed from +69.5% to +16.4%/+16.9% and fully attributed to the aggregation refresh; warm checkpoint recorded; hand-off complete with the successor's start command"
 }

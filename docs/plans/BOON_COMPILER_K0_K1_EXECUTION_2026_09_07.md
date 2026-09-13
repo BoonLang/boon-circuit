@@ -1583,3 +1583,15 @@ fingerprint per lane. This reproduces the decisive quiet-window acceptance for
 confirmed while the formal 3+30 A/B/A on `0e75532c` waits for an uninterrupted
 quiet window. Record:
 [paired standing](evidence/compiler-k1pp-paired-standing-2026-09-13.json).
+
+### 2026-09-13: probe hygiene and evidence-set check
+
+After the combined-walk slice the probe still printed `occurs_ms` and
+`resolve_ms`, which are permanently zero because both phases are now the single
+contributor check; the fields are removed from the probe struct and the line
+now reads `contributor_check_ms` instead, so a zero in the report cannot be
+mistaken for a broken measurement. Gates re-run green (kernel 197,
+kernel_transfer 10, compiler library 98 with one pre-existing ignored probe,
+staged 3, map_set 3, nested_boolean_match 3, pulses 8). The evidence set was
+checked too: all 26 evidence links in this log resolve and all 19
+`compiler-k1pp-*` evidence files parse and carry a status.

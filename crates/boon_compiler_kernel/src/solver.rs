@@ -442,8 +442,6 @@ struct RequirementPhaseProbe {
     calls: u64,
     folds: u64,
     memo_hits: u64,
-    occurs_ns: u64,
-    resolve_ns: u64,
     merge_ns: u64,
     collect_ns: u64,
     deps_ns: u64,
@@ -482,7 +480,7 @@ impl Drop for RequirementPhaseProbe {
         }
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         eprintln!(
-            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} occurs_ms={:.3} resolve_ms={:.3} contributor_check_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} open_contributor_visits={} closed_contributor_visits={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
+            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} contributor_check_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} open_contributor_visits={} closed_contributor_visits={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
             self.calls,
             self.folds,
             self.memo_hits,
@@ -490,8 +488,6 @@ impl Drop for RequirementPhaseProbe {
             ms(self.invalidate_ns),
             ms(self.collect_ns),
             ms(self.deps_ns),
-            ms(self.occurs_ns),
-            ms(self.resolve_ns),
             ms(self.contributor_check_ns),
             ms(self.merge_ns),
             ms(self.order_ns),

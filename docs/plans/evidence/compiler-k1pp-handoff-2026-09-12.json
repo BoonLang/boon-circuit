@@ -76,7 +76,9 @@
  },
  "successor_decision": {
   "goal": "Goal B - warm revision retention (K3/K4-lite) is the contract's declared successor and owns the retained-revision machinery: retain the packed solved revision across edits, solve demanded definitions only, exact dirty cones with backdating, last-good publication",
-  "note": "the within-compile avenues available to this goal are exhausted by measurement: eleven landed slices plus two rejected experiments; the remaining acceptance evidence item is the 3+30 A/B/A re-run in a quiet window"
+  "note": "the within-compile avenues available to this goal are exhausted by measurement: eleven landed slices plus two rejected experiments; the remaining acceptance evidence item is the 3+30 A/B/A re-run in a quiet window",
+  "start_command": "/goal Execute the warm-revision-retention contract in docs/plans/BOON_COMPILER_REQUIREMENT_AGGREGATION_GOAL_PROMPT.md from current HEAD (Goal B section). Retain the kernel's packed solved revision across edits, solve only demanded definitions, and recompute exact dirty cones with backdating and last-good publication. Follow the scope, evidence, checkpoint and stopping rules of that section. Do not push, do not edit budgets/compiler.toml, and do not start linked code.",
+  "why_this_goal_cannot_finish_novywave": "its residual is the 73 ms aggregation refresh: a cold compile re-derives every dirty destination from its contributors, and the two ways to avoid that within this goal's scope (dependency-versioned reuse and dense fold-state slots) were implemented, gated and measured as neutral or net-negative. Revision-level retention, which the next goal owns, is what removes the re-derivation itself."
  },
  "evidence_index": "docs/plans/evidence/compiler-k1pp-*.json (15 files) and the 2026-09-11/12 sections of docs/plans/BOON_COMPILER_K0_K1_EXECUTION_2026_09_07.md"
  ,

@@ -119,6 +119,48 @@ Stop at one of the two endings and hand off the checkpoint hash, measurements,
 remaining failures and the successor goal. Do not start the successor goals
 inside this goal.
 
+## Checkpoint Status — 2026-09-13
+
+Execution record, written by the goal itself. Full detail in
+[the checkpoint hand-off](evidence/compiler-k1pp-handoff-2026-09-12.json) and the
+2026-09-11/12/13 sections of
+[the K0+K1 execution log](BOON_COMPILER_K0_K1_EXECUTION_2026_09_07.md).
+
+**Mechanism: implemented.** Every requirement destination retains its ordered
+fold state; a committed site change restores the unchanged prefix, merges only
+the changed region, stops at re-convergence, publishes the retained ordering
+when its pair repeats, checks occurs during the resolution walk, and maintains
+its dependency receipt from a structural cache (eleven landed slices).
+
+**Correctness: proven on the current tree.** Refresh-before-read, exact
+withdrawal, A-to-B-to-A equality, alias ordering, ordering receipts that cannot
+resurrect removed fields and the whole-selector and tagged-payload regressions
+each map to a named passing test (kernel requirements suite 15, kernel_transfer
+10, full gates green); every measurement lane shows one distinct diagnostics
+fingerprint, and the machine plan is byte-identical except for the disclosed
+TodoMVC change from the touch-elimination slice.
+
+**Latency: one fixture met, one not.** In the decisive quiet-window A/B/A and
+the paired full-matrix re-measurement, TodoMVC is faster than the preserved K0
+producer in all four cells (−5.8% to −7.1% diagnostics, −1.3% to −2.4%
+verified). NovyWave remains slower (+22.0%/+15.6% diagnostics, +3.6%/+4.6%
+verified) with its non-refresh work already at parity; its whole residual is
+the ~73 ms aggregation refresh (21 ms contributor check, 12.6 merge, 11.7
+order, 4.8 deps, ~5.5 collection/invalidation/commit, rest bookkeeping).
+
+**Rejected by measurement:** dependency-versioned contributor reuse (the sound
+stamping walk costs more than it saves; ten qualifying NovyWave folds), dense
+fold-state slots (neutral, ~4.6 MB of empty slots), indexed merge-join (linear
+scans are under 1 ms against a 13.5 ms merge).
+
+**Not at an ending.** Both endings need one more statement than the evidence
+supports: the Implemented ending needs NovyWave at K0-class, which requires
+revision-level retention rather than more constant-factor work inside the
+refresh, and a Reviewed rejection would be false because incremental
+aggregation is sound and beneficial and is what closed most of the gap. The
+remaining evidence item is the formal 3+30 A/B/A on the current HEAD in an
+uninterrupted quiet window. Goal B below owns the residual.
+
 ## Successor Goals — Implement Next, Do Not Start Here
 
 These are declared so they are not lost. Each needs its own `/goal` selection

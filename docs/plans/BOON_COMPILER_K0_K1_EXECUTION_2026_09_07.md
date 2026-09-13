@@ -1783,3 +1783,28 @@ slice of the late batch. All gates green. Full record:
 
 NovyWave's refresh is now ~63 ms: contributor check 14.9, merge 12.2, order
 7.5, deps 4.8, collection/invalidation/commit ~5.6 and the rest bookkeeping.
+
+### 2026-09-14: rejected experiment — raw-input dedup, and a probe-timer confound
+
+The refresh resolves contributors before the resolved-term dedup, so a
+duplicate raw input costs a check that will be thrown away. A counter confirmed
+the duplication is heavy: NovyWave 62,917 of 177,538 raw visits (35%) and
+TodoMVC 522,839 of 569,421 (92%). Skipping a contributor whose exact raw term
+was already checked is sound — the resolution, occurs verdict and dedup outcome
+can only repeat — so it was implemented and gated (all gates green,
+fingerprints and plans unchanged).
+
+The probe looked like a large win: contributor check 15.0 → 7.0 ms on TodoMVC
+and 14.9 → 8.5 ms on NovyWave. The release paired A/B said the opposite, and
+two independent runs agreed: TodoMVC is **0.7% to 2.5% slower** in every cell
+while NovyWave is neutral. The explanation is a probe-timer confound: the
+skipped visits were also skipping one `Instant` pair each in probe mode, so the
+probe measured removed instrumentation, not removed work. The duplicated visits
+are mostly closed terms whose check was already two flag tests, and the extra
+containment scan costs more than those tests.
+
+Rejected and reverted with no code change; the diff is kept at
+`target/reports/compiler-performance/k1pp-rejected-raw-input-dedup.diff`. The
+duplicate-rate numbers stay useful: they show how much of the contributor list
+is redundant, which is why the flat-contributor and merge-pair slices paid off
+while this one did not.

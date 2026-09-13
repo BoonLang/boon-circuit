@@ -68,6 +68,13 @@
   "buckets": {"contributor_check_occurs_plus_resolve": 21, "merge": 12.6, "order": 11.7, "deps": 4.8, "collection_invalidation_commit": 5.5, "bookkeeping_and_probe_timers": 17.4},
   "why_not_k0_class": "NovyWave's non-refresh cost is already at K0 parity; the residual is the per-contributor re-derivation that a cold compile performs for every dirty destination. Removing it needs revision-level retention rather than more constant-factor work inside the refresh."
  },
+ "warm_checkpoint": {
+  "record": "docs/plans/evidence/compiler-k1pp-warm-2026-09-13.json",
+  "warm_diagnostics_ms": {"p50": 884.5, "p95": 916.1, "budget_p95": 16.7},
+  "warm_verified_preview_ms": {"p50": 2203.7, "p95": 2286.5, "budget_p95": 100.0},
+  "change_since_k1_prime_baseline_pct": {"diagnostics_p95": -25.6, "preview_p95": -20.9},
+  "reading": "every warm edit still performs a full solve, so the cold cuts carry into warm and the candidate's warm diagnostics is now 6.8% below the K0 warm baseline; the remaining 55x/23x over budget is the successor goal's retained revision"
+ },
  "acceptance_attempts": {
   "aba5": "decisive quiet-window run for a0579b2c (see standing above)",
   "aba6": "attempted for 0e75532c: candidate-a completed in a quiet window (NovyWave fresh-process p50 594.8 ms), then the host suspended for about fourteen hours and the K0 leg aborted with a clock anomaly (artifact endpoint 136,739 s against a 4,569 s process exit). Re-run scheduled rather than mixing windows."

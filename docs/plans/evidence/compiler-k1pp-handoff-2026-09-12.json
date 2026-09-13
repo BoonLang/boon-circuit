@@ -79,4 +79,22 @@
   "note": "the within-compile avenues available to this goal are exhausted by measurement: eleven landed slices plus two rejected experiments; the remaining acceptance evidence item is the 3+30 A/B/A re-run in a quiet window"
  },
  "evidence_index": "docs/plans/evidence/compiler-k1pp-*.json (15 files) and the 2026-09-11/12 sections of docs/plans/BOON_COMPILER_K0_K1_EXECUTION_2026_09_07.md"
+ ,
+ "contract_invariants": {
+  "note": "the contract names specific correctness constraints; each is mapped here to the test that proves it, run explicitly on the checkpoint (HEAD 01555861 is docs only, so the kernel/compiler tests below are the 0e75532c tree)",
+  "refresh_before_read_withdrawn_requirement": "solver::requirements::tests::projection_does_not_reimport_a_withdrawn_requirement_as_base",
+  "a_to_b_to_a_equals_fresh_a": "solver::requirements::tests::replacement_withdraws_only_its_own_occurrence, solver::requirements::tests::solver_withdrawal_restores_base_and_later_permanent_facts, solver::requirements::tests::branch_roundtrip_matches_fresh_state_without_new_sites",
+  "withdrawal_keeps_other_occurrences": "solver::requirements::tests::replacement_withdraws_only_its_own_occurrence",
+  "alias_ordering_deterministic": "solver::requirements::tests::alias_consumers_can_merge_facts_independent_of_member_order, solver::requirements::tests::solver_aliases_preserve_contributions_without_capturing_them_as_base",
+  "ordering_receipts_never_resurrect_removed_fields": "solver::requirements::tests::ordering_receipts_cannot_resurrect_removed_fields_or_old_types",
+  "self_supported_cycle_evidence": "solver::requirements::tests::withdrawing_cycle_seed_removes_self_supported_evidence",
+  "whole_selector_regressions": "kernel_transfer::whole_selector_forwarding_does_not_export_an_inactive_callee_alternative, kernel_transfer::whole_selector_guard_does_not_hide_an_incompatible_callee",
+  "tagged_payload_regressions": "kernel_transfer::tagged_whole_selector_forwarding_keeps_the_tag_and_payload, kernel_transfer::tagged_whole_selector_forwarding_rejects_an_incompatible_payload, kernel_transfer::nested_tagged_whole_selector_forwarding_rejects_an_incompatible_payload",
+  "novywave_verified": "the verified lanes of the quiet-window acceptance and the paired matrix both show one distinct diagnostics fingerprint and the expected plan hash",
+  "run_output": {
+   "requirements_suite": "cargo test -p boon_compiler_kernel --lib solver::requirements::tests -> 15 passed",
+   "kernel_transfer": "cargo test -p boon_compiler --test kernel_transfer -> 10 passed",
+   "full_gates": "kernel 197, kernel_transfer 10, compiler library 98 with one pre-existing ignored probe, staged 3, map_set 3, nested_boolean_match 3, pulses 8"
+  }
+ }
 }

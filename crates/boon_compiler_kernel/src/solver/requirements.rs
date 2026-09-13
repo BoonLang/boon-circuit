@@ -905,7 +905,189 @@ impl super::ComponentSolver {
     /// Preserve only the order of surviving fields. Every value, shape kind,
     /// openness bit and variable identity comes from the newly derived term.
     /// Removed fields are never reintroduced through an ordering receipt.
+    ///
+    /// The receipt walk almost always rebuilds the term it was given, so the
+    /// entry point first asks whether the current term already satisfies the
+    /// receipt order and skips the walk when it does.
     fn retain_requirement_order(
+        &mut self,
+        previous: TypeTermId,
+        current: TypeTermId,
+    ) -> TypeTermId {
+        if previous == current {
+            return current;
+        }
+        if self.requirement_order_matches(previous, current) {
+            if let Some(probe) = self.requirement_phase_probe.as_mut() {
+                probe.order_early_matches = probe.order_early_matches.saturating_add(1);
+            }
+            #[cfg(debug_assertions)]
+            {
+                let walked = self.retain_requirement_order_slow(previous, current);
+                debug_assert_eq!(
+                    walked, current,
+                    "an early order match must equal what the receipt walk rebuilds"
+                );
+            }
+            return current;
+        }
+        self.retain_requirement_order_slow(previous, current)
+    }
+
+    /// Whether the receipt walk would rebuild `current` unchanged: every
+    /// surviving field must already appear in the receipt's relative order,
+    /// new-only fields must follow them, and every nested payload must match
+    /// recursively.
+    fn requirement_order_matches(&mut self, previous: TypeTermId, current: TypeTermId) -> bool {
+        use crate::{TypeTermHead as H, VariantTerm};
+        if previous == current {
+            return true;
+        }
+        match (
+            self.program.terms.term_head(previous),
+            self.program.terms.term_head(current),
+        ) {
+            (H::Object { shape: old, .. }, H::Object { shape: new, .. }) => {
+                let old_len = self.program.terms.object_fields_for_shape(old).len();
+                let new_len = self.program.terms.object_fields_for_shape(new).len();
+                let mut old_ordinal = 0;
+                let mut seen_new_only = false;
+                for ordinal in 0..new_len {
+                    let new_name = self
+                        .program
+                        .terms
+                        .object_field_for_shape(new, ordinal)
+                        .expect("sealed receipt field exists")
+                        .name;
+                    let new_ty = self
+                        .program
+                        .terms
+                        .object_field_for_shape(new, ordinal)
+                        .expect("sealed receipt field exists")
+                        .ty;
+                    if self
+                        .program
+                        .terms
+                        .lookup_object_field(old, new_name)
+                        .is_none()
+                    {
+                        seen_new_only = true;
+                        continue;
+                    }
+                    if seen_new_only {
+                        return false;
+                    }
+                    let mut found = false;
+                    while old_ordinal < old_len {
+                        let old_field = self
+                            .program
+                            .terms
+                            .object_field_for_shape(old, old_ordinal)
+                            .expect("sealed receipt field exists");
+                        if old_field.name == new_name {
+                            if !self.requirement_order_matches(old_field.ty, new_ty) {
+                                return false;
+                            }
+                            old_ordinal += 1;
+                            found = true;
+                            break;
+                        }
+                        if self
+                            .program
+                            .terms
+                            .lookup_object_field(new, old_field.name)
+                            .is_some()
+                        {
+                            return false;
+                        }
+                        old_ordinal += 1;
+                    }
+                    if !found {
+                        return false;
+                    }
+                }
+                while old_ordinal < old_len {
+                    let old_field = self
+                        .program
+                        .terms
+                        .object_field_for_shape(old, old_ordinal)
+                        .expect("sealed receipt field exists");
+                    if self
+                        .program
+                        .terms
+                        .lookup_object_field(new, old_field.name)
+                        .is_some()
+                    {
+                        return false;
+                    }
+                    old_ordinal += 1;
+                }
+                true
+            }
+            (H::VariantSet(old), H::VariantSet(new)) => {
+                for ordinal in 0..new.len() {
+                    let VariantTerm::Tagged { tag, fields } =
+                        self.program.terms.variant_terms(new)[ordinal]
+                    else {
+                        continue;
+                    };
+                    let prior =
+                        self.program.terms.variant_terms(old).iter().find_map(
+                            |prior| match prior {
+                                VariantTerm::Tagged {
+                                    tag: old_tag,
+                                    fields,
+                                } if *old_tag == tag => Some(*fields),
+                                _ => None,
+                            },
+                        );
+                    if let Some(prior) = prior
+                        && !self.requirement_order_matches(prior, fields)
+                    {
+                        return false;
+                    }
+                }
+                true
+            }
+            (H::List(old), H::List(new)) => self.requirement_order_matches(old, new),
+            (H::Set(old), H::Set(new)) => self.requirement_order_matches(old, new),
+            (
+                H::Map {
+                    key: old_key,
+                    value: old_value,
+                },
+                H::Map { key, value },
+            ) => {
+                self.requirement_order_matches(old_key, key)
+                    && self.requirement_order_matches(old_value, value)
+            }
+            (
+                H::Function {
+                    args: old,
+                    result: old_result,
+                    ..
+                },
+                H::Function {
+                    args,
+                    result: current_result,
+                    ..
+                },
+            ) if old.len() == args.len() => {
+                for ordinal in 0..args.len() {
+                    let old_arg = self.program.terms.term_ids(old)[ordinal];
+                    let new_arg = self.program.terms.term_ids(args)[ordinal];
+                    if !self.requirement_order_matches(old_arg, new_arg) {
+                        return false;
+                    }
+                }
+                self.requirement_order_matches(old_result, current_result)
+            }
+            _ => true,
+        }
+    }
+
+    /// The receipt walk itself: rebuild the term in the receipt's order.
+    fn retain_requirement_order_slow(
         &mut self,
         previous: TypeTermId,
         current: TypeTermId,
@@ -913,9 +1095,6 @@ impl super::ComponentSolver {
         use crate::{TypeTermHead as H, VariantTerm};
         self.requirements.work.order_term_visits =
             self.requirements.work.order_term_visits.saturating_add(1);
-        if previous == current {
-            return current;
-        }
         match (
             self.program.terms.term_head(previous),
             self.program.terms.term_head(current),
@@ -929,7 +1108,10 @@ impl super::ComponentSolver {
                         .object_field_for_shape(old, ordinal)
                         .unwrap();
                     if let Some(value) = self.program.terms.lookup_object_field(new, field.name) {
-                        fields.push((field.name, self.retain_requirement_order(field.ty, value)));
+                        fields.push((
+                            field.name,
+                            self.retain_requirement_order_slow(field.ty, value),
+                        ));
                     }
                 }
                 for ordinal in 0..self.program.terms.object_fields_for_shape(new).len() {
@@ -986,7 +1168,7 @@ impl super::ComponentSolver {
                                         _ => None,
                                     });
                             let fields = prior.map_or(fields, |prior| {
-                                self.retain_requirement_order(prior, fields)
+                                self.retain_requirement_order_slow(prior, fields)
                             });
                             VariantTerm::Tagged { tag, fields }
                         }
@@ -1011,14 +1193,14 @@ impl super::ComponentSolver {
                 result
             }
             (H::List(old), H::List(new)) => {
-                let item = self.retain_requirement_order(old, new);
+                let item = self.retain_requirement_order_slow(old, new);
                 if item == new {
                     return current;
                 }
                 self.program.terms.list(item)
             }
             (H::Set(old), H::Set(new)) => {
-                let item = self.retain_requirement_order(old, new);
+                let item = self.retain_requirement_order_slow(old, new);
                 if item == new {
                     return current;
                 }
@@ -1034,8 +1216,8 @@ impl super::ComponentSolver {
                     value: current_value,
                 },
             ) => {
-                let key = self.retain_requirement_order(old_key, current_key);
-                let value = self.retain_requirement_order(old_value, current_value);
+                let key = self.retain_requirement_order_slow(old_key, current_key);
+                let value = self.retain_requirement_order_slow(old_value, current_value);
                 if key == current_key && value == current_value {
                     return current;
                 }
@@ -1058,12 +1240,12 @@ impl super::ComponentSolver {
                 for ordinal in 0..args.len() {
                     let old = self.program.terms.term_ids(old)[ordinal];
                     let new = self.program.terms.term_ids(args)[ordinal];
-                    let retained = self.retain_requirement_order(old, new);
+                    let retained = self.retain_requirement_order_slow(old, new);
                     changed |= retained != new;
                     arguments.push(retained);
                 }
                 let current_result = result;
-                let result = self.retain_requirement_order(old_result, current_result);
+                let result = self.retain_requirement_order_slow(old_result, current_result);
                 changed |= result != current_result;
                 if !changed {
                     self.term_id_scratch.recycle(arguments);

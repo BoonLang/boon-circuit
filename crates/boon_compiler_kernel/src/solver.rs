@@ -465,6 +465,7 @@ struct RequirementPhaseProbe {
     open_contributor_visits: u64,
     closed_contributor_visits: u64,
     flat_contributor_visits: u64,
+    order_early_matches: u64,
     contributor_check_ns: u64,
     intern_invalidate: u64,
     intern_collect: u64,
@@ -481,7 +482,7 @@ impl Drop for RequirementPhaseProbe {
         }
         let ms = |ns: u64| ns as f64 / 1_000_000.0;
         eprintln!(
-            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} contributor_check_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} open_contributor_visits={} closed_contributor_visits={} flat_contributor_visits={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
+            "kernel-aggregate-phase calls={} folds={} memo_hits={} total_ms={:.3} invalidate_ms={:.3} collect_ms={:.3} deps_ms={:.3} contributor_check_ms={:.3} merge_ms={:.3} order_ms={:.3} commit_ms={:.3} empty_refreshes={} dirty_refreshes={} invalidate_dirty_pops={} invalidate_affected={} invalidate_recorded={} commit_skipped_touches={} full_folds={} prefix_reuse_folds={} prefix_reuse_terms={} order_reuses={} open_contributor_visits={} closed_contributor_visits={} flat_contributor_visits={} order_early_matches={} intern_invalidate={} intern_collect={} intern_resolve={} intern_merge={} intern_order={} intern_commit={} closed_merges={} distinct_closed_pairs={} closed_pair_hits={}",
             self.calls,
             self.folds,
             self.memo_hits,
@@ -506,6 +507,7 @@ impl Drop for RequirementPhaseProbe {
             self.open_contributor_visits,
             self.closed_contributor_visits,
             self.flat_contributor_visits,
+            self.order_early_matches,
             self.intern_invalidate,
             self.intern_collect,
             self.intern_resolve,

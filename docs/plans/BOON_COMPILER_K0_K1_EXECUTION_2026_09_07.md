@@ -1699,3 +1699,26 @@ remaining lever for the order phase is an early structural check that decides
 "already in receipt order" before building the rebuilt field list, worth
 roughly half of 12 ms on NovyWave; it needs the debug cross-check to keep it
 honest against the walk.
+
+### 2026-09-13: K1″ thirteenth slice — the early receipt-order match
+
+`retain_requirement_order` now asks `requirement_order_matches(previous,
+current)` first. The predicate restates the walk's semantics — objects must
+already list the surviving fields in the receipt's relative order with
+new-only fields after them, variant sets only reorder nested payloads, and
+list/set/map/function recurse — so a match returns the current term without
+rebuilding it. Debug builds still run the walk and assert it returns the same
+term whenever the fast path claims a match, so every gate exercises the claim.
+
+Effect: NovyWave order 12.4 → 7.4 ms and refresh 72.0 → 64.4 ms, TodoMVC order
+0.76 → 0.58 ms; the early-match counters read 1,276 and 1,643, exactly the
+no-op walk counts the previous measurement found. Paired A/B, twelve rounds per
+cell: NovyWave −0.44%/−0.72% diagnostics and +0.43%/−0.17% verified, TodoMVC
++0.75%/+0.21%/+0.39%/−0.12% — small and near the noise floor, so the slice is
+recorded on the work it removes (1,276 full walks per compile) and the
+byte-identical results. Full record:
+[early receipt-order match](evidence/compiler-k1pp-order-early-match-2026-09-13.json).
+
+NovyWave's refresh is now ~64 ms with the contributor check (15.0) and merge
+(13.1) the only buckets above 10 ms — both doing genuine work for changed
+contributors.

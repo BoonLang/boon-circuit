@@ -1,0 +1,41 @@
+{
+ "status": "thirteenth aggregation slice: the order receipt is asked whether the term already satisfies it before rebuilding, capturing exactly the 1,276 wasted walks on NovyWave and cutting the order phase 40%",
+ "date": "2026-09-13",
+ "change": {
+  "cut": "early receipt-order match",
+  "what": "retain_requirement_order now asks requirement_order_matches(previous, current) first. That predicate mirrors the walk's semantics — objects must already list the surviving fields in the receipt's relative order with new-only fields after them, variant sets only reorder nested payloads, and list/set/map/function recurse — and returns the current term untouched when it holds, skipping the rebuilt field list, the interpretation of every field name and the final comparison.",
+  "why": "counters showed the walk almost never changes anything: NovyWave 634 identity returns, 1,276 rebuilds that reproduce the current term and 29 real changes across 1,305 walks (TodoMVC 1,330/1,643/1) against a 12.4 ms order phase.",
+  "soundness": "the predicate is a structural restatement of what the walk rebuilds, and debug builds still run the walk and assert that it returns the same term whenever the fast path claims a match, so every gate exercises the claim."
+ },
+ "phase_probe_release": {
+  "novywave_diagnostics": {"order_ms": [12.4, 7.4], "refresh_total_ms": [72.0, 64.4], "order_early_matches": 1276},
+  "todo_mvc_physical_diagnostics": {"order_ms": [0.76, 0.58], "refresh_total_ms": [105.3, 108.8], "order_early_matches": 1643},
+  "note": "the early-match counts equal the previously measured no-op walk counts exactly, which is the intended effect; single observations per build"
+ },
+ "paired_ab": {
+  "protocol": "twelve rounds per cell, both binaries back to back with alternating order, one process per observation",
+  "novywave_diagnostics_fresh_pct": -0.44,
+  "novywave_diagnostics_empty_pct": -0.72,
+  "novywave_verified_fresh_pct": 0.43,
+  "novywave_verified_empty_pct": -0.17,
+  "todo_mvc_diagnostics_fresh_pct": 0.75,
+  "todo_mvc_diagnostics_empty_pct": 0.21,
+  "todo_mvc_verified_fresh_pct": 0.39,
+  "todo_mvc_verified_empty_pct": -0.12,
+  "reading": "the 7.6 ms phase saving is partly probe-timer removal and the end-to-end reading is small and near the host's noise floor; the slice is kept on the work it removes (1,276 full receipt walks per compile) and the byte-identical results"
+ },
+ "gates": {
+  "boon_compiler_kernel_lib": 197,
+  "kernel_transfer": 10,
+  "boon_compiler_lib": "98 passed, 1 pre-existing ignored probe",
+  "staged_compilation": 3,
+  "map_set": 3,
+  "nested_boolean_match": 3,
+  "pulses": 8
+ },
+ "position": "NovyWave's refresh is ~64 ms: contributor check 15.0, merge 13.1, order 7.4, deps 4.9, collection/invalidation/commit ~5.5 and the rest bookkeeping. The contributor check and merge are the only buckets left above 10 ms, and both are now doing genuine work for the changed contributors.",
+ "caveats": [
+  "end-to-end effect is inside the noise floor; the phase and counter evidence is the claim",
+  "cold modes only; the warm path is the successor goal"
+ ]
+}

@@ -13,6 +13,17 @@
   "novywave_diagnostics": {"before_p50_ms": 532.5, "after_p50_ms": 628.7, "paired_median_delta_pct": 20.15, "round_delta_range_pct": [12.35, 24.30]},
   "todo_mvc_verified": {"before_p50_ms": 1342.3, "after_p50_ms": 1328.9, "paired_median_delta_pct": -1.25, "round_delta_range_pct": [-7.90, 3.58]}
  },
+ "full_matrix": {
+  "note": "the same harness extended to both cold modes and both intents, twelve rounds per cell, run after the first report; the NovyWave empty-session p50s (852.5/989.9) show interference in that cell, so its delta is the weakest of the eight",
+  "todo_mvc_diagnostics_fresh_pct": -5.81,
+  "todo_mvc_diagnostics_empty_pct": -5.99,
+  "todo_mvc_verified_fresh_pct": -1.34,
+  "todo_mvc_verified_empty_pct": -1.88,
+  "novywave_diagnostics_fresh_pct": 21.95,
+  "novywave_diagnostics_empty_pct": 15.60,
+  "novywave_verified_fresh_pct": 3.64,
+  "novywave_verified_empty_pct": 4.59
+ },
  "parity": "one distinct diagnostics fingerprint in every lane; the verified lane shows the two known machine-plan variants (candidate versus the K0-era plan constant)",
  "consistency": "the numbers reproduce the decisive quiet-window acceptance for a0579b2c (-7.1% diagnostics and -2.4% verified on TodoMVC, +20.4% on NovyWave diagnostics), so the current HEAD's standing is confirmed without a fresh leg-level run",
  "position": "recorded as supporting evidence; a 3+30 A/B/A on 0e75532c remains the formal acceptance item and is pending an uninterrupted quiet window (leg one of attempt aba7 completed at NovyWave fresh p50 644.7 ms with p95 765.6 during interference and is not used)"

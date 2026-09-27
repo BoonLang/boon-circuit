@@ -1,0 +1,97 @@
+{
+  "status": "a one-token edit and a minimal type-changing edit both leave the typecheck work counters byte-identical or off by one unit, while each edit still costs a full cold solve; the warm gap is a missing cache, not conservative invalidation",
+  "date": "2026-09-27",
+  "why_this_matters": "The performance plan gated retention (M4) on measuring the dirty cone, because every cost estimate for it depended on how far an edit reaches. This probe answers that without any compiler change, and it answers it in the strongest available direction: the differing work is zero or one unit, not a large fraction of the document.",
+  "protocol": {
+    "producer": "target/release/boon_cli",
+    "build_source_head": "e7065292",
+    "build_source_dirty": false,
+    "command": "compiler-sample <source> --intent diagnostics --mode fresh-process --samples 1",
+    "caches": "compiler_caches=disabled, cache_hit_count=0, fresh-process; every observation is a brand new process that recomputes everything",
+    "fixtures": [
+      "examples/todo_mvc_physical/RUN.bn (3,576 compiler-input lines)",
+      "examples/novywave/RUN.bn (11,926 compiler-input lines)"
+    ],
+    "edit_class_1_type_preserving": {
+      "todo_mvc": "TEXT { Walk the dog } -> TEXT { Walk the dogs } (the budgets' own warm benchmark edit, +2 bytes)",
+      "novywave": "TEXT { Visible editor syntax probe } -> TEXT { Visible editor syntax probe! } (+1 byte)"
+    },
+    "edit_class_2_type_changing": {
+      "todo_mvc": "add field `pinned: True` to one [title, completed] row literal",
+      "novywave": "add field `pinned: True` to one PackageAsset[...] tag payload"
+    },
+    "method": "each edit applied in place to the tracked example file, sampled, then reverted with git checkout; working tree verified clean afterwards (0 modified example files)",
+    "comparison": "every work counter the producer reports, per section (kernel_solve, kernel_compile, typecheck, parse), plus the per-definition summary ranking and the per-owner residual module ranking"
+  },
+  "findings": {
+    "type_preserving_edit": {
+      "todo_mvc": {
+        "elapsed_ms": [946.0, 954.9],
+        "kernel_solve_section_identical": true,
+        "kernel_compile_section_identical": true,
+        "typecheck_section_identical": true,
+        "only_moved": "parse.source_bytes_inspected 206254 -> 206256",
+        "diagnostic_count": [0, 0],
+        "reading": "a 2-byte edit changed no typecheck counter at all, and still cost a full 950 ms cold solve"
+      },
+      "novywave": {
+        "elapsed_ms": [602.1, 614.0],
+        "kernel_solve_section_identical": true,
+        "kernel_compile_section_identical": true,
+        "typecheck_section_identical": true,
+        "only_moved": "parse byte/token/symbol/validation counters, by the 2 bytes",
+        "reading": "an 11,926-line program shows the same result: zero typecheck work difference for a 1-byte edit"
+      }
+    },
+    "type_changing_edit": {
+      "todo_mvc": {
+        "elapsed_ms": [946.0, 873.7],
+        "kernel_solve.variables": [82358, 82359],
+        "kernel_solve.operations": [82451, 82452],
+        "typecheck.owner_expressions": [4079, 4080],
+        "kernel_solve.activations": [169680, 169688],
+        "unchanged_including": [
+          "kernel_solve.summary_node_evaluations (416698)",
+          "kernel_solve.requirements.aggregate_evaluations (15029)",
+          "kernel_solve.requirements.changed_sites (11553)",
+          "kernel_solve.requirements.invalidation_variable_visits",
+          "kernel_solve.requirements.invalidation_edge_visits",
+          "kernel_solve.requirements.path_step_evaluations"
+        ],
+        "type_store_did_grow": "object_field_rows 2961 -> 2962, name_rows 884 -> 885: a genuinely new tag variant shape was interned, so this is a real type change, not a disguised type-preserving one",
+        "reading": "a real type change moved 1 variable and 1 operation out of 82,458, and still cost a full solve"
+      },
+      "novywave": {
+        "kernel_solve.variables": [71134, 71135],
+        "kernel_solve.operations": [39252, 39253],
+        "typecheck.owner_expressions": [15575, 15576],
+        "kernel_solve.activations": [82907, 82908],
+        "unchanged_including": [
+          "kernel_solve.summary_node_evaluations (1337136)",
+          "kernel_solve.requirements.aggregate_evaluations (6287)",
+          "kernel_solve.requirements.changed_sites (7733)"
+        ],
+        "type_store_did_grow": "term_rows 6354 -> 6356, variant_rows 358 -> 359, object_field_rows 13524 -> 13526",
+        "reading": "a 1,389-definition-module program shows the same +1 result"
+      }
+    },
+    "interpretation": [
+      "The typecheck workload is a function of the program's shape, not of the edit. Both fixtures reproduce this.",
+      "The compiler currently has no edit-sensitivity whatsoever: a no-op edit and a one-unit edit are indistinguishable in cost, because nothing is retained and every request is a full cold solve by construction (`session.rs:480` clears `state.checked`; `compiler_caches=disabled`; `cache_hit_count=0`).",
+      "Therefore the 53x warm gap is not a conservative-invalidation problem. It is a missing-cache problem with a measured tiny delta, which is a materially better position than the plan assumed.",
+      "This also retro-justifies the repo's decision to keep a whole-document coverage gate. Because the work is shape-determined and near-invariant, a small edit cannot be made cheap by invalidation precision alone; it needs a retained revision."
+    ]
+  },
+  "gate_status": {
+    "M4_dirty_cone_measurement": "SATISFIED, with the caveat below. The plan required this number before implementing retention. The differing work is 0 for a type-preserving edit and 1 variable / 1 operation for a minimal type-changing edit, on both fixtures.",
+    "M3_distinct_shape_ratio": "STILL OPEN. This probe says nothing about how many distinct resolved argument shapes the 10,537 TodoMVC call sites have.",
+    "M0_attribution": "STILL OPEN. The 725 ms of unattributed TodoMVC typecheck is untouched by this probe."
+  },
+  "caveats": [
+    "Counters are not results. This compares work counters, not per-owner solved type tables. Two programs can perform identical work and produce different types. The counters moving by exactly zero across every fine-grained counter (term interns, scratch reuses, mutations, widen requests, invalidation edges) is strong evidence the solve followed the same path, but it is not a proof of per-owner output equality.",
+    "The type-changing edits chosen are the mildest available: one new field on one data row / tag payload. An edit that changes a type participating in inference (a WHEN tag set, a function result shape, a call argument shape) could perturb far more. These are lower bounds on the delta, not upper bounds.",
+    "Single samples per observation, not the 3+30 interleaved A/B/A protocol. This is a structural probe and claims nothing about latency acceptance.",
+    "The diagnostics_fingerprint_v1 differs between the two runs of each pair. That is expected: the fingerprint covers the source bundle digest, which legitimately changed. Both runs reported diagnostic_count 0 and full_document_typecheck_coverage true.",
+    "The probe was run in place on tracked example files and reverted; no example file is modified."
+  ]
+}

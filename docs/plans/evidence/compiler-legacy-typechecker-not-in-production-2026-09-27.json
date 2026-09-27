@@ -1,0 +1,54 @@
+{
+  "status": "boon_typecheck's inference engine does not run in the production compile path. Its context-scheme worklist, wrapper-scheme propagation and checked-flow cache are reachable only from tests, and the production path reports TypeCheckWorkCounters::default(), so all 18 of those counters are structurally zero rather than incidentally zero. This retires M2's premise and the external review's central diagnosis.",
+  "date": "2026-09-27",
+  "trigger": "An external research review of type-inference performance argued that Boon's PASS/PASSED implicit context forces a global fixed point over the call graph, and recommended removing context from inference or making PASSED an effect. Acting on that advice would have been wasted work, so the claims were verified against the source before any code was written.",
+  "how_it_was_found": [
+    "Read all 18 context_scheme_*, wrapper_scheme_* and checked_flow_* counters from a live release producer run on both fixtures. Every one is 0 on both.",
+    "The functions that maintain those counters are called unconditionally from boon_typecheck::checked_program (prepare_contextual_callable_schemes at crates/boon_typecheck/src/lib.rs:4532, called at :2648 inside checked_program's phase list), so a zero counter means the enclosing function never runs, not that the worklist converged immediately.",
+    "No production caller exists. Every call site of checked_program outside the crate is in crates/boon_semantic/src/out_net.rs test code (:3257 and following, all inside #[cfg(test)] fixtures).",
+    "The production kernel path constructs its counter struct as boon_typecheck::TypeCheckWorkCounters::default() at crates/boon_compiler/src/kernel_oracle.rs:3254 and never mutates it."
+  ],
+  "what_this_means": {
+    "M2_is_retired": "The freeze item existed to eliminate a global context/wrapper fixed point re-derived on every request. That fixed point is not in the production path. The underlying observation that the compiler re-derives facts that are static properties of the source text remains true, and the wrapper-edge and context-formal facts are still real, but there is no measured cost to remove. M2 should be recorded as retired-unnecessary rather than implemented.",
+    "the_external_review_is_wrong_on_this_codebase": "Its central claim, that PASSED makes inference require a global fixed point, describes code that only tests execute. Its recommendation to convert PASSED into an effect with per-path requirements describes a mechanism that the kernel already implements: see the requirement decomposition below.",
+    "no_language_change_is_justified": "Nothing in this finding supports changing PASS/PASSED, adding a WHERE clause, or annotating context formals. The earlier proposals A, E, K and the DEPENDS ON idea lose their motivation entirely."
+  },
+  "independent_verification_of_the_three_claims": {
+    "method": "A separate read-only pass checked each claim against the source with file:line evidence, instructed to default to 'not supported' absent proof.",
+    "claim_1_reusable_functions_accidentally_specialized_on_context": {
+      "verdict": "REFUTED",
+      "evidence": "No context-derived type reaches either key. SpecializationKey (crates/boon_compiler_kernel/src/owner.rs:15430) is {target, static_variants, initial_state_surface}; static_variants is an Arc<[SymbolId]> tag set built only from syntactically closed knowledge (owner.rs:16139-16169), and initial_state_surface is a control-flow bool (owner.rs:20593-20598, 16430-16464). InvocationKey (owner.rs:15364) does carry the caller's variable ids including the inherited context formal (owner.rs:20511-20573), so context fragments invocation frames, never plans.",
+      "consequence": "reused_specialization_plans is 10,123 of 10,537 call sites on TodoMVC, so plan sharing is already near-total. The real fragmentation is caller-variable identity in the frame key, not context type."
+    },
+    "claim_2_store_is_a_monolithic_structural_type": {
+      "verdict": "PREMISE VERIFIED, CONCLUSION REFUTED",
+      "evidence": "The knot exists but not as described: store.todos (examples/todo_mvc_physical/RUN.bn:54-70) calls new_todo(title:, initial_completed:) with no store argument (RUN.bn:63), while FUNCTION new_todo (RUN.bn:98) reads store.all_completed (RUN.bn:140), so type(store) and type(new_todo) are mutually recursive and are resolved per definition graph rather than globally.",
+      "why_the_conclusion_fails": "Requirements are already per-path with lazy projection. Each PASSED read stages a Site {target, value} (crates/boon_compiler_kernel/src/solver/requirements.rs:38-53); reads resolve head-by-head and allocate a private hole per still-open path (requirements.rs:423-449, counted by path_step_evaluations); and on commit each path's scaffold is rebuilt by re-projecting only its own steps (requirements.rs:362-386). The typechecker folds a requirement back up the read path into an open spine with one leaf variable per projection (crates/boon_typecheck/src/lib.rs:36845-36852, 5035-5038). The review's proposed redesign is the design that already ships.",
+      "residual": "The genuine remaining cost is aggregation, which is what the closed requirement-aggregation goal already reduced to 142 ms of 1057 ms of TodoMVC typecheck."
+    },
+    "claim_3_context_contagion_forces_a_global_fixed_point": {
+      "verdict": "CONTAGION REAL, GLOBAL FIXED POINT REFUTED",
+      "evidence": "main_scene (RUN.bn:327) has no PASSED while descendants do (new_todo_entry RUN.bn:498-499), so taint propagation is real in two places: the transitive contextual_callables cone (lib.rs:5059-5093) and the kernel taint owner_expressions_depend_on_formals, which marks UserCall{inherited_formal:Some(_)} dependent and floods the body (owner.rs:16553-16589). But the worklist is seeded in dependency postorder (lib.rs:5119-5192) so an acyclic component gets final inputs on its first visit and only recursive components re-run (lib.rs:5202-5210, 5289-5312), and the wrapper pass is seeded once and re-queued only through wrapper_callers_by_callee (lib.rs:4592-4601, 4790-4795).",
+      "empirical_confirmation": "All context_scheme_worklist_* and wrapper_scheme_* counters are 0, which is consistent with no fixed point running at all rather than with an expensive one.",
+      "residual": "Two real but unmeasured items: (a) the formal_dependent taint is conservative per definition (owner.rs:16564-16567), so a function whose result never reads context can still forfeit principal_result_reuses; (b) reused_invocation_frames is 10,205 against 10,537 TodoMVC call sites, i.e. near-zero frame reuse keyed on caller variable identity. Item (b) is the same open question as the M3 distinct-shape-ratio gate."
+    }
+  },
+  "consequences_for_the_plan": {
+    "M2_freeze": "RETIRED as unnecessary. No measured production cost. Do not implement.",
+    "M3_shape_keyed_specialization": "Still open and now the most interesting item, because the only surviving fragmentation mechanism is caller-variable identity in the frame key, and it is measurable with existing counters.",
+    "M4_retention": "Unchanged and still the largest item, with 100% measured interface reuse. It targets the kernel's per-revision rebuild, which is the code that actually runs.",
+    "M1_pass_deletion": "Unchanged.",
+    "language_proposals": "A, E, K, I and the WHERE DEPENDS ON idea are all withdrawn. There is no measured cost behind any of them."
+  },
+  "measurement_advice_added": [
+    "Any future proposal about context, schemes or the old checker must first show a non-zero production counter. All 18 boon_typecheck inference counters are structurally zero, so a proposal justified by them is describing the test path.",
+    "The compiler has two typecheckers. Only the dense kernel (crates/boon_compiler_kernel, driven through crates/boon_compiler/src/kernel_oracle.rs) is in production. boon_typecheck's inference engine survives as the legacy owner oracle, reachable via the test-kernel-oracle feature, and is large (109k lines).",
+    "This also means the crate-size figures in earlier discussion overstate production surface: boon_typecheck is 109,295 lines but most of it does not execute in a compile."
+  ],
+  "caveats": [
+    "The conclusion rests on call-graph reachability of boon_typecheck::checked_program, which was established by grepping every call site outside the crate. A dynamic call through a function pointer or a macro-generated path would not be caught; a definitive check is a coverage run or a breakpoint, and neither was performed here.",
+    "boon_typecheck::TypeCheckWorkCounters is still threaded through the production profile struct, so its presence in the report is misleading. Making that structurally impossible to misread (removing the field, or asserting non-default in a debug build) is a small, worthwhile cleanup and is recorded as a follow-up rather than done here.",
+    "The retired items are not deleted. The code, the counters and the plan text remain, so the decision can be revisited if a future change makes the old checker reachable in production again.",
+    "No budget, schema or gate was touched. The stale machine_plan_sha256 finding in compiler-m0-attribution-2026-09-27.json still stands."
+  ]
+}

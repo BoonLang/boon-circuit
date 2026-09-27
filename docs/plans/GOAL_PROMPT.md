@@ -9,23 +9,42 @@ is the active compiler execution plan. It is engineering-owned and changes no
 language surface, no user-facing behavior and no semantics; the only observable
 difference is latency. Read it completely before starting compiler work. Its
 ordering is: attribute the unmeasured remainder (M0), delete duplicated passes
-(M1), freeze static facts (M2), measure before shape-keyed specialization (M3),
-retain the solved revision (M4), then make the semantic phase incremental (M5),
-repair the measurement harness (M6) and the developer loop (M7).
+(M1), measure before shape-keyed specialization (M3), retain the solved revision
+(M4), then make the semantic phase incremental (M5), repair the measurement
+harness (M6) and the developer loop (M7). **M2 is retired as unnecessary.**
 
-M0 is complete and M1's term-arena items are partly resolved by rejection. Three
-measured results now govern the ordering: the typecheck remainder splits into a
-kernel-**compile** half and a kernel-**solve** half whose ratio inverts by fixture
-(TodoMVC 583/474 ms, NovyWave 136/316 ms); a per-definition solved-state probe
-shows **100% of definitions publishing byte-identical interface state** across
-both a type-preserving edit and a real type change on both fixtures; and the
-canonical set operations that three verified quadratic claims pointed at are
-unreachable at this scale (unions max 46 members, widened records 43 fields) and
-their restructuring measured +1.4% to +3.7% slower.
+M0 is complete, M1's term-arena items are partly resolved by rejection, and M2 is
+retired. Four measured results now govern the ordering:
 
-**Asymptotic argument is not a prioritization method in this codebase.** Six
-candidates have now been rejected by measurement. Measure the size or count of
-the thing before deciding to restructure it.
+1. The typecheck remainder splits into a kernel-**compile** half and a
+   kernel-**solve** half whose ratio inverts by fixture (TodoMVC 583/474 ms,
+   NovyWave 136/316 ms). Per-call-site work barely touches NovyWave.
+2. A per-definition solved-state probe shows **100% of definitions publishing
+   byte-identical interface state** across both a type-preserving edit and a real
+   type change on both fixtures. The 883 ms warm figure is a missing cache over a
+   near-zero delta, not conservative invalidation.
+3. The canonical set operations that three verified quadratic claims pointed at
+   are unreachable at this scale (unions max 46 members, widened records 43
+   fields) and restructuring them measured +1.4% to +3.7% slower.
+4. **The compiler has two typecheckers and only one runs.** All 18
+   `context_scheme_*`, `wrapper_scheme_*` and `checked_flow_*` counters read 0
+   because `boon_typecheck`'s inference engine has no production caller and the
+   kernel passes `TypeCheckWorkCounters::default()`. This retires M2, withdraws
+   every user-facing proposal that was justified by those counters (declaring
+   context formals, lexical-only `PASSED`, `WHERE DEPENDS ON`, declared exports),
+   and refutes the external review that motivated them.
+
+**Two rules have emerged from this and are binding on the rest of the plan.**
+
+*Asymptotic argument is not a prioritization method here.* Six candidates have
+been rejected by measurement. Measure the size or count of the thing before
+deciding to restructure it.
+
+*Verify an external claim against this source before acting on it.* Two of the
+three central claims in the research review were refuted by reading the code, and
+the third by a counter that read zero. A proposal justified by a
+`boon_typecheck` counter is describing the test path until it shows a non-zero
+production reading.
 
 It supersedes the *sequencing* of the requirement-aggregation goal's Goal B and
 Goal C sections while leaving that document's measurement discipline, evidence
@@ -36,8 +55,11 @@ slower on NovyWave with byte-identical diagnostics.
 
 ## Two questions are reserved for the repository owner
 
-1. Whether to approve a separate, explicitly attested oracle lane for the
-   producer's build-input scope to cover the M2 freeze artifact.
+1. Whether to re-establish the stale `machine_plan_sha256` oracles in
+   `budgets/compiler.toml` for `todo-mvc-physical` and `novywave`, which do not
+   match what HEAD produces. Unmodified HEAD reproduces the same hashes, so this
+   predates the active plan. Until it is settled, a plan-hash gate must compare
+   against the pre-change HEAD hash rather than the budget file.
 2. Anything that would change what a Boon program looks like. Nothing in the
    active plan does; such an item stops and escalates rather than being
    reclassified.

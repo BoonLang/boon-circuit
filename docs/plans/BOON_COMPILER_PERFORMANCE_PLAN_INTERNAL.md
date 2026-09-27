@@ -125,6 +125,13 @@ The findings changed the plan:
    counters-are-not-results caveat in the cone probe. The digest covers published
    interfaces only, so it is not a sound reuse key alone; a sound key pairs it
    with the existing term-id-free `definition_basis_fingerprint` for the inputs.
+5. **Half the typechecker's reported counters are structurally zero.** All 18
+   `context_scheme_*`, `wrapper_scheme_*` and `checked_flow_*` counters read 0 on
+   both fixtures, because `boon_typecheck`'s inference engine has no production
+   caller and the kernel path passes `TypeCheckWorkCounters::default()`. This
+   retires M2 and invalidates the premise of the external review that prompted
+   it. See [M2](#m2--freeze-static-facts--retired-as-unnecessary) and the
+   [evidence record](evidence/compiler-legacy-typechecker-not-in-production-2026-09-27.json).
 
 ### M1 — Delete duplicated passes
 
@@ -181,70 +188,50 @@ weaken a budget or a gate.
 
 Expected: 300-450 ms off the verified path, low risk, independently gated.
 
-### M2 — Freeze static facts (no source change, no semantic change)
+### M2 — Freeze static facts — **RETIRED as unnecessary**
 
-**Problem.** For every request the compiler re-derives facts that are static
-properties of source text: which names a body reads through `PASSED`
-(`signature.context_formal`, `crates/boon_typecheck/src/lib.rs:5344`), and which
-callables are direct wrappers (`owner.result_expression == Some(call.expression)`,
-`crates/boon_compiler_kernel/src/owner.rs:4687`). Because a callee's needs can be
-discovered only after its callers are examined, the derivation is a global fixed
-point seeded with every owner (`:4597`, `:5294-5312`). It is correct, and it is
-recomputed from nothing on every edit.
+Recorded in
+[legacy typechecker not in production](evidence/compiler-legacy-typechecker-not-in-production-2026-09-27.json).
 
-**Key observation.** Which *names* a function reads is static. What *value* flows
-into them is not. `lights()` reads the name `mode`; the value is `store.mode`,
-threaded from a record field three modules away. The dependency is a permanent
-property of the text; the binding is a per-revision fact. Today the first is
-re-derived by search every time.
+This item existed to eliminate a global context/wrapper fixed point that the
+compiler re-derived on every request. **That fixed point is not in the
+production path.** All 18 `context_scheme_*`, `wrapper_scheme_*` and
+`checked_flow_*` counters read 0 on both fixtures, and the cause is structural:
+`boon_typecheck::checked_program` has no production caller (every external call
+site is `#[cfg(test)]` code in `crates/boon_semantic/src/out_net.rs`), and the
+kernel path constructs `TypeCheckWorkCounters::default()` and never mutates it
+(`crates/boon_compiler/src/kernel_oracle.rs:3254`).
 
-**Design.** A generated, per-module, authoritative file:
+Do not implement. The underlying observation — that the compiler re-derives
+source-static facts per request — is still true of the *kernel*, but there is no
+measured cost to remove, and M4 already addresses the kernel's per-revision
+rebuild directly.
 
-```boon
-owner material:
-    reads_passed: [ mode ]
-    wraps:        [ get ]
-    basis:        <stable_fingerprint>
+**Corollary that changes how every other item must be argued:** the compiler has
+two typecheckers, and only the dense kernel is in production. Any proposal
+justified by a `boon_typecheck` counter is describing the test path until it
+shows a non-zero production reading. This also means the earlier crate-size
+figures overstated production surface: `boon_typecheck` is 109,295 lines, most of
+which does not execute in a compile.
 
-owner lights:
-    reads_passed: [ mode ]
-    basis:        <stable_fingerprint>
-```
+**What is still true, and what is retired.** The general observation holds for
+the kernel: it re-derives source-static facts per request, and M4 addresses that
+directly. The specific mechanism this item targeted — a global context/wrapper
+fixed point in `boon_typecheck` — is not in production, so there is nothing here
+to remove. The design text that followed (the generated per-module record, the
+fail-closed fingerprint rule, the attestation scope change) is preserved in the
+git history of this file at commit `5c282b27` should the item ever be revived,
+which would require evidence that the kernel does pay for the re-derivation.
 
-- The invalidation key is the **existing** term-id-free basis fingerprint
-  (`crates/boon_compiler/src/receipt.rs:255-272`, over `KernelOwnerProgramInput` /
-  `KernelDefinitionFactsInput`). No new epoch scheme is invented.
-- On each request: demand-load records, recompute each basis fingerprint. Match
-  admits the facts with no search. Mismatch drops the record, re-discovers it,
-  rewrites it, and re-discovers everything upstream through the frozen wrapper
-  edges.
-- First build after a change costs what it costs today. Every later build skips
-  the fixed point.
-
-**Hard requirement — fail closed.** If the basis fingerprint does not cover
-everything the frozen facts depend on, a stale record is admitted and this trades
-a performance problem for a correctness one. A cache that can be silently wrong is
-worse than no cache. Therefore: the fingerprint must be over the complete
-structural input for that owner; no record is written when a complete key cannot
-be computed; the file is build output and is never hand-edited. A corruption test
-is part of the gate — mutate one record, assert the next build reproduces the
-identical diagnostics fingerprint and plan hash.
-
-**Attestation.** The producer's build-input scope is
-`workspace-cargo-toolchain-and-crates-excluding-xtask-plus-mimalloc-v1`;
-`examples/` is not covered. Before this lands, the attested scope must cover the
-freeze inputs, or a stale freeze could be scored without appearing in the
-producer identity. This is owner question 1 and it is not optional.
-
-**Explicitly not in scope.** `PASSED` keeps its meaning and its spelling. No
-declaration is added to any Boon program. The hand-written `mode:` argument in
-`examples/novywave/View/NovyView.bn:139` is redundant plumbing and should be
-removed as a separate cleanup, not preserved as a convention. Nothing about this
-item changes how a user interacts with Boon.
-
-**Expected.** 1.10-1.35x cold typecheck. ~1.0x warm on its own, because the
-solve still runs. Its real payoff is that one dimension of the dirty cone becomes
-a static fact instead of a search result.
+**Withdrawn language proposals.** An external research review recommended
+converting `PASSED` into a per-path effect requirement, and an earlier pass of
+this plan proposed declaring context formals (A), lexical-only `PASSED` (K), a
+`WHERE DEPENDS ON` clause (E) and declared module exports (I). All four are
+withdrawn. An independent verification pass found the review's central premise
+refuted (no context type reaches either specialization key; requirements are
+already per-path with lazy projection, which is the design the review proposed)
+and its fixed-point claim refuted empirically (all scheme counters read 0). There
+is no measured cost behind any of these proposals.
 
 ### M3 — Shape-keyed specialization
 

@@ -1,0 +1,61 @@
+{
+  "status": "rejected by measurement. Three asymptotic weaknesses in the kernel's canonical set/shape operations are real in the source but unreachable at this program's scale, so restructuring them costs more than it saves. Reverted with no logic change; the size probes are retained as permanent instrumentation.",
+  "date": "2026-09-27",
+  "origin": "external research review of type-inference performance identified four candidate quadratic algorithms in the term arena. Each was verified in this repository's source before any code was written, and each was measured before being believed.",
+  "claims_verified_in_source": {
+    "union_membership_prefilter": "crates/boon_compiler_kernel/src/term.rs union(): `_ if !members.contains(&candidate) => members.push(candidate)` before a canonical sort + dedup",
+    "variant_set_merge_scan": "term.rs variant_set_with_order(): `merged.iter().position(|variant| variant.tag() == tag)` per incoming variant",
+    "object_widen_field_scan": "term.rs structural_widen() object/object arm: `fields.iter().position(|left| left.name == right.name)` per right field, i.e. O(L*R)",
+    "recursive_canonical_compare": "term.rs compare_terms() recurses through lists, maps, unions, objects, variants and functions, and is the comparator for every canonical sort"
+  },
+  "size_measurement": {
+    "method": "new env-gated BOON_TERM_SIZE_TRACE probes report the running maximum observed size at each operation, added before deciding to restructure anything",
+    "todo_mvc_physical": {
+      "union_members_before_sort_max": 46,
+      "union_members_after_dedup_max": 46,
+      "widen_left_fields_max": 43,
+      "widen_right_fields_max": 36,
+      "variant_set_merged_len_max": 16
+    },
+    "novywave": {
+      "union_members_before_sort_max": 42,
+      "union_members_after_dedup_max": 42,
+      "widen_left_fields_max": 32,
+      "widen_right_fields_max": 32,
+      "variant_set_merged_len_max": 8
+    },
+    "reading": "the quadratic worst cases require collection sizes these programs never approach. A 46-member union costs ~1000 comparisons in the worst single call, which is not a cost worth restructuring for. before == after_dedup in every observed maximum also shows the membership prefilter is rarely removing anything the subsequent dedup would not remove anyway."
+  },
+  "candidate_tested": {
+    "changes": [
+      "union(): drop the O(n) membership prefilter and let the existing canonical sort + dedup be the single authority; sort_unstable_by instead of sort_by",
+      "structural_widen() object/object: replace the O(L*R) per-right-field position scan with a single linear merge join, valid because both sides come from object_fields_for_shape and are therefore already in the same canonical lexical-rank order, and symbol_lexical_rank is a dense O(1) index"
+    ],
+    "correctness_gate": "boon_compiler_kernel lib 198 passed; all three machine_plan_sha256 values byte-identical",
+    "measurement": "interleaved A/B/A, one process per observation, producers alternating by observation index, 3 setup + 30 scored per fixture and intent, diagnostics and verified",
+    "host_caveat": "load average 7.54 at the time of the run, so these figures are noisier than the standing contract's quiet-window requirement. The verdict does not rest on them: no cell shows a win, and the size measurement independently explains why.",
+    "results": {
+      "todo-mvc-physical/diagnostics": "elapsed p50 976.3 -> 990.3 (+1.44%), p95 1053.2 -> 1082.3 (+2.77%), typecheck p50 +1.36%",
+      "todo-mvc-physical/verified": "elapsed p50 1391.6 -> 1443.7 (+3.74%), p95 1531.6 -> 1553.0 (+1.40%), typecheck p50 +1.98%",
+      "novywave/diagnostics": "elapsed p50 662.4 -> 656.9 (-0.83%), p95 727.0 -> 726.1 (-0.13%), typecheck p50 -0.60%",
+      "novywave/verified": "elapsed p50 2156.0 -> 2184.2 (+1.31%), p95 2309.9 -> 2367.2 (+2.48%), typecheck p50 +0.61%",
+      "identity": "one distinct (diagnostics_fingerprint, plan_sha256) per lane in all four cells, identical across lanes"
+    },
+    "verdict": "rejected. Neutral to slightly negative. The merge join pays a lexical-rank lookup per comparison step, which costs more than the bounded linear scan it replaces at these collection sizes."
+  },
+  "retained": {
+    "change": "the BOON_TERM_SIZE_TRACE probes only",
+    "cost": "one relaxed atomic load per call site when the variable is disabled; a OnceLock get_or_init thereafter",
+    "reason": "these three algorithms are permanent code with quadratic worst cases. The probes are what makes a future decision to restructure them evidence-based instead of asymptotic, and they cost nothing when disabled."
+  },
+  "consequences_for_the_plan": [
+    "M1 item 7 and the term-arena half of item 8 are resolved as rejections on measurement. The distinct_closed_pairs memo and the unsymmetric structural_widen cache remain untested; the widen cache is keyed on a pair and the observed widen sizes do not speak to its hit rate.",
+    "Asymptotic arguments are not a prioritization method for this codebase. Five separate measured rejections now share that shape: K1' memoization, K1' residual fallback, K1' domain fold, K1' scaffold cache, K1' refresh batching, and now this candidate. The plan's ordering principle should be 'measure the size or count of the thing first, then decide', which is what M0's attribution did successfully.",
+    "The research review's structural advice remains untested and unrefuted: it is about what the compiler does per revision, not about canonical set operations. The measured cone result (100% of definitions publishing identical solved state) and the measured attribution (kernel compile 583 ms vs solve 474 ms on TodoMVC) point at that layer instead."
+  ],
+  "caveats": [
+    "One sample per size observation; the maxima are maxima, not distributions. A different program shape could reach them, which is why the probes are retained rather than deleted.",
+    "The A/B ran under load average 7.5 rather than the contract's quiet window. A clean re-run could tighten the numbers but cannot turn a set of results with no positive cell into a win.",
+    "No budget, schema or gate was touched. The stale machine_plan_sha256 finding recorded in compiler-m0-attribution-2026-09-27.json still stands and is still the owner's to decide."
+  ]
+}

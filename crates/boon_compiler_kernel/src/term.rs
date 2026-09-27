@@ -9,6 +9,30 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 static NEXT_TYPE_STORE_AUTHORITY: AtomicU64 = AtomicU64::new(1);
 
+/// Attribution support for the canonical set/shape operations.
+///
+/// Several of these operations have quadratic worst cases in the size of the
+/// collection they canonicalize, but a quadratic bound is only reachable if
+/// real programs actually build collections large enough to reach it. These
+/// counters report the running maximum observed size per operation so that a
+/// decision to restructure one of them is made from measurement rather than
+/// from asymptotic reasoning. Gated so the default path pays one relaxed load.
+macro_rules! boon_term_size_probe {
+    ($name:literal, $value:expr) => {{
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static MAX: AtomicU64 = AtomicU64::new(0);
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        if *ENABLED.get_or_init(|| std::env::var_os("BOON_TERM_SIZE_TRACE").is_some()) {
+            let value = ($value) as u64;
+            COUNT.fetch_add(1, AtomicOrdering::Relaxed);
+            let previous = MAX.fetch_max(value, AtomicOrdering::Relaxed);
+            if value > previous {
+                eprintln!("boon_term_size {} max={}", $name, value);
+            }
+        }
+    }};
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct TypeStoreAuthorityId(u64);
 
@@ -1426,6 +1450,7 @@ impl TypeTermArena {
     ) -> TypeTermId {
         let mut merged = self.variant_scratch.take();
         for incoming in variants {
+            boon_term_size_probe!("variant_set_merged_len", merged.len());
             let tag = incoming.tag();
             let Some(index) = merged.iter().position(|variant| variant.tag() == tag) else {
                 merged.push(incoming);
@@ -1517,8 +1542,10 @@ impl TypeTermArena {
             let variant_set = self.variant_set(variants.iter().copied());
             members.push(variant_set);
         }
+        boon_term_size_probe!("union_members_before_sort", members.len());
         members.sort_by(|left, right| self.compare_terms(*left, *right));
         members.dedup();
+        boon_term_size_probe!("union_members_after_dedup", members.len());
         let term = match members.as_slice() {
             [] => self.absent,
             [member] => *member,
@@ -1628,6 +1655,8 @@ impl TypeTermArena {
                 fields.extend(self.object_fields_for_shape(left_shape).iter().copied());
                 let mut right_fields = self.object_field_scratch.take();
                 right_fields.extend(self.object_fields_for_shape(right_shape).iter().copied());
+                boon_term_size_probe!("widen_left_fields", fields.len());
+                boon_term_size_probe!("widen_right_fields", right_fields.len());
                 for right in right_fields.iter().copied() {
                     if let Some(index) = fields.iter().position(|left| left.name == right.name) {
                         fields[index].ty = self.structural_widen(fields[index].ty, right.ty);

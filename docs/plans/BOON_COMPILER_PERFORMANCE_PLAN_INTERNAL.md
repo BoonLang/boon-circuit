@@ -147,9 +147,32 @@ Each is a local change with no semantic content. All are verified in the tree.
    already computed. Its 41 checks are independent and may run in parallel.
 7. `structural_widen_cache` is unsymmetric and uses std SipHash although
    `structural_widen_uncached` is commutative — `crates/boon_compiler_kernel/src/term.rs:593`.
-   Order the pair and use the arena's own open-addressed table.
+   Order the pair and use the arena's own open-addressed table. *(Not yet tested;
+   see the rejected canonical-set candidate below for what "not yet tested" must
+   mean here.)*
 8. `intern_object` re-derives lexical rank inside a binary search per field —
    `term.rs:2314`. One sort of `(rank, index)` pairs.
+
+**Items 7 and 8 are now partly resolved by measurement — read this before
+revisiting them.** An external research review identified three further
+quadratic algorithms in the term arena, all verified in source and then measured
+with new `BOON_TERM_SIZE_TRACE` probes *before* any restructuring:
+[`canonical set operations rejected`](evidence/compiler-canonical-sets-rejected-2026-09-27.json).
+
+| observed maximum | TodoMVC | NovyWave |
+| --- | --- | --- |
+| union members before sort | 46 | 42 |
+| object fields widened (left / right) | 43 / 36 | 32 / 32 |
+| variant set merged length | 16 | 8 |
+
+Removing the `union()` membership prefilter and replacing the O(L*R) object-widen
+field scan with a linear merge join was implemented, gated (198 tests, all three
+plan hashes byte-identical) and measured at **+1.4%, +3.7%, −0.8%, +1.3%** across
+the four fixture/intent cells. Rejected and reverted with no logic change. The
+quadratics are real in the source and unreachable at this scale, and the merge
+join pays a lexical-rank lookup per step that costs more than the bounded scan it
+replaces. The probes are retained so any future restructuring decision is made
+from measured sizes rather than from asymptotic reasoning.
 
 Items 5 and 6 change hash *computation*, so they require the controlled oracle
 migration the performance plan already contemplates: re-establish the affected

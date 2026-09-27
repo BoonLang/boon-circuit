@@ -10,8 +10,22 @@ language surface, no user-facing behavior and no semantics; the only observable
 difference is latency. Read it completely before starting compiler work. Its
 ordering is: attribute the unmeasured remainder (M0), delete duplicated passes
 (M1), freeze static facts (M2), measure before shape-keyed specialization (M3),
-gate retention on a dirty-cone measurement (M4), then make the semantic phase
-incremental (M5), repair the measurement harness (M6) and the developer loop (M7).
+retain the solved revision (M4), then make the semantic phase incremental (M5),
+repair the measurement harness (M6) and the developer loop (M7).
+
+M0 is complete and M1's term-arena items are partly resolved by rejection. Three
+measured results now govern the ordering: the typecheck remainder splits into a
+kernel-**compile** half and a kernel-**solve** half whose ratio inverts by fixture
+(TodoMVC 583/474 ms, NovyWave 136/316 ms); a per-definition solved-state probe
+shows **100% of definitions publishing byte-identical interface state** across
+both a type-preserving edit and a real type change on both fixtures; and the
+canonical set operations that three verified quadratic claims pointed at are
+unreachable at this scale (unions max 46 members, widened records 43 fields) and
+their restructuring measured +1.4% to +3.7% slower.
+
+**Asymptotic argument is not a prioritization method in this codebase.** Six
+candidates have now been rejected by measurement. Measure the size or count of
+the thing before deciding to restructure it.
 
 It supersedes the *sequencing* of the requirement-aggregation goal's Goal B and
 Goal C sections while leaving that document's measurement discipline, evidence

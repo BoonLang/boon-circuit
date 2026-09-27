@@ -1,0 +1,113 @@
+{
+  "status": "M0 attribution complete. The previously unattributed typecheck remainder is now attributed and it splits differently per fixture: TodoMVC is kernel-compile bound (583 ms prepare vs 474 ms solve) and NovyWave is solve bound (136 ms prepare vs 316 ms solve). A cross-revision per-definition solved-state probe shows 100% of definitions publishing byte-identical interface state across both a type-preserving and a minimal type-changing edit on both fixtures.",
+  "date": "2026-09-27",
+  "instrumentation": {
+    "principle": "stderr only, environment gated, no effect on any result, work counter, plan hash or digest",
+    "BOON_COMPILER_PHASE_TRACE": "six-way sub-phase split of the previously opaque typecheck_ms, plus a compile/solve split inside the kernel's CheckDemand::Diagnostics arm",
+    "BOON_COMPILER_OWNER_STATE_TRACE": "one line per definition with a digest of its solved result flow and formal flows",
+    "BOON_PARSER_TRACE": "two added phases: validation_index (the whole-tree index build) and four policy_* phases for the project-unit validators that previously sat outside every trace phase",
+    "no_debug_assertions_gating": "all three flags are readable in the release producer; the pre-existing BOON_KERNEL_TRACE_SUMMARIES/_OWNERS/_EPOCHS remain debug-only and are still useless for measurement"
+  },
+  "behavior_neutrality": {
+    "method": "built the release producer twice from source differing only by the instrumentation and compared machine plan hashes",
+    "counter": "5158476e5e9f095ef8c8eb3d9041af4e103d428d5ffe0c691d2c8daa687e065d both builds",
+    "todo-mvc-physical": "0befc7f89cdeb6d6911b33883c238d42c67bdaae8ebcc01e9b56aa99d3c0ed34 both builds",
+    "novywave": "5926de7bed188b50a1726b9e4f0abdc581fbf83a31ffff760f8b47ad71aa00a7 both builds",
+    "conclusion": "the instrumentation is byte-for-byte behavior neutral on all three fixtures",
+    "focused_gate": "boon_compiler_kernel lib 198 passed (197 pre-existing plus definition_state_fingerprint_is_deterministic_and_type_sensitive)"
+  },
+  "stale_oracle_finding": {
+    "finding": "budgets/compiler.toml machine_plan_sha256 for todo-mvc-physical (8e7120c3...) and novywave (e2d673e3...) do not match the hashes HEAD actually produces (0befc7f8... and 5926de7b...). Only the counter oracle is current.",
+    "not_caused_by_this_change": "proved by building the unmodified HEAD source and reproducing the same two hashes",
+    "consistent_with": "the K1'' checkpoint already discloses that the machine plan is 'byte-identical except for the disclosed TodoMVC change from the touch-elimination slice'",
+    "action": "none taken. budgets/compiler.toml is the sole oracle authority and AGENTS.md forbids editing it to make a candidate pass. Recorded for the owner as part of the already-reserved oracle-lane question.",
+    "consequence_for_this_plan": "a plan-hash gate must compare a candidate against the pre-change HEAD hash, not against the budget file, until the oracle lane re-establishes it"
+  },
+  "attribution": {
+    "note": "single fresh-process sample per row, release producer, RAYON_NUM_THREADS default. These are attribution readings, not acceptance numbers.",
+    "todo-mvc-physical": {
+      "elapsed_ms": 1099.4,
+      "parse_ms": 27.3,
+      "typecheck_ms": 1099.4,
+      "typecheck_subphases_ms": {
+        "project_source_payload_abi": 1.5,
+        "prepare_kernel_project_projection": 23.2,
+        "kernel_input": 16.7,
+        "kernel_check_total": 1057.1,
+        "kernel_check_prepare_compile": 583.0,
+        "kernel_check_solve": 474.1,
+        "present_kernel_project_diagnostics": 0.9,
+        "coverage_receipt": 0.05
+      },
+      "requirement_refresh_share_of_solve": "142 ms of 474 ms solve, 30%",
+      "reading": "kernel compile dominates: 583 ms of 1057 ms. With 155 definitions and 10,537 call sites this fixture is call-site bound, and the compile half is where per-call-site instantiation work would sit."
+    },
+    "novywave": {
+      "elapsed_ms": 723.5,
+      "parse_ms": 98.6,
+      "typecheck_ms": 625.0,
+      "typecheck_subphases_ms": {
+        "project_source_payload_abi": 11.8,
+        "prepare_kernel_project_projection": 99.9,
+        "kernel_input": 57.7,
+        "kernel_check_total": 452.3,
+        "kernel_check_prepare_compile": 136.3,
+        "kernel_check_solve": 316.0,
+        "present_kernel_project_diagnostics": 2.8,
+        "coverage_receipt": 0.2
+      },
+      "requirement_refresh_share_of_solve": "87 ms of 316 ms solve, 28%",
+      "reading": "the ratio inverts: 1,389 definitions and only 2,699 call sites make this definition bound, so the solve half dominates. Any per-call-site optimization would barely touch this fixture."
+    },
+    "the_two_halves_are_different_problems": "the plan had been treating 'the solve' as the target. It is not one target. Compile-bound and solve-bound fixtures need different cuts, and the requirement-aggregation goal only ever addressed the solve."
+  },
+  "parse_attribution": {
+    "hypothesis_refuted": "the plan asserted that roughly 70% of parse time was ValidationIndex::build plus four whole-tree validator passes, based on the validation_visits counter. It is not.",
+    "todo_mvc_physical": {
+      "parse_ms": 27.3,
+      "traced_phase_sum_ms": 10.2,
+      "validation_index_ms": 0.64,
+      "policy_validators_total_ms": 2.06,
+      "untraced_remainder_ms": 17.1,
+      "reading": "index and validators are 2.7 ms of 27.3 ms, not the untraced majority"
+    },
+    "novywave": {
+      "parse_ms": 98.6,
+      "traced_phase_sum_ms": 47.2,
+      "validation_index_ms": 3.09,
+      "policy_validators_total_ms": 12.2,
+      "untraced_remainder_ms": 51.4
+    },
+    "conclusion": "the untraced parse remainder is project-level work, not per-unit validation: module resolution, link overlays and namespace assembly across the 8 units, which happen outside parse_project_source_unit_with_work. Parse is 2.5% of TodoMVC total and 14% of NovyWave total, so it stays off the critical path; the added phases are kept because they close a wrong assumption, not because they found a target."
+  },
+  "dirty_cone_measured_on_solved_state": {
+    "method": "per-definition digest of the solved result flow and formal flows, compared across two revisions of the same program. This compares solved state, not work counters, so it closes the caveat carried by compiler-cone-probe-2026-09-27.json.",
+    "todo_mvc_physical": {
+      "definitions": 155,
+      "type_preserving_edit": "TEXT { Walk the dog } -> TEXT { Walk the dogs }: 155/155 unchanged, 0 changed",
+      "type_changing_edit": "add field pinned: True to one [title, completed] row: 155/155 unchanged, 0 changed",
+      "numbering_stable": true
+    },
+    "novywave": {
+      "definitions": 1389,
+      "type_preserving_edit": "TEXT { Visible editor syntax probe } -> ...probe! : 1389/1389 unchanged, 0 changed",
+      "type_changing_edit": "add field pinned: True to one PackageAsset[...] payload: 1389/1389 unchanged, 0 changed",
+      "numbering_stable": true
+    },
+    "reading": "a real type change grew the internal type store (TodoMVC object_field_rows 2961->2962; NovyWave term_rows 6354->6356, variant_rows 358->359) and moved work counters by one unit, yet every definition published byte-identical interface state. A retained solved revision keyed on per-definition state would find a 100% reuse rate for both edit classes on both fixtures."
+  },
+  "caveats": [
+    "The digest covers each definition's published result flow and formal flows. It does not cover a definition's internal body or per-expression solved types. Two revisions can publish identical interfaces while differing internally, so this digest is NOT by itself a sound reuse key. A sound key needs the existing term-id-free definition_basis_fingerprint for the inputs plus this state digest, never the state digest alone. The method's doc comment states this.",
+    "Both type-changing edits are the mildest available: one added field on one data row or tag payload. A change to a type that participates in inference, such as a WHEN tag set, a function result shape or a call argument shape, may move many definitions. These are lower bounds on the delta.",
+    "The edits were applied in place to tracked example files and reverted; 0 example files are modified.",
+    "Attribution rows are single fresh-process samples, not the 3+30 interleaved A/B/A protocol. They establish composition, not latency acceptance.",
+    "Owner numbering is positional, so inserting or removing a definition would shift later indices. Both probes confirmed equal definition counts so the comparison is sound here, but a retention design must key on stable owner identity, not index."
+  ],
+  "plan_consequences": {
+    "M0": "complete",
+    "M3_shape_keyed_specialization": "priority raised. TodoMVC spends 583 ms of 1057 ms typecheck in kernel compile, with 10,537 call sites for 155 definitions. Measure the distinct resolved-shape ratio first, as the plan already requires.",
+    "M4_retention": "strongest support yet: 100% measured interface reuse for both edit classes. Retention is a cache with a measured near-100% hit rate, which is why the 883 ms warm figure is not conservative invalidation.",
+    "parse": "de-prioritized. Not the untraced cost the plan assumed, and small relative to typecheck on both fixtures.",
+    "M1_pass_deletion": "unchanged and still the best cold-path risk-adjusted win; the verified-path phases it targets were not re-measured in this item"
+  }
+}

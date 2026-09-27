@@ -24,6 +24,9 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 const KERNEL_DEFINITION_BASIS_DOMAIN_V14: &[u8] = b"boon.compiler-kernel.definition-basis.v14\0";
+/// Solved per-definition state, for cross-revision measurement only.
+pub(crate) const KERNEL_DEFINITION_STATE_DOMAIN_V1: &[u8] =
+    b"boon.compiler-kernel.definition-state.v1\0";
 const KERNEL_PUBLIC_RESULT_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.public-result.v1\0";
 const KERNEL_EXPRESSION_SURFACE_DOMAIN_V1: &[u8] = b"boon.compiler-kernel.expression-surface.v1\0";
 const KERNEL_DEFINITION_ARTIFACT_DOMAIN_V16: &[u8] =
@@ -3225,7 +3228,7 @@ impl Hasher for StableSha256Hasher<'_> {
     }
 }
 
-fn stable_fingerprint<T: Hash + ?Sized>(
+pub(crate) fn stable_fingerprint<T: Hash + ?Sized>(
     domain: &[u8],
     value: &T,
     scratch: &mut Vec<u8>,

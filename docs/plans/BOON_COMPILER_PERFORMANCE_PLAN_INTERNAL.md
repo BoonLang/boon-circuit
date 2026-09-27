@@ -76,19 +76,55 @@ correct.
 
 ## Work Items
 
-### M0 — Attribution (blocks everything)
+### M0 — Attribution (blocks everything) — **COMPLETE**
 
-Add production sub-phase timers inside `typecheck_ms`: project prepare (including
-the four untimed whole-project pre-passes at
-`crates/boon_compiler/src/kernel_oracle.rs:626-636`), owner projection, kernel
-module compile, solve, diagnostics presentation. Add timers in
-`parse_project_source_unit_with_work` for `ValidationIndex::build`
-(`crates/boon_parser/src/lib.rs:2389`) and the four validators (`:2794`); today
-roughly 70% of parse time is outside every trace phase.
+Recorded in
+[M0 attribution and solved-state cone](evidence/compiler-m0-attribution-2026-09-27.json).
+Instrumentation is stderr-only and environment-gated under
+`BOON_COMPILER_PHASE_TRACE`, `BOON_COMPILER_OWNER_STATE_TRACE` and two added
+`BOON_PARSER_TRACE` phases, none of it `debug_assertions`-gated. Behavior
+neutrality is proved by building the release producer twice from source differing
+only by the instrumentation: all three `machine_plan_sha256` values are identical.
+Focused gate: `boon_compiler_kernel` lib 198 passed.
 
-Gate: counters only, zero behavior change, machine plan and diagnostics
-fingerprint byte-identical. No trace environment variable may be
-`#[cfg(debug_assertions)]`-gated, or it is useless in the release producer.
+The findings changed the plan:
+
+| | TodoMVC (3,576 lines) | NovyWave (11,926 lines) |
+| --- | --- | --- |
+| parse | 27.3 ms | 98.6 ms |
+| typecheck | 1099.4 ms | 625.0 ms |
+| — project prepare | 23.2 | 99.9 |
+| — kernel input | 16.7 | 57.7 |
+| — **kernel compile (prepare)** | **583.0** | **136.3** |
+| — **kernel solve** | **474.1** | **316.0** |
+| — present diagnostics + receipt | 0.9 | 3.0 |
+| requirement refresh, share of solve | 142 ms (30%) | 87 ms (28%) |
+
+1. **The two halves are different problems and the ratio inverts.** TodoMVC is
+   compile bound (583 vs 474) with 10,537 call sites for 155 definitions. NovyWave
+   is solve bound (136 vs 316) with 1,389 definitions and 2,699 call sites. The
+   plan treated "the solve" as one target; it is two, and per-call-site work would
+   barely touch NovyWave. This raises M3's priority for call-site-heavy code and
+   lowers its value for definition-heavy code.
+2. **Parse is not the cost the plan assumed.** The `validation_visits` counter
+   suggested the index build plus four validators were ~70% of parse. They are
+   2.7 ms of TodoMVC's 27.3 ms and 15.3 ms of NovyWave's 98.6 ms. The untraced
+   remainder is project-level module resolution and link assembly. Parse is
+   de-prioritized.
+3. **A stale oracle, not a regression.** `budgets/compiler.toml`'s
+   `machine_plan_sha256` for `todo-mvc-physical` and `novywave` do not match what
+   HEAD produces; only `counter` is current. The unmodified HEAD source reproduces
+   the same two hashes, and the K1'' checkpoint already discloses a TodoMVC plan
+   change. The budget file was **not** edited. Until the oracle lane
+   re-establishes it, a plan-hash gate must compare against the pre-change HEAD
+   hash.
+4. **The dirty cone, measured on solved state, is 100% reusable.** A per-definition
+   digest of the solved result and formal flows is unchanged for **155/155**
+   TodoMVC definitions and **1389/1389** NovyWave definitions, for a
+   type-preserving edit *and* for a real type change. This closes the
+   counters-are-not-results caveat in the cone probe. The digest covers published
+   interfaces only, so it is not a sound reuse key alone; a sound key pairs it
+   with the existing term-id-free `definition_basis_fingerprint` for the inputs.
 
 ### M1 — Delete duplicated passes
 
@@ -295,11 +331,16 @@ Estimates, not measurements. Not additive; most items are enablers.
 | M5 | — | preview 120-200 ms |
 | M3 | if the ratio is large | — |
 
-M4's projection is better supported than the others. The cone probe measured the
-differing work for a real edit at **zero** (type-preserving) or **one variable and
-one operation** (minimal type-changing) on both fixtures, so the remaining budget
-is dominated by what has to be re-derived to *notice* that nothing changed, not by
-how much actually differs.
+M4's projection is better supported than the others. M0 measured the per-definition
+solved state across revisions and found **100% of definitions unchanged** on both
+fixtures for both a type-preserving edit and a real type change. The warm figure
+is a cache with a measured near-100% hit rate, which is why 883 ms is not
+conservative invalidation.
+
+M3's value is now fixture-dependent rather than general: TodoMVC spends 583 of
+1057 ms of typecheck in kernel compile against 10,537 call sites, while NovyWave
+spends 136 of 452 ms with 2,699 call sites. Any shape-key result must be reported
+per fixture, and a win on TodoMVC is not evidence about NovyWave.
 
 Cold is structurally capped: with caches disabled a fresh process is always a full
 solve, and the cold budgets (75 / 250 / 1000 ms) are not reachable for genuinely

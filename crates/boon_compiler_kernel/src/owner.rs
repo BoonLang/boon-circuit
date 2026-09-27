@@ -4154,6 +4154,32 @@ impl KernelInterfaceSnapshot {
         )
     }
 
+    /// Solved-state digest of one published definition.
+    ///
+    /// This exists so a consumer can compare two solves of two revisions and
+    /// learn which definitions' published interfaces actually differ, which is
+    /// the quantity a retained solved revision would have to invalidate. It is
+    /// a **measurement** aid, not a reuse key, and must never gate a cache hit
+    /// on its own: a definition whose published interface is unchanged may
+    /// still require re-solving when an input it reads changed, and owner
+    /// numbering is positional, so inserting a definition invalidates every
+    /// later index.
+    pub fn definition_state_fingerprint(&self, owner: KernelOwnerId) -> Option<[u8; 32]> {
+        let definition = self.definitions.get(owner.0 as usize)?;
+        let result = self.materialize_flow(definition, definition.result);
+        let formals = self
+            .flows[definition.formals.range()]
+            .iter()
+            .copied()
+            .map(|flow| self.materialize_flow(definition, flow))
+            .collect::<Vec<_>>();
+        Some(crate::receipt::stable_fingerprint(
+            crate::receipt::KERNEL_DEFINITION_STATE_DOMAIN_V1,
+            &(owner.0, &result, &formals),
+            &mut Vec::new(),
+        ))
+    }
+
     pub fn materialize_public_results(&self) -> impl ExactSizeIterator<Item = FlowType> + '_ {
         self.definitions
             .iter()

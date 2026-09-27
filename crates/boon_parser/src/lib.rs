@@ -2796,10 +2796,49 @@ fn validate_project_source_unit_with_work(
     validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    // Attribution: the four policy validators are whole-tree passes that sit
+    // outside every other parser trace phase, so without these the traced
+    // `ast` total badly under-reports real per-unit parse cost.
+    let trace = ParserTrace::from_environment();
+    let syntax_started = trace.start();
     validate_source_syntax_with_work(&parsed.path, &parsed.ast, validation_index, work)?;
+    trace.phase(&parsed.path, "policy_source_syntax", syntax_started, || {
+        String::new()
+    });
+    let capacities_started = trace.start();
     validate_list_capacities_with_work(&parsed.path, &parsed.ast, validation_index, work)?;
-    validate_no_reducer_style_update_with_work(&parsed.path, &parsed.ast, validation_index, work)?;
-    validate_no_hidden_identity_leak_with_work(&parsed.path, &parsed.ast, validation_index, work)?;
+    trace.phase(
+        &parsed.path,
+        "policy_list_capacities",
+        capacities_started,
+        || String::new(),
+    );
+    let reducer_started = trace.start();
+    validate_no_reducer_style_update_with_work(
+        &parsed.path,
+        &parsed.ast,
+        validation_index,
+        work,
+    )?;
+    trace.phase(
+        &parsed.path,
+        "policy_no_reducer_update",
+        reducer_started,
+        || String::new(),
+    );
+    let identity_started = trace.start();
+    validate_no_hidden_identity_leak_with_work(
+        &parsed.path,
+        &parsed.ast,
+        validation_index,
+        work,
+    )?;
+    trace.phase(
+        &parsed.path,
+        "policy_no_hidden_identity",
+        identity_started,
+        || String::new(),
+    );
     Ok(())
 }
 
@@ -2817,10 +2856,14 @@ fn parse_normalized_source_unit_syntax(
 ) -> Result<(ParsedSourceUnit, ValidationIndex), ParseError> {
     let path = source_unit_id.as_str().to_owned();
     let ast = parse_ast_traced(&path, &source, trace, work)?;
+    // Attribution: the index build is several whole-tree passes and was
+    // previously inside the untraced remainder of every unit's parse.
+    let index_started = trace.start();
     let validation_index = match validation_scope {
         ValidationIndexScope::Boundary => ValidationIndex::build_boundary(&ast, work),
         ValidationIndexScope::Full => ValidationIndex::build(&ast, work),
     };
+    trace.phase(&path, "validation_index", index_started, || String::new());
     validate_source_unit_boundary_with_work(&path, &source, &ast, &validation_index, work)?;
     let declared_functions = collect_raw_declared_functions_with_work(&ast.statements, work);
     let item_index = build_unit_item_index(&ast.statements);

@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// One-shot construction owner for a kernel project and its text namespace.
 ///
@@ -818,16 +819,29 @@ impl KernelSession {
                         solved.compile_work,
                     )
                 } else {
+                    // Attribution: preparing the owner programs and solving
+                    // their interfaces are the two halves of this demand, and
+                    // only their sum was observable. Measurement only: it
+                    // reports to stderr under BOON_COMPILER_PHASE_TRACE and
+                    // cannot affect a result, a work counter or a digest.
+                    let trace_phases = std::env::var_os("BOON_COMPILER_PHASE_TRACE").is_some();
+                    let prepare_started = Instant::now();
                     self.ensure_prepared()?;
+                    let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1_000.0;
                     let (compile_work, interfaces) = {
                         let prepared = self
                             .prepared
                             .as_mut()
                             .expect("kernel diagnostics own a prepared graph");
-                        (
-                            prepared.compile_work(),
-                            prepared.solve_interfaces().map_err(KernelCheckError::from),
-                        )
+                        let solve_started = Instant::now();
+                        let solved = prepared.solve_interfaces().map_err(KernelCheckError::from);
+                        let solve_ms = solve_started.elapsed().as_secs_f64() * 1_000.0;
+                        if trace_phases {
+                            eprintln!(
+                                "kernel_check_diagnostics prepare_ms={prepare_ms:.3} solve_ms={solve_ms:.3}"
+                            );
+                        }
+                        (prepared.compile_work(), solved)
                     };
                     match interfaces {
                         Ok(interfaces) => (
@@ -1181,6 +1195,43 @@ mod tests {
                 .into_boxed_slice(),
         )
         .expect("session fixture has aligned definition facts")
+    }
+
+    /// `definition_state_fingerprint` is a cross-revision measurement handle.
+    /// It must be deterministic for an identical solve, and it must actually
+    /// move when a solved interface changes, otherwise the dirty-cone probe it
+    /// exists to serve would report every revision as unchanged.
+    #[test]
+    fn definition_state_fingerprint_is_deterministic_and_type_sensitive() {
+        fn fingerprints(input: KernelProjectInput) -> Vec<[u8; 32]> {
+            let mut session = KernelSession::new(input);
+            let checked = session
+                .check(CheckDemand::Diagnostics)
+                .expect("fixture project solves");
+            let KernelCheckProduct::Diagnostics(interfaces) = checked.product else {
+                panic!("diagnostics demand returns an interface snapshot");
+            };
+            (0..interfaces.definition_count())
+                .map(|owner| {
+                    interfaces
+                        .definition_state_fingerprint(KernelOwnerId(owner as u32))
+                        .expect("in-range definition has a solved state")
+                })
+                .collect()
+        }
+
+        let first = fingerprints(project(KernelOwnerNodeKind::Number));
+        let again = fingerprints(project(KernelOwnerNodeKind::Number));
+        assert_eq!(
+            first, again,
+            "an identical solve must produce identical per-definition state"
+        );
+
+        let changed = fingerprints(project(KernelOwnerNodeKind::Tag("Other".into())));
+        assert_ne!(
+            first, changed,
+            "a changed solved type must move at least one definition state"
+        );
     }
 
     #[test]

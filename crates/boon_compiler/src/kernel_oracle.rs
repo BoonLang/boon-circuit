@@ -2379,8 +2379,16 @@ pub(crate) fn compiler_diagnostics_from_kernel(
     role: boon_checked::ProgramRole,
 ) -> Result<crate::CompilerDiagnostics, String> {
     let typecheck_started = Instant::now();
+    // Attribution: `typecheck_ms` previously reported one opaque number for the
+    // whole region below, which is why most of it was unattributed. These
+    // sub-phases report to stderr under BOON_COMPILER_PHASE_TRACE only; they
+    // cannot affect a result, a work counter, a plan hash or a digest.
+    let trace_phases = std::env::var_os("BOON_COMPILER_PHASE_TRACE").is_some();
+    let abi_started = Instant::now();
     let (source_payloads, source_abi_diagnostics) =
         boon_typecheck::project_source_payload_abi_types_and_diagnostics(&project);
+    let abi_ms = abi_started.elapsed().as_secs_f64() * 1_000.0;
+    let prepare_started = Instant::now();
     let PreparedKernelProjectProjection {
         owner_order,
         prepared: _,
@@ -2399,6 +2407,7 @@ pub(crate) fn compiler_diagnostics_from_kernel(
         role,
         PreparedProjectionRetention::Runtime,
     );
+    let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1_000.0;
     if !unsupported.is_empty() {
         if std::env::var_os("BOON_KERNEL_DIAGNOSTICS_UNSUPPORTED_TRACE").is_some() {
             eprintln!(
@@ -2425,17 +2434,33 @@ pub(crate) fn compiler_diagnostics_from_kernel(
     drop(unsupported);
     drop(root_blocker_by_owner);
 
+    let input_started = Instant::now();
     let input =
         KernelProjectInput::new_with_abi(project_input, definition_facts, definition_keys, abi)
             .map_err(|error| format!("cannot build dense kernel diagnostics input: {error}"))?;
+    let input_ms = input_started.elapsed().as_secs_f64() * 1_000.0;
+    let check_started = Instant::now();
     let mut session = KernelSession::new(input);
     let checked = session
         .check(CheckDemand::Diagnostics)
         .map_err(|error| format!("cannot solve dense kernel diagnostics: {error}"))?;
+    let check_ms = check_started.elapsed().as_secs_f64() * 1_000.0;
     let compile_work = checked.compile_work;
     let KernelCheckProduct::Diagnostics(interfaces) = checked.product else {
         unreachable!("diagnostics demand returns an interface snapshot")
     };
+    // Per-definition solved-state digests, for the cross-revision dirty-cone
+    // measurement only. See `KernelInterfaceSnapshot::definition_state_fingerprint`:
+    // this is not a reuse key and must not gate any cache.
+    if std::env::var_os("BOON_COMPILER_OWNER_STATE_TRACE").is_some() {
+        for owner in 0..interfaces.definition_count() {
+            let owner = KernelOwnerId(u32::try_from(owner).expect("owner count fits u32"));
+            let digest = interfaces
+                .definition_state_fingerprint(owner)
+                .expect("in-range definition interface state");
+            eprintln!("kernel_owner_state {owner:?} {digest:02x?}");
+        }
+    }
     if interfaces.definition_count() != dense_owner_count {
         return Err(format!(
             "dense kernel diagnostics publish {} of {} definition interfaces",
@@ -2444,13 +2469,16 @@ pub(crate) fn compiler_diagnostics_from_kernel(
         ));
     }
 
+    let present_started = Instant::now();
     let diagnostics = present_kernel_project_diagnostics(
         &project,
         session.project(),
         source_abi_diagnostics.as_ref(),
         &interfaces,
     )?;
+    let present_ms = present_started.elapsed().as_secs_f64() * 1_000.0;
 
+    let receipt_started = Instant::now();
     let checked_expression_count = (0..session.project().definition_count())
         // Compact owners may append a synthetic structural result when an
         // authored container publishes only child-owner values. That node is
@@ -2499,7 +2527,16 @@ pub(crate) fn compiler_diagnostics_from_kernel(
         &(project.source_bundle_digest_v1().to_hex(), &diagnostics),
     )
     .map_err(|error| format!("cannot fingerprint kernel diagnostics: {error}"))?;
+    let receipt_ms = receipt_started.elapsed().as_secs_f64() * 1_000.0;
     let typecheck_ms = typecheck_started.elapsed().as_secs_f64() * 1_000.0;
+    if trace_phases {
+        eprintln!(
+            "boon_typecheck_diagnostics total_ms={typecheck_ms:.3} abi_ms={abi_ms:.3} \
+             prepare_projection_ms={prepare_ms:.3} kernel_input_ms={input_ms:.3} \
+             kernel_check_ms={check_ms:.3} present_diagnostics_ms={present_ms:.3} \
+             coverage_receipt_ms={receipt_ms:.3}"
+        );
+    }
     let owner_work = crate::CompilerOwnerWork {
         statements: session
             .project()

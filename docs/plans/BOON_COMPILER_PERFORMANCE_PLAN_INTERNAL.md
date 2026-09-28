@@ -550,3 +550,35 @@ solve session outlive one revision. It cannot be started as a local edit to
 landable slice is the cheapest sound one: **retain the previous revision's
 `CompiledSealedMachinePlanFromSource` and short-circuit a request whose kernel
 input is unchanged**, which needs a kernel-input digest that does not exist yet.
+
+### M4 reuse key — measured (2026-09-28)
+
+[`M4 reuse key`](evidence/compiler-m4-reuse-key-2026-09-28.json). A per-owner
+compiled-program fingerprint is now available and release-measurable. It hashes
+one owner's node kinds and modes in order, and deliberately does not cover the
+separate flat edge column, so it over-reports change rather than under-reporting
+it — the safe direction for a reuse hint, and explicitly not a soundness key.
+
+| edit | owners unchanged by index | distinct fingerprints shared |
+| --- | --- | --- |
+| type-preserving (`Walk the dog` → `Walk the dogs`) | **155/155 (100%)** | identical as a multiset |
+| type-changing (`+pinned` field on one row) | 38/155 (24.5%) | 23 of 109 |
+
+The type-changing result is not a dense-renumbering artefact. Its by-index
+changed set is a near-contiguous tail from owner 25, which looks like a shift,
+but a pure renumbering would leave the 109-element multiset of fingerprints
+unchanged, and 86 of 109 differ. The owners' content really changed.
+
+This is consistent with, and sharper than, the solved-state result. Published
+interface (what a definition promises callers) stayed identical across the
+type-changing edit, while the compiled program was rewritten — because the
+shared structural term store renumbers when any term is appended. The same
+append-only property that makes cross-revision term reuse sound is what moves
+dense positions. **Consequence: a reuse key must be owner content, never the
+dense owner id.**
+
+So M4's ceiling is edit-class dependent, and the budgets' own warm benchmark edit
+is the type-preserving one, where the entire project is reusable and a retained
+revision could skip the whole kernel compile and solve. The remaining work is a
+retained request family in `ProjectState` plus letting a solve session outlive one
+revision; neither is started.

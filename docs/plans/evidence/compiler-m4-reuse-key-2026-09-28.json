@@ -1,0 +1,55 @@
+{
+  "status": "M4 reuse key measured. A per-owner compiled-program fingerprint is 100% stable across a type-preserving edit, which is the common case in an editor, and only ~23% stable by content across a type-changing edit. Retention therefore has a real key and a real ceiling, and the ceiling depends sharply on edit class rather than being a single number.",
+  "date": "2026-09-28",
+  "what_was_built": {
+    "function": "owner_program_fingerprint in crates/boon_compiler_kernel/src/packed_owner.rs",
+    "digest_input": "one owner's node kinds and modes, in owner order, hashed through the codebase's existing stable_fingerprint",
+    "deliberate_limitation": "does not cover the separate flat edge column or the private input Span32, because neither is reachable through Hash without adding derives across the packed representation. The digest is therefore a conservative over-approximation and explicitly a reuse hint, never a soundness key. A missing owner row returns the zero digest, which compares equal to nothing reusable.",
+    "exposure": "BOON_COMPILER_OWNER_FINGERPRINT_TRACE in the production diagnostics path, so the ratio is measurable in the release producer rather than only in a debug build",
+    "gate": "all three machine_plan_sha256 byte-identical; boon_compiler_kernel lib 198 passed",
+    "behaviour": "none. No reuse decision consumes it yet."
+  },
+  "method": {
+    "fixtures": "examples/todo_mvc_physical/RUN.bn, 155 owners, 155 distinct fingerprint lines per revision",
+    "protocol": "fingerprint all owners on the base program and on two edited variants, then compare",
+    "edits": {
+      "type_preserving": "TEXT { Walk the dog } -> TEXT { Walk the dogs }, the budgets' own warm benchmark edit",
+      "type_changing": "add field `pinned: True` to one [title, completed] row literal"
+    },
+    "cleanliness": "edits applied in place to the tracked example file and reverted; 0 example files modified"
+  },
+  "results": {
+    "type_preserving": {
+      "unchanged_by_index": "155/155 (100.0%)",
+      "unchanged_as_multiset": "identical",
+      "reading": "a per-owner compiled-program fingerprint is perfectly stable across a type-preserving edit, so a retained revision could reuse every owner in the common editor case"
+    },
+    "type_changing": {
+      "unchanged_by_index": "38/155 (24.5%)",
+      "distinct_fingerprints_base": 109,
+      "distinct_fingerprints_type_changing": 109,
+      "shared_distinct_fingerprints": 23,
+      "changed_by_content": "86 of 109 distinct fingerprints differ",
+      "renumbering_ruled_out": "the by-index changed set is a near-contiguous tail from owner 25, which is the signature of a dense-id shift. But a pure renumbering would leave the 109-element multiset of fingerprints identical, and it does not: 86 of 109 differ. The owners' content really changed, it is not an artefact of renumbering.",
+      "reading": "a type-changing edit genuinely recompiles most owners, so per-owner retention reuses only about a fifth of the project in that case"
+    }
+  },
+  "why_both_results_are_true_and_both_matter": [
+    "The earlier solved-state probe found 100% of definitions publishing byte-identical interface state across this same type-changing edit. That is not in conflict with the 23% figure here, and the distinction is exactly what retention has to respect.",
+    "Published interface = what a definition promises its callers. Compiled program = the private representation it was compiled into. An edit can leave the promise identical while rewriting the representation, because a shared structural term store renumbers when any term is added.",
+    "This is the same append-only property that makes cross-revision term reuse sound, observed from the other side: the arena grows by pure appends, so existing TypeTermIds stay valid, but their *dense positions* move, so anything keyed by dense id must be re-keyed by content.",
+    "The practical consequence is that a reuse key must be the per-owner content fingerprint, never the dense owner id. The fingerprint added here is that key; the positional comparison above is only how the ratio was measured."
+  ],
+  "consequences_for_M4": {
+    "the_key_exists": "a sound-enough reuse key is now available and measurable in release. It is deliberately conservative, so it over-reports change rather than under-reporting it, which is the safe direction for a reuse hint.",
+    "the_ceiling_depends_on_edit_class": "for a type-preserving edit the whole project is reusable, so a retained revision can skip the entire kernel compile and solve. For a type-changing edit roughly a fifth is reusable, so most of the work still has to happen. The product metric therefore depends on which edits matter, and the budgets' own warm benchmark edit is the type-preserving one.",
+    "the_real_work_remaining": "a retained request family in boon_compiler's ProjectState holding the previous revision's solve, plus letting the retained solve session outlive one revision so its TypeTermIds stay valid. Neither is started. The first requires a use-before-drop decision this code currently prevents by construction.",
+    "no_soundness_shortcut": "the fingerprint does not cover the edge column, so it must not be the sole gate on reuse. A reuse decision that skips recompiling an owner must prove its inputs are unchanged by a key that covers edges, or fall back to recompiling."
+  },
+  "caveats": [
+    "One sample per revision, and one type-changing edit shape. A different kind of type change, such as altering a WHEN tag set or a function result shape, could produce a different ratio. The 24.5% figure is specific to adding a field to one data row.",
+    "The fingerprint is a hint, not a soundness key, and this measurement therefore bounds reuse from below rather than proving any particular owner is safe to skip.",
+    "The trace adds a hash per owner to the measured path when enabled; the disabled cost is one environment lookup outside the timed region.",
+    "No budget, schema or gate was touched. The stale machine_plan_sha256 finding in compiler-m0-attribution-2026-09-27.json still stands and is still the owner's to decide."
+  ]
+}

@@ -504,3 +504,49 @@ requirement-side instability, which is the same invariance the requirement
 aggregation work already failed to key around five times. Do not re-open without
 a sound requirement-side key, which is a research problem rather than a
 performance task.
+
+### M4 — Retain the solved revision: structural findings (2026-09-28)
+
+The plan described M4 as "retain the packed solved revision, dirty-cone it,
+backdate, and publish last-good". Reading the code before writing it changes the
+shape of the work in three ways.
+
+**1. The kernel session is not reused at all, so `replace_project` is the wrong
+retention point.** `KernelSession::replace_project` looks like the place where
+retention should happen — it discards `prepared`, `solved` and `checks` on every
+revision. But it has **no production caller**: the only call site is a unit test
+at `crates/boon_compiler_kernel/src/session.rs:1793`. Every production path does
+`KernelSession::new(input)` at `crates/boon_compiler/src/kernel_oracle.rs:1279`,
+`:2443` and `:2877`, constructing a brand-new session per request. Retention
+therefore belongs one layer up, in `boon_compiler`'s `ProjectState`
+(`crates/boon_compiler/src/session.rs:189`), which already retains six frontend
+request tables — including `parse_requests`, which is why a warm edit re-parses
+only the changed unit and costs 6.9 ms — but retains no kernel request family at
+all. `state.checked` and `state.diagnostics` are cleared on every update at
+`:485-486`.
+
+**2. The enabling property holds: the term arena is append-only.**
+`TypeTermArena::append_term` (`crates/boon_compiler_kernel/src/term.rs:2485`)
+only pushes; no existing row is mutated or reordered, and `ensure_term_slot_capacity`
+rebuilds only the open-addressed slot table, not the rows. This matches the
+measured type-store growth, which was pure appends with untouched existing rows.
+So an arena retained across revisions stays valid: old `TypeTermId`s keep meaning
+whatever they meant, and new terms append. This is what makes reuse sound rather
+than a use-after-free.
+
+**3. The blocker is that the arena is deliberately one-shot.**
+`TypeTermArena` is a field of `KernelProjectConstruction` (`session.rs:186`),
+moved out by `take_construction` and consumed by `compile_with_construction` in
+`ensure_prepared` (`:927-951`); its doc comment states the design
+"deliberately establishes that ownership before persistent red/green reuse is
+implemented". So the groundwork was laid and the reuse never built. The
+`KernelProjectSolveSession` retains the derived terms, and it is that session's
+lifetime, not the arena's, that must be extended to cover a revision boundary.
+
+**Consequence for ordering.** M4 is a two-layer change, not one: a new retained
+request family in `ProjectState` for the kernel solve, plus letting the retained
+solve session outlive one revision. It cannot be started as a local edit to
+`replace_project`, which the earlier draft of this plan implied. The first
+landable slice is the cheapest sound one: **retain the previous revision's
+`CompiledSealedMachinePlanFromSource` and short-circuit a request whose kernel
+input is unchanged**, which needs a kernel-input digest that does not exist yet.

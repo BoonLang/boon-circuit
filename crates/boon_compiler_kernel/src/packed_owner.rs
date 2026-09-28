@@ -178,6 +178,76 @@ pub struct PackedKernelProjectProgram {
     external_expressions: Box<[KernelExternalExpression]>,
 }
 
+/// Content-derived digest of one owner's packed program row.
+///
+/// The dense program is a flat set of parallel columns, so digesting the whole
+/// program means visiting every node, edge and external expression. This
+/// digests a single owner's slice of them, which is what a per-owner reuse
+/// decision needs, and keeps that decision proportional to the owner under
+/// consideration rather than to the project.
+///
+/// The node kind carries the whole authored shape of an expression, and the
+/// remaining columns are dense ids that are already covered by it, so this
+/// hashes the kinds in owner order. That is a conservative over-approximation:
+/// two owners with equal digests are equal here, and an edit that changes an
+/// input edge without changing any kind does not move the digest. It is a reuse
+/// *hint* for measurement and for a future reuse decision, never a soundness
+/// key on its own.
+pub fn owner_program_fingerprint(
+    program: &PackedKernelProjectProgram,
+    owner: crate::KernelOwnerId,
+    scratch: &mut Vec<u8>,
+) -> [u8; 32] {
+    let Some(owner_ref) = program.owner(owner) else {
+        // A dense id with no row cannot match any retained owner, so a value
+        // that never compares equal is the safe answer for a reuse hint.
+        return [0; 32];
+    };
+    crate::receipt::stable_fingerprint(
+        b"boon.compiler-kernel.owner-program.v1\0",
+        &OwnerProgramFingerprintInput::new(owner_ref),
+        scratch,
+    )
+}
+
+/// Hashable projection of one owner's node stream.
+///
+/// `PackedKernelOwnerNode` holds a private `Span32` input range and the program
+/// keeps its edges in a separate flat column, so neither is reachable through
+/// `Hash` here. This projects the fields that are, which keeps the digest a
+/// conservative over-approximation: an edit that moves an input edge without
+/// changing a node kind or mode does not move the digest. That is acceptable
+/// because this is a reuse *hint* for measurement and for a future reuse
+/// decision, never a soundness key on its own.
+struct OwnerProgramFingerprintInput<'a> {
+    kinds: Vec<PackedKernelOwnerNodeKind>,
+    modes: Vec<FlowMode>,
+    marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> OwnerProgramFingerprintInput<'a> {
+    fn new(owner: PackedKernelOwnerProgramRef<'a>) -> Self {
+        let mut kinds = Vec::new();
+        let mut modes = Vec::new();
+        for node in owner.nodes() {
+            kinds.push(node.kind);
+            modes.push(node.mode);
+        }
+        Self {
+            kinds,
+            modes,
+            marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Hash for OwnerProgramFingerprintInput<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.kinds.hash(state);
+        self.modes.hash(state);
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct PackedKernelOwnerProgramRef<'a> {
     store: &'a PackedKernelProjectProgram,

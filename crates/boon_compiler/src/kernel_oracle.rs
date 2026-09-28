@@ -2452,6 +2452,20 @@ pub(crate) fn compiler_diagnostics_from_kernel(
     // Per-definition solved-state digests, for the cross-revision dirty-cone
     // measurement only. See `KernelInterfaceSnapshot::definition_state_fingerprint`:
     // this is not a reuse key and must not gate any cache.
+    // Per-owner packed-program fingerprints. These are the reuse keys a retained
+    // solved revision would key on: an owner whose fingerprint is unchanged
+    // across revisions has, by construction, an unchanged compiled program.
+    // Emitting them here makes that ratio measurable in the release producer,
+    // which is where a retention decision has to be justified.
+    if std::env::var_os("BOON_COMPILER_OWNER_FINGERPRINT_TRACE").is_some() {
+        let program = session.project().program();
+        let mut scratch = Vec::new();
+        for index in 0..program.owners().len() {
+            let owner = KernelOwnerId(u32::try_from(index).expect("owner count fits u32"));
+            let digest = boon_compiler_kernel::owner_program_fingerprint(program, owner, &mut scratch);
+            eprintln!("kernel_owner_fingerprint {owner:?} {digest:02x?}");
+        }
+    }
     if std::env::var_os("BOON_COMPILER_OWNER_STATE_TRACE").is_some() {
         for owner in 0..interfaces.definition_count() {
             let owner = KernelOwnerId(u32::try_from(owner).expect("owner count fits u32"));

@@ -160,9 +160,18 @@ Each is a local change with no semantic content. All are verified in the tree.
    before hashing turns the index lookup into a linear scan over every node and
    is far worse. The key is exactly what `push` would have recomputed, so index
    contents and every digest are unchanged.
-5. Every semantic execution row is CBOR+SHA'd twice —
-   `crates/boon_semantic/src/semantic_image.rs:2643` (payload) and `:2658` (row
-   fingerprint). One preimage, one hash.
+5. **FALSIFIED — do not implement.** This item claimed every semantic execution
+   row is CBOR+SHA'd twice (`semantic_image.rs:2643` payload and `:2658` row
+   fingerprint) and that one preimage would serve both. It is false. The two
+   hashes have different domains and different inputs:
+   `payload_digest = H(ROW_PAYLOAD_DOMAIN, CBOR(payload))` and
+   `row_digest = H(ROW_DOMAIN, CBOR({stable_key_digest, domain, payload_digest,
+   relocations}))`. The second is not a re-hash of the first, and 12 of the 73
+   `push`/`push_presealed` call sites never hash a payload at all. The measured
+   127 ms on NovyWave (`payload_hash_ms=75.0`, `row_hash_ms=52.1`) is necessary
+   domain-separated hashing, not duplicated work. Removing either hash would
+   break the artifact digest contract for no gain. The entry is retained so the
+   claim is not re-derived from the plan text later.
 6. `verify_plan` recomputed on an unchanged plan — `crates/boon_plan/src/lib.rs:10977`.
    It is a pure function of the sealed plan; memoize on the plan digest, which is
    already computed. Its 41 checks are independent and may run in parallel.

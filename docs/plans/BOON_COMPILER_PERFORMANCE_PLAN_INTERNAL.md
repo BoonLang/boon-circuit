@@ -139,13 +139,27 @@ Each is a local change with no semantic content. All are verified in the tree.
 
 1. `row_expressions.validate()` runs at least twice per compile —
    `crates/boon_compiler/src/machine_plan_backend.rs:7545` and
-   `crates/boon_plan/src/lib.rs:10978`.
-2. Per-root reachability walk; the multi-root variant already exists at
-   `crates/boon_plan/src/lib.rs:9025` — `machine_plan_backend.rs:7546`.
+   `crates/boon_plan/src/lib.rs:10978`. **Parked, not waste:** the two calls sit
+   in different phases (`finalize_machine_plan_row_expressions` and
+   `seal_shared_machine_plan`), and the seal-time one is the authoritative gate.
+   Removing either weakens an error path rather than removing duplication.
+2. **DONE** — per-root reachability walk replaced by one shared-visit walk.
+   `walk_postorder_many` is now public (`crates/boon_plan/src/lib.rs`) and
+   `validate_machine_plan_row_expression_reachability` calls it once with all
+   roots. Each previous single-root call allocated its own visited set, so a
+   child shared by two roots was walked, ordered and inserted twice.
 3. `plan.clone()` of the whole plan in `refresh_typed_list_view_fingerprints` —
-   `machine_plan_backend.rs:7341`.
-4. Arena intern hashes (CBOR + SHA-256) before comparing nodes —
-   `crates/boon_plan/src/lib.rs:8969-8987`. Compare first, hash on miss.
+   `machine_plan_backend.rs:7341`. **Parked:** the clone is a borrow-checker
+   workaround, because `TypedListViewFingerprintContext` borrows
+   `row_expressions` while the rewrite closure mutates it. A partial fix
+   restructures that borrow, which needs its own measurement.
+4. **DONE** — `PlanRowExpressionArena::intern` computed `canonical_sha256(&node)`
+   for the index lookup, then called `push`, which hashed *the same node* again
+   and re-ran `validate_new_node`. A private `push_with_key` now takes the key
+   `intern` already computed. Note the rejected alternative first: comparing nodes
+   before hashing turns the index lookup into a linear scan over every node and
+   is far worse. The key is exactly what `push` would have recomputed, so index
+   contents and every digest are unchanged.
 5. Every semantic execution row is CBOR+SHA'd twice —
    `crates/boon_semantic/src/semantic_image.rs:2643` (payload) and `:2658` (row
    fingerprint). One preimage, one hash.
@@ -187,6 +201,15 @@ digests from a fresh producer and record the migration in evidence. They do not
 weaken a budget or a gate.
 
 Expected: 300-450 ms off the verified path, low risk, independently gated.
+
+**Items 2 and 4 are DONE and measured NEUTRAL** — see
+[`M1 items 2 and 4`](evidence/compiler-m1-items-2-4-neutral-2026-09-28.json). All
+three plan hashes byte-identical, `boon_plan` 59 and `boon_compiler_kernel` 198
+green, one fingerprint per lane. Interleaved 3+30 A/B: min −1.21% / +0.24% /
+−0.44% / +0.26% across the four cells, no consistent sign. Kept as correct
+simplifications with **no latency claim**. The 300-450 ms estimate was never
+attributed to specific items, and items 2 and 4 demonstrably do not deliver it;
+the unattributed share is in items 5 and 6, which remain unbuilt.
 
 ### M2 — Freeze static facts — **RETIRED as unnecessary**
 
@@ -390,3 +413,37 @@ fingerprint, except where the item is explicitly a controlled hash migration (M1
 items 5 and 6) and records the re-established oracle. If an item cannot meet its
 gate, stop, record the measurement that explains why, and hand off. Do not iterate
 micro-optimizations against a failing gate.
+
+### M3 gate measurement — invocation-frame fragmentation (2026-09-28)
+
+The M3 gate was open pending the distinct-shape ratio. That ratio cannot be
+measured cheaply, because shape-keying needs *resolved* argument types and those
+do not exist at compile time — the kernel is compiling call sites into
+pre-solve frames. What can be measured is the fragmentation those frames imply.
+
+| counter | TodoMVC | NovyWave |
+| --- | --- | --- |
+| `compiled_call_sites` | 10,537 | 2,699 |
+| `invocation_frames` | 5,789 | 703 |
+| `reused_invocation_frames` | 302 | 32 |
+| frames that serve exactly one call site | **5,487 (94.8%)** | **671 (95.4%)** |
+| call sites that reuse a frame | 2.9% | 1.2% |
+
+`InvocationKey` (`crates/boon_compiler_kernel/src/owner.rs:15364`) keys on the
+caller's `TypeVariableId`s, so two call sites that will resolve to the same
+argument shapes still get separate frames. About 95% of frames are singletons on
+both fixtures.
+
+This is the fragmentation that survived the M2 retirement, and unlike every
+retired proposal it is backed by non-zero **production** counters on both
+fixtures. It is the largest measured structural inefficiency left in the compile
+path, and it sits squarely in the kernel-compile half that M0 identified as
+TodoMVC's dominant cost (583 ms of 1057 ms of typecheck).
+
+What it is not: proof that shape-keying will pay. The ceiling is bounded by how
+many of those 5,487 singleton frames would collapse to a shared shape, and that
+is exactly the ratio that cannot be measured without running a solve. A cheap
+next step is to instrument the *solve* side, where resolved types do exist, and
+count distinct `(target, resolved formal shape)` tuples against the 5,487
+frames they came from. That is a probe, not a redesign, and it is the correct
+next measurement rather than an implementation.

@@ -1,0 +1,55 @@
+{
+  "status": "landed as correct simplifications with no measurable speedup. Both changes are provably result-neutral and provably do strictly less work, but interleaved A/B shows them inside the noise floor on all four fixture/intent cells. No latency claim is made.",
+  "date": "2026-09-28",
+  "items": {
+    "item_2_per_root_reachability_walk": {
+      "change": "validate_machine_plan_row_expression_reachability now calls the arena's walk_postorder_many once with every root instead of looping walk_postorder per root",
+      "why_it_was_duplicate_work": "each single-root call allocated its own visited set and re-walked every shared child, so a child reachable from N roots was walked, ordered and inserted N times",
+      "why_it_did_not_pay": "walk_postorder_many was already implemented and already used internally at boon_plan/src/lib.rs:9119; the reachability roots overlap little in practice, so the duplicated walking was a small fraction of a phase that is not itself dominant",
+      "mechanical_note": "walk_postorder_many was private and is now public; no behavioural change to the walk itself"
+    },
+    "item_4_arena_intern_double_hash": {
+      "change": "intern now hands its already-computed canonical_sha256 to a new private push_with_key, instead of calling push which recomputed the identical hash and re-ran validate_new_node",
+      "why_it_was_duplicate_work": "a miss cost two canonical CBOR+SHA-256 passes over the same node plus a second validate_new_node walk",
+      "why_it_did_not_pay": "the affected phase is the plan backend's derived_values/document lowering, which is not where either fixture's time is concentrated (kernel compile and solve dominate typecheck; the verified-only phases are a minority of total)",
+      "rejected_alternative": "comparing nodes before hashing was implemented first and immediately reverted: it converts a hash-index lookup into a linear scan over every node, which is far worse. Threading the key through is strictly better and digest-identical."
+  },
+  "correctness_gate": {
+    "machine_plan_sha256": {
+      "counter": "5158476e5e9f095ef8c8eb3d9041af4e103d428d5ffe0c691d2c8daa687e065d, identical",
+      "todo-mvc-physical": "0befc7f89cdeb6d6911b33883c238d42c67bdaae8ebcc01e9b56aa99d3c0ed34, identical",
+      "novywave": "5926de7bed188b50a1726b9e4f0abdc581fbf83a31ffff760f8b47ad71aa00a7, identical"
+    },
+    "per_observation_identity": "one distinct (diagnostics_fingerprint, plan_sha256) per lane in all four cells, and identical across lanes",
+    "tests": "boon_plan lib 59 passed; boon_compiler_kernel lib 198 passed"
+  },
+  "measurement": {
+    "protocol": "interleaved A/B/A, one process per observation, producers alternating by observation index, 3 setup + 30 scored per fixture and intent, diagnostics and verified",
+    "host_caveat": "a Firefox content process held ~205% CPU throughout, so absolute variance is high. Interleaving keeps the comparison unbiased, and min is reported because background load can inflate a sample but cannot push the minimum below the uncontended cost.",
+    "results": {
+      "todo-mvc-physical/diagnostics": "elapsed min 841.7 -> 831.5 (-1.21%), p50 919.5 -> 897.6 (-2.38%), p95 1093.4 -> 992.7 (-9.21%)",
+      "todo-mvc-physical/verified": "elapsed min 1211.4 -> 1214.4 (+0.24%), p50 1339.3 -> 1341.5 (+0.17%); plan_validation p50 96.7 -> 96.8 (+0.07%)",
+      "novywave/diagnostics": "elapsed min 552.2 -> 549.7 (-0.44%), p50 560.3 -> 559.1 (-0.21%)",
+      "novywave/verified": "elapsed min 1847.2 -> 1852.0 (+0.26%), p50 1866.7 -> 1889.1 (+1.20%); plan_validation p50 64.9 -> 65.2 (+0.41%)"
+    },
+    "verdict": "neutral. min, the most contamination-robust statistic here, is within +/-1.3% in every cell with no consistent sign. The single -9.21% p95 is a contention artifact and is not treated as a result.",
+    "note_on_the_estimate": "the plan predicted 300-450 ms for M1 as a whole. That figure was never attributed to specific items, and items 2 and 4 demonstrably do not deliver it. The unattributed share sits in items 5 and 6, which change hash computation and are still unbuilt."
+  },
+  "decision": "KEEP, as a correct simplification, not as a speedup",
+  "decision_reasoning": [
+    "Both changes remove work that is provably redundant, verified by the byte-identical digests.",
+    "Neither is a risk: no semantic change, no schema change, no budget change, and both test suites are green.",
+    "The alternative is reverting correct, tested simplifications on the grounds that their benefit is unmeasurable at this scale, which would be churn.",
+    "No latency claim is attached to this commit, and none should be quoted from it."
+  ],
+  "consequences_for_the_plan": [
+    "M1 items 2 and 4 are DONE with no measured payoff. Items 1 and 3 are parked with recorded reasons (different phases with an authoritative gate; a borrow-checker workaround whose partial fix restructures a borrow).",
+    "M1 items 5 and 6 remain the only M1 items with a plausible material payoff, and both change hash computation, so they require the controlled oracle migration rather than a plan-hash check.",
+    "The plan's 300-450 ms estimate for M1 should be treated as unattributed until items 5 and 6 are individually measured.",
+    "M3 is now the highest-value open item: the invocation-frame probe found 5,487 singleton frames on TodoMVC (94.8%) and 671 on NovyWave (95.4%), backed by non-zero production counters. The correct next step is the solve-side probe, not an implementation."
+  ],
+  "caveats": [
+    "The host was contended throughout, so this measurement bounds the effect as 'no larger than about 1%', not as 'exactly zero'. A quiet-window re-run could tighten the bound but cannot turn four same-signed-neutral cells into a win.",
+    "No budget, schema or gate was touched. The stale machine_plan_sha256 finding in compiler-m0-attribution-2026-09-27.json still stands and is still the owner's to decide."
+  ]
+}

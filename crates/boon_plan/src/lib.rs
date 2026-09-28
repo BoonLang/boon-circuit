@@ -8953,12 +8953,28 @@ impl PlanRowExpressionArena {
 
     pub fn push(&mut self, node: PlanRowExpressionNode) -> Result<PlanRowExpressionId, PlanError> {
         self.validate_new_node(&node)?;
-        let id = PlanRowExpressionId(self.nodes.len());
         let structural_key = self
             .structural_index
             .as_ref()
             .map(|_| canonical_sha256(&node))
             .transpose()?;
+        self.push_with_key(node, structural_key)
+    }
+
+    /// Append a node whose canonical structural key the caller has already
+    /// computed.
+    ///
+    /// `intern` must hash every candidate to consult the structural index, so
+    /// handing the key to `push` removes a second canonical CBOR + SHA-256 over
+    /// the identical node on every intern miss, and a second
+    /// `validate_new_node` pass. The key is the value `push` would have
+    /// recomputed, so the index contents are unchanged.
+    fn push_with_key(
+        &mut self,
+        node: PlanRowExpressionNode,
+        structural_key: Option<[u8; 32]>,
+    ) -> Result<PlanRowExpressionId, PlanError> {
+        let id = PlanRowExpressionId(self.nodes.len());
         self.nodes.push(node);
         if let (Some(index), Some(structural_key)) = (&mut self.structural_index, structural_key) {
             index.entry(structural_key).or_default().push(id);
@@ -8983,7 +8999,7 @@ impl PlanRowExpressionArena {
         }) {
             return Ok(id);
         }
-        self.push(node)
+        self.push_with_key(node, Some(structural_key))
     }
 
     pub fn builder(&mut self) -> PlanRowExpressionBuilder<'_> {
@@ -9022,7 +9038,13 @@ impl PlanRowExpressionArena {
         self.walk_postorder_many([root])
     }
 
-    fn walk_postorder_many(
+    /// Visit every root's subgraph once, sharing one visited set.
+    ///
+    /// Callers that walk many roots of the same arena should prefer this over
+    /// repeated `walk_postorder`: each single-root call allocates its own
+    /// visited set and re-walks every shared child, so N roots over one arena
+    /// cost N times the union of their subgraphs.
+    pub fn walk_postorder_many(
         &self,
         roots: impl IntoIterator<Item = PlanRowExpressionId>,
     ) -> Result<Vec<PlanRowExpressionId>, PlanError> {

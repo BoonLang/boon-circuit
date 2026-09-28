@@ -13,8 +13,8 @@ ordering is: attribute the unmeasured remainder (M0), delete duplicated passes
 (M4), then make the semantic phase incremental (M5), repair the measurement
 harness (M6) and the developer loop (M7). **M2 is retired as unnecessary.**
 
-M0 is complete, M1's term-arena items are partly resolved by rejection, and M2 is
-retired. Four measured results now govern the ordering:
+M0 is complete, M1 is partly landed, and M2 is retired. Five measured results now
+govern the ordering:
 
 1. The typecheck remainder splits into a kernel-**compile** half and a
    kernel-**solve** half whose ratio inverts by fixture (TodoMVC 583/474 ms,
@@ -33,6 +33,12 @@ retired. Four measured results now govern the ordering:
    every user-facing proposal that was justified by those counters (declaring
    context formals, lexical-only `PASSED`, `WHERE DEPENDS ON`, declared exports),
    and refutes the external review that motivated them.
+5. **Invocation frames are the surviving fragmentation.** TodoMVC compiles 10,537
+   call sites into 5,789 invocation frames with only 302 reused, because
+   `InvocationKey` keys on the caller's variable ids. Unlike the retired context
+   proposals this is a real, production-counter-backed cost, and it is M3's open
+   question — but its payoff cannot be measured cheaply, because shape-keying
+   needs resolved types that do not exist at compile time.
 
 **Two rules have emerged from this and are binding on the rest of the plan.**
 

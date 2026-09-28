@@ -7543,10 +7543,12 @@ fn remap_row_node_indexes(
 
 fn validate_machine_plan_row_expression_reachability(plan: &MachinePlan) -> Result<(), PlanError> {
     plan.row_expressions.validate()?;
-    let mut reachable = BTreeSet::new();
-    for root in collect_machine_plan_row_expression_roots(plan, true) {
-        reachable.extend(plan.row_expressions.walk_postorder(root)?);
-    }
+    // One shared-visit walk over every root. The previous per-root loop gave
+    // each root its own visited set, so any child shared by two roots was
+    // walked, ordered and inserted twice.
+    let reachable = plan
+        .row_expressions
+        .walk_postorder_many(collect_machine_plan_row_expression_roots(plan, true))?;
     if reachable.len() != plan.row_expressions.len() {
         return Err(PlanError::new(format!(
             "row expression compaction retained {} unreachable nodes",

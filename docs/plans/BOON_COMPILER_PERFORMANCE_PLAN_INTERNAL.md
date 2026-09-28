@@ -447,3 +447,51 @@ next step is to instrument the *solve* side, where resolved types do exist, and
 count distinct `(target, resolved formal shape)` tuples against the 5,487
 frames they came from. That is a probe, not a redesign, and it is the correct
 next measurement rather than an implementation.
+
+### M3 — Shape-keyed specialization: **the answer was already measured, and it is no**
+
+The frame-fragmentation measurement above (5,487 of 5,789 TodoMVC frames are
+singletons) looks like a large opportunity, and it is the reason M3 was ranked
+above the retired items. It is not. The ceiling was measured during K1′ and
+recorded in
+[`compiler-k1p-reuse-ceiling-2026-09-11.json`](evidence/compiler-k1p-reuse-ceiling-2026-09-11.json),
+on a debug build, and the release producer can now reproduce it because the reuse
+probe's `#[cfg(debug_assertions)]` gate has been removed in favour of the
+environment variable alone.
+
+| | TodoMVC | NovyWave |
+| --- | --- | --- |
+| `closed_share` of summary calls | 0.348 | 0.348 |
+| `closed_classes` | 168 | 143 |
+| `closed_calls_in_shared_classes` | 3,743 of 3,911 (95.7%) | 1,793 of 1,936 |
+| `value_mismatches` on repeats | 0 | 0 |
+| `requirement_mismatches` on repeats | **84** | **4** |
+
+Read together with the frame count this closes M3:
+
+1. **Only 34.8% of summary calls ever close their inputs.** Shape-keying needs a
+   resolved argument shape; two thirds of calls never have one, so they cannot be
+   keyed by shape at all regardless of how the key is built.
+2. **Where calls do close, they already collapse.** 95.7% of TodoMVC's closed
+   calls share a `(definition, input terms)` class, forming only 168 classes
+   against 3,911 calls. The reuse the shape key would enable is largely already
+   present in the closed path.
+3. **The value half is a pure function; the requirement half is not.** Zero value
+   mismatches across 3,743 repeats, but 84 TodoMVC and 4 NovyWave repeats produce
+   *different* closed requirement terms for identical inputs. So a
+   `(definition, input terms)` key is sound for the computed value and unsound
+   for the requirement state, and a sound key must additionally cover the
+   dependency epochs behind the requirement side. No such key exists.
+
+The 94.8% singleton-frame figure is therefore **not** recoverable headroom. It is
+the correct cost of calls whose argument types are genuinely not known until the
+solve completes, plus a small unsound-to-key remainder. This is the same wall
+K1′ hit, reached from a different direction, and it is why the earlier estimate of
+"1.3-2.0x on typecheck" for this item was never defensible.
+
+**Disposition: M3 is closed as measured-unavailable.** The remaining shape-keyed
+payoff is bounded above by the 34.8% closed share and further reduced by the
+requirement-side instability, which is the same invariance the requirement
+aggregation work already failed to key around five times. Do not re-open without
+a sound requirement-side key, which is a research problem rather than a
+performance task.

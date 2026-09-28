@@ -350,13 +350,13 @@ struct ComponentSolver {
     /// Opt-in K1′ reuse probe. It classifies each summary call by whether its
     /// resolved inputs are closed and whether the call owns a requirement
     /// backflow channel, then groups closed calls by definition and resolved
-    /// input terms. Debug-only; absent from release producers.
-    #[cfg(debug_assertions)]
+    /// input terms. Gated on `BOON_KERNEL_TRACE_REUSE` alone so the ceiling is
+    /// measurable in the release producer, which is where the budget lives.
     reuse_probe: Option<SummaryReuseProbe>,
     /// Opt-in K1″ aggregation probe. Records how often a destination's
     /// resolved input signature repeats or differs by a single element, which
-    /// bounds what incremental aggregation can save. Debug-only.
-    #[cfg(debug_assertions)]
+    /// bounds what incremental aggregation can save. Gated on
+    /// `BOON_KERNEL_TRACE_AGGREGATE` alone.
     aggregate_probe: Option<AggregateProbe>,
     /// Per-destination fold memo: the resolved input signature last folded and
     /// the resulting aggregate. An identical signature skips the merge loop
@@ -403,7 +403,6 @@ struct RetainedFold {
     ordered: Option<TypeTermId>,
 }
 
-#[cfg(debug_assertions)]
 #[derive(Default)]
 struct AggregateProbe {
     folds: u64,
@@ -419,7 +418,6 @@ struct AggregateProbe {
     last: std::collections::HashMap<u32, Vec<u32>>,
 }
 
-#[cfg(debug_assertions)]
 impl Drop for AggregateProbe {
     fn drop(&mut self) {
         if std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE").is_none() {
@@ -527,7 +525,6 @@ impl Drop for RequirementPhaseProbe {
     }
 }
 
-#[cfg(debug_assertions)]
 #[derive(Default)]
 struct SummaryReuseProbe {
     calls: u64,
@@ -550,7 +547,6 @@ struct SummaryReuseProbe {
     closed_requirement_examples: u64,
 }
 
-#[cfg(debug_assertions)]
 impl Drop for SummaryReuseProbe {
     fn drop(&mut self) {
         if std::env::var_os("BOON_KERNEL_TRACE_REUSE").is_none() {
@@ -827,10 +823,8 @@ impl ComponentSolver {
             record_field_scratch: ScratchPool::default(),
             variant_scratch: ScratchPool::default(),
             variable_scratch: ScratchPool::default(),
-            #[cfg(debug_assertions)]
             reuse_probe: std::env::var_os("BOON_KERNEL_TRACE_REUSE")
                 .map(|_| SummaryReuseProbe::default()),
-            #[cfg(debug_assertions)]
             aggregate_probe: std::env::var_os("BOON_KERNEL_TRACE_AGGREGATE")
                 .map(|_| AggregateProbe::default()),
             requirement_fold_memo: std::collections::HashMap::new(),
@@ -2094,11 +2088,9 @@ impl ComponentSolver {
         inputs: &[KernelSummaryCallInput],
     ) -> Result<(), KernelSolveError> {
         self.work.summary_call_activations = self.work.summary_call_activations.saturating_add(1);
-        #[cfg(debug_assertions)]
         self.record_summary_reuse(program.definition, inputs);
         self.begin_summary_requirements(output, inputs);
         let result = self.evaluate_summary_program(program, inputs);
-        #[cfg(debug_assertions)]
         if let Ok(value) = &result {
             self.probe_closed_transfer(program.definition, inputs, value.term);
         }
@@ -2119,7 +2111,6 @@ impl ComponentSolver {
     ///
     /// Returns (all_closed, without_backflow, resolved input term ids,
     /// caller requirement target ids).
-    #[cfg(debug_assertions)]
     fn classify_summary_inputs(
         &mut self,
         inputs: &[KernelSummaryCallInput],
@@ -2176,7 +2167,6 @@ impl ComponentSolver {
         (closed, without_backflow, key, targets)
     }
 
-    #[cfg(debug_assertions)]
     fn record_summary_reuse(&mut self, definition: u32, inputs: &[KernelSummaryCallInput]) {
         if self.reuse_probe.is_none() {
             return;
@@ -2205,7 +2195,6 @@ impl ComponentSolver {
 
     /// Opt-in K1′ probe: capture the evaluated transfer of a closed call and
     /// compare it with the first capture of the same class.
-    #[cfg(debug_assertions)]
     fn probe_closed_transfer(
         &mut self,
         definition: u32,

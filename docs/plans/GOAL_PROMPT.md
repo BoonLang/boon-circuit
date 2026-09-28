@@ -33,12 +33,15 @@ govern the ordering:
    every user-facing proposal that was justified by those counters (declaring
    context formals, lexical-only `PASSED`, `WHERE DEPENDS ON`, declared exports),
    and refutes the external review that motivated them.
-5. **Invocation frames are the surviving fragmentation.** TodoMVC compiles 10,537
-   call sites into 5,789 invocation frames with only 302 reused, because
-   `InvocationKey` keys on the caller's variable ids. Unlike the retired context
-   proposals this is a real, production-counter-backed cost, and it is M3's open
-   question — but its payoff cannot be measured cheaply, because shape-keying
-   needs resolved types that do not exist at compile time.
+5. **M3 is closed as measured-unavailable.** TodoMVC compiles 10,537 call sites
+   into 5,789 invocation frames with only 302 reused (94.8% singletons), which
+   looked like the largest surviving lead. It is not: only ~35% of summary calls
+   ever close their inputs, so most admit no shape key at all; where they do
+   close, 95% already share one of just 168 classes; and across 3,214 repeats
+   there are 0 value mismatches but 84 requirement mismatches, so the obvious
+   key is sound for values and unsound for requirement state. Reproduced in the
+   release producer after removing the probes' `#[cfg(debug_assertions)]` gate.
+   See [`M3 closed`](evidence/compiler-m3-closed-unavailable-2026-09-28.json).
 
 **Two rules have emerged from this and are binding on the rest of the plan.**
 

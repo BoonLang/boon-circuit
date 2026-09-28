@@ -1,0 +1,58 @@
+{
+  "status": "M3 closed as measured-unavailable. The reuse ceiling reproduces in the release producer on the current tree: only ~35% of summary calls ever close their inputs, so no shape key can cover the majority; where calls do close they already collapse into 143-168 classes; and the requirement half of a closed transfer is not a pure function of its inputs, so the obvious memo key is unsound. The 94.8% singleton-frame figure is honest cost, not recoverable headroom.",
+  "date": "2026-09-28",
+  "why_this_item_was_ranked_high": {
+    "measurement": "TodoMVC compiles 10,537 call sites into 5,789 invocation frames, of which only 302 are reused, so 5,487 (94.8%) serve exactly one call site; NovyWave is 671 of 703 (95.4%)",
+    "mechanism": "InvocationKey (crates/boon_compiler_kernel/src/owner.rs:15364) keys on the caller's TypeVariableIds rather than on resolved argument shapes",
+    "placement": "sits inside the kernel-compile half that attribution measured as TodoMVC's dominant cost, 583 ms of 1057 ms of typecheck",
+    "standing_vs_retired_items": "unlike every retired proposal this was backed by non-zero production counters on both fixtures, which is why it was promoted above them"
+  },
+  "release_reproduction": {
+    "change_required": "the reuse and aggregate probes in crates/boon_compiler_kernel/src/solver.rs were gated on #[cfg(debug_assertions)] in addition to their environment variable, which is why the K1-prime ceiling could only be recorded from a debug producer. The gate is now the environment variable alone. The eight remaining debug_assertions gates in that file are trace state and cross-check observers (trace_variables, trace_epochs, trace_quiescent_inputs) and were deliberately left in place, because they are consistency assertions rather than measurement.",
+    "gate": "all three machine_plan_sha256 values byte-identical (counter, todo-mvc-physical, novywave); boon_compiler_kernel lib 198 passed",
+    "todo_mvc_physical": {
+      "calls": 9761,
+      "closed": 3382,
+      "closed_share": "0.346",
+      "closed_classes": 168,
+      "closed_shared_classes": 100,
+      "closed_calls_in_shared_classes": 3214,
+      "closed_repeats": 3214,
+      "closed_value_mismatches": 0,
+      "closed_requirement_mismatches": 84,
+      "closed_class_max_targets": 103
+    },
+    "novywave": {
+      "calls": 4242,
+      "closed": 1430,
+      "closed_share": "0.337",
+      "closed_classes": 143,
+      "closed_shared_classes": 107,
+      "closed_calls_in_shared_classes": 1287,
+      "closed_repeats": 1287,
+      "closed_value_mismatches": 0,
+      "closed_requirement_mismatches": 2,
+      "closed_class_max_targets": 89
+    },
+    "agreement_with_k1_prime": "closed_share 0.348 on both fixtures in the K1-prime debug record against 0.346 and 0.337 here; closed_classes identical at 168 and 143; closed_value_mismatches 0 on both; closed_requirement_mismatches 84 on TodoMVC reproduced exactly, and NovyWave improved from 4 to 2. The current tree is not worse than the tree that was measured, so the earlier conclusion carries forward rather than needing to be re-argued."
+  },
+  "why_shape_keying_cannot_pay": [
+    "Shape-keying requires a resolved argument shape. Only 34.6% of TodoMVC summary calls and 33.7% of NovyWave calls ever close their inputs, so roughly two thirds of calls admit no shape key under any construction. The remaining two thirds are the ones whose types are genuinely undetermined until the solve completes.",
+    "Where calls do close, the collapse has largely already happened. 3,214 of 3,382 closed TodoMVC calls (95.1%) share a (definition, input terms) class, forming 168 classes; NovyWave is 1,287 of 1,430 (90.0%) in 143 classes. A shape key would mostly rediscover classes the closed path already forms.",
+    "The key that works for values is unsound for requirement state. Across 3,214 TodoMVC repeats there are zero value mismatches but 84 requirement mismatches: identical definition and identical resolved inputs producing different closed requirement terms. NovyWave is 2. A memo keyed on (definition, input terms) would therefore be correct for the computed value and incorrect for the accumulated requirement state, and a sound key must additionally cover the dependency epochs behind the requirement side. No such key exists.",
+    "The observed mismatch lines identify the population directly: definition 154 on TodoMVC re-derives the theme variant set Classic/Glassmorphism/Neobrutalism/Neumorphism/Professional where a repeat produced nothing, and definition 51 on NovyWave re-derives the seven-value ASCII/Binary/GroupedBinary/Hexadecimal/Octal/Signed/Unsigned set. Both are context-propagation surfaces, which is the same class of dependency the retired M2 work would have addressed, and it is precisely what the closed-call filter excludes."
+  ],
+  "conclusion": "The 94.8% singleton-frame fraction is the correct cost of calls whose argument types are not known until the solve finishes, plus a small remainder that is unsound to key. It is not recoverable headroom. This is the same invariance K1-prime reached from the memo-key direction, now confirmed from the frame-fragmentation direction on the current tree in the release producer.",
+  "disposition": "M3 is closed as measured-unavailable. Do not re-open without a sound requirement-side memo key covering dependency epochs, which is a research problem rather than a performance task. The earlier plan estimate of 1.3-2.0x on typecheck for shape-keyed specialization is withdrawn as never having been defensible.",
+  "consequences_for_the_plan": [
+    "M4 retention is now the only remaining item with material headroom, alongside the unbuilt M1 items 5 and 6 which require the controlled oracle migration.",
+    "Every cheap structural candidate identified so far is now either landed-and-neutral (M1 items 2 and 4) or closed by measurement (M2 retired, M3 unavailable, the canonical set restructure rejected). That is the honest state of the space, not an argument that the compiler is fast.",
+    "The gap between the measured state and the product budget is unchanged: warm diagnostics 883 ms against 16.7 ms, warm verified preview 2,145 ms against 100 ms. The measured 100% per-definition interface reuse across an edit remains the strongest argument that the budget is reachable, and it is a retention problem rather than an inference problem."
+  ],
+  "caveats": [
+    "The probe is opt-in and env-gated, so the default production path is unchanged; the three identical plan hashes confirm this.",
+    "closed_calls and closed_repeats differ slightly from the K1-prime debug record (3,382 vs 3,911 and 3,214 vs 3,743 on TodoMVC) because the tree has changed since. The ratios and the mismatch counts are what the conclusion rests on, and those are stable or improved.",
+    "Removing the debug_assertions gate means the probe code is now compiled into release. It costs one Option branch per summary call when disabled, which was not separately measured and is not claimed to be free.",
+    "No budget, schema or gate was touched. The stale machine_plan_sha256 finding in compiler-m0-attribution-2026-09-27.json still stands and is still the owner's to decide."
+  ]
+}

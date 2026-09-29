@@ -610,10 +610,12 @@ sized from spike S1:
 | R5 | A `List/replace_all` collection op (D17) | Runtime + catalog |
 | R6 | Removal of `Dependency/catch_cycle` (D9) | Catalog |
 | R7 | Snapshot-read semantics (D21), landed early on the shared executor (P0/P1); old-engine gates re-run afterwards | Runtime behaviour |
+| R8 | **Change model (D30, D32, D33).** Copy ops for THEN bodies and WHEN arms (evaluate only when the input updates) beside live ops for WHILE; every write fires (HOLD stops deduplicating equal values; a derived value fires once per step); a later update of HOLD's piped input resets it; follow-up microsteps within a tick, each reading its own committed snapshot (D21); SKIP keeps the last value; activation is not an update. Old-engine plans keep today's behaviour through a plan semantics version until P8, because today's examples rely on live WHEN | Runtime behaviour + format |
+| R9 | **Effects (D31, D34-D36).** Commands staged once with copied arguments and never re-staged when inputs update; queries superseded by a newer run from the same call site in both contexts; no `Pending` injection; `Http/get` + `Http/send`; host level ports such as `focused` and server connection lists, plus a "restored" occurrence; an effect log for the dev window and the scenario runner | Runtime + catalog |
 
 Until cutover the runtime accepts both the old engine's plans (document v11) and
 the new ones. The old-vs-new differential is exact for dataflow parts that use
-none of R2-R7. Documents are compared by rendered frames, structurally, modulo
+none of R2-R9. Documents are compared by rendered frames, structurally, modulo
 ids.
 
 **Lowering is total.** Each of the ~680 PlanError sites in today's back half
@@ -861,9 +863,10 @@ P1a overlaps P0.
 ### P0: Reset, decide, de-risk (2 weeks)
 
 **Semantics (owner).**
-- Answer the language questions L1-L15 (§11).
-- Write "static semantics v2" into LANGUAGE_SEMANTICS.md, covering all of D4-D18:
-  - types, flows, the union model, homogeneity, cycles and temporal rules;
+- The language questions L1-L15 were answered on 2026-09-29 (D20-D36, §11).
+- Write "static semantics v2" into LANGUAGE_SEMANTICS.md, covering all of D4-D36:
+  - types, change rules (D30-D34), effects (D31, D36), persistence scope (D35),
+    the union model, homogeneity and cycles;
   - names, contracts, precedence, layout;
   - the diagnostic catalog, with codes and owners.
 - Produce the HOLD-alternative options note (D9).
@@ -1002,7 +1005,7 @@ on purpose; the owner reviews screenshots.
 - `boonc_lower`: Phase A, dataflow and element emission, persistence (D12 plus
   identity_v1 golden vectors), list access, distributed link,
   `persistence_only` stages, assembly with the hidden v11 contracts (§4.5).
-- Runtime delta R1-R3 and R5-R6, plus R7 if scheduled.
+- Runtime delta R1-R3, R5-R6, R8 and R9, plus R7 if scheduled.
 - Classify all PlanError sites.
 
 **Exit:**
@@ -1240,7 +1243,7 @@ and P0 cannot exit without the answers.
 | The v11+delta runtime changes turn out larger than listed. | Spike S1 lists and sizes every change before P2. D2 allows format changes. |
 | Checker cost with structural element records. | Spike S2 before P2; a representation decision if the model fails. |
 | The strict spec breaks more code than estimated (closed contracts, D15, D9). | S4 census plus the real P2b census before sizing P3b; fix-its for mechanical classes; the per-milestone gate profile. |
-| The temporal rules disagree with the runtime (L2, L3). | Runtime snapshot fix (D21, S5) plus runtime scenario differentials per rule. |
+| The change and effect rules disagree with the runtime (D30-D36). | Runtime snapshot fix (D21, S5), runtime deltas R8-R9, and one runtime scenario per rule seeded from `compiler_rewrite_notes/change_probes/`. |
 | No mountable behaviour baseline. | S6: host-service runner, bisected baseline, triage table. |
 | Persistence schema drift. | D12 rule, structural-route identities, identity_v1 golden vectors, restart scenarios (O2). |
 | Gate churn turns `verify-all` red. | New crates stay additive. The old-engine compatibility rule for examples. Old gates change only in P0 (line cap), P5 (engine stamping) and the atomic P8. |

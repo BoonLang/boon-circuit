@@ -86,6 +86,8 @@ These are settled. Any semantic change beyond them goes to the owner.
 | D17 | Effect lists | New event-driven builtin that replaces a collection's contents, e.g. `rows: LIST {} \|> List/replace_all(with: page_event.rows)`. An effect-returned list lives in its own collection authority. |
 | D18 | Syntax cleanups | 1. One newline/indent rule (§4.2), which must not break multi-line TEXT. 2. `--` inside TEXT is text. 3. Comparisons do not chain. 4. A tag is either bare (`Panel`) or a **tagged object** (`Panel[x: 1]`) within one type, never both. |
 | D19 | FjordPulse | The deployed app (apps/fjordpulse, deploy/fjordpulse) may be reset at cutover; no data migration. |
+| D20 | Element values | Elements are **tagged objects**: `Element/button(...)` returns `Button[label: TEXT, style: [...], ...]`. Each kind keeps its exact payload inside unions and matches with binder patterns (`Button[label] => label`). |
+| D21 | Snapshot reads | Fix the runtime so reads within a tick see committed values, as RUNTIME_MODEL says. Today a HOLD can see another cell's new same-tick value, so results depend on declaration order. The owner's explanation: earlier runtimes were asynchronous and had no ticks, so the rewrite may have implemented ticks incorrectly. Unconditional. |
 
 ---
 
@@ -396,8 +398,7 @@ Flows are computed in one forward pass in dependency order, seeded at HOLD
   renderer and host key tables.
 - Element values are data. Code may read them, spread them, pattern-match
   them and build them from literals. Slots check element values against the
-  per-kind contracts. The exact representation (a `kind` field versus tagged
-  objects) is decided in P0 (L1).
+  per-kind contracts. Elements are tagged objects (D20).
 - User FUNCTIONs: a record literal written directly as an argument may carry
   only keys the callee reads or forwards (excess-key error). A record passed
   through a name keeps width subtyping, so functions can still pass records
@@ -563,7 +564,7 @@ sized from spike S1:
 | R4 | **Document model v2 (D13).** Elements are data values with a hidden stable identity (construction site key + instance path + row key). The renderer reconciles record trees by identity into frame nodes. This replaces DocumentPlan templates and constructors | Runtime + format |
 | R5 | A `List/replace_all` collection op (D17) | Runtime + catalog |
 | R6 | Removal of `Dependency/catch_cycle` (D9) | Catalog |
-| R7 | Snapshot-read semantics, only if S5 schedules it before cutover (L4) | Runtime behaviour |
+| R7 | Snapshot-read semantics (D21), landed early on the shared executor (P0/P1); old-engine gates re-run afterwards | Runtime behaviour |
 
 Until cutover the runtime accepts both the old engine's plans (document v11) and
 the new ones. The old-vs-new differential is exact for dataflow parts that use
@@ -579,8 +580,8 @@ Elements become real data, so the runtime, not the compiler, reconciles the
 UI.
 
 **Design points, decided in spike S3.**
-- **Representation.** Element values are records or tagged objects (L1) with
-  structural sharing (Arc).
+- **Representation.** Element values are tagged objects (D20) with structural
+  sharing (Arc).
 - **Identity.** A hidden identity comes from the construction site key + the
   instance path + the list-row key. Values copied or moved keep their identity.
 - **Recomputation.** The dataflow recomputes element subtrees incrementally,
@@ -846,8 +847,8 @@ P1a overlaps P0.
 - Run all 7 handoff gates once and record which are red.
 - Measure line-cap headroom on the playground and runtime (31,082/32,000 and
   41,105/42,000). Plan compensating deletions for R1-R7.
-- Owner action: commit or revert the pending kernel edits (Q14).
-  `perf_event_paranoid=1` is already persisted (Q13).
+- The pending kernel edits are committed (Q14), and `perf_event_paranoid=1` is
+  persisted (Q13).
 
 **Spikes** (time-boxed; each ends with a report):
 
@@ -857,7 +858,7 @@ P1a overlaps P0.
 | **S2: checker core with structural elements** | TodoMVC view functions (theme refactored) plus a NovyWave-shaped generator (373 constructors, 252 style records, depth 22, theme and PASSED reads). | Largest scheme and instantiation counts within the model; extrapolated check ≤6 ms TodoMVC, ≤20 ms NovyWave. If not, the element representation is fixed before P2. |
 | **S3: document model v2** | Prototype element-record reconciliation on TodoMVC (many rows), Cells and a NovyWave list. | Per-frame work and retained-update counts no worse than today; identity rules settled. |
 | **S4: census scanner** | Closed contracts against the renderer and host tables, stateful LATEST, collections in state, effects in continuous arms, THEN over state, suffix-resolved names, Optional fields reaching storage, cycles under D9. | Counts per class, which size P3. |
-| **S5: snapshot semantics** | Instrument the executor to count same-tick reads of another cell's new value across all runnable scenarios. | A decision on L4 timing. |
+| **S5: snapshot semantics** | Instrument the executor to count same-tick reads of another cell's new value across all runnable scenarios, then implement the D21 fix. | Fix landed on the shared executor; affected examples and scenarios listed and adjusted; old-engine gates re-run. |
 | **S6: scenario triage and baseline pin** | Host-service runner, bisection, triage table. | Each runtime bug sized. If they add up to more than ~1 week, a runtime-fix track is added that must finish before P4 exits. |
 
 **Exit.** The owner signs off the spec and the spike reports, and the plan is
@@ -1140,10 +1141,10 @@ and P0 cannot exit without the answers.
 
 | # | question | recommended |
 | --- | --- | --- |
-| L1 | Element representation under D13: records with a `kind` field (`[kind: Button, label: …]`, today's notation), or **tagged objects** (`Button[label: …]`)? | Tagged objects. Each element kind keeps its own precise payload inside unions and pattern-matches naturally (`Button[label] => …`). This matches the owner's "Panel[x: 1] is a tagged object". |
-| L2 | Effect calls (host effects) only in event-gated contexts (THEN bodies, HOLD updates)? | Yes; NovyWave's hierarchy-page call migrates. |
-| L3 | THEN over a HOLD value (persons_pro uses it to mean "on change"). | Error, as documented; the effect completion is exposed as an event field. |
-| L4 | Snapshot reads: RUNTIME_MODEL says reads within a tick see committed values, but today the runtime shows new same-tick values, so results depend on declaration order. When should the runtime be fixed? | Early (P1) if S5 finds few or no dependents. Otherwise after cutover, with the checker rejecting same-event cross-HOLD read cycles until then. |
+| L1 | Element representation. | **Answered 2026-09-29: tagged objects (D20).** |
+| L2 | When do host effects run, and how is that visible to the user? | **Under discussion.** The owner notes that effects are not visible in Boon today; an options memo with snippets is being prepared. |
+| L3 | Events vs values. The owner: "there is no explicit distinction between events and anything else - everything is just change; that was the original Boon idea." Should the checker's flow modes (continuous / event) be user-visible at all, and what does THEN over a HOLD mean? | **Under discussion**, together with L2. This decides the flow rules in §4.3. |
+| L4 | Snapshot reads. | **Answered 2026-09-29: fix the runtime (D21).** |
 | L5 | Event lists `List/map(new: <event>) \|> List/latest()` (27 sites). | Keep them as derived event lists, consumable only by `List/latest` and never stored, rendered or published. |
 | L6 | State and SOURCE created inside WHEN arms or THEN bodies. | Allowed in WHEN/WHILE arms (activation scopes); forbidden in THEN bodies. |
 | L7 | FLUSH boundaries. | Record fields, FUNCTION return, BLOCK result and root; not BLOCK variables. |
@@ -1161,7 +1162,7 @@ and P0 cannot exit without the answers.
 | # | question | default |
 | --- | --- | --- |
 | Q13 | Persist `perf_event_paranoid=1` via sysctl.d so samply works. | **Done** 2026-09-29 (`/etc/sysctl.d/60-perf.conf`); samply recording verified. |
-| Q14 | The pending uncommitted old-kernel speedups. | The owner commits or reverts them. They become the behaviour baseline only if they pass its scenarios (§5.2). |
+| Q14 | The pending uncommitted old-kernel speedups. | **Done:** committed 2026-09-29 (e36b2c24, 198 kernel tests pass). They become the behaviour baseline only if they pass its scenarios (§5.2). |
 | Q15 | Engine switch timing. | As soon as the P7 gates pass on `next`, then P8. |
 | Q16 | Allocator. | The playground adopts mimalloc, as the bench measures (glibc malloc is 17% slower on NovyWave). |
 | Q17 | wasm32. | The new compiler builds for wasm32, single-threaded. In-browser compile latency is reported, not gated. |
@@ -1181,7 +1182,7 @@ and P0 cannot exit without the answers.
 | The v11+delta runtime changes turn out larger than listed. | Spike S1 lists and sizes every change before P2. D2 allows format changes. |
 | Checker cost with structural element records. | Spike S2 before P2; a representation decision if the model fails. |
 | The strict spec breaks more code than estimated (closed contracts, D15, D9). | S4 census plus the real P2b census before sizing P3b; fix-its for mechanical classes; the per-milestone gate profile. |
-| The temporal rules disagree with the runtime (L3, L4). | S5 plus runtime scenario differentials per rule. |
+| The temporal rules disagree with the runtime (L2, L3). | Runtime snapshot fix (D21, S5) plus runtime scenario differentials per rule. |
 | No mountable behaviour baseline. | S6: host-service runner, bisected baseline, triage table. |
 | Persistence schema drift. | D12 rule, structural-route identities, identity_v1 golden vectors, restart scenarios (O2). |
 | Gate churn turns `verify-all` red. | New crates stay additive. The old-engine compatibility rule for examples. Old gates change only in P0 (line cap), P5 (engine stamping) and the atomic P8. |

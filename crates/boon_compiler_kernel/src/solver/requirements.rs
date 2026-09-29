@@ -498,6 +498,7 @@ impl super::ComponentSolver {
     /// terms remain the dependency authority even when their current resolved
     /// aggregate is closed, unchanged, or has widened away a payload.
     pub(super) fn refresh_requirements(&mut self) {
+        self.end_reschedule_epoch();
         self.requirement_previous_bindings.clear();
         let phase_started = self
             .requirement_phase_probe
@@ -538,6 +539,7 @@ impl super::ComponentSolver {
             }
         }
         while let Some(target) = self.requirements.pop_dirty() {
+            self.end_reschedule_epoch();
             let target = self.root(target);
             let Some(base) = self.cells[target.0 as usize].requirement_base else {
                 continue;

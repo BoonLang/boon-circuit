@@ -17209,11 +17209,47 @@ fn instantiate_owner(
     Ok(instance)
 }
 
+/// Memo for [`direct_result_summary_supported`].
+///
+/// The predicate is a conjunction over the expression graph reachable from a
+/// node (including the result graph of every called definition), and a cycle
+/// anywhere in that reachable graph makes every node on or above the cycle
+/// unsupported. The answer for a node is therefore path-independent, so it is
+/// computed once per `(owner, expression)` for the whole project instead of
+/// once per path: without the memo every call site re-walked its callee's
+/// whole body, which multiplied through nested calls and was the single
+/// largest cost of the compile phase on call-heavy projects.
+#[derive(Default)]
+struct DirectSummarySupportMemo {
+    states: Vec<Vec<u8>>,
+}
+
+const DIRECT_SUMMARY_SUPPORT_UNVISITED: u8 = 0;
+const DIRECT_SUMMARY_SUPPORT_ACTIVE: u8 = 1;
+const DIRECT_SUMMARY_SUPPORT_UNSUPPORTED: u8 = 2;
+const DIRECT_SUMMARY_SUPPORT_SUPPORTED: u8 = 3;
+
+impl DirectSummarySupportMemo {
+    fn new(project: &PackedKernelProjectProgram) -> Self {
+        Self {
+            states: vec![Vec::new(); project.definition_count()],
+        }
+    }
+
+    fn state(&mut self, owner_id: KernelOwnerId, node_count: usize, expression: usize) -> &mut u8 {
+        let states = &mut self.states[owner_id.0 as usize];
+        if states.is_empty() {
+            states.resize(node_count, DIRECT_SUMMARY_SUPPORT_UNVISITED);
+        }
+        &mut states[expression]
+    }
+}
+
 fn direct_result_summary_supported(
     project: &PackedKernelProjectProgram,
     owner_id: KernelOwnerId,
     expression: usize,
-    active: &mut BTreeSet<(KernelOwnerId, usize)>,
+    active: &mut DirectSummarySupportMemo,
     trace: bool,
 ) -> bool {
     let Some(owner) = project.owner(owner_id) else {
@@ -17222,11 +17258,18 @@ fn direct_result_summary_supported(
     let Some(node) = owner.nodes().get(expression) else {
         return false;
     };
-    if !active.insert((owner_id, expression)) {
-        return false;
+    match *active.state(owner_id, owner.node_count(), expression) {
+        DIRECT_SUMMARY_SUPPORT_UNVISITED => {}
+        // A node reached again while it is still being decided closes a
+        // cycle: the walk rejects it exactly as the path-set walk did, and the
+        // node's own state is settled by the outer visit.
+        DIRECT_SUMMARY_SUPPORT_ACTIVE => return false,
+        DIRECT_SUMMARY_SUPPORT_UNSUPPORTED => return false,
+        _ => return true,
     }
+    *active.state(owner_id, owner.node_count(), expression) = DIRECT_SUMMARY_SUPPORT_ACTIVE;
     let child = |edge: &crate::PackedKernelOwnerInputEdge,
-                 active: &mut BTreeSet<(KernelOwnerId, usize)>| {
+                 active: &mut DirectSummarySupportMemo| {
         direct_result_summary_supported(
             project,
             owner_id,
@@ -17310,7 +17353,8 @@ fn direct_result_summary_supported(
         }
         PackedKernelOwnerNodeKind::UserCall { target, .. } => {
             let Some(target_owner) = project.owner(*target) else {
-                active.remove(&(owner_id, expression));
+                *active.state(owner_id, owner.node_count(), expression) =
+                    DIRECT_SUMMARY_SUPPORT_UNSUPPORTED;
                 return false;
             };
             inputs.iter().all(|edge| {
@@ -17413,7 +17457,11 @@ fn direct_result_summary_supported(
         | PackedKernelOwnerNodeKind::FreshOut => inputs.is_empty(),
         _ => false,
     };
-    active.remove(&(owner_id, expression));
+    *active.state(owner_id, owner.node_count(), expression) = if supported {
+        DIRECT_SUMMARY_SUPPORT_SUPPORTED
+    } else {
+        DIRECT_SUMMARY_SUPPORT_UNSUPPORTED
+    };
     #[cfg(debug_assertions)]
     if trace && !supported {
         // Predicates short-circuit in source edge order. The first emitted
@@ -19675,6 +19723,7 @@ fn compile_direct_result_summaries(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    let mut support_memo = DirectSummarySupportMemo::new(project);
     let supported = targets
         .into_iter()
         .filter(|target| {
@@ -19692,7 +19741,7 @@ fn compile_direct_result_summaries(
                 project,
                 *target,
                 owner.result().0 as usize,
-                &mut BTreeSet::new(),
+                &mut support_memo,
                 trace,
             )
         })
@@ -20691,8 +20740,10 @@ fn compile_node(
                 // K1′ experiment: evaluate through the residual specialization
                 // path with shared physical bytes instead of the interpreted
                 // summary cut. Opt-in so the accepted path is unchanged.
-                let summary_enabled =
-                    std::env::var_os("BOON_KERNEL_DISABLE_DIRECT_SUMMARIES").is_none();
+                static SUMMARY_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let summary_enabled = *SUMMARY_ENABLED.get_or_init(|| {
+                    std::env::var_os("BOON_KERNEL_DISABLE_DIRECT_SUMMARIES").is_none()
+                });
                 if summary_enabled {
                     emit_compiled_direct_summary(
                         builder,

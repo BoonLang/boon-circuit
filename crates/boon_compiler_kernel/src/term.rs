@@ -1290,8 +1290,17 @@ impl TypeTermArena {
     pub(crate) fn lookup_object_field(&self, shape: u32, name: SymbolId) -> Option<TypeTermId> {
         let shape = self.object_shapes[shape as usize];
         let fields = &self.object_fields[shape.canonical_fields.range()];
+        // Canonical fields are sorted by lexical rank, and the rank order is
+        // the byte order of the symbol text, so comparing ranks is the same
+        // comparison as comparing names without re-validating UTF-8 per step.
+        let rank = |symbol: SymbolId| {
+            self.text_catalog
+                .symbol_lexical_rank(symbol)
+                .expect("object field symbol belongs to the project text authority")
+        };
+        let target = rank(name);
         fields
-            .binary_search_by(|field| self.name(field.name).cmp(self.name(name)))
+            .binary_search_by_key(&target, |field| rank(field.name))
             .ok()
             .map(|index| fields[index].ty)
     }

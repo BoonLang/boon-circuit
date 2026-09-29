@@ -16,3 +16,4 @@
 | examples.md | example breakage census, Theme refactor drafts, verification + review |
 | process.md | AGENTS.md/contract/budgets v4/measurement/gates/cutover + review |
 | process_alternative.md | earlier variant of the process design |
+| original_change_model.md | survey of the original `~/repos/boon` change and effect model (input to L2/L3) |

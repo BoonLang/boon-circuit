@@ -1,6 +1,11 @@
 # Boon Compiler Performance Plan — Internal
 
-Status: **active compiler execution plan.** It supersedes the work sequencing in
+Status: **superseded on 2026-09-28** by
+[the profile-driven plan](BOON_COMPILER_PROFILE_DRIVEN_PLAN_2026_09_28.md),
+which keeps this document's measurement discipline and correctness constraints
+and replaces its M-item ordering with sampled-profile attribution. The text
+below is preserved as the record of M0-M4. Original status: active compiler
+execution plan; it supersedes the work sequencing in
 `BOON_COMPILER_REQUIREMENT_AGGREGATION_GOAL_PROMPT.md` (Goals B and C) while
 leaving that document's measurement discipline, evidence format and correctness
 constraints in force. It changes no language surface, no user-facing behavior and

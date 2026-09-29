@@ -36,10 +36,12 @@ summary evaluator without per-tuple reuse: the measured K1 cut re-walked
 shared summary programs per invocation and lost 23-130% end to end despite
 removing 71% of the targeted residual work. Reuse keys must be exact semantic
 input tuples plus dependency epochs, never final result-type equality.
-The selected next cuts are, in order: incremental requirement aggregation,
-warm revision retention, and conditional linked transfer code — see
-`docs/plans/BOON_COMPILER_REQUIREMENT_AGGREGATION_GOAL_PROMPT.md` for their
-contracts and start commands. Do not open a successor inside another's goal.
+The current compiler speed plan is
+`docs/plans/BOON_COMPILER_PROFILE_DRIVEN_PLAN_2026_09_28.md`; work its tiers in
+order and attribute with a sampling profile (samply) of the release binary
+before choosing an item. The older K1″/warm-retention/linked-code sequence in
+`docs/plans/BOON_COMPILER_REQUIREMENT_AGGREGATION_GOAL_PROMPT.md` is
+superseded; do not reopen linked transfer code or summary memoization.
 
 When the user asks for or explicitly permits parallel help, use subagents for
 independent reads before continuing micro-fixes. Good splits include native

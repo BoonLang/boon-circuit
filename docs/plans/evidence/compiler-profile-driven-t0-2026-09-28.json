@@ -1,0 +1,44 @@
+{
+  "record": "compiler-profile-driven-t0",
+  "date": "2026-09-28",
+  "plan": "docs/plans/BOON_COMPILER_PROFILE_DRIVEN_PLAN_2026_09_28.md",
+  "status": "development A/B, not 3+30 acceptance",
+  "baseline_source_head": "286aa974",
+  "baseline_binary_sha256_prefix": "5949b03b8d2a41ca",
+  "change": "crates/boon_compiler_kernel/src/owner.rs: direct_result_summary_supported memoized per (owner, expression) with an unvisited/active/unsupported/supported state table instead of a per-path BTreeSet; the predicate is a conjunction over the reachable graph so the answer is path-independent and a cycle still yields false at the closing edge.",
+  "attribution": {
+    "tool": "samply 1kHz sampling of target/release/boon_cli, presymbolicated, summarized by self/inclusive time",
+    "todomvc_diagnostics_before": {
+      "direct_result_summary_supported_inclusive": "36.3%",
+      "schedule_variable_self": "15.8%",
+      "btree_set_insert_remove_for_the_predicate_path_set": "~11%"
+    },
+    "todomvc_verified_before": {
+      "direct_result_summary_supported_inclusive": "22.6%"
+    },
+    "novywave_verified_before": {
+      "direct_result_summary_supported_inclusive": "1.4%",
+      "elaborate_with_representation_inclusive": "27.5%",
+      "finish_checked_machine_plan_inclusive": "23.5%",
+      "erased_field_is_runtime_row_storage_self": "4.2%"
+    }
+  },
+  "measurement": {
+    "protocol": "interleaved A/B, 2 setup + N scored fresh-process observations per binary, compiler-sample, single compiler thread, caches disabled, same machine/session",
+    "cells": [
+      {"fixture": "todo-mvc-physical", "intent": "diagnostics", "n": 8, "a_p50_ms": 851.5, "b_p50_ms": 465.9, "a_p95_ms": 1020.4, "b_p95_ms": 612.5, "delta_p50": "-45.3%", "typecheck_p50_ms": [830.3, 445.9], "diagnostics_fingerprint_identical": true},
+      {"fixture": "todo-mvc-physical", "intent": "verified", "n": 8, "a_p50_ms": 1238.1, "b_p50_ms": 852.4, "a_p95_ms": 1360.0, "b_p95_ms": 965.0, "delta_p50": "-31.2%", "typecheck_p50_ms": [882.0, 498.5], "plan_sha256": "0befc7f89cdeb6d6911b33883c238d42c67bdaae8ebcc01e9b56aa99d3c0ed34", "plan_identical": true},
+      {"fixture": "novywave", "intent": "verified", "n": 6, "a_p50_ms": 1890.5, "b_p50_ms": 1875.4, "delta_p50": "-0.8%", "plan_sha256": "5926de7bed188b50a1726b9e4f0abdc581fbf83a31ffff760f8b47ad71aa00a7", "plan_identical": true},
+      {"fixture": "counter", "intent": "verified", "n": 6, "a_p50_ms": 15.7, "b_p50_ms": 16.0, "delta_p50": "+1.8% (noise)", "plan_sha256": "5158476e5e9f095ef8c8eb3d9041af4e103d428d5ffe0c691d2c8daa687e065d", "plan_identical": true}
+    ],
+    "peak_rss": "unchanged within 1.5% on every cell"
+  },
+  "gates": {
+    "boon_compiler_kernel_lib_tests": "198 passed",
+    "boon_compiler_test_suites": "98 + 10 + 3 + 3 + 8 + 3 passed, 1 ignored"
+  },
+  "notes": [
+    "The TodoMVC and NovyWave plan hashes reproduced here match what HEAD produced before the change; they still differ from budgets/compiler.toml's stale oracle values, as the internal plan's M0 finding already records. budgets/compiler.toml was not edited.",
+    "The K1'' hand-off attributed TodoMVC's residual to the requirement-aggregation refresh; the sampling profile shows that phase at ~13% of the run while this predicate was 36%. Attribution by phase timer hid it inside 'kernel compile (prepare)'."
+  ]
+}

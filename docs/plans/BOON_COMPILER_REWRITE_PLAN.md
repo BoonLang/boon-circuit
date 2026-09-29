@@ -88,6 +88,10 @@ These are settled. Any semantic change beyond them goes to the owner.
 | D19 | FjordPulse | The deployed app (apps/fjordpulse, deploy/fjordpulse) may be reset at cutover; no data migration. |
 | D20 | Element values | Elements are **tagged objects**: `Element/button(...)` returns `Button[label: TEXT, style: [...], ...]`. Each kind keeps its exact payload inside unions and matches with binder patterns (`Button[label] => label`). |
 | D21 | Snapshot reads | Fix the runtime so reads within a tick see committed values, as RUNTIME_MODEL says. Today a HOLD can see another cell's new same-tick value, so results depend on declaration order. The owner's explanation: earlier runtimes were asynchronous and had no ticks, so the rewrite may have implemented ticks incorrectly. Unconditional. |
+| D22 | Unrendered style data | Keys the themes set that no renderer draws today (`glow` and `shadows` inside `material:`, `family` in spread font records, …) get **renderer support**. They are not deleted. The contracts include them, and the renderer implements them (work item R-RENDER). |
+| D23 | Exact record parameters | A record passed to a user FUNCTION must contain exactly the fields the function consumes. "Consumes" means reads, or forwards into another exact position: a callee parameter, state, a collection, a contract. Extra fields are an error. The owner does not want functions to receive data by accident, especially when a function changes later. Context flows through PASSED. |
+| D24 | Unused names | Unused FUNCTION parameters and unused pattern binders are errors, with a fix-it. |
+| D25 | Dead arms | Every WHEN arm's state exists, even when a compile-time constant rules the arm out. State never depends on values. The compiler may warn about unreachable arms. |
 
 ---
 
@@ -399,10 +403,12 @@ Flows are computed in one forward pass in dependency order, seeded at HOLD
 - Element values are data. Code may read them, spread them, pattern-match
   them and build them from literals. Slots check element values against the
   per-kind contracts. Elements are tagged objects (D20).
-- User FUNCTIONs: a record literal written directly as an argument may carry
-  only keys the callee reads or forwards (excess-key error). A record passed
-  through a name keeps width subtyping, so functions can still pass records
-  along (L10).
+- User FUNCTIONs: record parameters are **exact** (D23). A scheme's record
+  parameter lists exactly the fields the body consumes: reads, and forwarding
+  into another exact position. Passing extra fields is an error. Whole records
+  forwarded to a callee, into state or into a collection take that
+  destination's exact type. P0 specifies how exactness composes through
+  spreads and forwarding.
 
 **SOURCE payloads** come from the provider: the element event group or the host
 port. This replaces today's heuristic based on how names are spelled.
@@ -496,7 +502,7 @@ TodoMVC, ≤20 ms NovyWave.
   are user-reachable only inside `verify_plan` today: typed-index capacity and
   declared capacity.
 
-**No static arm pruning (L14).** Every WHEN arm's state exists, whatever the
+**No static arm pruning (D25).** Every WHEN arm's state exists, whatever the
 values.
 
 **Phase B** (preview lane; target ≤8 ms TodoMVC, ≤20 ms NovyWave):
@@ -707,9 +713,10 @@ files are either triaged or deleted.
 | Suffix fallback removed (D14) | TodoMVC `visible_todos`/`selected_filter`, NovyWave RUN.bn:4506, … (census) | Qualify with `store.` or pass through PASSED. |
 | Optional-field reads (D5) | TodoMVC append without `completed`; persons_pro variant-union reads (5) | Append complete rows; use binder patterns. |
 | Collections in HOLD (D9) | census | Move them into collection authorities. |
-| Closed contracts (D13) | census: `event` vs `events` (142/59), `hovered: <port>` (137), style keys no renderer reads (`glow`/`shadows` inside `material:`, `family` in spread fonts, Cells `__selected_*`) | Fix against the generated contracts. Unrendered keys are deleted (L8). |
+| Closed contracts (D13) | census: `event` vs `events` (142/59), `hovered: <port>` (137), private keys such as Cells `__selected_*` | Fix against the generated contracts. Unrendered theme keys (glow, material shadows, font family) stay and get renderer support (D22). |
+| Exact record parameters (D23) | census | Remove the extra fields at call sites, or move context into PASSED. |
 | Pony precedence and comparison chains (D11, D18) | ≤19 | Parentheses (fix-it). |
-| Unused parameters and binders | ~12 | Remove them (fix-it). |
+| Unused parameters and binders (D24) | ~12 | Remove them (fix-it). |
 | Event lists `List/map(new: <event>) \|> List/latest()` | 27 (Cells, NovyWave) | Kept as derived event lists (L5). |
 | Old-compiler bugs that look like example bugs | fjordpulse (the parser tokenizes TEXT contents), cells (builtins missing from the old ABI) | Fixed in the new compiler; examples unchanged. |
 
@@ -942,6 +949,13 @@ web-host adaptation, per §4.6.
 **Exit:** its own performance gate (§4.6); both document representations run
 until P8.
 
+### ∥ R-RENDER: Renderer support for theme styling (D22; 1-2 weeks, any time before P7)
+
+Implement `glow`, shadows inside `material:`, and font `family` in the native
+renderer and the web host. Add them to the render contracts. Verify with the
+native readback A/B. Unlike the rest of the migration, the pixels change here
+on purpose; the owner reviews screenshots.
+
 ### P4: Lowering (5-7 weeks; can be split across 2-3 agents)
 
 - `boonc_lower`: Phase A, dataflow and element emission, persistence (D12 plus
@@ -1148,13 +1162,13 @@ and P0 cannot exit without the answers.
 | L5 | Event lists `List/map(new: <event>) \|> List/latest()` (27 sites). | Keep them as derived event lists, consumable only by `List/latest` and never stored, rendered or published. |
 | L6 | State and SOURCE created inside WHEN arms or THEN bodies. | Allowed in WHEN/WHILE arms (activation scopes); forbidden in THEN bodies. |
 | L7 | FLUSH boundaries. | Record fields, FUNCTION return, BLOCK result and root; not BLOCK variables. |
-| L8 | Style/material keys no renderer reads (glow and shadows inside `material:`, `family` in spread fonts, …). They are errors under D13. | Delete them in the refactor, so pixels stay identical. Wanted visuals become renderer features. Scene `lights`/`geometry` stay as API. |
+| L8 | Style keys no renderer draws. | **Answered 2026-09-29: add renderer support (D22).** |
 | L9 | A FUNCTION nested inside BLOCK. | Positioned error. |
-| L10 | User FUNCTIONs and extra keys (D13: "you can pass only what the functions called expects/can handle"). | An excess-key error for record literals written directly as arguments. Named records keep width subtyping, so they can be passed along. |
+| L10 | User FUNCTIONs and extra keys. | **Answered 2026-09-29: exact record parameters (D23).** |
 | L11 | Collection values joined through WHEN (`zs: WHEN { A => xs, B => ys }`). | Read-only covariant views; writes carry an effect that reaches every authority they can touch. |
-| L12 | Unused parameters and unused pattern binders. | Error with fix-it: the OUT plan's rule for parameters, extended to binders. |
+| L12 | Unused parameters and binders. | **Answered 2026-09-29: error with fix-it (D24).** |
 | L13 | State reachable only from view code (element-local HOLD such as hover). | Transient, not persisted. |
-| L14 | Lowering prunes the state of WHEN arms whose selector is a compile-time constant. | No pruning; state never depends on values (D4). |
+| L14 | Constant-selector arm pruning. | **Answered 2026-09-29: arms always exist (D25).** |
 | L15 | Which constructs count as "stateful builtins" (D9)? | Bool/toggle and any builtin whose catalog entry is marked stateful. The list is reviewed in P0. |
 
 **Process and product.** The default applies unless the owner objects.

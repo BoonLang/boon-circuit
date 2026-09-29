@@ -78,10 +78,10 @@ These are settled. Any semantic change beyond them goes to the owner.
 | D9 | Cycles | A dependency cycle is legal only through a **HOLD update**, an **event-driven collection update** (append, remove, replace_all, …) or a **stateful builtin** (Bool/toggle and the like; "some can almost be written with HOLD"). Nothing else closes a cycle: not LATEST, not derived fields, not THEN bodies. Explicit cycle-handling builtins (`Dependency/catch_cycle`) are removed ("duct tape"). LIST, SET and MAP values, and records or tagged objects containing them, may not be HOLD state. The owner would welcome a HOLD alternative (P0 produces an options note). |
 | D10 | WHEN payloads | Binder patterns only, Rust/Roc style: `HierarchyPage[rows] => rows`. The WHEN subject is not refined inside arms. |
 | D11 | Precedence | Pony rule: mixing two different binary operators without parentheses is an error, with a fix-it. A chain of one operator (`a + b + c`) is left-associative. Comparisons do not chain (D18). Unary minus binds tightest. `\|>` is structural. |
-| D12 | Persistence | A clean schema that stores only source-of-truth state: HOLD states, stateful-builtin state and authoritative collection rows. Never derived values or event payloads: only what a restart needs to restore the previous state. Existing local data may reset once. |
+| D12 | Persistence | A clean schema that stores only source-of-truth state: what a restart needs to restore the previous state, never anything that can be recomputed. That is HOLD states, LATEST current values, stateful-builtin state, authoritative collection rows, and (because every value keeps its last value, D30) the last value of anything that gets its first value later when code reads it outside its own update; the compiler infers that set. Query results are re-run on restore, commands never (D31). Existing local data may reset once. |
 | D13 | Elements | Everything is structural data, **now**. Element values are real data at runtime: code may read, spread and build them. Builtin and render contracts are closed: "you can pass only what the functions called expects/can handle". |
 | D14 | Own name | A field's own name is not in scope inside its own initializer, so `[events: events]` copies the outer `events`. The undocumented unique-suffix bare-name lookup is removed. A value refers to itself only through HOLD's named binder. |
-| D15 | LATEST | State only via HOLD. LATEST merges events only. A LATEST with a non-event arm is an error, with the fix-it `initial \|> HOLD s { LATEST { events } }`. |
+| D15 | LATEST | *Revised 2026-09-29 with D30:* **self-reference only via HOLD.** LATEST is the most recently updated of its arms; it may not name itself. A constant or other starting arm gives LATEST its starting value, so `LATEST { Text/empty(), input.text, done \|> THEN { Text/empty() } }` keeps the last text without HOLD. The owner: "HOLD should be an escape hatch for cycles, not something needed to use". (Originally: "state only via HOLD; LATEST merges events only".) |
 | D16 | Cells | Cells becomes a spreadsheet written in plain Boon that behaves like Excel: dependent recalculation, and circular references shown as an error value. No language support for cycles. |
 | D17 | Effect lists | New event-driven builtin that replaces a collection's contents, e.g. `rows: LIST {} \|> List/replace_all(with: page_event.rows)`. An effect-returned list lives in its own collection authority. |
 | D18 | Syntax cleanups | 1. One newline/indent rule (§4.2), which must not break multi-line TEXT. 2. `--` inside TEXT is text. 3. Comparisons do not chain. 4. A tag is either bare (`Panel`) or a **tagged object** (`Panel[x: 1]`) within one type, never both. |
@@ -96,8 +96,11 @@ These are settled. Any semantic change beyond them goes to the owner.
 | D27 | Nested FUNCTION | A FUNCTION declared inside a BLOCK is a positioned error; FUNCTIONs live at module level. |
 | D28 | Immutability | "Everything is basically immutable from the user point of view." A collection chosen through WHEN (`zs: WHEN { A => xs, B => ys }`) is a read-only view whose element type is the union. Writes must name the real authority. |
 | D29 | FLUSH boundaries | Rust `?` style: FLUSH skips the rest of the enclosing expression and lands at the nearest boundary. Boundaries are record fields (including `store` fields), FUNCTION results, BLOCK results and the root. BLOCK locals are **not** boundaries: they keep their normal type. The docs' "named binding initializer" wording is corrected in P0. |
-| D30 | Change model | **Model C, "change with moments"** (`compiler_rewrite_notes/change_and_effects.md` §3). There is no event type and no event keyword. Users read only "change": "never changes", "changes when …", "happens when …". The compiler infers, per expression, whether it never changes, has a value from the start and may change, or exists only when something happens, and reports temporal mistakes as positioned diagnostics in those words. THEN over a HOLD or a derived value is legal and fires when its input changes. Sub-questions L3a (what counts as a change) and L3b (whether a payload stays readable after it happens) are open in §11. |
-| D31 | Effects | **Query/command split by catalog class, no syntax.** A *query* is safe to re-run (File/read_*, Directory/entries, Wellen/*, Secret/verify, Timer/deadline, …): used as a value it is a live resource that starts when its scope activates, restarts when its arguments change, cancels the superseded run and stops when its scope ends. A *command* acts on the outside world or answers differently each run (File/write_*, DevelopmentPasskey/*, Http/request, Clock/wall, Random/bytes, …): allowed only where something happens (a THEN body, or a WHEN over something that happens), runs exactly once per trigger with arguments read at that moment, and never runs on start, restore or hot reload. Effects become visible through hover, an inferred effect row on every FUNCTION scheme, diagnostics, and an effect log in the dev window and scenario runner. |
+| D30 | Change model | **"Everything is change": the original Boon model, made strict.** There is no event type, no event keyword and no "moment". Every expression is a value that updates; it has a value from the start or gets its first value later (SOURCE payloads, effect results, THEN outputs), and it keeps its last value. **WHEN and THEN copy:** the body runs once each time the input updates and copies the current values of everything else it reads (the owner: WHEN "freezes/copies dependencies, a sip of the current values"). **WHILE is live:** while an arm is selected, it follows every update of what it reads. So TodoMVC's `key_down.key \|> WHEN { Enter => new_todo_text … }` copies the text at the press and later keystrokes do not re-fire it. The compiler still infers, per expression, "never updates / has a value from the start / gets its first value later" and reports mistakes in those words (e.g. "`TEXT {x} \|> THEN {…}` never runs: `TEXT {x}` never updates"). Rules: §4.3 "Change rules". |
+| D31 | Effects | **Query/command split by catalog class, no syntax.** A *query* is safe to re-run (File/read_*, Directory/entries, Wellen/*, Secret/verify, Timer/deadline, …): in a live context (a plain field or a WHILE arm) it is a live resource that starts when its scope activates, restarts when its arguments change, cancels the superseded run and stops when its scope ends; in a copy context it runs once per update. A *command* acts on the outside world or answers differently each run (File/write_*, DevelopmentPasskey/*, Http/request, Clock/wall, Random/bytes, …): allowed only in copy contexts (THEN bodies and WHEN arms, D30), runs exactly once each time the input updates with its arguments copied at that moment, and never runs on start, restore or hot reload. Effects become visible through hover, an inferred effect row on every FUNCTION scheme, diagnostics, and an effect log in the dev window and scenario runner. |
+| D32 | What counts as an update | **Every write fires**, equal or not: one rule everywhere, as in the original Boon ("more consistent, less surprising"). Presses, keys and effect results fire on every occurrence; a HOLD fires on every accepted write; a derived value fires (at most once per step) whenever one of its inputs fires. So `count > 5 \|> THEN` runs on every count update, and an effect-result HOLD fires on every completion without a special case. Start, restore, hot reload, entering a WHILE arm and creating a row are not updates. A "only real changes" filter, if ever wanted, is a library function over HOLD, not engine support. |
+| D33 | HOLD input | **A later update of the piped value resets the HOLD** (the original rule). HOLD takes every value that arrives, from its piped input or its body; its own writes do not re-trigger it. |
+| D34 | Asynchrony | **Hidden, as the original Boon intended. No `Pending` in the language.** A query result is a value that gets its first value later, like a key press; while a restarted query runs, the value keeps its last answer. An app that wants to show "loading" writes it as business logic, e.g. `LATEST { Loading, request \|> THEN { Loading }, Wellen/hierarchy_page(…) }`. Wellen's hand-written `request_fingerprint` is unnecessary once restarts are driven by argument updates. |
 
 ---
 
@@ -331,8 +334,9 @@ error aborts the whole project.
 ### 4.3 Typing rules ("Boon static semantics v2"; normative after P0)
 
 **Types.**
-- Every expression has a **flow** (continuous C, present-or-absent event E,
-  absent A, tracked at every nested field) and **data**.
+- Every expression has an **update kind** (never updates, has a value from the
+  start, gets its first value later; tracked at every nested field, D30) and
+  **data**.
 - The data is a **kind-partitioned union**: at most one member per kind. The
   kinds are TEXT, NUMBER, BYTES, BITS, tags, record, LIST, SET, MAP and SOURCE
   port.
@@ -369,17 +373,44 @@ are errors. WHEN results and FUNCTION results may be multi-kind unions (D5).
   polymorphic selector, the arms become the scheme predicate "tags within {…}".
 - The subject is never refined inside an arm (D10).
 
-**Flow rules.** From TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md, adjusted by D15:
-- THEN needs an event input;
-- HOLD needs a continuous initial value and event updates;
-- WHILE needs a continuous selector;
-- **LATEST arms must all be events**, and the result is an event (D15);
-- a one-input LATEST is an error: remove the wrapper;
-- LIST literal items must be continuous;
-- `List/append item:` and `List/replace_all with:` need events.
+**Change rules (D30-D34).** They replace the continuous/event flow table of
+TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md.
+- **Updates.** Every write fires, equal or not (D32). A derived value fires at
+  most once per step when any input fires. Start, restore, hot reload, entering
+  a WHILE arm and creating a row are not updates. Every value keeps its last
+  value.
+- **Copy contexts: THEN bodies and WHEN arms.** The body runs once each time the
+  input updates, reading the committed snapshot (D21) plus the input's new
+  value; nothing else it reads re-runs it. THEN or WHEN over something that
+  never updates is an error ("never runs").
+- **Live contexts: plain expressions and WHILE arms.** They follow every update
+  of what they read while selected.
+- **Placement.** HOLD, SOURCE declarations, stateful builtins and live queries
+  belong to live contexts; inside a copy context they are an error ("this HOLD
+  would be copied once and never update; use WHILE"). Commands belong to copy
+  contexts only (D31). This also answers L6.
+- **LATEST** is the most recently updated arm. At most one arm has a value from
+  the start (the starting value). Two arms that can update from the same
+  trigger in the same step are an error. A one-input LATEST is an error: remove
+  the wrapper. LATEST may not name itself (D15).
+- **HOLD** takes every value that arrives, from its piped input (a reset, D33)
+  or its body; its own writes do not re-trigger it. Self-reference only through
+  its binder (D14).
+- **SKIP** means no update: the value keeps its last value and nothing
+  downstream fires.
+- **No value yet.** Anything computed from a value that has no value yet has no
+  value yet. How the document shows that is L3c.
+- **Fire edges never close a cycle.** A cycle must pass through a HOLD's
+  committed-value read, a collection update or a stateful builtin (D9); a THEN
+  input, WHEN selector or update candidate on the cycle is an error, not a
+  runtime loop.
+- **Stale-copy hint.** Hover always says what a WHEN copies ("copies `todos`
+  when `selected_filter` updates"). P0 decides whether a WHEN over a value with
+  a start value that copies an independently updating value into the document
+  also gets a warning with the fix-it "use WHILE".
 
-Flows are computed in one forward pass in dependency order, seeded at HOLD
-(C), stateful builtins (C) and SOURCE (E).
+Update kinds are computed in one forward pass in dependency order, seeded at
+constants, HOLD, stateful builtins, SOURCE and effect results.
 
 **Cycles (D9).**
 - There is one labelled dependency graph, at root-field-path granularity,
@@ -423,7 +454,7 @@ port. This replaces today's heuristic based on how names are spelled.
 families, all emitted in the diagnostics lane:
 - **Phase A** owns instance-level cycles, OUT producer checks and pulse
   membership.
-- **The checker** owns kinds, fields, exhaustiveness, flows, homogeneity,
+- **The checker** owns kinds, fields, exhaustiveness, change rules, homogeneity,
   definition-level cycles and recursion, PASSED presence, D14 names, contracts,
   DRAIN/DRAINING, the document root, role adjacency, unused parameters (the
   OUT plan's rule) and static constant checks.
@@ -709,13 +740,13 @@ files are either triaged or deleted.
 | --- | ---: | --- |
 | TodoMVC Theme `get(request)` mixes NUMBER, record, LIST and tags (D4, D8) | 94 call sites, 6 files | **Themes as data.** Each theme exports `tokens(mode)`, whose tokens have the same type in every theme. `Theme/tokens(name, mode)` picks one. RUN.bn reads `theme.material.panel`, `theme.font.body.color`. About 2,443 lines become ~1,110, and ~20 shapes become ~8 role types. Draft: `compiler_rewrite_notes/examples.md` §4. |
 | NovyWave `NovyTheme` (D8) | 84 material + 60 font calls | Same idiom. Bordered and borderless materials are separate roles. Dead `trace_*` functions are deleted. |
-| Stateful LATEST (D15) | census; 341 LATEST blocks, stateful subset unknown | Fix-it: `initial \|> HOLD s { LATEST { events } }`. Sites whose first arm is a changing value, whose meaning differs, get manual review. Includes TodoMVC title/completed, counter_latest, interval_latest and NovyWave value_format. |
+| Self-referential LATEST (D15 revised) | counter_latest, interval_latest; census for others | Fix-it: `initial \|> HOLD s { LATEST { … } }`. A LATEST with a starting arm is legal now. LATEST blocks with two starting arms get manual review. |
 | One-input LATEST | ~80 (mostly bytes_* fixtures) | Remove the wrapper (fix-it). |
 | Cycles (D9) | TodoMVC new_todo (title ↔ edited_title) after D15; completed ↔ all_completed passes through Bool/toggle (legal) | Rewrite with HOLD where the census flags it. |
 | Cells (D16) | the formula engine | **Redesign in plain Boon, Excel-like.** Computed values live in HOLD/collection state updated on edit events. Recalculation follows dependency order. A visited/depth guard marks circular references with an error value. Size L. |
 | WHEN subject reads in arms (D10) | 68 (NovyWave 55) | Binder patterns. |
-| THEN over HOLD state (flow rule, L3) | 18 (persons_pro 14, NovyWave 4) | Expose effect completions as their own event fields. This is not a codemod: the persons-pro gate asserts these steps. |
-| Effect-returned lists (D9, D17) and effects in continuous arms (L2) | NovyWave hierarchy and signal pages | `List/replace_all` authorities; effect calls move into event contexts. |
+| WHEN that must follow live updates (D30) | census in P2b; 1,400 WHEN vs 40 WHILE today | Today's runtime runs WHEN over a value live, but the language copies. Every WHEN whose arm reads something that can update independently of its selector, and whose result must follow it (views, themes with nested WHENs on other parameters), becomes WHILE. The new checker lists them; WHENs that copy on purpose (TodoMVC `title_to_add`) stay. THEN over HOLD state (18 sites) stays legal (D30, D32). |
+| Effect-returned lists (D9, D17) and effect placement (D31) | NovyWave hierarchy and signal pages, BUILD files | `List/replace_all` authorities. Commands move into THEN bodies or WHEN arms; queries in WHILE arms stay live. Hand-written `request_fingerprint` keys go (D34). |
 | Suffix fallback removed (D14) | TodoMVC `visible_todos`/`selected_filter`, NovyWave RUN.bn:4506, … (census) | Qualify with `store.` or pass through PASSED. |
 | Optional-field reads (D5) | TodoMVC append without `completed`; persons_pro variant-union reads (5) | Append complete rows; use binder patterns. |
 | Collections in HOLD (D9) | census | Move them into collection authorities. |
@@ -723,7 +754,7 @@ files are either triaged or deleted.
 | Exact record parameters (D23) | census | Remove the extra fields at call sites, or move context into PASSED. |
 | Pony precedence and comparison chains (D11, D18) | ≤19 | Parentheses (fix-it). |
 | Unused parameters and binders (D24) | ~12 | Remove them (fix-it). |
-| Event lists `List/map(new: <event>) \|> List/latest()` | 27 (Cells, NovyWave) | Kept as derived event lists (L5). |
+| Lists of row updates `List/map(new: <row update>) \|> List/latest()` | 27 (Cells, NovyWave) | Ordinary lists of last values; `List/latest` gives the most recently updated row (L5). |
 | Old-compiler bugs that look like example bugs | fjordpulse (the parser tokenizes TEXT contents), cells (builtins missing from the old ABI) | Fixed in the new compiler; examples unchanged. |
 
 **Old-engine compatibility rule.** Until P7 the old engine stays the native
@@ -1162,13 +1193,14 @@ and P0 cannot exit without the answers.
 | # | question | recommended |
 | --- | --- | --- |
 | L1 | Element representation. | **Answered 2026-09-29: tagged objects (D20).** |
-| L2 | When do host effects run, and how is that visible to the user? | **Answered 2026-09-29: query/command split, no syntax (D31).** Open detail: whether a query used as a value carries `Pending` in its type; borderline catalog classes (Http/request, Clock/wall, Random/bytes, Log/*). |
+| L2 | When do host effects run, and how is that visible to the user? | **Answered 2026-09-29: query/command split (D31); no `Pending` (D34).** Open detail: borderline catalog classes (Http/request, Log/*). |
 | L3 | Events vs values. | **Answered 2026-09-29: model C (D30).** |
-| L3a | What counts as a change for a HOLD or a derived value? | **Under discussion.** Owner leaning: every write fires ("more consistent, less surprising"), not only a real difference. Clicks, keys and effect results count on every occurrence in both options. |
-| L3b | Does a payload (a key press, an Enter title, an effect result) stay readable after it happens? | **Under discussion.** Owner leaning: sticky, "HOLD should be an escape hatch for cycles, not something needed to use", unless that causes problems. It does in TodoMVC (see the notes); a hybrid with LATEST keeping a starting value is proposed. |
+| L3a | What counts as an update for a HOLD or a derived value? | **Answered 2026-09-29: every write fires (D32).** |
+| L3b | Does a payload stay readable after it happens? | **Answered 2026-09-29: yes; every value keeps its last value, and WHEN/THEN copy while WHILE is live (D30).** |
+| L3c | A part of the document whose value has no value yet (e.g. a label showing the last key before any key was pressed). | Proposed: renders nothing until the first value arrives (the original behaviour, hides asynchrony, D34); hover says "no value until … first happens". |
 | L4 | Snapshot reads. | **Answered 2026-09-29: fix the runtime (D21).** |
-| L5 | Event lists `List/map(new: <event>) \|> List/latest()` (27 sites). | Keep them as derived event lists, consumable only by `List/latest` and never stored, rendered or published. |
-| L6 | State and SOURCE created inside WHEN arms or THEN bodies. | Allowed in WHEN/WHILE arms (activation scopes); forbidden in THEN bodies. |
+| L5 | Lists of row updates `List/map(new: <row update>) \|> List/latest()` (27 sites). | Proposed: ordinary lists of last values (every value keeps its last value, D30); `List/latest` gives the most recently updated row. No special restriction. |
+| L6 | State and SOURCE created inside WHEN arms or THEN bodies. | Follows from D30: allowed in WHILE arms (live scopes), an error in WHEN arms and THEN bodies (they copy once). Owner to confirm. |
 | L7 | FLUSH boundaries. | **Answered 2026-09-29: BLOCK locals are not boundaries (D29).** |
 | L8 | Style keys no renderer draws. | **Answered 2026-09-29: add renderer support (D22).** |
 | L9 | Nested FUNCTION in BLOCK. | **Answered 2026-09-29: error (D27).** |

@@ -95,6 +95,7 @@ These are settled. Any semantic change beyond them goes to the owner.
 | D26 | Stateful builtins | Rewritten as ordinary Boon standard-library functions over HOLD (e.g. `Bool/toggle`). A builtin stays only where Boon cannot express it, and is then marked stateful in the catalog. HOLD and collection updates are then the only state primitives, which is what the cycle (D9) and persistence (D12) rules are built on. |
 | D27 | Nested FUNCTION | A FUNCTION declared inside a BLOCK is a positioned error; FUNCTIONs live at module level. |
 | D28 | Immutability | "Everything is basically immutable from the user point of view." A collection chosen through WHEN (`zs: WHEN { A => xs, B => ys }`) is a read-only view whose element type is the union. Writes must name the real authority. |
+| D29 | FLUSH boundaries | Rust `?` style: FLUSH skips the rest of the enclosing expression and lands at the nearest boundary. Boundaries are record fields (including `store` fields), FUNCTION results, BLOCK results and the root. BLOCK locals are **not** boundaries: they keep their normal type. The docs' "named binding initializer" wording is corrected in P0. |
 
 ---
 
@@ -1164,7 +1165,7 @@ and P0 cannot exit without the answers.
 | L4 | Snapshot reads. | **Answered 2026-09-29: fix the runtime (D21).** |
 | L5 | Event lists `List/map(new: <event>) \|> List/latest()` (27 sites). | Keep them as derived event lists, consumable only by `List/latest` and never stored, rendered or published. |
 | L6 | State and SOURCE created inside WHEN arms or THEN bodies. | Allowed in WHEN/WHILE arms (activation scopes); forbidden in THEN bodies. |
-| L7 | FLUSH boundaries: is a BLOCK local a boundary? | **Under discussion** (snippets shown to the owner). The docs (foundations:1583-1600, "named binding initializer") suggest yes; Cells' code assumes no. |
+| L7 | FLUSH boundaries. | **Answered 2026-09-29: BLOCK locals are not boundaries (D29).** |
 | L8 | Style keys no renderer draws. | **Answered 2026-09-29: add renderer support (D22).** |
 | L9 | Nested FUNCTION in BLOCK. | **Answered 2026-09-29: error (D27).** |
 | L10 | User FUNCTIONs and extra keys. | **Answered 2026-09-29: exact record parameters (D23).** |

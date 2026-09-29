@@ -92,6 +92,9 @@ These are settled. Any semantic change beyond them goes to the owner.
 | D23 | Exact record parameters | A record passed to a user FUNCTION must contain exactly the fields the function consumes. "Consumes" means reads, or forwards into another exact position: a callee parameter, state, a collection, a contract. Extra fields are an error. The owner does not want functions to receive data by accident, especially when a function changes later. Context flows through PASSED. |
 | D24 | Unused names | Unused FUNCTION parameters and unused pattern binders are errors, with a fix-it. |
 | D25 | Dead arms | Every WHEN arm's state exists, even when a compile-time constant rules the arm out. State never depends on values. The compiler may warn about unreachable arms. |
+| D26 | Stateful builtins | Rewritten as ordinary Boon standard-library functions over HOLD (e.g. `Bool/toggle`). A builtin stays only where Boon cannot express it, and is then marked stateful in the catalog. HOLD and collection updates are then the only state primitives, which is what the cycle (D9) and persistence (D12) rules are built on. |
+| D27 | Nested FUNCTION | A FUNCTION declared inside a BLOCK is a positioned error; FUNCTIONs live at module level. |
+| D28 | Immutability | "Everything is basically immutable from the user point of view." A collection chosen through WHEN (`zs: WHEN { A => xs, B => ys }`) is a read-only view whose element type is the union. Writes must name the real authority. |
 
 ---
 
@@ -1161,15 +1164,15 @@ and P0 cannot exit without the answers.
 | L4 | Snapshot reads. | **Answered 2026-09-29: fix the runtime (D21).** |
 | L5 | Event lists `List/map(new: <event>) \|> List/latest()` (27 sites). | Keep them as derived event lists, consumable only by `List/latest` and never stored, rendered or published. |
 | L6 | State and SOURCE created inside WHEN arms or THEN bodies. | Allowed in WHEN/WHILE arms (activation scopes); forbidden in THEN bodies. |
-| L7 | FLUSH boundaries. | Record fields, FUNCTION return, BLOCK result and root; not BLOCK variables. |
+| L7 | FLUSH boundaries: is a BLOCK local a boundary? | **Under discussion** (snippets shown to the owner). The docs (foundations:1583-1600, "named binding initializer") suggest yes; Cells' code assumes no. |
 | L8 | Style keys no renderer draws. | **Answered 2026-09-29: add renderer support (D22).** |
-| L9 | A FUNCTION nested inside BLOCK. | Positioned error. |
+| L9 | Nested FUNCTION in BLOCK. | **Answered 2026-09-29: error (D27).** |
 | L10 | User FUNCTIONs and extra keys. | **Answered 2026-09-29: exact record parameters (D23).** |
-| L11 | Collection values joined through WHEN (`zs: WHEN { A => xs, B => ys }`). | Read-only covariant views; writes carry an effect that reaches every authority they can touch. |
+| L11 | Collections joined through WHEN. | **Answered 2026-09-29: read-only views (D28).** |
 | L12 | Unused parameters and binders. | **Answered 2026-09-29: error with fix-it (D24).** |
 | L13 | State reachable only from view code (element-local HOLD such as hover). | Transient, not persisted. |
 | L14 | Constant-selector arm pruning. | **Answered 2026-09-29: arms always exist (D25).** |
-| L15 | Which constructs count as "stateful builtins" (D9)? | Bool/toggle and any builtin whose catalog entry is marked stateful. The list is reviewed in P0. |
+| L15 | Stateful builtins. | **Answered 2026-09-29: rewritten as a Boon library over HOLD where possible (D26).** |
 
 **Process and product.** The default applies unless the owner objects.
 

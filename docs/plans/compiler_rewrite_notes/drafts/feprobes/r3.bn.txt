@@ -1,0 +1,4 @@
+value: LIST { 1, 2
+    3 }
+n: value |> List/count()
+document: Document/new(root: Element/label(element: [], style: [], label: n |> Number/to_text()))

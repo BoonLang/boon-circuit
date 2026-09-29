@@ -1,0 +1,2 @@
+value: TEXT { a -- b }
+document: Document/new(root: Element/label(element: [], style: [], label: value))

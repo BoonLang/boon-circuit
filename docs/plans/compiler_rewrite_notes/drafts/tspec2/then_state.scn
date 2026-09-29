@@ -1,0 +1,28 @@
+name = "then_state"
+source = "then_state.bn.txt"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.label" = "s=0 c=0"
+
+[[step]]
+id = "inc"
+user_action = { kind = "button_press", target = "inc button", target_text = "inc" }
+expected_source_event = { source = "store.sources.inc.press", target_text = "inc" }
+  [step.expect_root_text]
+  "store.label" = "s=1 c=1"
+
+[[step]]
+id = "other"
+user_action = { kind = "button_press", target = "other button", target_text = "other" }
+expected_source_event = { source = "store.sources.other.press", target_text = "other" }
+  [step.expect_root_text]
+  "store.label" = "s=1 c=1"
+
+[[step]]
+id = "inc2"
+user_action = { kind = "button_press", target = "inc button", target_text = "inc" }
+expected_source_event = { source = "store.sources.inc.press", target_text = "inc" }
+  [step.expect_root_text]
+  "store.label" = "s=2 c=2"

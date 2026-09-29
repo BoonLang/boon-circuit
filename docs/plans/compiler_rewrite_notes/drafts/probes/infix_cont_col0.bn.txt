@@ -1,0 +1,3 @@
+value: 1
++ 2
+document: Document/new(root: Element/label(element: [], style: [], label: value))

@@ -488,4 +488,4 @@ Legend: **P0/P1** = act in that migration phase; **C** = at cutover (one atomic 
 - crates/boon_compiler_kernel/src/lib.rs:50-74 kernel layering test bans 7 crates; crates/xtask/src/packed_site_inventory.rs:29-53 SCAN_ROOTS include boon_compiler, boon_ir, boon_typecheck and boon_semantic files
 - boon_compiler dependents (Cargo.toml): boon_cli, boon_host_runtime, boon_program_runtime, boon_native_playground, boon_plan_executor, boon_runtime, boon_web_host, optional boon_phase0_baseline and boon_behavior_harness
 - /proc/sys/kernel/perf_event_paranoid = 2; samply installed at ~/.cargo/bin/samply; gdb at /usr/bin/gdb
-- Draft files: /tmp/claude-1000/-home-martinkavik-repos-boon-circuit/76a4caad-9c38-4c5a-9114-58de96a02de9/scratchpad/design/compiler.v4.toml and compiler_edits.toml (anchors checked to occur exactly once)
+- Draft files: drafts/compiler.v4.toml and compiler_edits.toml (anchors checked to occur exactly once)

@@ -1,0 +1,7 @@
+store: [
+    e: SOURCE
+    items: LIST { [title: TEXT { a }, completed: False] }
+        |> List/append(item: e |> THEN { [title: TEXT { b }] })
+    firsts: items |> List/map(item, new: item.completed)
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { x }))

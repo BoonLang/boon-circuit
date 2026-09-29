@@ -1,0 +1,8 @@
+store: [
+    s: SOURCE
+    n:
+        0 |> HOLD n {
+            s |> THEN { 10 - 3 - 2 }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.n |> Number/to_text()))

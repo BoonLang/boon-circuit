@@ -1,0 +1,4 @@
+value: TEXT { a {x} {y} b }
+x: TEXT { X }
+y: TEXT { Y }
+document: Document/new(root: Element/label(element: [], style: [], label: value))

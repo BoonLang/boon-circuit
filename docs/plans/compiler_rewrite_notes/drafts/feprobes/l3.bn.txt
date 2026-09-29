@@ -1,0 +1,4 @@
+value:
+    5
+    -7
+document: Document/new(root: Element/label(element: [], style: [], label: value |> Number/to_text()))

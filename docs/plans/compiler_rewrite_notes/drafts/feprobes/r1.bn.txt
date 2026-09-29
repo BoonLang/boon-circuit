@@ -1,0 +1,5 @@
+store:
+    a: 1
+    b: 2
+value: store.a
+document: Document/new(root: Element/label(element: [], style: [], label: value |> Number/to_text()))

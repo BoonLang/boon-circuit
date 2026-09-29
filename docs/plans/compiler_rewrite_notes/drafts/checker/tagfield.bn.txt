@@ -1,0 +1,5 @@
+store: [
+    c: Oklch[lightness: 1]
+    l: c.lightness + 1
+]
+document: Document/new(root: Element/label(element: [], label: store.l |> Number/to_text()))

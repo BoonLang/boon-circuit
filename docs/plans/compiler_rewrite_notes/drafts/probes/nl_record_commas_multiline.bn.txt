@@ -1,0 +1,4 @@
+r: [a: 1,
+    b: 2]
+value: r.a
+document: Document/new(root: Element/label(element: [], style: [], label: value |> Number/to_text()))

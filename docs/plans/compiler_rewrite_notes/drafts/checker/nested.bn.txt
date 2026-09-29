@@ -1,0 +1,4 @@
+x: BLOCK {
+    FUNCTION inner(a) { a + 1 }
+    inner(a: 2)
+}

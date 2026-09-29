@@ -1,5 +1,5 @@
 name = "p5"
-source = "p5_latest_continuous.bn"
+source = "p5_latest_continuous.bn.txt"
 
 [[step]]
 id = "initial"

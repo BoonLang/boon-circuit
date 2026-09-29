@@ -1,0 +1,8 @@
+store: [
+    e: SOURCE
+    count: LATEST {
+        count
+        e |> THEN { 1 }
+    }
+]
+document: Document/new(root: Element/label(element: [], label: store.count))

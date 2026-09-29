@@ -1,0 +1,7 @@
+sel: A
+value: sel |> WHEN {
+    A =>
+        1
+    B => 2
+}
+document: Document/new(root: Element/label(element: [], style: [], label: value |> Number/to_text()))

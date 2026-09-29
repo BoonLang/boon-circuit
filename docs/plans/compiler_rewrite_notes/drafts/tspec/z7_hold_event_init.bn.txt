@@ -1,0 +1,5 @@
+store: [
+    e: SOURCE
+    x: e |> THEN { 1 } |> HOLD s { e |> THEN { s + 1 } }
+]
+document: Document/new(root: Element/label(element: [], label: store.x))

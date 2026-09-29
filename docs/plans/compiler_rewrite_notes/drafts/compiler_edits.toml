@@ -1,0 +1,202 @@
+# budgets/compiler_edits.toml, format 1 (proposal, 2026-09-29, revision 2). Warm edit corpus.
+#
+# Semantics, per [[edit]]:
+# - Each step finds the unique `anchor` in `unit` (the run fails fast if it is absent
+#   or not unique), then types `insert` one character per revision right after the
+#   anchor, or deletes `delete` characters after the anchor one per revision.
+#   Steps run in order; a later step sees the text produced by earlier steps.
+# - `paste = true`: the whole insert is one revision (clipboard paste).
+# - `undo = true`: after the steps, one extra revision restores the text from
+#   before the edit in a single jump (editor undo); measured as its own class.
+# - `restore = true`: after the steps (and undo, if any), the inverse is typed
+#   one character per revision, so the session ends on the original text.
+# - Every revision goes through the product compile service. The final revision
+#   of each edit (before restore) is also compiled cold and compared with the warm
+#   result (normalized diagnostics and canonical plan identity).
+# Anchors move when examples are refactored; update them in the same commit.
+# Removing a class or an edit needs the owner's approval (budgets/compiler.toml policy).
+
+format_version = 1
+required_classes = [
+  "literal-text", "literal-number", "whitespace", "comment",
+  "local-rename", "add-field", "remove-field", "add-function",
+  "type-error-and-fix", "incomplete-syntax", "cross-unit", "cross-unit-type-change",
+  "undo-to-previous", "paste-block", "migration-stage", "child-program",
+]
+
+# ----------------------------------------------------------------- TodoMVC
+
+[[edit]]
+class = "literal-text"
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "TEXT { Walk the dog", insert = "s and the cat" }]
+restore = true
+
+[[edit]]
+class = "undo-to-previous"
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "TEXT { Walk the dog", insert = "gy" }]
+undo = true
+
+[[edit]]
+class = "literal-number"
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "has_completed:\n        completed_count > ", insert = "1" }]
+restore = true
+
+[[edit]]
+class = "whitespace"
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "    active_count:", insert = "   " }]
+restore = true
+
+[[edit]]
+class = "comment"
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "FUNCTION new_todo(title, initial_completed) {\n", insert = "    -- per-item edit state\n" }]
+restore = true
+
+[[edit]]
+class = "local-rename"          # parameter and its one use; unresolved-name states in between
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [
+  { anchor = "FUNCTION clear_button_font(", delete = 7 },
+  { anchor = "FUNCTION clear_button_font(", insert = "hot" },
+  { anchor = "        line: [underline: ", delete = 7 },
+  { anchor = "        line: [underline: ", insert = "hot" },
+]
+restore = true
+
+[[edit]]
+class = "add-field"             # widens a record type used by several consumers
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "[title: TEXT { Buy groceries }, completed: False", insert = ", urgent: True" }]
+restore = true
+
+[[edit]]
+class = "remove-field"
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "        line: [strike: completed]\n        width: Fill\n        height: Fill\n", delete = 22 }]
+restore = true
+
+[[edit]]
+class = "add-function"
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "FUNCTION delete_button_text() {\n    [\n        font: Theme/font(of: BodyDanger)\n        depth: Theme/depth(of: Detail)\n        move: [further: Theme/elevation(of: TodoItem)]\n    ]\n}\n", insert = "\nFUNCTION probe_double(x) {\n    x * 2\n}\n" }]
+restore = true
+
+[[edit]]
+class = "paste-block"
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "FUNCTION delete_button_text() {\n    [\n        font: Theme/font(of: BodyDanger)\n        depth: Theme/depth(of: Detail)\n        move: [further: Theme/elevation(of: TodoItem)]\n    ]\n}\n", insert = "\nFUNCTION delete_button_text_copy() {\n    [\n        font: Theme/font(of: BodyDanger)\n        depth: Theme/depth(of: Detail)\n        move: [further: Theme/elevation(of: TodoItem)]\n    ]\n}\n" }]
+paste = true
+undo = true
+
+[[edit]]
+class = "type-error-and-fix"    # TEXT - 1 is an error under the strict rules; restore fixes it
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "new_todo(title: item.title |> Text/trim()", insert = " - 1" }]
+restore = true
+
+[[edit]]
+class = "incomplete-syntax"
+fixture = "todo-mvc-physical"
+unit = "examples/todo_mvc_physical/RUN.bn"
+steps = [{ anchor = "    all_completed:\n        active_count == 0 |> Bool/and(right: completed_count > 0)\n", insert = "    probe: has_todos |> WHEN { True => TEXT { yes } False => TEXT { no } }\n" }]
+restore = true
+
+# TodoMVC cross-unit edits target Theme/*.bn, which the owner asked to refactor
+# (decision 4). They are written against the refactored Theme in the same commit.
+
+# ----------------------------------------------------------------- NovyWave
+
+[[edit]]
+class = "literal-text"
+fixture = "novywave"
+unit = "examples/novywave/RUN.bn"
+steps = [{ anchor = "True => TEXT { NOT_REQUESTED", insert = "_YET" }]
+restore = true
+
+[[edit]]
+class = "literal-number"
+fixture = "novywave"
+unit = "examples/novywave/RUN.bn"
+steps = [{ anchor = "FUNCTION real_signal_bit_width(signal_row) {\n    signal_row.width == ", insert = "1" }]
+restore = true
+
+[[edit]]
+class = "local-rename"
+fixture = "novywave"
+unit = "examples/novywave/RUN.bn"
+steps = [                       # parameter and all three uses; ends valid
+  { anchor = "FUNCTION real_signal_bit_width(", delete = 10 },
+  { anchor = "FUNCTION real_signal_bit_width(", insert = "row" },
+  { anchor = "FUNCTION real_signal_bit_width(row) {\n    ", delete = 10 },
+  { anchor = "FUNCTION real_signal_bit_width(row) {\n    ", insert = "row" },
+  { anchor = "FUNCTION real_signal_bit_width(row) {\n    row.width == 0 |> WHEN {\n        True => ", delete = 10 },
+  { anchor = "FUNCTION real_signal_bit_width(row) {\n    row.width == 0 |> WHEN {\n        True => ", insert = "row" },
+  { anchor = "True => row.encoding\n        False =>\n            ", delete = 10 },
+  { anchor = "True => row.encoding\n        False =>\n            ", insert = "row" },
+]
+restore = true
+
+[[edit]]
+class = "add-field"
+fixture = "novywave"
+unit = "examples/novywave/RUN.bn"
+steps = [{ anchor = "        bridge_key: signal.bridge_key\n", insert = "        pinned: False\n" }]
+restore = true
+
+[[edit]]
+class = "add-function"
+fixture = "novywave"
+unit = "examples/novywave/RUN.bn"
+steps = [{ anchor = "FUNCTION startup_file_record(file) {\n    store.startup_workspace_opened_files\n    |> List/find(item, if: item.file == file)\n}\n", insert = "\nFUNCTION probe_file_count() {\n    store.startup_workspace_opened_files |> List/count()\n}\n" }]
+restore = true
+
+[[edit]]
+class = "type-error-and-fix"
+fixture = "novywave"
+unit = "examples/novywave/RUN.bn"
+steps = [{ anchor = "True => TEXT { NOT_REQUESTED }", insert = " - 1" }]
+restore = true
+
+[[edit]]
+class = "cross-unit"            # type-preserving literal edit in a dependency unit
+fixture = "novywave"
+unit = "examples/novywave/Model/NovyModel.bn"
+steps = [{ anchor = "TEXT { clk } => TEXT { simple_tb.s.A[3:0]", insert = "x" }]
+restore = true
+
+[[edit]]
+class = "cross-unit-type-change" # adds a tag to a result union; dependents must recheck
+fixture = "novywave"
+unit = "examples/novywave/Model/NovyModel.bn"
+steps = [{ anchor = "                        True => Closer", insert = "Still" }]
+restore = true
+
+# ----------------------------------------------------------------- persons_pro
+
+[[edit]]
+class = "migration-stage"       # launch stage v3; the product also compiles predecessor stages
+fixture = "persons-pro"
+unit = "examples/persons_pro/RUN.bn"
+steps = [{ anchor = "Registering => TEXT { Running simulated passkey registration", insert = " now" }]
+restore = true
+
+[[edit]]
+class = "child-program"         # the program a user types into the persons_pro profile editor
+fixture = "persons-pro-child"
+start = "empty"
+type_from_scenario = { scenario = "examples/persons_pro.scn", step = "valid-edit-preview" }

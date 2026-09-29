@@ -1,5 +1,5 @@
 name = "change_probe"
-source = "/tmp/claude-1000/-home-martinkavik-repos-boon-circuit/76a4caad-9c38-4c5a-9114-58de96a02de9/scratchpad/changefx/change_probe.bn"
+source = "change_probe.bn.txt"
 
 [[step]]
 id = "initial"

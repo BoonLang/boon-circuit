@@ -1,0 +1,25 @@
+store: [
+    sources: [
+        inc: [events: [press: SOURCE]]
+        other: [events: [press: SOURCE]]
+    ]
+    s: 0 |> HOLD s {
+        LATEST {
+            sources.inc.events.press |> THEN { s + 1 }
+            sources.other.events.press |> THEN { s }
+        }
+    }
+    c: 0 |> HOLD c { s |> THEN { c + 1 } }
+    label: TEXT { s={s} c={c} }
+]
+
+document: Document/new(root: Element/stripe(
+    element: []
+    direction: Row
+    gap: 1
+    items: LIST {
+        Element/button(element: [events: store.sources.inc.events], label: TEXT { inc })
+        Element/button(element: [events: store.sources.other.events], label: TEXT { other })
+        Element/label(element: [], label: store.label)
+    }
+))

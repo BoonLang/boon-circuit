@@ -1,0 +1,7 @@
+value: TEXT {
+    line one
+        indented {x}
+    last
+}
+x: TEXT { X }
+document: Document/new(root: Element/label(element: [], style: [], label: value))

@@ -1,0 +1,5 @@
+store: [
+    r: [a: 1, b: 2]
+    t: TEXT { v {r} }
+]
+document: Document/new(root: Element/label(element: [], label: store.t))

@@ -1,5 +1,5 @@
 name = "p3"
-source = "p3_source_repeat.bn"
+source = "p3_source_repeat.bn.txt"
 
 [[step]]
 id = "initial"

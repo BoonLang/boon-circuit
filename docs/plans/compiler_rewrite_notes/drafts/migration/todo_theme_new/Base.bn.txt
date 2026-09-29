@@ -1,0 +1,31 @@
+-- Neutral records shared by every theme. Each value equals what the renderer
+-- uses when the field is missing, so `[...Base/material(), color: X]` renders
+-- exactly like `[color: X]` while every material keeps one shape.
+
+FUNCTION material() {
+    [
+        color: None
+        gloss: 0
+        metal: 0
+        refraction: 0
+        transparency: 0
+        frosted_blur: 0
+        frosted_saturate: 1
+        glass_highlight: 0
+        glass_highlight_color: TEXT { #ffffff }
+    ]
+}
+
+-- Edges spread into a row or footer style. None draws nothing; every themed
+-- side border sets its own width, so the zero widths are never read.
+FUNCTION frame() {
+    [
+        border: None
+        border_width: 0
+        border_top: None
+        border_top_width: 0
+        border_bottom: None
+        border_bottom_width: 0
+        shadows: LIST {}
+    ]
+}

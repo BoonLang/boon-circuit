@@ -1,5 +1,5 @@
 name = "probe5"
-source = "probe5.bn"
+source = "probe5.bn.txt"
 
 [[step]]
 id = "initial"

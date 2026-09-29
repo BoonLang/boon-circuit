@@ -1,5 +1,5 @@
 name = "p2b_then_over_const"
-source = "p2b_then_over_const.bn"
+source = "p2b_then_over_const.bn.txt"
 
 [[step]]
 id = "initial"

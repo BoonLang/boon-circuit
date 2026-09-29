@@ -1,0 +1,12 @@
+-- Every theme returns the same record shape, so switching theme or mode is a
+-- plain value choice and every token has exactly one type.
+
+FUNCTION tokens(name, mode) {
+    name |> WHEN {
+        Classic => Classic/tokens(mode: mode)
+        Professional => Professional/tokens(mode: mode)
+        Glassmorphism => Glassmorphism/tokens(mode: mode)
+        Neobrutalism => Neobrutalism/tokens(mode: mode)
+        Neumorphism => Neumorphism/tokens(mode: mode)
+    }
+}

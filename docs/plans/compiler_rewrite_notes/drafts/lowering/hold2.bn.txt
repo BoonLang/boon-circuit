@@ -1,0 +1,30 @@
+store: [
+    sources: [
+        a_button: [events: [press: SOURCE]]
+        b_button: [events: [press: SOURCE]]
+    ]
+    a: tally(events: sources.a_button.events)
+    b: tally(events: sources.b_button.events)
+]
+
+FUNCTION tally(events) {
+    [
+        count:
+            0 |> HOLD count {
+                events.press |> THEN { count + 1 }
+            }
+    ]
+}
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        gap: 4
+        style: []
+        items: LIST {
+            Element/label(element: [], style: [], label: store.a.count)
+            Element/label(element: [], style: [], label: store.b.count)
+        }
+    )
+)

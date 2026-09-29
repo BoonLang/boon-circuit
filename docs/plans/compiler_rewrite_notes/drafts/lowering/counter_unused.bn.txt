@@ -1,0 +1,145 @@
+-- Boon Circuit executable example: Counter
+--
+-- This small generic example exists to keep the native playground tabs honest:
+-- example identity lives in the manifest, while this file stays regular Boon
+-- source that flows elements and styles into the document value.
+
+store: [
+    sources: [
+        increment_button: [
+            events: [
+                press: SOURCE
+            ]
+        ]
+        decrement_button: [
+            events: [
+                press: SOURCE
+            ]
+        ]
+        reset_button: [
+            events: [
+                press: SOURCE
+            ]
+        ]
+    ]
+
+    unused_total:
+        0 |> HOLD total {
+            sources.increment_button.events.press |> THEN { total + 1 }
+        }
+
+    count:
+        0 |> HOLD count {
+            LATEST {
+                sources.increment_button.events.press |> THEN { count + 1 }
+                sources.decrement_button.events.press |> THEN { count - 1 }
+                sources.reset_button.events.press |> THEN { 0 }
+            }
+        }
+
+]
+
+document: Document/new(
+    root: counter_app()
+)
+
+FUNCTION counter_app() {
+    Element/container(
+        element: []
+        style: [
+            width: Fill
+            height: Fill
+            align: [row: Center]
+            background: [color: Oklch[lightness:0.97]]
+            font: [size: 16, color: Oklch[lightness:0.18]]
+        ]
+        child: counter_panel()
+    )
+}
+
+FUNCTION counter_panel() {
+    Element/stripe(
+        element: [tag: Section]
+        direction: Column
+        gap: 16
+        style: [
+            width: 420
+            height: 260
+            padding: 24
+            align: [row: Center]
+            background: [color: Oklch[lightness:1]]
+            border: [color: Oklch[lightness:0.88]]
+        ]
+        items: LIST {
+            counter_title()
+            counter_value()
+            counter_controls()
+        }
+    )
+}
+
+FUNCTION counter_title() {
+    Element/label(
+        element: []
+        style: [
+            width: Fill
+            height: 34
+            align: [row: Center]
+            font: [size: 24, color: Oklch[lightness:0.24]]
+        ]
+        label: TEXT { Counter }
+    )
+}
+
+FUNCTION counter_value() {
+    Element/label(
+        element: []
+        style: [
+            width: Fill
+            height: 76
+            align: [row: Center]
+            font: [size: 64, color: Oklch[lightness:0.28,chroma:0.10,hue:250]]
+        ]
+        label: store.count
+    )
+}
+
+FUNCTION counter_controls() {
+    Element/stripe(
+        element: []
+        direction: Row
+        gap: 10
+        style: [width: Fill, height: 44, align: [row: Center]]
+        items: LIST {
+            decrement_button()
+            reset_button()
+            increment_button()
+        }
+    )
+}
+
+FUNCTION decrement_button() {
+    counter_button(events: store.sources.decrement_button.events, label: TEXT { - })
+}
+
+FUNCTION reset_button() {
+    counter_button(events: store.sources.reset_button.events, label: TEXT { Reset })
+}
+
+FUNCTION increment_button() {
+    counter_button(events: store.sources.increment_button.events, label: TEXT { + })
+}
+
+FUNCTION counter_button(events, label) {
+    Element/button(
+        element: [events: events]
+        style: [
+            width: 96
+            height: 40
+            background: [color: Oklch[lightness:0.96]]
+            border: [color: Oklch[lightness:0.78]]
+            font: [size: 16, color: Oklch[lightness:0.22]]
+        ]
+        label: label
+    )
+}

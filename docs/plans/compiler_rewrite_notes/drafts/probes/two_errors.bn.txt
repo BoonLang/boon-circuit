@@ -1,0 +1,4 @@
+value: TEXT { hi }
+a: (1 +
+b: ]]
+document: Document/new(root: Element/label(element: [], style: [], label: value))

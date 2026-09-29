@@ -1,0 +1,7 @@
+name = "theme probe"
+source = "theme_probe.bn.txt"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.mode" = "Light"

@@ -1,0 +1,5 @@
+store: [
+    e: SOURCE
+    x: e |> WHILE { __ => 1 }
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { x }))

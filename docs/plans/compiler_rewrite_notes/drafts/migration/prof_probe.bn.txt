@@ -1,0 +1,267 @@
+store: [
+    toggle: SOURCE
+    mode: Light |> HOLD state {
+        toggle |> THEN { state |> WHEN { Light => Dark, Dark => Light } }
+    }
+]
+
+theme: prof_tokens(mode: store.mode)
+
+document: Document/new(root: panel())
+
+FUNCTION panel() {
+    Element/stripe(
+        element: []
+        direction: Column
+        gap: theme.spacing.tight
+        style: [
+            width: 300
+            depth: theme.depth.container
+            move: [closer: theme.elevation.card]
+            rounded_corners: theme.corners.comfort
+            material: theme.material.panel
+            shadows: theme.panel_shadows
+        ]
+        items: LIST {
+            Element/label(element: [], style: [font: theme.font.body, color: theme.font.body_disabled.color, ...theme.frame.todo_row], label: TEXT { row })
+            Element/checkbox(element: [], style: [size: 40, ...theme.checkbox], label: TEXT { c }, checked: False)
+            Element/label(element: [], style: [font: [...theme.font.small, line: [underline: False]], material: theme.material.editing], label: TEXT { hi })
+        }
+    )
+}
+
+-- Neutral records shared by every theme. Each value equals what the renderer
+-- uses when the field is missing, so `[...Base/material(), color: X]` renders
+-- exactly like `[color: X]` while every material keeps one shape.
+
+FUNCTION base_material() {
+    [
+        color: None
+        gloss: 0
+        metal: 0
+        refraction: 0
+        transparency: 0
+        frosted_blur: 0
+        frosted_saturate: 1
+        glass_highlight: 0
+        glass_highlight_color: TEXT { #ffffff }
+    ]
+}
+
+-- Edges spread into a row or footer style. None draws nothing; every themed
+-- side border sets its own width, so the zero widths are never read.
+FUNCTION base_frame() {
+    [
+        border: None
+        border_width: 0
+        border_top: None
+        border_top_width: 0
+        border_bottom: None
+        border_bottom_width: 0
+        shadows: LIST {}
+    ]
+}
+
+-- Professional Theme
+-- Soft rounded edges, subtle shadows, low gloss materials
+-- Neutral warm lighting, classic design system aesthetic
+
+FUNCTION prof_tokens(mode) {
+    [
+        material: prof_materials(mode: mode)
+        panel_shadows: mode |> WHEN {
+            Light => LIST {
+                [x: 0, y: 24, blur: 48, spread: 0, color: TEXT { #222e4424 }]
+                [x: 0, y: 2, blur: 7, spread: 0, color: TEXT { #222e4414 }]
+            }
+            Dark => LIST {
+                [x: 0, y: 26, blur: 52, spread: 0, color: TEXT { #0000006b }]
+                [x: 0, y: 1, blur: 0, spread: 0, color: TEXT { #ffffff08 }]
+            }
+        }
+        frame: prof_frames(mode: mode)
+        checkbox: prof_checkbox(mode: mode)
+        font: prof_fonts(mode: mode)
+        primary_color: mode |> WHEN { Light => TEXT { #bd454d }, Dark => TEXT { #dc6463 } }
+        depth: [container: 8, element: 6, detail: 2, hero: 10]
+        elevation: [card: 50, editing_focus: 24, selection: 4, todo_item: 4]
+        corners: [
+            touch: 8
+            comfort: 8
+            filter: mode |> WHEN { Light => 999, Dark => 6 }
+            pill: Fully
+        ]
+        sizing: [toggle_control: 60]
+        spacing: [tight: 5, standard: 10, new_todo_input_inset: 6]
+        spring: [
+            button: [extend: 6, compress: 4]
+            button_destructive: [extend: 4, compress: 6]
+            checkbox: [extend: 4, compress: 8]
+        ]
+
+        geometry: [edge_radius: 2, bevel_angle: 45]
+    ]
+}
+
+FUNCTION prof_materials(mode) {
+    BLOCK {
+        surface_base: [
+            ...base_material()
+            color: mode |> WHEN { Light => TEXT { #ffffff }, Dark => TEXT { #1b1f24 } }
+        ]
+        primary_subtle_base: [
+            ...base_material()
+            color: mode |> WHEN { Light => TEXT { #fbf1f2 }, Dark => TEXT { #1d2127 } }
+            border: mode |> WHEN { Light => TEXT { #f0d0d3 }, Dark => TEXT { #d65d5e } }
+            border_width: 1
+        ]
+
+        [
+            background: [
+                ...base_material()
+                color: mode |> WHEN { Light => TEXT { #f8fafc }, Dark => TEXT { #16191e } }
+            ]
+            surface: surface_base
+            surface_variant: surface_base
+            surface_elevated: [
+                ...base_material()
+                color: mode |> WHEN { Light => TEXT { #ffffff }, Dark => TEXT { #1d2127 } }
+            ]
+            panel: [
+                ...surface_base
+                border: mode |> WHEN { Light => TEXT { #d7dde6 }, Dark => TEXT { #3a414b } }
+                border_width: 1
+            ]
+            interactive: [...surface_base, metal: 0.03]
+            interactive_hovered: [...surface_base, gloss: 0.04, metal: 0.03]
+            editing: [...primary_subtle_base, gloss: 0.02]
+            filter_selected: primary_subtle_base
+            hero_title: [...base_material(), color: TEXT { #00000000 }]
+        ]
+    }
+}
+
+FUNCTION prof_frames(mode) {
+    BLOCK {
+        divider: mode |> WHEN { Light => TEXT { #e5e8ee }, Dark => TEXT { #323840 } }
+        [
+            new_todo_row: [...base_frame(), border_bottom: divider, border_bottom_width: 1]
+            todo_row: [...base_frame(), border_bottom: divider, border_bottom_width: 1]
+            footer: [...base_frame(), border_top: divider, border_top_width: 1]
+        ]
+    }
+}
+
+FUNCTION prof_checkbox(mode) {
+    [
+        checkbox_background: mode |> WHEN { Light => TEXT { #ffffff }, Dark => TEXT { #00000000 } }
+        checkbox_border: mode |> WHEN { Light => TEXT { #d8dde4 }, Dark => TEXT { #626a75 } }
+        checked_border: mode |> WHEN { Light => TEXT { #62c6aa }, Dark => TEXT { #3fb18f } }
+        check_color: mode |> WHEN { Light => TEXT { #43bc9a }, Dark => TEXT { #45c9a3 } }
+        checkbox_border_width: 2
+        checkbox_inset: 3
+        checkbox_aa: 1.2
+        check_aa: 0.9
+        check_width: 3
+        checkbox_cast_color: mode |> WHEN { Light => TEXT { #1e293b24 }, Dark => TEXT { #00000054 } }
+        checkbox_cast_blur: 3
+        checkbox_cast_x: 0
+        checkbox_cast_y: 1
+        checkbox_highlight: mode |> WHEN { Light => TEXT { #ffffffb5 }, Dark => TEXT { #ffffff1c } }
+        checkbox_highlight_width: 1
+    ]
+}
+
+FUNCTION prof_fonts(mode) {
+    BLOCK {
+        family: TEXT { Segoe UI, Roboto, Helvetica, Arial, SansSerif }
+        text: mode |> WHEN { Light => TEXT { #32363d }, Dark => TEXT { #dce1e8 } }
+        body_base: [family: family, size: 25, color: text, weight: Light, style: Normal]
+
+        [
+            hero: [
+                family: family
+                size: 80
+                color: mode |> WHEN { Light => TEXT { #bd454d }, Dark => TEXT { #dc6463 } }
+                weight: Light
+                style: Normal
+            ]
+            body: body_base
+            body_secondary: [
+                family: family
+                size: 14
+                color: mode |> WHEN { Light => TEXT { #606977 }, Dark => TEXT { #c4cad3 } }
+                weight: Normal
+                style: Normal
+            ]
+            body_disabled: [
+                ...body_base
+                color: mode |> WHEN { Light => TEXT { #8a8f98 }, Dark => TEXT { #787f8b } }
+            ]
+            body_danger: [
+                family: family
+                size: 30
+                color: mode |> WHEN { Light => TEXT { #b5424a }, Dark => TEXT { #d65d5e } }
+                weight: Normal
+                style: Normal
+            ]
+            filter_selected: [
+                family: family
+                size: 14
+                color: mode |> WHEN { Light => TEXT { #b5424a }, Dark => TEXT { #f3f5f7 } }
+                weight: Normal
+                style: Normal
+            ]
+            input: body_base
+            placeholder: [
+                ...body_base
+                color: mode |> WHEN { Light => TEXT { #a2a8b2 }, Dark => TEXT { #7c838d } }
+                style: Italic
+            ]
+            icon: [
+                family: family
+                size: 22
+                color: mode |> WHEN { Light => TEXT { #7f8792 }, Dark => TEXT { #b8c0ca } }
+                weight: Normal
+                style: Normal
+            ]
+            icon_checked: [family: family, size: 22, color: text, weight: Normal, style: Normal]
+            small: [
+                family: family
+                size: 11
+                color: mode |> WHEN { Light => TEXT { #626b78 }, Dark => TEXT { #c0c6cf } }
+                weight: Normal
+                style: Normal
+            ]
+        ]
+    }
+}
+
+FUNCTION prof_lights(mode) {
+    LIST {
+        Light/directional(
+            azimuth: 30
+            altitude: 45
+            spread: 1
+            intensity: 1.2
+            color: Oklch[lightness: 0.98, chroma: 0.015, hue: 65]
+        )
+        Light/ambient(
+            intensity: 0.4
+            color: mode |> WHEN {
+                Light => Oklch[lightness: 0.8, chroma: 0.01, hue: 220]
+                Dark => Oklch[lightness: 0.3, chroma: 0.01, hue: 220]
+            }
+        )
+        Light/spot(
+            target: FocusedElement
+            color: mode |> WHEN {
+                Light => Oklch[lightness: 0.7, chroma: 0.1, hue: 220]
+                Dark => Oklch[lightness: 0.8, chroma: 0.12, hue: 220]
+            }
+            intensity: 0.3
+            radius: 60
+            softness: 0.85
+        )
+    }
+}

@@ -1,0 +1,92 @@
+store: [
+    toggle: SOURCE
+    mode: Light |> HOLD state {
+        toggle |> THEN { state |> WHEN { Light => Dark, Dark => Light } }
+    }
+    name: Classic
+]
+
+theme: tokens(name: store.name, mode: store.mode)
+
+FUNCTION plain_material() {
+    [
+        color: None
+        gloss: 0
+        metal: 0
+        refraction: 0
+        transparency: 0
+        frosted_blur: 0
+        frosted_saturate: 1
+        glass_highlight: 0
+        glass_highlight_color: TEXT { #ffffff }
+    ]
+}
+
+FUNCTION tokens(name, mode) {
+    name |> WHEN {
+        Classic => classic_tokens(mode: mode)
+        Professional => professional_tokens(mode: mode)
+    }
+}
+
+FUNCTION classic_tokens(mode) {
+    BLOCK {
+        surface_base: [
+            ...plain_material()
+            color: mode |> WHEN { Light => Oklch[lightness: 1], Dark => TEXT { #202020 } }
+        ]
+        [
+            material: [
+                surface: surface_base
+                panel: [...surface_base, border: None, border_width: 1]
+            ]
+            panel_shadows: LIST {
+                [x: 0, y: 2, blur: 4, spread: 0, color: TEXT { #0000003d }]
+            }
+            depth: [detail: 0]
+            corners: [pill: 3]
+        ]
+    }
+}
+
+FUNCTION professional_tokens(mode) {
+    BLOCK {
+        surface_base: [
+            ...plain_material()
+            color: mode |> WHEN { Light => TEXT { #ffffff }, Dark => TEXT { #1b1f24 } }
+        ]
+        [
+            material: [
+                surface: surface_base
+                panel: [
+                    ...surface_base
+                    border: mode |> WHEN { Light => TEXT { #d7dde6 }, Dark => TEXT { #3a414b } }
+                    border_width: 1
+                ]
+            ]
+            panel_shadows: LIST {
+                [x: 0, y: 24, blur: 48, spread: 0, color: TEXT { #222e4424 }]
+                [x: 0, y: 2, blur: 7, spread: 0, color: TEXT { #222e4414 }]
+            }
+            depth: [detail: 2]
+            corners: [pill: Fully]
+        ]
+    }
+}
+
+document: Document/new(root: panel())
+
+FUNCTION panel() {
+    Element/container(
+        element: []
+        style: [
+            width: 200
+            height: 100
+            depth: theme.depth.detail
+            rounded_corners: theme.corners.pill
+            material: theme.material.panel
+            shadows: theme.panel_shadows
+        ]
+        child: Element/label(element: [], style: [], label: TEXT { hi })
+    )
+}

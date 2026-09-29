@@ -1,0 +1,17 @@
+store: [
+    press: SOURCE
+    item: make(title: TEXT { original }, press: press)
+]
+
+FUNCTION make(title, press) {
+    [
+        update: press |> THEN { TEXT { changed } }
+        title: LATEST {
+            title
+            update
+        }
+        echo: title
+    ]
+}
+
+document: Document/new(root: Element/label(element: [], style: [], label: store.item.echo))

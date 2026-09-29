@@ -1,0 +1,5 @@
+store: [
+    a: b + 1
+    b: a + 1
+]
+document: Document/new(root: Element/label(element: [], label: store.a))

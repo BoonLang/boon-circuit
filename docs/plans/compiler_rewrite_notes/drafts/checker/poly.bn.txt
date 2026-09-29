@@ -1,0 +1,8 @@
+FUNCTION wrap(x) { [value: x] }
+store: [
+    wa: wrap(x: 1)
+    wb: wrap(x: TEXT { t })
+    a: wa.value + 1
+    b: wb.value |> Text/trim()
+]
+document: Document/new(root: Element/label(element: [], label: store.b))

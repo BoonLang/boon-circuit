@@ -1,0 +1,210 @@
+-- Classic Theme
+-- Flat scene materials shaped to match the document-api TodoMVC reference.
+
+FUNCTION tokens(mode) {
+    BLOCK {
+        shadow_medium: mode |> WHEN {
+            Light => Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.24]
+            Dark => Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.45]
+        }
+        shadow_soft: mode |> WHEN {
+            Light => Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.14]
+            Dark => Oklch[lightness: 0, chroma: 0, hue: 0, alpha: 0.30]
+        }
+        primary: mode |> WHEN {
+            Light => Oklch[lightness: 0.585, chroma: 0.172, hue: 24.1]
+            Dark => TEXT { #b83f45 }
+        }
+
+        [
+            material: materials(mode: mode, primary: primary)
+            panel_shadows: LIST {
+                [x: 0, y: 2, blur: 4, spread: 0, color: shadow_medium]
+                [x: 0, y: 25, blur: 50, spread: 0, color: shadow_soft]
+            }
+            frame: frames(mode: mode, shadow_medium: shadow_medium)
+            checkbox: checkbox(mode: mode)
+            font: fonts(mode: mode)
+            primary_color: primary
+            depth: [container: 0, element: 0, detail: 0, hero: 0]
+            elevation: [card: 0, editing_focus: 0, selection: 0, todo_item: 0]
+            corners: [touch: 0, comfort: 0, filter: 3, pill: 3]
+            sizing: [toggle_control: 45]
+            spacing: [tight: 11, standard: 9, new_todo_input_inset: 15]
+            spring: [
+                button: [extend: 0, compress: 0]
+                button_destructive: [extend: 0, compress: 0]
+                checkbox: [extend: 0, compress: 0]
+            ]
+            geometry: [edge_radius: 0, bevel_angle: 0]
+        ]
+    }
+}
+
+FUNCTION materials(mode, primary) {
+    BLOCK {
+        surface_color: mode |> WHEN { Light => Oklch[lightness: 1], Dark => TEXT { #202020 } }
+        surface_base: [...Base/material(), color: surface_color, gloss: 0]
+
+        [
+            background: [
+                ...Base/material()
+                color: mode |> WHEN { Light => Oklch[lightness: 0.97], Dark => TEXT { #1b1b1b } }
+            ]
+            surface: surface_base
+            surface_variant: surface_base
+            surface_elevated: surface_base
+            panel: [...surface_base, border: None, border_width: 1]
+            interactive: surface_base
+            interactive_hovered: surface_base
+            editing: [...surface_base, border: primary, border_width: 1]
+            filter_selected: [...Base/material(), border: primary, border_width: 1]
+            hero_title: [...Base/material(), color: TEXT { #00000000 }]
+        ]
+    }
+}
+
+FUNCTION frames(mode, shadow_medium) {
+    BLOCK {
+        divider: mode |> WHEN { Light => Oklch[lightness: 0.93], Dark => TEXT { #373737 } }
+        stack_fill: mode |> WHEN { Light => Oklch[lightness: 0.973], Dark => TEXT { #1d1d1d } }
+        [
+            new_todo_row: [
+                ...Base/frame()
+                border: mode |> WHEN {
+                    Light => Oklch[lightness: 0.7, chroma: 0.18, hue: 24.1]
+                    Dark => TEXT { #3c3c3c }
+                }
+                border_width: 1
+            ]
+            todo_row: [...Base/frame(), border_bottom: divider, border_bottom_width: 0.8]
+            footer: [
+                ...Base/frame()
+                border_top: divider
+                border_top_width: 0.8
+                shadows: LIST {
+                    [x: 0, y: 1, blur: 1, spread: 0, color: shadow_medium]
+                    [x: 0, y: 8, blur: 0, spread: -3, color: stack_fill]
+                    [x: 0, y: 9, blur: 1, spread: -3, color: shadow_medium]
+                    [x: 0, y: 16, blur: 0, spread: -6, color: stack_fill]
+                    [x: 0, y: 17, blur: 2, spread: -6, color: shadow_medium]
+                }
+            ]
+        ]
+    }
+}
+
+FUNCTION checkbox(mode) {
+    [
+        checkbox_background: mode |> WHEN { Light => Oklch[lightness: 1], Dark => TEXT { #00000000 } }
+        checkbox_border: mode |> WHEN { Light => TEXT { #ededed }, Dark => TEXT { #595959 } }
+        checked_border: mode |> WHEN { Light => TEXT { #bddad5 }, Dark => TEXT { #4aa582 } }
+        check_color: mode |> WHEN { Light => TEXT { #5dc2af }, Dark => TEXT { #53b994 } }
+        checkbox_border_width: mode |> WHEN { Light => 1.5, Dark => 2 }
+        checkbox_inset: 2
+        checkbox_aa: 1.25
+        check_aa: 0.9
+        check_width: 3
+        checkbox_cast_color: mode |> WHEN { Light => TEXT { #00000000 }, Dark => TEXT { #00000026 } }
+        checkbox_cast_blur: mode |> WHEN { Light => 0, Dark => 2 }
+        checkbox_cast_x: 0
+        checkbox_cast_y: 1
+        checkbox_highlight: mode |> WHEN { Light => TEXT { #ffffff9c }, Dark => TEXT { #ffffff14 } }
+        checkbox_highlight_width: 1
+    ]
+}
+
+FUNCTION fonts(mode) {
+    BLOCK {
+        family: TEXT { Helvetica Neue, Helvetica, Arial, SansSerif }
+        body_color: mode |> WHEN { Light => Oklch[lightness: 0.4017], Dark => TEXT { #dfdfdf } }
+        [
+            hero: [
+                family: family
+                size: 80
+                color: mode |> WHEN {
+                    Light => Oklch[lightness: 0.5404, chroma: 0.1561, hue: 21.24]
+                    Dark => TEXT { #b83f45 }
+                }
+                weight: ExtraLight
+                style: Normal
+            ]
+            body: [family: family, size: 24, color: body_color, weight: Light, style: Normal]
+            body_secondary: [
+                family: family
+                size: 15
+                color: mode |> WHEN { Light => Oklch[lightness: 0.17], Dark => TEXT { #d6d6d6 } }
+                weight: Light
+                style: Normal
+            ]
+            body_disabled: [
+                family: family
+                size: 24
+                color: mode |> WHEN { Light => Oklch[lightness: 0.6665], Dark => TEXT { #868686 } }
+                weight: Light
+                style: Normal
+            ]
+            body_danger: [
+                family: family
+                size: 30
+                color: mode |> WHEN {
+                    Light => Oklch[lightness: 0.57, chroma: 0.109, hue: 18.87]
+                    Dark => TEXT { #b83f45 }
+                }
+                weight: Normal
+                style: Normal
+            ]
+            filter_selected: [
+                family: family
+                size: 15
+                color: mode |> WHEN { Light => Oklch[lightness: 0.17], Dark => TEXT { #eeeeee } }
+                weight: Light
+                style: Normal
+            ]
+            input: [
+                family: family
+                size: 24
+                color: mode |> WHEN { Light => Oklch[lightness: 0.42], Dark => TEXT { #dfdfdf } }
+                weight: Light
+                style: Normal
+            ]
+            placeholder: [
+                family: family
+                size: 24
+                color: mode |> WHEN { Light => Oklch[lightness: 0.68], Dark => TEXT { #868686 } }
+                weight: Light
+                style: Italic
+            ]
+            icon: [
+                family: family
+                size: 22
+                color: mode |> WHEN { Light => Oklch[lightness: 0.667], Dark => TEXT { #8f8f8f } }
+                weight: Normal
+                style: Normal
+            ]
+            icon_checked: [
+                family: family
+                size: 22
+                color: mode |> WHEN { Light => Oklch[lightness: 0.4], Dark => TEXT { #dfdfdf } }
+                weight: Normal
+                style: Normal
+            ]
+            small: [
+                family: family
+                size: 11
+                color: mode |> WHEN { Light => Oklch[lightness: 0.4202], Dark => TEXT { #858585 } }
+                weight: Light
+                style: Normal
+            ]
+        ]
+    }
+}
+
+FUNCTION lights(mode) {
+    LIST {
+        Light/ambient(
+            intensity: 1
+            color: Oklch[lightness: 1]
+        )
+    }
+}

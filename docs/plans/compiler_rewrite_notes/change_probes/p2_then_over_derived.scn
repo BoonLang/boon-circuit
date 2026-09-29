@@ -1,5 +1,5 @@
 name = "p2"
-source = "p2_then_over_derived.bn"
+source = "p2_then_over_derived.bn.txt"
 
 [[step]]
 id = "initial"

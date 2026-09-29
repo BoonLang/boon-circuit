@@ -1,0 +1,19 @@
+store: [
+    sources: [
+        a_button: [events: [press: SOURCE]]
+    ]
+    a: tally()
+]
+
+FUNCTION tally() {
+    [
+        count:
+            0 |> HOLD n {
+                store.sources.a_button.events.press |> THEN { n + 1 }
+            }
+    ]
+}
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: store.a.count)
+)

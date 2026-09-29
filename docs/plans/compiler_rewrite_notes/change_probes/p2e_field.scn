@@ -1,5 +1,5 @@
 name = "p2e_field"
-source = "p2e_field.bn"
+source = "p2e_field.bn.txt"
 
 [[step]]
 id = "initial"

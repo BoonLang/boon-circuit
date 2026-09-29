@@ -1,0 +1,5 @@
+store: [
+    a: 1
+    b: a == TEXT { x }
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { x }))

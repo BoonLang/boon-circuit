@@ -1,5 +1,5 @@
 name = "p1"
-source = "p1_then_over_hold.bn"
+source = "p1_then_over_hold.bn.txt"
 
 [[step]]
 id = "initial"

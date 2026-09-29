@@ -1,0 +1,19 @@
+store: [
+    items: LIST {
+            [title: TEXT { original }]
+        }
+        |> List/map(item, new: make(title: item.title))
+]
+
+FUNCTION make(title) {
+    [
+        elements: [button: [events: [press: SOURCE]]]
+        update: elements.button.events.press |> THEN { TEXT { changed } }
+        title: LATEST {
+            title
+            update
+        }
+    ]
+}
+
+document: Document/new(root: Element/stripe(element: [], direction: Column, style: [], items: store.items |> List/map(item, new: Element/label(element: [], style: [], label: item.title))))

@@ -1,0 +1,231 @@
+# budgets/compiler.toml, format 4 (proposal, 2026-09-29, revision 2).
+#
+# Contract: docs/architecture/BOON_COMPILER.md. Read by `cargo xtask compiler-ab`
+# and `cargo xtask compiler-checkpoint [--nightly]`. Replaces format 3 entirely.
+#
+# Change policy (the only rules; AGENTS.md points here):
+# - Tightening any limit, adding a fixture, edit, scenario or workload: always allowed.
+# - Loosening a time, CPU, throughput or RSS limit, raising a scaling ratio, or
+#   removing a fixture, edit class, scenario or workload: owner approval, in chat.
+# - Edit-corpus anchors move with example refactors; update them in the same commit.
+# - No stored byte hash is a correctness oracle, and nothing here pins build flags.
+#   Every report records profile, lto, codegen-units, panic, target-cpu, rustflags,
+#   rustc, allocator, git head and dirty state. A build-profile change is an
+#   ordinary A/B candidate; adopting it requires a checkpoint run.
+#
+# Gates apply to the engine the playground uses by default. Until cutover the old
+# engine is measured with this same file and reported as "reference" (never gated).
+
+format_version = 4
+contract = "docs/architecture/BOON_COMPILER.md"
+report_dir = "target/reports/compiler"
+
+[machine]
+reference = "i7-9700K 8C/8T, no SHA-NI, COSMIC desktop"
+single_thread_cpu = 2          # taskset core for the single_thread lane; A and B share it
+max_loadavg_1m = 1.5           # checkpoint samples taken above this are discarded and retried
+record = ["scaling_governor", "no_turbo", "loadavg", "kernel", "cpu_model"]  # recorded, never changed
+
+# ---------------------------------------------------------------------------
+# Timing window. A cold sample is one fresh process that runs the product order
+# on one fixture: all source units are already in memory when the clock starts
+# (the playground always has them; the compiler never reads examples/manifest.toml
+# to find files). The process records
+#   t_diag = diagnostics (and the editor language snapshot) available
+#   t_plan = runnable MachinePlan available to the runtime
+# Budgets named diagnostics_* gate t_diag, verified_* gate t_plan. Process start,
+# file IO, report writing and any oracle hashing are outside the window.
+# cpu_ms = getrusage(RUSAGE_SELF) user+sys across the window (all threads).
+# rss_delta = ru_maxrss after the window minus ru_maxrss just before it.
+#
+# Phases are engine-neutral; every engine reports them:
+#   front = lex + parse + name resolution
+#   check = type inference and every user diagnostic
+#   lower = typed program -> MachinePlan
+#   seal  = plan finalization (no hashing, no self re-verification)
+# Old-engine mapping: parse->front, typecheck->check, semantic+ir+backend->lower,
+# plan_validation->seal.
+# lines = compiler input source lines of all units (format 3's
+# compiler_input_source_lines: counter 140, TodoMVC 3576, NovyWave 11926).
+# ---------------------------------------------------------------------------
+
+[lanes.product]                # what the user feels
+threads = "auto"
+caches = "none"                # no persistent on-disk caches; process-static tables allowed
+process = "fresh"
+
+[lanes.single_thread]          # throughput floor: work cannot hide behind cores
+threads = 1
+caches = "none"
+process = "fresh"
+pin = "machine.single_thread_cpu"
+
+[protocol.dev]                 # cargo xtask compiler-ab --a <bin|rev> --b <bin|rev>
+lane = "product"
+schedule = "interleaved-ABBA"  # one block = A B B A, each a fresh process
+cells = [
+  "todo-mvc-physical",         # one process gives both t_diag and t_plan
+  "novywave",
+]
+primary_metric = "wall_ms"     # cpu_ms also reported; a cpu_ms rise > 5% is flagged
+min_blocks = 5
+max_blocks = 30
+stop = "99% CI of the mean per-block log ratio excludes 0, or lies inside +-1%"
+compare_outputs = true         # A-vs-B normalized diagnostics + canonical plan identity, informative
+
+[protocol.checkpoint]          # milestone close, any build-profile change, before cutover
+setup_samples = 3
+scored_samples = 20
+lanes = ["product", "single_thread"]
+include = ["cold", "small", "warm", "scaling", "throughput", "rss", "determinism", "oracles"]
+
+[protocol.nightly]             # checkpoint plus the slow lanes
+scored_samples = 30
+include_extra = ["differential", "allocation-counts", "aa-calibration", "debug-verifier"]
+
+# ---------------------------------------------------------------------------
+# Cold fixtures (product lane, p95 of scored samples).
+# *_cpu_p95_ms = 1.25 x the wall budget: threads may cut wall time, but may not
+# buy it with much more total work. target_* are reported, not gated; tighten
+# the gates toward them as they are beaten.
+# ---------------------------------------------------------------------------
+
+[[fixtures]]
+id = "counter"
+source = "examples/counter.bn"
+lines = 140
+diagnostics_p95_ms = 5.0       # format 3: 10.0
+verified_p95_ms = 10.0         # format 3: 50.0
+diagnostics_cpu_p95_ms = 6.25
+verified_cpu_p95_ms = 12.5
+rss_delta_mib_max = 8
+target_diagnostics_p95_ms = 1.0
+target_verified_p95_ms = 2.0
+scenario = "examples/counter.scn"
+
+[[fixtures]]
+id = "todo-mvc-physical"
+source = "examples/todo_mvc_physical/RUN.bn"
+lines = 3576
+diagnostics_p95_ms = 75.0
+verified_p95_ms = 300.0
+diagnostics_cpu_p95_ms = 94.0
+verified_cpu_p95_ms = 375.0
+rss_delta_mib_max = 64
+target_diagnostics_p95_ms = 25.0
+target_verified_p95_ms = 60.0
+scenario = "examples/todo_mvc_physical.scn"
+
+[[fixtures]]
+id = "novywave"
+source = "examples/novywave/RUN.bn"
+lines = 11926
+diagnostics_p95_ms = 250.0
+verified_p95_ms = 1000.0
+diagnostics_cpu_p95_ms = 312.0
+verified_cpu_p95_ms = 1250.0
+rss_delta_mib_max = 192
+target_diagnostics_p95_ms = 75.0
+target_verified_p95_ms = 150.0
+scenario = "examples/novywave.scn"
+
+[throughput]                   # single_thread lane, median of scored samples, min over fixtures
+applies_to = ["todo-mvc-physical", "novywave"]
+front_lines_per_s_min = 400_000      # today ~190k
+check_lines_per_s_min = 100_000      # today 9.7k (TodoMVC) / 26k (NovyWave)
+lower_lines_per_s_min = 60_000
+verified_lines_per_s_min = 30_000    # today 4.5k-6.4k
+target_front_lines_per_s = 1_000_000
+target_check_lines_per_s = 300_000
+target_lower_lines_per_s = 200_000
+
+[small]                        # starter-source / child-program path, many compiles in one process
+sources = [
+  { path = "examples/counter.bn" },
+  { path = "examples/hello_world.bn" },
+  { path = "examples/minimal.bn" },
+  { scenario = "examples/persons_pro.scn", step = "valid-edit-preview" },   # the typed child program
+  { scenario = "examples/persons_pro.scn", step = "corrected-edit-preview" },
+]
+warmup_compiles = 1            # process-static tables (builtin ABI) may be built once
+scored_compiles = 50
+diagnostics_p95_ms = 1.0
+verified_p95_ms = 2.0
+verified_max_ms = 4.0
+# Leaves half of the native persons-pro gate (bounded-starter-source-compile
+# p95 4 ms, max 8 ms end to end; examples/persons_pro.budget.toml) for runtime/IPC.
+
+# ---------------------------------------------------------------------------
+# Warm. The driver uses the same compile-service object the playground uses:
+# submit(revision) -> diagnostics published -> preview plan published,
+# latest-wins, cancellation inside long phases. Each corpus edit is typed one
+# character per revision, so the intermediate (mostly invalid) states are real.
+# ---------------------------------------------------------------------------
+
+[warm]
+driver = "product-compile-service"
+corpus = "budgets/compiler_edits.toml"
+fixtures = ["todo-mvc-physical", "novywave", "persons-pro"]
+modes = ["settled", "typing"]  # settled: wait for each revision; typing: fixed cadence
+typing_interval_ms = 60
+diagnostics_p95_ms = 16.7      # settled: submit -> diagnostics published, all keystrokes, all classes
+diagnostics_p99_ms = 25.0
+diagnostics_max_ms = 33.4
+verified_preview_p95_ms = 100.0
+verified_preview_max_ms = 200.0
+typing_freshness_p95_ms = 25.0 # typing: keystroke k -> first diagnostics for any revision >= k
+noop_edit_p95_ms = 1.0         # whitespace and comment classes, diagnostics lane
+supersede_stop_p95_ms = 2.0    # newer revision submitted -> in-flight older work stopped
+cpu_ms_per_keystroke_p95 = 20.0
+rss_growth_mib_max = 8         # whole corpus, one session per fixture
+from_scratch_consistency = true  # final revision of every edit: warm == cold (diagnostics, canonical plan)
+per_class_report = true        # p50/p95 per class reported; only the overall numbers gate
+target_diagnostics_p95_ms = 5.0
+target_verified_preview_p95_ms = 40.0
+
+[warm.switch]                  # predicts the counter-dev example-switch measurements
+from = "examples/todo_mvc_physical/RUN.bn"
+to = "examples/counter.bn"
+switch_ack_p95_ms = 16.7
+switch_present_p95_ms = 100.0
+switch_present_max_ms = 200.0
+
+# ---------------------------------------------------------------------------
+# Scaling: generated programs, single_thread lane, median cpu_ms of 5 runs minus
+# the size-0 baseline, ratio per doubling. n log n at these sizes is ~2.21, so
+# 2.3 admits n log n and rejects n^1.25 and worse. Format 3 gated work
+# counters at 2.2; this gates time on engine-neutral generators.
+# ---------------------------------------------------------------------------
+
+[scaling]
+lane = "single_thread"
+metric = "cpu_ms_minus_baseline"
+runs = 5
+default_sizes = [800, 1600, 3200]
+max_doubling_ratio = 2.3
+workloads = [
+  { id = "call-depth", intent = "diagnostics", sizes = [200, 400, 800] },
+  { id = "call-site-count", intent = "diagnostics" },
+  { id = "contextual-call-site-count", intent = "verified" },
+  { id = "union-width", intent = "verified" },          # was static-branch-count (n^2.5 today)
+  { id = "when-arm-count", intent = "diagnostics" },
+  { id = "record-width", intent = "diagnostics" },
+  { id = "pass-depth", intent = "diagnostics", sizes = [200, 400, 800] },
+  { id = "list-pipeline-length", intent = "verified" },
+  { id = "source-unit-count", intent = "diagnostics", sizes = [50, 100, 200] },
+  { id = "dependency-cone-size", intent = "verified" },
+]
+
+# ---------------------------------------------------------------------------
+# Oracles. None of them is a stored byte hash.
+# ---------------------------------------------------------------------------
+
+[oracles]
+diagnostics_corpus = "tests/compiler/diagnostics"   # <name>.bn + <name>.expect; a positive case has no .expect
+expect_format = "one line per diagnostic: <unit>:<line>:<col> <code>   (message text is not compared)"
+examples = "examples/manifest.toml"                 # every example compiles clean; its scenario passes
+scenario_runner = "boon_behavior_harness"
+migrations = ["examples/migrations/todo/sequence.toml", "examples/migrations/persons_pro/sequence.toml"]
+determinism = { runs = 2, vary_threads = true }      # same build, same input: identical canonical plan bytes and diagnostics
+differential = { engine = "old", divergences = "tests/compiler/divergences.toml", until = "cutover" }
+debug_verifier = true                                # debug/test builds verify every produced plan

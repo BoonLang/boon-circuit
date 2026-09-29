@@ -1,0 +1,5 @@
+store: [
+    e: SOURCE
+    x: LATEST { e |> THEN { 1 } }
+]
+document: Document/new(root: Element/label(element: [], label: TEXT { {store.x} }))

@@ -1,0 +1,18 @@
+store: [
+    click: SOURCE
+    start:
+        0 |> HOLD start {
+            click |> THEN { 1 }
+        }
+    runaway:
+        0 |> HOLD runaway {
+            LATEST {
+                start |> THEN { runaway + 1 }
+                runaway |> THEN { runaway + 1 }
+            }
+        }
+]
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: TEXT { {store.runaway} })
+)

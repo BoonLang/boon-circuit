@@ -1,0 +1,30 @@
+store: [
+    press: SOURCE
+    set_a: SOURCE
+    a:
+        0 |> HOLD a {
+            set_a |> THEN { a + 1 }
+        }
+    derived: a * 10
+    merged:
+        LATEST {
+            press |> THEN { 100 }
+            derived
+        }
+    held_plain:
+        0 |> HOLD held_plain {
+            derived
+        }
+    held_when:
+        0 |> HOLD held_when {
+            merged |> WHEN {
+                100 => 1
+                __ => 2
+            }
+        }
+    fires:
+        0 |> HOLD fires {
+            merged |> THEN { fires + 1 }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.a))

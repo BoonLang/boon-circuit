@@ -1,0 +1,8 @@
+name = "p2e_field"
+source = "p2e_field.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.value" = "?"
+  "store.fires" = "?"

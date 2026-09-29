@@ -1,0 +1,29 @@
+store: [
+    input: SOURCE
+    count:
+        0 |> HOLD count {
+            input |> THEN { count + 1 }
+        }
+    payload_count:
+        0 |> HOLD payload_count {
+            input.text |> THEN { payload_count + 1 }
+        }
+    last:
+        TEXT { none } |> HOLD last {
+            input |> THEN { input.text }
+        }
+    last_fires:
+        0 |> HOLD last_fires {
+            last |> THEN { last_fires + 1 }
+        }
+    latest_text:
+        LATEST {
+            TEXT { init }
+            input |> THEN { input.text }
+        }
+    latest_fires:
+        0 |> HOLD latest_fires {
+            latest_text |> THEN { latest_fires + 1 }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.last))

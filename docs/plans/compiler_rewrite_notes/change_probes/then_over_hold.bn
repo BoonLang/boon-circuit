@@ -1,0 +1,15 @@
+store: [
+    click: SOURCE
+    count:
+        0 |> HOLD count {
+            click |> THEN { count + 1 }
+        }
+    doubled_on_change:
+        0 |> HOLD doubled_on_change {
+            count |> THEN { count * 2 }
+        }
+]
+
+outputs: [
+    doubled: store.doubled_on_change
+]

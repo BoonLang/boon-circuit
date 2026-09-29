@@ -1,0 +1,27 @@
+store: [
+    set_one: SOURCE
+    set_two: SOURCE
+    value:
+        0 |> HOLD value {
+            LATEST {
+                set_one |> THEN { 1 }
+                set_two |> THEN { 2 }
+            }
+        }
+    fires:
+        0 |> HOLD fires {
+            value |> THEN { fires + 1 }
+        }
+    presses:
+        0 |> HOLD presses {
+            set_one |> THEN { presses + 1 }
+        }
+]
+
+outputs: [
+    value: store.value
+    fires: store.fires
+    presses: store.presses
+]
+
+document: Document/new(root: Element/label(element: [], style: [], label: store.value))

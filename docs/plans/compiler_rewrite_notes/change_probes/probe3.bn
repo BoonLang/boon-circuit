@@ -1,0 +1,32 @@
+store: [
+    click: SOURCE
+    count:
+        0 |> HOLD count {
+            click |> THEN { count + 1 }
+        }
+    zeroed: count * 0
+    doubled: count * 2
+    zeroed_changes:
+        0 |> HOLD zeroed_changes {
+            zeroed |> THEN { zeroed_changes + 1 }
+        }
+    doubled_changes:
+        0 |> HOLD doubled_changes {
+            doubled |> THEN { doubled_changes + 1 }
+        }
+    record_changes:
+        0 |> HOLD record_changes {
+            [a: zeroed] |> THEN { record_changes + 1 }
+        }
+    when_changes:
+        0 |> HOLD when_changes {
+            count |> WHEN {
+                2 => when_changes + 1
+                __ => SKIP
+            }
+        }
+]
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: TEXT { {store.count} })
+)

@@ -1,0 +1,20 @@
+store: [
+    press: SOURCE
+    b_before:
+        0 |> HOLD b_before {
+            press |> THEN { a }
+        }
+    a:
+        0 |> HOLD a {
+            press |> THEN { a + 1 }
+        }
+    b_after:
+        0 |> HOLD b_after {
+            press |> THEN { a }
+        }
+    c_chain:
+        0 |> HOLD c_chain {
+            a |> THEN { a * 10 }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.a))

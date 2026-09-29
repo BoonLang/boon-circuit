@@ -1,0 +1,27 @@
+store: [
+    click: SOURCE
+    count:
+        0 |> HOLD count {
+            click |> THEN { count + 1 }
+        }
+    constant:
+        0 |> HOLD constant {
+            click |> THEN { 5 }
+        }
+    count_changes:
+        0 |> HOLD count_changes {
+            count |> THEN { count_changes + 1 }
+        }
+    constant_changes:
+        0 |> HOLD constant_changes {
+            constant |> THEN { constant_changes + 1 }
+        }
+    seen_count:
+        0 |> HOLD seen_count {
+            count |> THEN { count }
+        }
+]
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: TEXT { {store.count} })
+)

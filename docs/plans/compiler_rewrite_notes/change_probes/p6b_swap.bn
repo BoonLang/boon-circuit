@@ -1,0 +1,12 @@
+store: [
+    press: SOURCE
+    x:
+        1 |> HOLD x {
+            press |> THEN { y }
+        }
+    y:
+        2 |> HOLD y {
+            press |> THEN { x }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.x))

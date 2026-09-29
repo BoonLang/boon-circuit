@@ -1,0 +1,18 @@
+store: [
+    click: SOURCE
+    ping:
+        0 |> HOLD ping {
+            LATEST {
+                click |> THEN { ping + 1 }
+                pong |> THEN { ping + 10 }
+            }
+        }
+    pong:
+        0 |> HOLD pong {
+            ping |> THEN { pong + 1 }
+        }
+]
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: TEXT { {store.ping} })
+)

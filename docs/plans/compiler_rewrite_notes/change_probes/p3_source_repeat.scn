@@ -1,0 +1,45 @@
+name = "p3"
+source = "p3_source_repeat.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.count" = "0"
+  "store.payload_count" = "0"
+  "store.last" = "none"
+  "store.last_fires" = "0"
+  "store.latest_text" = "init"
+  "store.latest_fires" = "0"
+
+[[step]]
+id = "a1"
+expected_source_event = { source = "store.input", text = "a" }
+  [step.expect_root_text]
+  "store.count" = "1"
+  "store.payload_count" = "1"
+  "store.last" = "a"
+  "store.last_fires" = "1"
+  "store.latest_text" = "a"
+  "store.latest_fires" = "1"
+
+[[step]]
+id = "a2"
+expected_source_event = { source = "store.input", text = "a" }
+  [step.expect_root_text]
+  "store.count" = "2"
+  "store.payload_count" = "2"
+  "store.last" = "a"
+  "store.last_fires" = "1"
+  "store.latest_text" = "a"
+  "store.latest_fires" = "1"
+
+[[step]]
+id = "b"
+expected_source_event = { source = "store.input", text = "b" }
+  [step.expect_root_text]
+  "store.count" = "3"
+  "store.payload_count" = "3"
+  "store.last" = "b"
+  "store.last_fires" = "2"
+  "store.latest_text" = "b"
+  "store.latest_fires" = "2"

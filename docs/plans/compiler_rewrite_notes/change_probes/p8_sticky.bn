@@ -1,0 +1,21 @@
+store: [
+    press: SOURCE
+    other: SOURCE
+    input: SOURCE
+    ev: press |> THEN { 5 }
+    typed: input.text
+    typed_upper: input.text |> Text/to_uppercase()
+    count_other:
+        0 |> HOLD count_other {
+            other |> THEN { count_other + 1 }
+        }
+    reads_ev:
+        0 |> HOLD reads_ev {
+            other |> THEN { ev }
+        }
+    typed_fires:
+        0 |> HOLD typed_fires {
+            typed |> THEN { typed_fires + 1 }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.count_other))

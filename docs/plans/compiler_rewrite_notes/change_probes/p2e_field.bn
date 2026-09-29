@@ -1,0 +1,5 @@
+store: [
+    constant: 5
+    value: constant |> THEN { 2 }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.value))

@@ -1,0 +1,30 @@
+store: [
+    set_a: SOURCE
+    set_b: SOURCE
+    a:
+        0 |> HOLD a {
+            set_a |> THEN { a + 1 }
+        }
+    b:
+        0 |> HOLD b {
+            set_b |> THEN { b + 1 }
+        }
+    flag: a > 5
+    sum: a + b
+    flag_fires:
+        0 |> HOLD flag_fires {
+            flag |> THEN { flag_fires + 1 }
+        }
+    sum_fires:
+        0 |> HOLD sum_fires {
+            sum |> THEN { sum_fires + 1 }
+        }
+    flag_when:
+        0 |> HOLD flag_when {
+            flag |> WHEN {
+                True => flag_when + 100
+                False => flag_when + 1
+            }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.a))

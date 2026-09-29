@@ -1,0 +1,43 @@
+store: [
+    go: SOURCE
+    stop: SOURCE
+    bump: SOURCE
+    mode:
+        Inactive |> HOLD mode {
+            LATEST {
+                go |> THEN { Active }
+                stop |> THEN { Inactive }
+            }
+        }
+    size:
+        8 |> HOLD size {
+            bump |> THEN { size + 1 }
+        }
+    in_while:
+        NotRequested |> HOLD in_while {
+            mode |> WHILE {
+                Active => Random/bytes(byte_count: size)
+                Inactive => SKIP
+            }
+        }
+    in_when:
+        NotRequested |> HOLD in_when {
+            mode |> WHEN {
+                Active => Random/bytes(byte_count: size)
+                Inactive => SKIP
+            }
+        }
+    in_then:
+        NotRequested |> HOLD in_then {
+            go |> THEN { Random/bytes(byte_count: size) }
+        }
+    latest_const:
+        LATEST {
+            NotRequested
+            mode |> WHEN {
+                Active => Random/bytes(byte_count: size)
+                Inactive => SKIP
+            }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.size))

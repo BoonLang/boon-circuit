@@ -1,0 +1,9 @@
+store: [
+    bump: SOURCE
+    size:
+        8 |> HOLD size {
+            bump |> THEN { size + 1 }
+        }
+    top_level: Random/bytes(byte_count: size)
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.size))

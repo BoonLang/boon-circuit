@@ -1,0 +1,19 @@
+name = "probe4"
+source = "probe4.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.runaway" = "0"
+
+[[step]]
+id = "tick1"
+expected_source_event = { source = "store.click" }
+  [step.expect_root_text]
+  "store.runaway" = "1"
+
+[[step]]
+id = "tick2"
+expected_source_event = { source = "store.click" }
+  [step.expect_root_text]
+  "store.runaway" = "1"

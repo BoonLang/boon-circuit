@@ -1,0 +1,22 @@
+store: [
+    press: SOURCE
+    a:
+        0 |> HOLD a {
+            press |> THEN { a + 1 }
+        }
+    tie:
+        0 |> HOLD tie {
+            LATEST {
+                press |> THEN { 1 }
+                press |> THEN { 2 }
+            }
+        }
+    state_vs_event:
+        0 |> HOLD state_vs_event {
+            LATEST {
+                press |> THEN { 10 }
+                a |> THEN { 20 }
+            }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.a))

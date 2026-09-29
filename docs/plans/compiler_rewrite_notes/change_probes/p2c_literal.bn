@@ -1,0 +1,7 @@
+store: [
+    fires:
+        0 |> HOLD fires {
+            5 |> THEN { fires + 1 }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.fires))

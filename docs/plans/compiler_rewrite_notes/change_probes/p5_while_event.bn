@@ -1,0 +1,6 @@
+store: [
+    press: SOURCE
+    value: press |> WHILE { __ => 1 }
+    one: LATEST { press |> THEN { 1 } }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.value))

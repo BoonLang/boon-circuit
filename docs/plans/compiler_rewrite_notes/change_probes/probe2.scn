@@ -1,0 +1,28 @@
+name = "change_probe"
+source = "probe2.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.count" = "0"
+  "store.count_changes" = "0"
+  "store.constant_changes" = "0"
+  "store.seen_count" = "0"
+
+[[step]]
+id = "tick1"
+expected_source_event = { source = "store.click" }
+  [step.expect_root_text]
+  "store.count" = "1"
+  "store.count_changes" = "1"
+  "store.constant_changes" = "1"
+  "store.seen_count" = "1"
+
+[[step]]
+id = "tick2"
+expected_source_event = { source = "store.click" }
+  [step.expect_root_text]
+  "store.count" = "2"
+  "store.count_changes" = "2"
+  "store.constant_changes" = "1"
+  "store.seen_count" = "2"

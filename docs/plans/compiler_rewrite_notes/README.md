@@ -17,3 +17,4 @@
 | process.md | AGENTS.md/contract/budgets v4/measurement/gates/cutover + review |
 | process_alternative.md | earlier variant of the process design |
 | original_change_model.md | survey of the original `~/repos/boon` change and effect model (input to L2/L3) |
+| change_and_effects.md | event/change models A/B/C and query/command effect split, with current-tree probes and prior art (input to L2/L3) |

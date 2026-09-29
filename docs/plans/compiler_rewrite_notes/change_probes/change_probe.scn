@@ -1,0 +1,28 @@
+name = "change_probe"
+source = "/tmp/claude-1000/-home-martinkavik-repos-boon-circuit/76a4caad-9c38-4c5a-9114-58de96a02de9/scratchpad/changefx/change_probe.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.count" = "0"
+  "store.count_changes" = "?"
+  "store.constant_changes" = "?"
+  "store.seen_count" = "?"
+
+[[step]]
+id = "tick1"
+expected_source_event = { source = "store.tick" }
+  [step.expect_root_text]
+  "store.count" = "1"
+  "store.count_changes" = "?"
+  "store.constant_changes" = "?"
+  "store.seen_count" = "?"
+
+[[step]]
+id = "tick2"
+expected_source_event = { source = "store.tick" }
+  [step.expect_root_text]
+  "store.count" = "2"
+  "store.count_changes" = "?"
+  "store.constant_changes" = "?"
+  "store.seen_count" = "?"

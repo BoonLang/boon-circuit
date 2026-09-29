@@ -1,0 +1,20 @@
+store: [
+    click: SOURCE
+    count:
+        0 |> HOLD count {
+            click |> THEN { count + 1 }
+        }
+    parity: count |> Number/modulo(divisor: 2)
+    flips:
+        0 |> HOLD flips {
+            parity |> THEN { flips + 1 }
+        }
+]
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: TEXT { x })
+)
+
+outputs: [
+    flips: store.flips
+]

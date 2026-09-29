@@ -1,0 +1,51 @@
+name = "probe3"
+source = "probe3.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.count" = "0"
+  "store.zeroed_changes" = "0"
+  "store.doubled_changes" = "0"
+  "store.record_changes" = "0"
+  "store.when_changes" = "0"
+
+[[step]]
+id = "tick1"
+expected_source_event = { source = "store.click" }
+  [step.expect_root_text]
+  "store.count" = "1"
+  "store.zeroed_changes" = "1"
+  "store.doubled_changes" = "1"
+  "store.record_changes" = "1"
+  "store.when_changes" = "0"
+
+[[step]]
+id = "tick2"
+expected_source_event = { source = "store.click" }
+  [step.expect_root_text]
+  "store.count" = "2"
+  "store.zeroed_changes" = "2"
+  "store.doubled_changes" = "2"
+  "store.record_changes" = "2"
+  "store.when_changes" = "1"
+
+[[step]]
+id = "tick3"
+expected_source_event = { source = "store.click" }
+  [step.expect_root_text]
+  "store.count" = "3"
+  "store.zeroed_changes" = "3"
+  "store.doubled_changes" = "3"
+  "store.record_changes" = "3"
+  "store.when_changes" = "1"
+
+[[step]]
+id = "tick4"
+expected_source_event = { source = "store.click" }
+  [step.expect_root_text]
+  "store.count" = "4"
+  "store.zeroed_changes" = "4"
+  "store.doubled_changes" = "4"
+  "store.record_changes" = "4"
+  "store.when_changes" = "1"

@@ -1,0 +1,33 @@
+name = "p1"
+source = "p1_then_over_hold.bn"
+
+[[step]]
+id = "initial"
+  [step.expect_root_text]
+  "store.value" = "0"
+  "store.fires" = "0"
+  "store.presses" = "0"
+
+[[step]]
+id = "one"
+expected_source_event = { source = "store.set_one" }
+  [step.expect_root_text]
+  "store.value" = "1"
+  "store.fires" = "1"
+  "store.presses" = "1"
+
+[[step]]
+id = "one-again-same-value"
+expected_source_event = { source = "store.set_one" }
+  [step.expect_root_text]
+  "store.value" = "1"
+  "store.fires" = "2"
+  "store.presses" = "2"
+
+[[step]]
+id = "two"
+expected_source_event = { source = "store.set_two" }
+  [step.expect_root_text]
+  "store.value" = "2"
+  "store.fires" = "2"
+  "store.presses" = "2"

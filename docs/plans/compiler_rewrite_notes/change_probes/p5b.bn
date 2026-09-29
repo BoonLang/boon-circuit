@@ -1,0 +1,21 @@
+store: [
+    set_a: SOURCE
+    a:
+        0 |> HOLD a {
+            set_a |> THEN { a + 1 }
+        }
+    derived: a + 1000
+    held_plain:
+        0 |> HOLD held_plain {
+            derived
+        }
+    held_then:
+        0 |> HOLD held_then {
+            derived |> THEN { derived }
+        }
+    held_then_a:
+        0 |> HOLD held_then_a {
+            a |> THEN { derived }
+        }
+]
+document: Document/new(root: Element/label(element: [], style: [], label: store.a))

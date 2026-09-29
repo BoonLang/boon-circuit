@@ -1193,21 +1193,21 @@ and P0 cannot exit without the answers.
 | # | question | recommended |
 | --- | --- | --- |
 | L1 | Element representation. | **Answered 2026-09-29: tagged objects (D20).** |
-| L2 | When do host effects run, and how is that visible to the user? | **Answered 2026-09-29: query/command split (D31); no `Pending` (D34).** Open detail: borderline catalog classes (Http/request, Log/*). |
+| L2 | When do host effects run, and how is that visible to the user? | **Answered 2026-09-29: query/command split (D31); no `Pending` (D34).** Defaults: Log/* allowed anywhere and logs every update of its argument; Clock/wall and Random/bytes are commands. Open: Http/request class (owner asked for pros/cons). |
 | L3 | Events vs values. | **Answered 2026-09-29: model C (D30).** |
 | L3a | What counts as an update for a HOLD or a derived value? | **Answered 2026-09-29: every write fires (D32).** |
 | L3b | Does a payload stay readable after it happens? | **Answered 2026-09-29: yes; every value keeps its last value, and WHEN/THEN copy while WHILE is live (D30).** |
-| L3c | A part of the document whose value has no value yet (e.g. a label showing the last key before any key was pressed). | Proposed: renders nothing until the first value arrives (the original behaviour, hides asynchrony, D34); hover says "no value until … first happens". |
+| L3c | A part of the document that has no value yet. | **Answered 2026-09-29: renders nothing until the first value arrives** (the original behaviour; hides asynchrony, D34). Hover says "no value until … first happens". |
 | L4 | Snapshot reads. | **Answered 2026-09-29: fix the runtime (D21).** |
 | L5 | Lists of row updates `List/map(new: <row update>) \|> List/latest()` (27 sites). | Proposed: ordinary lists of last values (every value keeps its last value, D30); `List/latest` gives the most recently updated row. No special restriction. |
-| L6 | State and SOURCE created inside WHEN arms or THEN bodies. | Follows from D30: allowed in WHILE arms (live scopes), an error in WHEN arms and THEN bodies (they copy once). Owner to confirm. |
+| L6 | State and SOURCE created inside WHEN arms or THEN bodies. | **Answered 2026-09-29: WHILE arms only** (live scopes); an error in WHEN arms and THEN bodies, which copy once (D30). |
 | L7 | FLUSH boundaries. | **Answered 2026-09-29: BLOCK locals are not boundaries (D29).** |
 | L8 | Style keys no renderer draws. | **Answered 2026-09-29: add renderer support (D22).** |
 | L9 | Nested FUNCTION in BLOCK. | **Answered 2026-09-29: error (D27).** |
 | L10 | User FUNCTIONs and extra keys. | **Answered 2026-09-29: exact record parameters (D23).** |
 | L11 | Collections joined through WHEN. | **Answered 2026-09-29: read-only views (D28).** |
 | L12 | Unused parameters and binders. | **Answered 2026-09-29: error with fix-it (D24).** |
-| L13 | State reachable only from view code (element-local HOLD such as hover). | Transient, not persisted. |
+| L13 | State reachable only from view code (element-local HOLD such as hover). | **Under discussion.** The owner asks to consider CLIs, FPGA and server logic too, not only web UI, and to recommend what works in practice. |
 | L14 | Constant-selector arm pruning. | **Answered 2026-09-29: arms always exist (D25).** |
 | L15 | Stateful builtins. | **Answered 2026-09-29: rewritten as a Boon library over HOLD where possible (D26).** |
 

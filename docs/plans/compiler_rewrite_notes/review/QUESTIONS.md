@@ -556,6 +556,8 @@ offering the DRAIN fix-it: a copy is not authority.
 label_text: press |> WHEN { __ => TEXT { clicked } }   -- was TEXT { pressed }: drop shows nothing, keep shows "pressed"
 ```
 
+*Also under B10 (SEM-032, PLAN_EDITS.md §1 D35 clause).* D35 says "dev hot reload always keeps state", which cannot hold when a HOLD's type changes or a leaf disappears; today restore fails on any schema mismatch. Options: (a) keep every leaf whose identity and type are unchanged, reset a changed leaf in dev with a dev-window note, and make it a migration error in release (the clause PLAN_EDITS.md proposes; recommended, because it keeps the common edit cheap and never restores a value into a type it no longer fits); (b) reset all state on any schema change in dev (simplest, but every edit to a store field loses the session); (c) keep D35 literally and refuse the reload on mismatch (strict, but the developer is stuck until the schema is restored). The developer sees (a) as "your `count` HOLD changed type; it restarted at 0", (b) as a full restart, (c) as a blocked reload.
+
 **B11. Stores and commits on FPGA and console** [P0 reconcile; hardware plan;
 MIS-006, MIS-002]. D35 calls FPGA in-memory, but console app.wasm has a flash
 journal. Options: (a) only RTL registers reset at power-on, and a console
@@ -717,7 +719,7 @@ the cap only on paper, and (c) has no source of deletable lines.
 
 **C9. Effort and P0 staffing** [MIG-023, MIG-021, MIG-017]. P0 holds six spikes
 and the spec in 2 weeks with one engineer; R8 and R9 hide in P4; P7 is not
-"days"; the migration is about 1,050 edits. The reviewer estimates 24-34 weeks
+"days"; the migration is about 1,050 edits. The reviewer estimates 24-34 weeks (24-35 with MIG-017's 3-4 weeks for P3b, the figure PLAN_EDITS.md uses)
 critical path and 50-70 engineer-weeks, against 20-27 and 32-45. Options: (a)
 spikes as parallel agents in the engineer-week sum, a scheduler row (R-CHG), P7
 at 1-3 weeks, all estimates re-baselined by S1's measured-to-estimated ratio;

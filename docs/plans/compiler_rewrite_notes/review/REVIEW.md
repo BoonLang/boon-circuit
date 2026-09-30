@@ -53,7 +53,7 @@ exits.
 
 **What holds.** Every headline number reproduces on a fresh build (§2 below):
 the baselines within 10%, the 30x call-site amplification exactly, the
-SHA-256/CBOR shares within one point, the warm path equal to cold, the
+SHA-256/CBOR shares within one point for the two large fixtures (35-39% against 39% for counter), the warm path equal to cold, the
 prototype parser within 6%. The old compiler is a weak oracle, as claimed
 (the denominators are wrong, the conclusion is not). The direction of the
 architecture (per-function schemes instantiated once per call site, no
@@ -72,8 +72,10 @@ decision D1 is not questioned by any confirmed finding.
    "never runs" error); the cycle rule rejects the canonical counter in one
    sentence and admits an unbounded loop through a HOLD's piped input in
    another; the tie rule's "same step" is undefined; and the D12 clause that
-   decides what persists cannot be evaluated. Every one of these was
-   reproduced with probes on today's runtime. They are all instances of one
+   decides what persists cannot be evaluated. These were
+   checked with probes on today's runtime where today's behaviour bears on
+   it (SEM-001, SEM-004, SEM-007, SEM-008); EVI-005 and MIS-003 rest on the
+   plan text and the examples. They are all instances of one
    missing table (fire vs copy edge per construct) plus one missing rule
    (activation). The proposed text is in `PLAN_EDITS.md` §4.3.
 2. **Three owner decisions need a second answer**, not because they are wrong
@@ -86,9 +88,9 @@ decision D1 is not questioned by any confirmed finding.
    scheme and breaks passing a row to a view function). `QUESTIONS.md` puts
    each with snippets, options and a recommendation.
 3. **WHEN/WHILE under D30 is the event/value split in disguise** (SEM-012,
-   SEM-011). The measured census finds about 335 WHENs whose arms read a value
-   that updates independently of the selector; 36 of 37 hand-checked must
-   become WHILE. The plan's own Theme draft copies `mode` when `name` updates,
+   SEM-011). The measured census finds about 290-335 WHENs whose arms read a
+   value that updates independently of the selector; at most 35 of 37
+   hand-checked must become WHILE (36 before the MIG-007 refuter's correction). The plan's own Theme draft copies `mode` when `name` updates,
    so its light/dark toggle would stop working. A hover hint will not carry
    this migration; the review proposes an error with a fix-it and asks the
    owner to confirm.
@@ -101,7 +103,9 @@ decision D1 is not questioned by any confirmed finding.
 5. **P7 is a big bang** (MIG-020, EVI-007). The old-engine compatibility rule
    keeps every next-only migration (List/replace_all, Http/get and send, host
    ports, Cells) off main until the switch, while P3b, P4 and P5 exits need
-   them. A per-example engine flip is proposed.
+   them. A per-example `next_source` overlay is proposed (`QUESTIONS.md` C1
+   option (d), the refuter's alternative; MIG-020's finder proposed a
+   per-example engine flip, C1 option (a)).
 6. **Targets are estimates presented as gates** (ARC-020, ARC-011, ARC-023,
    ARC-013). Only the front end is measured; the check target is 4–5x below the
    notes' own model; the ≤8 ms warm goal and ≤1 ms no-op gate contradict the
@@ -110,7 +114,7 @@ decision D1 is not questioned by any confirmed finding.
    that "cold first" has no precedent at these latencies: every system with
    sub-frame edits gets there by per-definition reuse, so P6's "if needed"
    should read "required". S2 must become a real measurement gate with a
-   re-baseline band, and the §6 table needs a provenance column.
+   re-baseline band, and the §6 table needs a method (provenance) column; the ARC-020 refuter's narrower core is that S2's exit must be a measurement with a band, since the plan's basis column already discloses the estimates.
 7. **Oracles and process** (MIG-025, MIG-024, MIG-028, ARC-019). O1 has no
    author, size or independence rule and would be written from a spec that
    predates D14–D36; the change rules have no oracle independent of the new
@@ -175,7 +179,7 @@ the regeneration scripts are in `measurements/`. Verdicts:
 | throughput 9-23 k lines/s diagnostics, 4.5-6.4 k verified, parse ~190 k (§2) | 8.8-21.6 k; 4.4-6.2 k; 181-199 k | confirmed |
 | 350 checked calls become 10,537 compiled call sites (§0, §3.1) | work counters: 352 checked calls, 10,537 compiled call sites (30.0x), identical in both builds | confirmed |
 | SHA-256 + CBOR is 25 / 31 / 39% of verified time (§3.2) | samply, compile window, nearest-preceding-symbol attribution: 25.3 / 31.3 / 35-39% | confirmed |
-| all plainly incidental work 34-46% (§0) | 34.4% TodoMVC, 43.1% NovyWave (68% counter, where manifest validation dominates) | confirmed for the two large fixtures |
+| all plainly incidental work 34-46% (§0) | 34.4% TodoMVC, 43.1% NovyWave (68% counter, where manifest validation dominates) | partially confirmed: 34 exact, NovyWave 43 vs 46 (`profile.md`) |
 | typecheck orchestration 30-70% outside the solver (§3.4) | 29% TodoMVC verified, 57% NovyWave, 86% counter, but only 16% in the TodoMVC diagnostics lane | partially confirmed: the diagnostics lane, the one that matters for the editor, is mostly solver |
 | half of NovyWave semantic is receipts/self-validation (§3.4) | 46-53% | confirmed |
 | one field predicate is 57% of NovyWave backend (§3.4) | 48.6% | partially confirmed |
@@ -183,7 +187,7 @@ the regeneration scripts are in `measurements/`. Verdicts:
 | parse NovyWave 2.6 ms, TodoMVC 0.64 ms, counter 0.021 ms, 141 files 6.9 ms with the prototype (§0, §4.2) | 2.74 / 0.67 / 0.020 / 7.0 ms best-of-30; 142 example files, 1 rejected (a planned-feature WHERE fixture) | confirmed; but the prototype has no name resolution, drops several constructs, rejects the bare `\|> HOLD name` form and accepts tabs |
 | warm edit -> diagnostics 372-397 ms, -> preview 1,151-1,207 ms; warm not faster than cold; status hard-coded to fail (§2, §3.5) | 380 ms xtask sample, 386.8 ms median of 30 (cold 385.8); 1,158 / 1,192.5 ms; `compiler_interactions.rs:1012,1014` set both gates to false | confirmed |
 | `check` fails on 8 of 22 manifest sources; 5 of 21 scenarios pass (§2) | manifest has 20 examples, 22 distinct sources, 20 scenarios: 8/20 example sources fail (10/22 distinct sources), 5/20 scenarios pass; 8 of the 15 failures are compile rejections, 3 are scenario-file drift, only 4 exercise old-compiler output at all | qualitatively confirmed; denominators wrong |
-| "the root cause is semantic" (§3.1) | a 66-line program with one LATEST and no WHEN, records or joins costs 503 ms and 12,261 kernel frames; the kernel has no generalization code; per-path instantiation is an implementation choice (E12) | refuted as stated (see EVI findings) |
+| "the root cause is semantic" (§3.1) | a 66-line program with one LATEST and no WHEN, records or joins costs 503 ms and 12,261 kernel frames (both numbers come from the E12 finder's generated probe `latest_12.bn`, a 12-level binary call tree with one LATEST at the leaf, measured with `compiler-sample --intent diagnostics`: 12,261 invocation frames, 502.8 ms typecheck; the EVI-001 refuter re-ran it and got 12,261 frames and 508.2 ms; the generator is in the finder output, not in `measurements/`); the kernel has no generalization code; per-path instantiation is an implementation choice (E12) | wording only: EVI-001 ('refuted') was dropped on refutation and survives as a low diagnosis-accuracy edit (§9); the diagnosis stands |
 
 Side findings from the measurements: the plan-hash oracles in
 `budgets/compiler.toml` match neither binary (the plan's §3.6 says two of three
@@ -261,7 +265,7 @@ hides them), restore and hot reload.
 | 50 | EVI-011 | medium | evidence | The preamble overstates review coverage: the lowering design the plan adopts and the change-model note were never adversarially reviewed | D2 |
 | 51 | MIG-004 | medium | migration | Cells work outside the formula engine is missing from 'Size L': D30 WHILE conversions, D13 private keys, D24 binders | D13, D24, D30 |
 | 52 | MIG-005 | medium | migration | The plan never states whether a WHEN over a value with a start value evaluates at activation, which decides the size of the D30 migration (~335 vs ~1,070+ sites) and whether every constant-tag theme dispatch becomes a 'never runs' error | D30, D31, D32, D8 |
-| 53 | MIG-007 | medium | migration | The WHEN→WHILE migration under D30 is measurable now: about 335 sites, of which 36 of 37 sampled must change |  |
+| 53 | MIG-007 | medium | migration | The WHEN→WHILE migration under D30 is measurable now: about 335 sites, of which 36 of 37 sampled must change (refuter: at most 35 of 37) |  |
 | 54 | MIG-008 | medium | migration | The Theme draft keeps copying WHEN where the arm must follow mode updates: under D30, toggling mode without switching theme leaves the old colours, and no scenario would catch it | D8, D30, D25 |
 | 55 | MIG-009 | medium | migration | The Theme draft covers only 2 of 5 themes, contradicts D22 and D5, and fails today's lowering, so '2,443 → ~1,110 lines, ~20 → ~8 types' is an extrapolation | D5, D8, D13, D22 |
 | 56 | MIG-010 | medium | migration | The draft's neutral 'None' sentinels (Base/material color: None, Base/frame border: None) need an explicit closed-contract rule under D13 | D5, D13 |
@@ -561,6 +565,8 @@ FUNCTION pick(m, n) { m |> WHEN { Off => 0  On => n } }  -- mode goes to On, the
 - (b) Keep the big bang: all next-only migrations and consumer ports land together at P7 (resize P7 to 1-3 weeks)
 - (c) A long-lived migration branch rebased until P7
 Recommendation: (a): it removes the single high-risk change set, and it lets each native gate go green on next as evidence accumulates. 'No code path may depend on an example's name' still holds, because the engine is manifest data.
+
+*Cross-reference.* After refutation, `QUESTIONS.md` C1 adds the refuter's option (d), a per-example `next_source` overlay, and recommends it; `PLAN_EDITS.md` §5.1 carries the (d) text.
 
 ---
 
@@ -1097,7 +1103,7 @@ Full text, all evidence, snippets and refuter corrections for each are in `findi
 
 **MIG-005 [medium] The plan never states whether a WHEN over a value with a start value evaluates at activation, which decides the size of the D30 migration (~335 vs ~1,070+ sites) and whether every constant-tag theme dispatch becomes a 'never runs' error** (D30, D31, D32, D8; §4.3 Change rules, lines 381-387 and 409-411; §5.1 D30 row; ). §4.3 (plan:382-387) says a WHEN arm runs 'once each time the input updates'. It also says start is not an update (D32, plan:101 and :382) and that 'THEN or WHEN over something that never updates is an error ("never runs")'. Read literally, `PASSED.mode |> WHEN { Light => Oklch[...], Dark => ... }` has no value until mode first updates, because mode's start value is not an update. And `of |> WHEN {...}` inside a … *Proposed:* Add to §4.3 Change rules: "Start. A copy context whose input has a value from the start runs once at start, against the start snapshot. Commands inside it do not run then (D31). 'Never runs' is reported for THEN, and for a WHEN whose input has no start value … [detail](findings/lens_migration.md#mig-005)
 
-**MIG-007 [medium] The WHEN→WHILE migration under D30 is measurable now: about 335 sites, of which 36 of 37 sampled must change** (no decision; §5.1 D30 row; §4.3 stale-copy hint; S4; P3a). §5.1 leaves this row as 'census in P2b'. A static heuristic, described in RESULTS.md, finds 335 refined candidates in the .bn files (+15 in Rust strings): view 142, state 132, theme 61. The heuristic takes a value selector outside a copy context whose arms read something the selector does not read, or call a user FUNCTION that transitively reads PASSED. By example: NovyWave 192 (state 111, view 74, theme 7), … *Proposed:* Replace the §5.1 D30 row's 'census in P2b' with: '~335 .bn sites (view 142, state 132, theme 61; NovyWave 192, FjordPulse 57, TodoMVC 48, persons_pro 23), plus 27 WHENs over effect results to review by hand and 7 with state inside a copy context. Sampled … [detail](findings/lens_migration.md#mig-007)
+**MIG-007 [medium] The WHEN→WHILE migration under D30 is measurable now: about 335 sites, of which 36 of 37 sampled must change (refuter: at most 35 of 37)** (no decision; §5.1 D30 row; §4.3 stale-copy hint; S4; P3a). §5.1 leaves this row as 'census in P2b'. A static heuristic, described in RESULTS.md, finds 335 refined candidates in the .bn files (+15 in Rust strings): view 142, state 132, theme 61. The heuristic takes a value selector outside a copy context whose arms read something the selector does not read, or call a user FUNCTION that transitively reads PASSED. By example: NovyWave 192 (state 111, view 74, theme 7), … *Proposed:* Replace the §5.1 D30 row's 'census in P2b' with: '~335 .bn sites (view 142, state 132, theme 61; NovyWave 192, FjordPulse 57, TodoMVC 48, persons_pro 23), plus 27 WHENs over effect results to review by hand and 7 with state inside a copy context. Sampled … [detail](findings/lens_migration.md#mig-007)
 
 **MIG-008 [medium] The Theme draft keeps copying WHEN where the arm must follow mode updates: under D30, toggling mode without switching theme leaves the old colours, and no scenario would catch it** (D8, D30, D25; §5.1 Theme and NovyTheme rows (lines 745-746) and the 'WHEN ). The draft Theme.bn.txt is `name |> WHEN { Classic => Classic/tokens(mode: mode) … }`. Under D30 the arm, and every `mode |> WHEN` inside Classic/tokens (the §4.3 placement rule treats a copy context's body as evaluated once), runs only when `name` updates. So the toggle-light-dark-mode step, taken while the theme stays Neumorphism, leaves every Light token in place. The draft's RUN.bn call-site table has the same … *Proposed:* Update the Theme row and examples.md §4: Theme/tokens and every call-site selector whose arms read `theme.*` use WHILE. For NovyTheme, either `of |> WHILE` or convert to `tokens(mode)` records, and make plan line 746 and notes §5 agree. Add to the §5.2 step-3 … [detail](findings/lens_migration.md#mig-008)
 
@@ -1487,11 +1493,17 @@ Nothing in `PLAN_EDITS.md` has been applied; the plan file is unchanged by this 
   ones), reading the plan, the code and the original documents and re-running
   probes; not a panel. Nine findings were dropped. Refuters lowered the
   severity of about a third of the rest; the tables show the lowered values.
-- **Census precision:** the WHEN→WHILE count (about 335) is a token-level
-  scanner with a hand-classified sample of 40; the real number is the new
+- **Census precision:** the WHEN→WHILE count (about 290-335) is a token-level
+  scanner with a hand-classified sample of 40 (precision at most 35 of 37
+  after the MIG-007 refuter's correction); the real number is the new
   checker's. The D23 count (93–140) is an upper bound from the same scanner.
 - **Measurement noise:** the machine was shared (load 1–4); medians of 10
-  fresh processes were used, not the budgets' 3+30 protocol.
+  fresh processes were used for the cold baselines, not the budgets' 3+30
+  protocol (the warm series in `measurements/warm.md` used 3+30).
+- **Not re-measured:** the 503 ms / 12,261-frame figure in the §2 root-cause
+  row comes from the notes' audit, not from `measurements/`; the census
+  per-file split for suffix-resolved names is incomplete (`census/RESULTS.md`
+  closing note).
 - **What a finder could not see:** owner intent that lives outside the plan
   text. Where the plan's wording admits two readings, the review says so and
   asks, rather than assuming the intended one.

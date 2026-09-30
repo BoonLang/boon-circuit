@@ -15,7 +15,7 @@ Review output, not authority, not applied. Line numbers refer to the plan at a60
 ## §1 Owner decisions (wording)
 
 ### §1 D4 (line 73): which values types never depend on
-Findings: MIS-016 (as corrected: spec.md:24 already has this wording).
+Findings: MIS-016 (as corrected: spec.md:24 already has this wording). Specification that follows from spec.md:24 and today's BITS[N] rule (LANGUAGE_SEMANTICS.md), not a new decision.
 Replace: "Types never depend on values."
 With:
 > Types never depend on runtime values; BITS and BYTES widths come from compile-time constants.
@@ -87,12 +87,19 @@ With (the RTL clause is conditional on QUESTIONS.md B11, the last sentence on B8
 > … in-memory for one-shot CLIs, tests and Boon-generated RTL (power-on resets every HOLD to its starting value); a console board profile with a state journal is a deployment with a store. Dev hot reload keeps every leaf whose identity and type are unchanged; a leaf whose type changed is reset to its starting value in dev and listed in the dev window, and it is a migration error in a release build. Sensitive host inputs (password text and the like) stay in a host-owned buffer; Boon code sees a host reference, never plaintext, so they are never app memory (BOON_PERSISTENCE_ARCHITECTURE_PLAN.md "Sensitive Input And Credentials"). *(Owner item, SEM-032: the hot-reload clause replaces D35's "dev hot reload always keeps state"; confirm before applying.)*
 
 ### §1 D36 (line 105): HEAD/OPTIONS and transient sends
+*(Specification addition, not pure wording: HEAD and OPTIONS are not named in D36. It follows from D36's own criterion, HTTP method semantics, and is marked here so the owner can strike it.)*
 Findings: SEM-019, SEM-025.
 Replace: "`Http/get` is a query (…); `Http/send` (POST, PUT, PATCH, DELETE) is a command (copy contexts only, exactly once per update)."
 With (the "transient" clause is conditional on QUESTIONS.md B2):
 > `Http/get` (and HEAD and OPTIONS) is a query (…); `Http/send` (POST, PUT, PATCH, DELETE) is a command (copy contexts only, exactly once per update), transient by default: a send in flight at a crash is not replayed and delivers its `Interrupted` outcome after restore.
 
 ## §3 Diagnosis
+
+### §3.1 (lines 149-151): the cause of per-path solving, as the EVI-001 refuter worded it
+Findings: EVI-001 (dropped as a finding, kept as a low diagnosis-accuracy edit; its probe `latest_12.bn` was re-run by the refuter: 12,261 frames, 508 ms).
+Replace: "The root cause is semantic. Results were narrowed per call by singleton tags, joins were non-monotone, and field order was part of type identity. D4, D5 and D7 remove all three."
+With:
+> The mechanism is per-path copying without generalization: the kernel copies callee constraint graphs per call path, keyed by the caller's variable ids, and direct summaries re-evaluate callee summaries on every activation. A 66-line program with one LATEST at the leaf of a 12-level call tree, with no WHEN, joins or records, costs about 500 ms and 12,261 frames. The old semantics (per-call narrowing, order-sensitive requirement folds, retractable requirements) made generalization unsafe; D4, D5 and D7 remove that obstacle, and §4.4's scheme compaction with one instantiation per syntactic site removes the mechanism. The `latest_K`, `chain_K` and `view_K` generator families join the §6 stress corpus.
 
 ### §3.1 (lines 152-153): the 340 ms figure is a timer, not a subtraction
 Findings: EVI-013 (the 9-14% shares are to be re-measured before adoption).
@@ -548,12 +555,12 @@ With (rows that depend on a question say so):
 > | THEN over HOLD state | 35 in the same file (persons_pro 14, typed_passkey_effects 14, host_service_effects 6, server_effect_chain 1), plus NovyWave 4 over a LATEST with a fallback | Stays legal (D30, D32); equal rewrites now fire (S5 counts affected sites). |
 > | State inside copy contexts (placement) | 7: NovyWave RUN.bn:4540, fibonacci.bn:61, 3 in `testdata/compiler_*_pulses.bn`, 2 in boon_plan_executor testdata; plus calls through state-creating FUNCTIONs (NovyWave `new_selected_signal`, `new_selected_visible_item`) | NovyWave by the WHILE pass or by moving its SOURCEs to row creation; fibonacci per A10; fixtures rewritten. |
 > | Effect-returned lists and effect placement (D9, D17, D31) | NovyWave hierarchy and signal pages; LATEST/HOLD fed by a query in a copy context (NovyWave, several); commands in live contexts: 2 (`File/write_text`, todo_mvc_physical/BUILD.bn:33, novywave/BUILD.bn:33) | `List/replace_all` authorities, in the example's next overlay (§5.1 rule). `code => TEXT {…} \|> File/write_text(path: output_file)` moves inside the arm; BUILD files are new-engine only for O4a. `request_fingerprint` goes (D34). |
-> | Suffix fallback removed (D14) | 67: NovyWave 44 (41 `elements.*` in row constructors, RUN.bn:4490-4853), TodoMVC 2 (RUN.bn:552, :810), server examples 5, fixtures 16 | Qualify with `store.`, or pass `elements` in as a parameter or through PASSED. |
+> | Suffix fallback removed (D14) | 67: NovyWave 44 (41 `elements.*` in row constructors, RUN.bn:4490-4853), TodoMVC 2 (RUN.bn:552, :810), server examples 5, fixtures 10 (the per-file split sums to 61; re-run `census.py` for the rest, `census/RESULTS.md` closing note) | Qualify with `store.`, or pass `elements` in as a parameter or through PASSED. |
 > | Sibling call-argument reads | 119, of which `element.hovered` 110 | Legal: §4.3 Names lists the constructor `element` binder. |
 > | Optional-field reads (D5) | TodoMVC append without `completed`; persons_pro variant-union reads (5) | Append complete rows; use binder patterns. |
 > | Collections in stored state (D9) | 0 in HOLD; NovyWave `real_hierarchy_page_result` keeps a LIST in a LATEST (A6) | The HOLD diagnostic stays; the LATEST moves to a `List/replace_all` authority. |
 > | Closed contracts (D13) | `event: [` 142; `events: [` 147 (54 as `element: [events:`); `hovered:` 243 lines (96 `hovered: element.hovered`); private keys such as Cells `__selected_*` | Fix against the generated contracts; S4 records the rule behind each count. Unrendered keys go to R-RENDER from S4's list (D22). |
-> | Exact record parameters (D23) | 140 calls pass a record variable (NovyWave 104), +53 R; 93 never forward the whole parameter; 0 literals with extra fields | Entry-point narrowing fix-it (P2a) under A3; edits in P3b. |
+> | Exact record parameters (D23) | 140 calls pass a record variable (NovyWave 104; the finder's scanner also saw 53 in Rust strings, a figure census/RESULTS.md does not report); 93 never forward the whole parameter; 0 literals with extra fields | Entry-point narrowing fix-it (P2a) under A3; edits in P3b. |
 > | Pony precedence and comparison chains (D11, D18) | 12 mixed, 0 chains; 182 `a == b \|> f()` sites keep their meaning (§4.2) | Parentheses (fix-it); the 182 sites are a named P1b corpus. |
 > | Tag both bare and tagged in one type (D18.4) | 3: BUILD.bn `Ok` ×2, NovyWave `StringValue`, +3 R | Rename one form (fix-it); catalog outcome tags made consistent. |
 > | Unused parameters and binders (D24) | 43: 7 parameters (plus 4 unused OUT parameters; P0 decides whether they count), 36 pattern binders (cells 16, NovyWave 21, TodoMVC 5), +26 R | Drop them: `Tag[a, b] => e` becomes `Tag => e` (fix-it). |

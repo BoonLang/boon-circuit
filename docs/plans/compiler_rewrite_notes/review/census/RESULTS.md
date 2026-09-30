@@ -99,3 +99,5 @@ Roles:
 Taking these into account, the estimated D30 migration is **300-360 `.bn`
 sites**. Today's runtime already evaluates WHEN live, so switching these sites
 to WHILE keeps today's behaviour.
+
+**Post-review consistency note.** The suffix-resolved-names row states 67 sites in 16 files, but its per-file list names 10 files whose counts sum to 61; the total is the scanner's summary figure and the per-file list is incomplete. Re-run `census.py` before quoting the per-file split.

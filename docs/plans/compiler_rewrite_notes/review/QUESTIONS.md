@@ -456,6 +456,8 @@ answer: ask.press |> THEN { Secret/verify(secret: secret_input.text) }   -- two 
 page_is_current: page.offset == page_offset                             -- possible only with echoed arguments
 ```
 
+*Reviewer note after critique.* The SEM-017 refuter asked not to recommend reversing D31's supersede rule by default. Treat (c) as an optional variant; the default is (a), D31 as written, unless the owner wants per-press results kept.
+
 **B2. A command in flight when the process dies** [P4/R9; SEM-025]. D12 restores
 `Sending`, D31 never re-runs the command, nothing completes. Options: (a) the app
 handles the host "restored" occurrence (D35); (b) the runtime delivers one
@@ -565,6 +567,8 @@ per stage: **defer to the hardware plan in writing,** one edge as default.
 ```boon
 c: 0 |> HOLD c { a |> THEN { a * 10 } }   -- RTL: the same edge as `a`, or one cycle later
 ```
+
+*Reviewer note after critique.* The "one edge" default follows A2's rank scheduling. If A2 is answered with per-microstep semantics instead, the MIS-002 finder's "one cycle per stage" becomes the natural hardware mapping.
 
 **B12. BYTES capacity in HOLD** [P2a; MIS-016, narrowed]. Is a HOLD that starts
 at `BYTES[N]` fixed at N, or does it widen to dynamic BYTES (spec.md:44, today)?

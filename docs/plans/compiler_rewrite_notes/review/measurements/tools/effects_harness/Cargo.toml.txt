@@ -1,0 +1,154 @@
+[package]
+name = "effects_probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+boon_plan = { path = "/home/martinkavik/repos/boon-circuit/crates/boon_plan" }
+boon_runtime = { path = "/home/martinkavik/repos/boon-circuit/crates/boon_runtime" }
+boon_program_runtime = { path = "/home/martinkavik/repos/boon-circuit/crates/boon_program_runtime" }
+boon_host_runtime = { path = "/home/martinkavik/repos/boon-circuit/crates/boon_host_runtime" }
+boon_host_services = { path = "/home/martinkavik/repos/boon-circuit/crates/boon_host_services" }
+tokio = { version = "1.52.4", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[profile.release]
+# Keep the normative baseline explicit so producer reports can attest the
+# actual pre-M6 code-generation lane. M6 evaluates ThinLTO, one codegen unit,
+# target-cpu, and PGO independently rather than silently inheriting overrides.
+opt-level = 3
+lto = false
+codegen-units = 16
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
+
+[profile.dev]
+# Line tables preserve actionable panic/backtrace locations while avoiding the
+# hundreds-of-megabytes-per-binary cost of full variable-level DWARF in this
+# large workspace. This also keeps downstream CLI relinks practical.
+debug = "line-tables-only"
+
+[profile.test]
+# Test harnesses previously reached 500-980 MiB each and spent most of focused
+# test latency writing/linking debug data. Tests still retain line locations.
+debug = "line-tables-only"
+# A workspace test run produces many independently hashed harnesses. Retaining
+# incremental state for each harness consumed far more disk than it saved in
+# the focused edit/test loop; normal dev builds remain incremental.
+incremental = false
+
+[profile.dev.package.boon_contract]
+opt-level = 2
+
+[profile.dev.package.boon_compiler]
+opt-level = 2
+debug = "line-tables-only"
+
+[profile.dev.package.boon_document]
+opt-level = 2
+
+[profile.dev.package.boon_ir]
+opt-level = 2
+debug = "line-tables-only"
+
+[profile.dev.package.boon_native_app_window]
+opt-level = 2
+
+[profile.dev.package.boon_native_gpu]
+opt-level = 2
+
+[profile.dev.package.boon_native_playground]
+opt-level = 2
+
+# Parsing is on every editor diagnostic request. Keep assertions and line
+# tables, but avoid making the development frontend several times slower than
+# the release compiler solely because this crate remained at opt-level 0.
+[profile.dev.package.boon_parser]
+opt-level = 2
+debug = "line-tables-only"
+
+# MachinePlan construction and validation are part of every source edit/run
+# loop. These crates retain dev assertions and line tables, but must not execute
+# their large deterministic lowering passes at opt-level 0.
+[profile.dev.package.boon_plan]
+opt-level = 2
+debug = "line-tables-only"
+
+# Semantic elaboration is part of the interactive compiler path. Keeping this
+# crate completely unoptimized turns canonical dependency inventories into
+# minute-scale debug runs even after graph growth is bounded. Level 2 retains
+# debug assertions and debuginfo while making the compiler usable in dev builds.
+[profile.dev.package.boon_semantic]
+opt-level = 2
+# Full variable-level DWARF makes each semantic rlib hundreds of megabytes and
+# turns every downstream compiler edit into a long relink. Line tables retain
+# useful panic/backtrace locations without paying that interactive-build cost.
+debug = "line-tables-only"
+
+[profile.dev.package.boon_typecheck]
+opt-level = 2
+debug = "line-tables-only"
+
+# Dev-package overrides also apply while Cargo builds tests. Override the two
+# largest compiler crates back to level 0 explicitly so focused correctness
+# tests do not spend minutes optimizing and linking them. Compiler latency and
+# scaling acceptance uses the prebuilt release CLI and is never inferred from a
+# debug test harness.
+[profile.test.package.boon_semantic]
+opt-level = 0
+debug = "line-tables-only"
+
+[profile.test.package.boon_typecheck]
+opt-level = 0
+debug = "line-tables-only"
+
+[profile.test.package.boon_compiler]
+opt-level = 0
+debug = "line-tables-only"
+
+[profile.test.package.boon_native_playground]
+opt-level = 0
+debug = "line-tables-only"
+
+[profile.dev.package.ciborium]
+opt-level = 2
+
+[profile.dev.package.ciborium-io]
+opt-level = 2
+
+[profile.dev.package.ciborium-ll]
+opt-level = 2
+
+[profile.dev.package.glyphon]
+opt-level = 2
+
+[profile.dev.package.image]
+opt-level = 2
+
+[profile.dev.package.png]
+opt-level = 2
+
+[profile.dev.package.sha2]
+opt-level = 2
+
+[profile.dev.package.fdeflate]
+opt-level = 2
+
+[profile.dev.package.flate2]
+opt-level = 2
+
+[profile.dev.package.miniz_oxide]
+opt-level = 2
+
+[profile.dev.package.crc32fast]
+opt-level = 2
+
+[profile.dev.package.wgpu]
+opt-level = 2

@@ -1,0 +1,22 @@
+store: [
+    go: SOURCE
+    bump: SOURCE
+    size:
+        8 |> HOLD size {
+            bump |> THEN { size + 1 }
+        }
+    result:
+        NotRequested |> HOLD result {
+            go |> THEN { Random/bytes(byte_count: size) }
+        }
+    result_ready:
+        result |> WHEN {
+            RandomBytesReady => 1
+            __ => 0
+        }
+]
+
+outputs: [
+    size: store.size
+    result_ready: store.result_ready
+]

@@ -1,0 +1,33 @@
+store: [
+    bump: SOURCE
+    stop: SOURCE
+    go: SOURCE
+    mode:
+        Inactive |> HOLD mode {
+            LATEST {
+                go |> THEN { Active }
+                stop |> THEN { Inactive }
+            }
+        }
+    size:
+        8 |> HOLD size {
+            bump |> THEN { size + 1 }
+        }
+    result:
+        NotRequested |> HOLD result {
+            mode |> WHEN {
+                Active => Random/bytes(byte_count: size)
+                Inactive => SKIP
+            }
+        }
+    result_ready:
+        result |> WHEN {
+            RandomBytesReady => 1
+            __ => 0
+        }
+]
+
+outputs: [
+    size: store.size
+    result_ready: store.result_ready
+]

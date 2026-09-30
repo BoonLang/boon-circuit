@@ -1,0 +1,44 @@
+   Compiling boon_syntax v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_syntax)
+   Compiling errno v0.3.14
+   Compiling socket2 v0.6.5
+   Compiling mio v1.2.2
+   Compiling signal-hook-registry v1.4.8
+   Compiling rand_core v0.9.5
+   Compiling boon_host_services v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_host_services)
+   Compiling rand_chacha v0.9.0
+   Compiling tokio v1.52.4
+   Compiling rand v0.9.5
+   Compiling boon_parser v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_parser)
+   Compiling atomic-write-file v0.3.0
+   Compiling boon_checked v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_checked)
+   Compiling boon_plan v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_plan)
+   Compiling boon_host v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_host)
+   Compiling boon_compiler_kernel v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_compiler_kernel)
+   Compiling boon_typecheck v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_typecheck)
+   Compiling boon_persistence v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_persistence)
+   Compiling boon_example_manifest v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_example_manifest)
+   Compiling boon_semantic v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_semantic)
+   Compiling boon_plan_executor v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_plan_executor)
+   Compiling boon_document v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_document)
+   Compiling boon_verify v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_verify)
+   Compiling boon_ir v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_ir)
+   Compiling boon_compiler v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_compiler)
+   Compiling boon_runtime v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_runtime)
+   Compiling boon_program_runtime v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_program_runtime)
+   Compiling boon_host_runtime v0.1.0 (/home/martinkavik/repos/boon-circuit/crates/boon_host_runtime)
+   Compiling effects_probe v0.1.0 (/tmp/claude-1000/-home-martinkavik-repos-boon-circuit/19403ab8-10d9-4589-8161-fdcdd61d4820/scratchpad/measure/effects/harness)
+warning: unused import: `Value`
+  --> src/lib.rs:20:47
+   |
+20 |     SourcePayload, TransientEffectInvocation, Value,
+   |                                               ^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: `effects_probe` (lib test) generated 1 warning (run `cargo fix --lib -p effects_probe --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 31s
+  Executable unittests src/lib.rs (/home/martinkavik/repos/boon-circuit/target/debug/deps/effects_probe-f104d8553bd5e6ea)
+
+real	1m31.353s
+user	5m40.184s
+sys	0m14.950s

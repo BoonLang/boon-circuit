@@ -1,0 +1,228 @@
+warning: profile package spec `boon_native_playground` in profile `test` did not match any packages
+warning: profile package spec `boon_native_app_window` in profile `dev` did not match any packages
+warning: profile package spec `boon_native_gpu` in profile `dev` did not match any packages
+warning: profile package spec `boon_native_playground` in profile `dev` did not match any packages
+warning: profile package spec `crc32fast` in profile `dev` did not match any packages
+warning: profile package spec `fdeflate` in profile `dev` did not match any packages
+warning: profile package spec `flate2` in profile `dev` did not match any packages
+warning: profile package spec `glyphon` in profile `dev` did not match any packages
+warning: profile package spec `image` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `hmac`
+warning: profile package spec `miniz_oxide` in profile `dev` did not match any packages
+warning: profile package spec `png` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `cc`
+warning: profile package spec `wgpu` in profile `dev` did not match any packages
+
+help: a package with a similar name exists: `wasi`
+   Compiling effects_probe v0.1.0 (/tmp/claude-1000/-home-martinkavik-repos-boon-circuit/19403ab8-10d9-4589-8161-fdcdd61d4820/scratchpad/measure/effects/harness)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.20s
+     Running unittests src/lib.rs (/home/martinkavik/repos/boon-circuit/target/debug/deps/effects_probe-f104d8553bd5e6ea)
+
+running 6 tests
+test tests::q1a_then_effect_hold_changes_while_in_flight ... === q1a: THEN effect, intent reads HOLD size; bump while call in flight ===
+[q1_then_effect_reads_hold] ProgramSession::start: Ok (no startup host work)
+  turn 0 [initial turn (startup)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 8, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 1 [step1: dispatch store.go] source_sequence=Some(1): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=1 intent=Record({"byte_count": Number(ExactNumber { numerator: 8, denominator: 1 })})
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 8, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 2 [step2 (HOLD size 8->9 while call in flight): dispatch store.bump] source_sequence=Some(2): 1 transient invocation(s), 1 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=2 intent=Record({"byte_count": Number(ExactNumber { numerator: 9, denominator: 1 })})
+    CANCEL call=TransientEffectCallId(..)
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 9, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 3 [step3 (HOLD size 9->10 while call in flight): dispatch store.bump] source_sequence=Some(3): 1 transient invocation(s), 1 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=3 intent=Record({"byte_count": Number(ExactNumber { numerator: 10, denominator: 1 })})
+    CANCEL call=TransientEffectCallId(..)
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  complete call TransientEffectCallId(..) [step4 deliver every call ever issued]: Err(invalid source event: transient effect call TransientEffectCallId(..) is unknown, cancelled, or already completed)
+  complete call TransientEffectCallId(..) [step4 deliver every call ever issued]: Err(invalid source event: transient effect call TransientEffectCallId(..) is unknown, cancelled, or already completed)
+  turn 4 [step4 deliver every call ever issued: complete call TransientEffectCallId(..)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  turn 5 [step5 (bump after all completions): dispatch store.bump] source_sequence=Some(4): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=4 intent=Record({"byte_count": Number(ExactNumber { numerator: 11, denominator: 1 })})
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 11, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  total invocations issued: 4
+ok
+test tests::q1b_then_effect_hold_changes_after_completion ... === q1b: THEN effect, intent reads HOLD size; bump after completion ===
+[q1_then_effect_reads_hold] ProgramSession::start: Ok (no startup host work)
+  turn 0 [initial turn (startup)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+  turn 1 [step1: dispatch store.go] source_sequence=Some(1): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=1 intent=Record({"byte_count": Number(ExactNumber { numerator: 8, denominator: 1 })})
+    pending transient effects after turn: 1
+  turn 2 [step2: complete call TransientEffectCallId(..)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 8, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  turn 3 [step3 (HOLD size 8->9 after completion): dispatch store.bump] source_sequence=Some(2): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=2 intent=Record({"byte_count": Number(ExactNumber { numerator: 9, denominator: 1 })})
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 9, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  turn 4 [step4 (HOLD size 9->10 after completion): dispatch store.bump] source_sequence=Some(3): 1 transient invocation(s), 1 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=3 intent=Record({"byte_count": Number(ExactNumber { numerator: 10, denominator: 1 })})
+    CANCEL call=TransientEffectCallId(..)
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  complete call TransientEffectCallId(..) [step5 deliver later calls]: Err(invalid source event: transient effect call TransientEffectCallId(..) is unknown, cancelled, or already completed)
+  turn 5 [step5 deliver later calls: complete call TransientEffectCallId(..)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  turn 6 [step6 (go again): dispatch store.go] source_sequence=Some(4): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=4 intent=Record({"byte_count": Number(ExactNumber { numerator: 10, denominator: 1 })})
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  total invocations issued: 4
+ok
+test tests::q2_when_arm_initially_open ... === q2: WHEN arm effect, selector HOLD mode starts Active ===
+[q2_when_initially_open] ProgramSession::start: Ok (no startup host work)
+  turn 0 [initial turn (startup)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 8, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 1 [step1 (HOLD size 8->9, gate open): dispatch store.bump] source_sequence=Some(1): 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 9, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+    output size = Number(ExactNumber { numerator: 9, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 2 [step3 (HOLD size 9->10, gate open): dispatch store.bump] source_sequence=Some(2): 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 3 [step4 (stop: mode Active->Inactive): dispatch store.stop] source_sequence=Some(3): 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  total invocations issued: 0
+ok
+test tests::q2_while_arm_initially_open ... === q2: WHILE arm effect, selector HOLD mode starts Active ===
+[q2_while_initially_open] ProgramSession::start: Ok (no startup host work)
+  turn 0 [initial turn (startup)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 8, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 1 [step1 (HOLD size 8->9, gate open): dispatch store.bump] source_sequence=Some(1): 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 9, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+    output size = Number(ExactNumber { numerator: 9, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 2 [step3 (HOLD size 9->10, gate open): dispatch store.bump] source_sequence=Some(2): 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 3 [step4 (stop: mode Active->Inactive): dispatch store.stop] source_sequence=Some(3): 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  total invocations issued: 0
+ok
+test tests::q3_when_arm_initially_closed ... === q3w: WHEN arm effect, selector HOLD mode starts Inactive; go opens ===
+[q3_when_initially_closed] ProgramSession::start: Ok (no startup host work)
+  turn 0 [initial turn (startup)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 8, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 1 [step1 (bump while gate closed): dispatch store.bump] source_sequence=Some(1): 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+  turn 2 [step2 (go: mode Inactive->Active): dispatch store.go] source_sequence=Some(2): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=2 intent=Record({"byte_count": Number(ExactNumber { numerator: 9, denominator: 1 })})
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 9, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 3 [step3 (bump while call in flight, gate open): dispatch store.bump] source_sequence=Some(3): 1 transient invocation(s), 1 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=3 intent=Record({"byte_count": Number(ExactNumber { numerator: 10, denominator: 1 })})
+    CANCEL call=TransientEffectCallId(..)
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  complete call TransientEffectCallId(..) [step4 deliver every call]: Err(invalid source event: transient effect call TransientEffectCallId(..) is unknown, cancelled, or already completed)
+  turn 4 [step4 deliver every call: complete call TransientEffectCallId(..)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  turn 5 [step5 (bump after completion, gate open): dispatch store.bump] source_sequence=Some(4): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=4 intent=Record({"byte_count": Number(ExactNumber { numerator: 11, denominator: 1 })})
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 11, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  turn 6 [step6 (stop: gate closes): dispatch store.stop] source_sequence=Some(5): 0 transient invocation(s), 1 cancellation(s)
+    CANCEL call=TransientEffectCallId(..)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 11, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  turn 7 [step7 (go again): dispatch store.go] source_sequence=Some(6): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=6 intent=Record({"byte_count": Number(ExactNumber { numerator: 11, denominator: 1 })})
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 11, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  total invocations issued: 4
+ok
+test tests::q3_while_arm_initially_closed ... === q3: WHILE arm effect, selector HOLD mode starts Inactive; go opens ===
+[q3_while_initially_closed] ProgramSession::start: Ok (no startup host work)
+  turn 0 [initial turn (startup)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 8, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 1 [step1 (bump while gate closed): dispatch store.bump] source_sequence=Some(1): 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+  turn 2 [step2 (go: mode Inactive->Active): dispatch store.go] source_sequence=Some(2): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=2 intent=Record({"byte_count": Number(ExactNumber { numerator: 9, denominator: 1 })})
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 9, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  turn 3 [step3 (bump while call in flight, gate open): dispatch store.bump] source_sequence=Some(3): 1 transient invocation(s), 1 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=3 intent=Record({"byte_count": Number(ExactNumber { numerator: 10, denominator: 1 })})
+    CANCEL call=TransientEffectCallId(..)
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 0, denominator: 1 })
+  complete call TransientEffectCallId(..) [step4 deliver every call]: Err(invalid source event: transient effect call TransientEffectCallId(..) is unknown, cancelled, or already completed)
+  turn 4 [step4 deliver every call: complete call TransientEffectCallId(..)] source_sequence=None: 0 transient invocation(s), 0 cancellation(s)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 10, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  turn 5 [step5 (bump after completion, gate open): dispatch store.bump] source_sequence=Some(4): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=4 intent=Record({"byte_count": Number(ExactNumber { numerator: 11, denominator: 1 })})
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 11, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  turn 6 [step6 (stop: gate closes): dispatch store.stop] source_sequence=Some(5): 0 transient invocation(s), 1 cancellation(s)
+    CANCEL call=TransientEffectCallId(..)
+    pending transient effects after turn: 0
+    output size = Number(ExactNumber { numerator: 11, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  turn 7 [step7 (go again): dispatch store.go] source_sequence=Some(6): 1 transient invocation(s), 0 cancellation(s)
+    INVOKE call=TransientEffectCallId(..) effect=b160caa19c5f0782537c99e8ebe6a6a7794f64184567a114b21fc5ab36454883 trigger_sequence=6 intent=Record({"byte_count": Number(ExactNumber { numerator: 11, denominator: 1 })})
+    pending transient effects after turn: 1
+    output size = Number(ExactNumber { numerator: 11, denominator: 1 })
+    output result_ready = Number(ExactNumber { numerator: 1, denominator: 1 })
+  total invocations issued: 4
+ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s
+
+   Doc-tests effects_probe
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

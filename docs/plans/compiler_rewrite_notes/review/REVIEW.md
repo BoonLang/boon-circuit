@@ -1491,8 +1491,10 @@ Nothing in `PLAN_EDITS.md` has been applied; the plan file is unchanged by this 
   reader's guide to what was not confirmed.
 - **Verification depth:** one refuter per finding (a second for critical
   ones), reading the plan, the code and the original documents and re-running
-  probes; not a panel. Nine findings were dropped. Refuters lowered the
-  severity of about a third of the rest; the tables show the lowered values.
+  probes; not a panel. Nine findings were dropped. Refuters changed the
+  severity of about a third of the rest, mostly lowering it (two process
+  findings, MIG-025 and MIG-028, were raised); the tables show the corrected
+  values.
 - **Census precision:** the WHEN→WHILE count (about 290-335) is a token-level
   scanner with a hand-classified sample of 40 (precision at most 35 of 37
   after the MIG-007 refuter's correction); the real number is the new

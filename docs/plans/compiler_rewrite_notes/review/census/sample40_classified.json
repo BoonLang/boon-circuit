@@ -1,0 +1,618 @@
+[
+ {
+  "n": 1,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 1727,
+  "role": "view",
+  "sel": "PASSED . store . mode",
+  "indep": [
+   "label_text"
+  ],
+  "impure": [
+   "tree_row_text_resting_dark",
+   "tree_row_text_resting_light"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 2,
+  "file": "examples/novywave/Theme/NovyTheme.bn",
+  "line": 473,
+  "role": "theme",
+  "sel": "tone",
+  "indep": [
+   "mode"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 3,
+  "file": "examples/todo_mvc_physical/Theme/Classic.bn",
+  "line": 5,
+  "role": "theme",
+  "sel": "request",
+  "indep": [],
+  "impure": [
+   "corners",
+   "depth",
+   "elevation",
+   "font"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 4,
+  "file": "examples/novywave/RUN.bn",
+  "line": 1088,
+  "role": "state",
+  "sel": "external_catalog_file_tree_rows |> List / is_not_empty ( )",
+  "indep": [
+   "external_catalog_file_tree_rows",
+   "external_fallback_file_tree_rows"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 5,
+  "file": "examples/todo_mvc_physical/Theme/Professional.bn",
+  "line": 287,
+  "role": "theme",
+  "sel": "checked",
+  "indep": [
+   "colors.chevron",
+   "colors.text"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 6,
+  "file": "examples/novywave/RUN.bn",
+  "line": 2530,
+  "role": "state",
+  "sel": "signal_search_text |> Text / is_empty ( )",
+  "indep": [
+   "active_scope",
+   "item.family",
+   "item.name",
+   "item.scope",
+   "signal_search_needle"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 7,
+  "file": "examples/todo_mvc_physical/Theme/Glassmorphism.bn",
+  "line": 8,
+  "role": "theme",
+  "sel": "request",
+  "indep": [],
+  "impure": [
+   "corners",
+   "depth",
+   "elevation",
+   "font"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 8,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 3780,
+  "role": "view",
+  "sel": "signal . kind",
+  "indep": [
+   "signal"
+  ],
+  "impure": [
+   "row_analog_limits_button",
+   "row_format_control"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 9,
+  "file": "examples/todo_mvc_physical/Theme/Glassmorphism.bn",
+  "line": 290,
+  "role": "theme",
+  "sel": "font",
+  "indep": [
+   "body_base",
+   "colors.chevron",
+   "colors.danger",
+   "colors.filter_selected",
+   "colors.placeholder",
+   "colors.text"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 10,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 485,
+  "role": "view",
+  "sel": "PASSED . store . workspace_selected_key == Repo",
+  "indep": [],
+  "impure": [
+   "workspace_tree_repo_resting",
+   "workspace_tree_repo_selected"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 11,
+  "file": "examples/fjordpulse/Model/FjordPulseModel.bn",
+  "line": 18,
+  "role": "view",
+  "sel": "basemap",
+  "indep": [
+   "language"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 12,
+  "file": "examples/fjordpulse/Server/RUN.bn",
+  "line": 269,
+  "role": "state",
+  "sel": "path",
+  "indep": [
+   "method",
+   "query"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 13,
+  "file": "examples/persons_pro/Model/Workspace.bn",
+  "line": 27,
+  "role": "view",
+  "sel": "state",
+  "indep": [
+   "revision"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 14,
+  "file": "examples/novywave/RUN.bn",
+  "line": 1722,
+  "role": "state",
+  "sel": "diagnostic_state == Unsupported",
+  "indep": [
+   "effective_metadata_large_file_contract",
+   "waveform_status"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 15,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 1893,
+  "role": "view",
+  "sel": "PASSED . store . mode",
+  "indep": [
+   "PASSED.store.focused_control_label"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 16,
+  "file": "examples/persons_pro/Theme/PersonsTheme.bn",
+  "line": 207,
+  "role": "theme",
+  "sel": "tone",
+  "indep": [
+   "mode"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 17,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 1359,
+  "role": "view",
+  "sel": "PASSED . store . mode",
+  "indep": [
+   "PASSED.store.diagnostic_state"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 18,
+  "file": "examples/fjordpulse/Model/FjordPulseModel.bn",
+  "line": 71,
+  "role": "view",
+  "sel": "station",
+  "indep": [
+   "language"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 19,
+  "file": "examples/fjordpulse/Model/FjordPulseModel.bn",
+  "line": 194,
+  "role": "view",
+  "sel": "vehicle",
+  "indep": [
+   "language"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 20,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 3426,
+  "role": "view",
+  "sel": "hovered",
+  "indep": [
+   "PASSED.store.mode"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 21,
+  "file": "examples/fjordpulse/View/FjordPulseView.bn",
+  "line": 376,
+  "role": "view",
+  "sel": "PASSED . store . route",
+  "indep": [],
+  "impure": [
+   "line_context_panel",
+   "place_context_panel",
+   "station_panel",
+   "vehicle_panel"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 22,
+  "file": "examples/novywave/Model/NovyModel.bn",
+  "line": 195,
+  "role": "view",
+  "sel": "signal_value_trimmed ( value : value ) |> Text / starts_with ( prefix : TEXT{} )",
+  "indep": [
+   "value"
+  ],
+  "impure": [],
+  "in_refined": false,
+  "verdict": "stays WHEN",
+  "note": "stays WHEN: every read is also read by the selector (derived selector fires on every input update, D32)"
+ },
+ {
+  "n": 23,
+  "file": "examples/todo_mvc_physical/RUN.bn",
+  "line": 199,
+  "role": "view",
+  "sel": "hovered",
+  "indep": [],
+  "impure": [
+   "Theme/material"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 24,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 4393,
+  "role": "state",
+  "sel": "signal . key == TEXT{}",
+  "indep": [
+   "signal.bit_width",
+   "signal.direction",
+   "signal.key",
+   "signal.kind",
+   "signal.name"
+  ],
+  "impure": [
+   "variable_baud_tick_row",
+   "variable_framing_error_row",
+   "variable_static_row",
+   "variable_uart_busy_row"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 25,
+  "file": "examples/novywave/RUN.bn",
+  "line": 3496,
+  "role": "state",
+  "sel": "bridge_file_format == TEXT{}",
+  "indep": [
+   "bridge_file_format"
+  ],
+  "impure": [],
+  "in_refined": false,
+  "verdict": "stays WHEN",
+  "note": "stays WHEN: reads covered by selector"
+ },
+ {
+  "n": 26,
+  "file": "examples/fjordpulse/View/FjordPulseView.bn",
+  "line": 10,
+  "role": "view",
+  "sel": "PASSED . store . route",
+  "indep": [],
+  "impure": [
+   "admin_root",
+   "public_root"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 27,
+  "file": "examples/novywave/RUN.bn",
+  "line": 4324,
+  "role": "state",
+  "sel": "signal_row . width == 0",
+  "indep": [
+   "signal_row.encoding",
+   "signal_row.width"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 28,
+  "file": "examples/novywave/RUN.bn",
+  "line": 3122,
+  "role": "state",
+  "sel": "selected_timeline_cursor_value <= selected_timeline_cursor_left",
+  "indep": [
+   "selected_timeline_cursor_right",
+   "selected_timeline_cursor_value"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 29,
+  "file": "examples/fjordpulse/Theme/FjordPulseTheme.bn",
+  "line": 382,
+  "role": "theme",
+  "sel": "selected",
+  "indep": [
+   "hovered"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 30,
+  "file": "examples/novywave/Theme/NovyTheme.bn",
+  "line": 452,
+  "role": "theme",
+  "sel": "tone",
+  "indep": [
+   "mode"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 31,
+  "file": "examples/fjordpulse/Model/FjordPulseModel.bn",
+  "line": 226,
+  "role": "view",
+  "sel": "route",
+  "indep": [
+   "language"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 32,
+  "file": "examples/novywave/RUN.bn",
+  "line": 1589,
+  "role": "state",
+  "sel": "active_file",
+  "indep": [
+   "active_metadata_large_file_contract",
+   "external_file_active",
+   "external_loaded_metadata_large_file_contract"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 33,
+  "file": "examples/cells/formula.bn",
+  "line": 55,
+  "role": "state",
+  "sel": "text |> Text / to_number ( )",
+  "indep": [
+   "text"
+  ],
+  "impure": [],
+  "in_refined": false,
+  "verdict": "stays WHEN",
+  "note": "stays WHEN: reads covered by selector"
+ },
+ {
+  "n": 34,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 3805,
+  "role": "view",
+  "sel": "hovered",
+  "indep": [
+   "PASSED.store.mode"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 35,
+  "file": "examples/novywave/RUN.bn",
+  "line": 1724,
+  "role": "state",
+  "sel": "waveform_status",
+  "indep": [
+   "effective_metadata_large_file_contract"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 36,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 1554,
+  "role": "view",
+  "sel": "PASSED . store . scope_cpu_expansion_state",
+  "indep": [
+   "row"
+  ],
+  "impure": [
+   "file_tree_simple_scope_expand_button",
+   "file_tree_simple_scope_expanded_row"
+  ],
+  "in_refined": true,
+  "verdict": "unclear",
+  "note": "unclear: row labels are probably constant per row"
+ },
+ {
+  "n": 37,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 4057,
+  "role": "view",
+  "sel": "segment . state",
+  "indep": [
+   "segment"
+  ],
+  "impure": [
+   "waveform_segment_blue",
+   "waveform_segment_cyan",
+   "waveform_segment_dark",
+   "waveform_segment_indigo"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 38,
+  "file": "examples/novywave/View/NovyView.bn",
+  "line": 4545,
+  "role": "view",
+  "sel": "PASSED . store . active_signal == signal . key",
+  "indep": [
+   "PASSED.store.mode"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 39,
+  "file": "examples/fjordpulse/View/FjordPulseView.bn",
+  "line": 770,
+  "role": "view",
+  "sel": "PASSED . store . station_vehicles_state",
+  "indep": [
+   "PASSED.store.language"
+  ],
+  "impure": [
+   "station_vehicle_list",
+   "station_vehicle_state_panel"
+  ],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ },
+ {
+  "n": 40,
+  "file": "examples/novywave/Model/NovyModel.bn",
+  "line": 421,
+  "role": "state",
+  "sel": "signal_id",
+  "indep": [
+   "cursor",
+   "fallback",
+   "format"
+  ],
+  "impure": [],
+  "in_refined": true,
+  "verdict": "must become WHILE",
+  "note": "arm reads a value that updates independently of the selector (param, PASSED/theme, sibling state)"
+ }
+]
